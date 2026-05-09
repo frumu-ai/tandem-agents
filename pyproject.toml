@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aca"
+name = "tandem-agents"
 version = "0.1.0"
-description = "ACA: Autonomous Coding Agent control plane"
+description = "Tandem Agents: autonomous coding agent control plane"
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0",
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-aca = "src.aca.cli.cli:main"
+aca = "src.tandem_agents.cli.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

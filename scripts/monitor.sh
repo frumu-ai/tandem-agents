@@ -10,4 +10,4 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
   set +a
 fi
 
-exec python3 -m src.aca.cli monitor "$@"
+exec python3 -m src.tandem_agents.cli monitor "$@"

@@ -96,7 +96,7 @@ ACA_DEFAULT_BRANCH=main
 Create the board template inside ACA:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli.cli init-board
+docker compose exec aca python3 -m src.tandem_agents.cli.cli init-board
 ```
 
 This prepares `config/board.yaml` if it does not already exist.
@@ -208,8 +208,8 @@ cards:
 Check that ACA can see the repo binding and board:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli.cli validate
-docker compose exec aca python3 -m src.aca.cli.cli next-task
+docker compose exec aca python3 -m src.tandem_agents.cli.cli validate
+docker compose exec aca python3 -m src.tandem_agents.cli.cli next-task
 ```
 
 Expected result:
@@ -222,7 +222,7 @@ Expected result:
 Run ACA once:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli.cli run
+docker compose exec aca python3 -m src.tandem_agents.cli.cli run
 ```
 
 Then inspect the result:
@@ -234,7 +234,7 @@ Then inspect the result:
 Or inside Docker:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli.cli monitor
+docker compose exec aca python3 -m src.tandem_agents.cli.cli monitor
 ```
 
 Expected result:
@@ -253,8 +253,8 @@ After the first card completes, move the next card from `backlog` to `ready` in 
 Then repeat:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli.cli next-task
-docker compose exec aca python3 -m src.aca.cli.cli run
+docker compose exec aca python3 -m src.tandem_agents.cli.cli next-task
+docker compose exec aca python3 -m src.tandem_agents.cli.cli run
 ```
 
 Repeat until all 4 cards are complete.

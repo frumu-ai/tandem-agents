@@ -33,7 +33,7 @@ you informed as we investigate. We aim to provide an initial assessment
 
 In scope:
 
-- The Tandem Agents control plane: orchestration loop, coordination ledger,
+- The ACA control plane: orchestration loop, coordination ledger,
   outbox dispatcher, lease management, run state writers, CLI / API.
 - The Knowledgebase MCP server bundled in this repository.
 - Container definitions and compose stack as published.

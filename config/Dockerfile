@@ -30,36 +30,36 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN --mount=type=cache,target=/root/.npm \
     npm install -g "@frumu/tandem@${TANDEM_ENGINE_RELEASE_VERSION}"
 
-RUN mkdir -p /workspace/aca/runs /workspace/repos /workspace/tandem-data
+RUN mkdir -p /workspace/tandem-agents/runs /workspace/repos /workspace/tandem-data
 
 ENV PATH="/home/node/npm/bin:${PATH}"
 
-COPY --chown=${HOST_UID}:${HOST_GID} requirements.txt /workspace/aca/requirements.txt
+COPY --chown=${HOST_UID}:${HOST_GID} requirements.txt /workspace/tandem-agents/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /workspace/aca/requirements.txt
+    pip install -r /workspace/tandem-agents/requirements.txt
 
-WORKDIR /workspace/aca
+WORKDIR /workspace/tandem-agents
 
-COPY --chown=${HOST_UID}:${HOST_GID} src/aca /workspace/aca/src/aca
-COPY --chown=${HOST_UID}:${HOST_GID} pyproject.toml /workspace/aca/pyproject.toml
-COPY --chown=${HOST_UID}:${HOST_GID} requirements.txt /workspace/aca/requirements.txt
-COPY --chown=${HOST_UID}:${HOST_GID} config/agent.yaml /workspace/aca/config/agent.yaml
-COPY --chown=${HOST_UID}:${HOST_GID} config/board.yaml /workspace/aca/config/board.yaml
-COPY --chown=${HOST_UID}:${HOST_GID} scripts/run.sh /workspace/aca/scripts/run.sh
-COPY --chown=${HOST_UID}:${HOST_GID} scripts/monitor.sh /workspace/aca/scripts/monitor.sh
-COPY --chown=${HOST_UID}:${HOST_GID} scripts/entrypoint.sh /workspace/aca/scripts/entrypoint.sh
-COPY --chown=${HOST_UID}:${HOST_GID} scripts/tandem-engine-serve.sh /workspace/aca/scripts/tandem-engine-serve.sh
-RUN chmod +x /workspace/aca/scripts/run.sh /workspace/aca/scripts/monitor.sh /workspace/aca/scripts/entrypoint.sh /workspace/aca/scripts/tandem-engine-serve.sh
+COPY --chown=${HOST_UID}:${HOST_GID} src/tandem_agents /workspace/tandem-agents/src/tandem_agents
+COPY --chown=${HOST_UID}:${HOST_GID} pyproject.toml /workspace/tandem-agents/pyproject.toml
+COPY --chown=${HOST_UID}:${HOST_GID} requirements.txt /workspace/tandem-agents/requirements.txt
+COPY --chown=${HOST_UID}:${HOST_GID} config/agent.yaml /workspace/tandem-agents/config/agent.yaml
+COPY --chown=${HOST_UID}:${HOST_GID} config/board.yaml /workspace/tandem-agents/config/board.yaml
+COPY --chown=${HOST_UID}:${HOST_GID} scripts/run.sh /workspace/tandem-agents/scripts/run.sh
+COPY --chown=${HOST_UID}:${HOST_GID} scripts/monitor.sh /workspace/tandem-agents/scripts/monitor.sh
+COPY --chown=${HOST_UID}:${HOST_GID} scripts/entrypoint.sh /workspace/tandem-agents/scripts/entrypoint.sh
+COPY --chown=${HOST_UID}:${HOST_GID} scripts/tandem-engine-serve.sh /workspace/tandem-agents/scripts/tandem-engine-serve.sh
+RUN chmod +x /workspace/tandem-agents/scripts/run.sh /workspace/tandem-agents/scripts/monitor.sh /workspace/tandem-agents/scripts/entrypoint.sh /workspace/tandem-agents/scripts/tandem-engine-serve.sh
 
 COPY LICENSE /LICENSE
 COPY NOTICE /NOTICE
 
-LABEL org.opencontainers.image.title="ACA" \
-      org.opencontainers.image.description="ACA portable auto-coder runtime" \
+LABEL org.opencontainers.image.title="Tandem Agents" \
+      org.opencontainers.image.description="Tandem Agents portable autonomous coding runtime" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
 EXPOSE 39735
 
-CMD ["/workspace/aca/scripts/entrypoint.sh"]
+CMD ["/workspace/tandem-agents/scripts/entrypoint.sh"]

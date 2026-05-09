@@ -47,7 +47,7 @@ Example:
 ```json
 {
   "type": "kanban_board",
-  "path": "/home/user/aca/config/board.yaml",
+  "path": "/home/user/tandem-agents/config/board.yaml",
   "card_id": "card-123"
 }
 ```
@@ -134,8 +134,8 @@ Each task source has different requirements. Make sure the required dependencies
 
 ```bash
 # Inside the container:
-python3 -m src.aca.cli check-engine
-python3 -m src.aca.cli next-task
+python3 -m src.tandem_agents.cli check-engine
+python3 -m src.tandem_agents.cli next-task
 ```
 
 **Fallback:** Use `kanban_board` task source to test ACA without GitHub integration.

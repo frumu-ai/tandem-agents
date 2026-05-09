@@ -9,6 +9,7 @@ tmp/
 runs/
 workspace/
 .ACA/
+.tandem-agents/
 tandem-data/
 tandem-engine-state/
 kb-data/

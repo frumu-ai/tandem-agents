@@ -47,15 +47,15 @@ walkthrough and [AGENTS.md](AGENTS.md) for the contributor read order.
 Backend unit tests run inside the `aca` container:
 
 ```bash
-docker compose exec aca python3 -m unittest discover -s src/aca -p "*_test.py"
+docker compose exec aca python3 -m unittest discover -s src/tandem_agents -p "*_test.py"
 ```
 
 Targeted runs are faster:
 
 ```bash
 docker compose exec aca python3 -m unittest \
-  src.aca.core.coordination.coordination_test \
-  src.aca.config.config_loader_test
+  src.tandem_agents.core.coordination.coordination_test \
+  src.tandem_agents.config.config_loader_test
 ```
 
 For UI / control-panel work, run `npx tsc --noEmit` against the control-panel

@@ -226,8 +226,8 @@ The multi-project workspace registry is runtime state, not a config field, but i
 
 Default layout:
 
-- `.ACA/workspace.yaml`
-- `.ACA/projects/<project_id>.yaml`
+- `.tandem-agents/workspace.yaml`
+- `.tandem-agents/projects/<project_id>.yaml`
 
 Behavior:
 

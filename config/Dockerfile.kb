@@ -21,14 +21,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN addgroup --system --gid "${HOST_GID}" tandem \
   && adduser --system --uid "${HOST_UID}" --ingroup tandem tandem
 
-WORKDIR /workspace/aca
+WORKDIR /workspace/tandem-agents
 
-COPY requirements.txt /workspace/aca/requirements.txt
+COPY requirements.txt /workspace/tandem-agents/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip \
-  && pip install -r /workspace/aca/requirements.txt
+  && pip install -r /workspace/tandem-agents/requirements.txt
 
-COPY src /workspace/aca/src
+COPY src /workspace/tandem-agents/src
 COPY scripts/kb-server-serve.sh /usr/local/bin/kb-server-serve.sh
 RUN chmod +x /usr/local/bin/kb-server-serve.sh
 

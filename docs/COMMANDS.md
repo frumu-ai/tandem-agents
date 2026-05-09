@@ -17,7 +17,7 @@ Use the Compose-sidecar command when you want the ACA-managed engine.
 ./scripts/setup.sh
 ./scripts/monitor.sh
 ./scripts/monitor.sh --follow
-./scripts/monitor.sh --run-dir ~/aca/runs/<run_id>
+./scripts/monitor.sh --run-dir ~/tandem-agents/runs/<run_id>
 ```
 
 ```bash
@@ -61,7 +61,7 @@ docker compose logs -f tandem-control-panel
 `./scripts/run.sh outbox-dispatcher` starts the standalone GitHub outbox drain loop.
 `./scripts/run.sh scheduler-plan` prints the scheduler admission snapshot and the currently admissible task batch.
 `./scripts/run.sh scheduler-dispatch` starts the admitted batch in parallel using worker mode and the scheduler plan.
-`./scripts/run.sh workspace` prints the saved workspace registry from `.ACA/workspace.yaml` and can set the active project with `--set-active <project_id>`.
+`./scripts/run.sh workspace` prints the saved workspace registry from `.tandem-agents/workspace.yaml` and can set the active project with `--set-active <project_id>`.
 `./scripts/run.sh operator-status` prints a joined operator view across tasks, leases, workers, runs, branch / PR links, and recovery state.
 `curl -s -H "Authorization: Bearer <token>" "http://127.0.0.1:39735/dashboard"` renders the compact operator dashboard HTML view.
 `./scripts/setup.sh` is the recommended first-run path because it bootstraps token files and writes `tandem-data/control-panel-config.json`.

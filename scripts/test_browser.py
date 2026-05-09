@@ -5,8 +5,8 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.aca.config.config import resolve_config
-from src.aca.core.engine.tandem_client_sdk import (
+from src.tandem_agents.config.config import resolve_config
+from src.tandem_agents.core.engine.tandem_client_sdk import (
     sdk_browser_close,
     sdk_browser_extract,
     sdk_browser_open,

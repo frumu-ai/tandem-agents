@@ -1,6 +1,9 @@
-# ACA Agent Instructions
+# Tandem Agents — Repo Agent Instructions
 
-This directory is the working home for a portable ACA agent.
+This repo (Tandem Agents) hosts the **ACA** (Autonomous Coding Agent)
+runtime alongside other agent-related features. ACA is the autonomous
+coding agent inside this project — when this doc says "the agent" or
+"ACA", it means that runtime specifically.
 
 ## Read First
 

@@ -1,12 +1,15 @@
 <p align="center">
-  <img src="assets/aca_logo.png" alt="ACA logo" width="450">
+  <img src="assets/aca_logo.png" alt="Tandem Agents logo" width="450">
 </p>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-Tandem ACA (Autonomous Coding Agent) is an autonomous coding control plane that runs a repeatable software-delivery loop:
+**Tandem Agents** is a project that hosts agent-based runtimes built on the
+[Tandem](https://github.com/frumu-ai/tandem) workflow engine. The flagship
+runtime in this repo is **ACA** (Autonomous Coding Agent), an autonomous
+coding control plane that runs a repeatable software-delivery loop:
 
 - pick the next task from a board or GitHub Project
 - bind that work to the correct repository and workspace
@@ -16,7 +19,19 @@ Tandem ACA (Autonomous Coding Agent) is an autonomous coding control plane that 
 
 It is designed to run the same way on a laptop, in Docker Compose, or on a hosted Linux box.
 
-ACA is built on top of [Tandem](https://github.com/frumu-ai/tandem), the workflow engine we also developed. Tandem provides the durable runtime underneath ACA: engine-owned state, coordination primitives, provider-agnostic execution, and backend APIs that let ACA run governed coding workflows without treating a chat transcript as the source of truth.
+> **Naming.** This project was previously published as **ACA**. The repo,
+> Python package (`tandem_agents`), and Compose project name are now
+> "Tandem Agents" because the project hosts more than just the coding
+> agent. The coding agent itself is still **ACA** — the CLI is `aca`, the
+> Compose service is `aca`, the agent's MCP server is `ac.tandem/aca-mcp`,
+> and the agent's git artifacts (branches, PR markers, commit prefixes)
+> still use the `aca/` and `aca:` prefixes.
+
+ACA is built on top of Tandem, the workflow engine we also developed.
+Tandem provides the durable runtime underneath: engine-owned state,
+coordination primitives, provider-agnostic execution, and backend APIs
+that let ACA run governed coding workflows without treating a chat
+transcript as the source of truth.
 
 ## What ACA Changes
 
@@ -159,14 +174,14 @@ docker compose up -d --build
 5. Run one task:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli.cli run
+docker compose exec aca python3 -m src.tandem_agents.cli.cli run
 ```
 
 6. Watch the run:
 
 ```bash
 ./scripts/monitor.sh
-docker compose exec aca python3 -m src.aca.cli.cli monitor --follow
+docker compose exec aca python3 -m src.tandem_agents.cli.cli monitor --follow
 ```
 
 ## Services And Ports
@@ -183,7 +198,7 @@ If `39734` or `39735` is already in use, change the corresponding values in `.en
 
 - Configure GitHub Project intake in the control panel Install settings.
 - Provide `GITHUB_PERSONAL_ACCESS_TOKEN` (or `GITHUB_TOKEN`) in `.env` if you want Tandem's built-in GitHub MCP bootstrap to work non-interactively.
-- Start stack and run `docker compose exec aca python3 -m src.aca.cli.cli run`.
+- Start stack and run `docker compose exec aca python3 -m src.tandem_agents.cli.cli run`.
 
 ### Run ACA Against A Local Board
 
@@ -203,9 +218,9 @@ Screenshot artifacts are written under:
 
 ## Key Paths
 
-- orchestration code: `src/aca/core/`
-- CLI/API entry points: `src/aca/cli/` and `src/aca/api/`
-- runtime state writers: `src/aca/runtime/`
+- orchestration code: `src/tandem_agents/core/`
+- CLI/API entry points: `src/tandem_agents/cli/` and `src/tandem_agents/api/`
+- runtime state writers: `src/tandem_agents/runtime/`
 - setup + launch scripts: `scripts/`
 - container definitions: `docker-compose.yml`, `config/Dockerfile*`
 - docs index: [docs/README.md](docs/README.md)

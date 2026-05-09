@@ -22,7 +22,7 @@ EOF
 }
 
 if [[ $# -eq 0 ]]; then
-  exec python3 -m src.aca.cli run
+  exec python3 -m src.tandem_agents.cli run
 fi
 
 case "$1" in
@@ -30,27 +30,27 @@ case "$1" in
     exec "${ROOT_DIR}/scripts/setup.sh"
     ;;
   --validate)
-    exec python3 -m src.aca.cli validate
+    exec python3 -m src.tandem_agents.cli validate
     ;;
   --check-engine)
-    exec python3 -m src.aca.cli check-engine
+    exec python3 -m src.tandem_agents.cli check-engine
     ;;
   --print-config|--show-config)
-    exec python3 -m src.aca.cli print-config
+    exec python3 -m src.tandem_agents.cli print-config
     ;;
   --init-board)
-    exec python3 -m src.aca.cli init-board
+    exec python3 -m src.tandem_agents.cli init-board
     ;;
   --dry-run)
-    exec python3 -m src.aca.cli run --dry-run
+    exec python3 -m src.tandem_agents.cli run --dry-run
     ;;
   -h|--help)
     usage
     ;;
   run|worker|outbox-dispatcher|validate|check-engine|print-config|init-board|monitor)
-    exec python3 -m src.aca.cli "$@"
+    exec python3 -m src.tandem_agents.cli "$@"
     ;;
   *)
-    exec python3 -m src.aca.cli run "$@"
+    exec python3 -m src.tandem_agents.cli run "$@"
     ;;
 esac

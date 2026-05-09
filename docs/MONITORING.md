@@ -30,7 +30,7 @@ The agent should continuously produce:
 ## Suggested Run Layout
 
 ```text
-.ACA/runs/<run_id>/
+.tandem-agents/runs/<run_id>/
   status.json
   summary.md
   events.jsonl
@@ -94,14 +94,14 @@ Use `scripts/monitor.sh` to inspect run artifacts from the host:
 
 ```bash
 ./scripts/monitor.sh
-./scripts/monitor.sh --run-dir .ACA/runs/run_2026_03_21_001
+./scripts/monitor.sh --run-dir .tandem-agents/runs/run_2026_03_21_001
 ./scripts/monitor.sh --follow
 ```
 
 For live engine status and run monitoring, run the monitor inside the container:
 
 ```bash
-docker compose exec aca python3 -m src.aca.cli monitor --follow
+docker compose exec aca python3 -m src.tandem_agents.cli monitor --follow
 docker compose logs -f aca
 ```
 

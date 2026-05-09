@@ -65,4 +65,4 @@ os.execvp(sys.argv[1], sys.argv[1:])
 PY
 }
 
-exec_as_runtime_user uvicorn src.aca.kb.main:app --host "$HOST" --port "$PORT" --proxy-headers --forwarded-allow-ips '*' 2>&1
+exec_as_runtime_user uvicorn src.tandem_agents.kb.main:app --host "$HOST" --port "$PORT" --proxy-headers --forwarded-allow-ips '*' 2>&1

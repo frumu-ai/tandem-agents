@@ -14,7 +14,7 @@ The local run directory is the source of truth for monitoring, debugging, and ha
 The runner currently writes these files and folders:
 
 ```text
-.ACA/runs/<run_id>/
+.tandem-agents/runs/<run_id>/
   status.json
   events.jsonl
   summary.md
@@ -337,7 +337,7 @@ For the canonical board and task objects used in the workspace schema, see `WORK
     "description": "Make the local control plane runnable.",
     "source": {
       "type": "kanban_board",
-      "board_path": "/home/user/aca/config/board.yaml",
+      "board_path": "/home/user/tandem-agents/config/board.yaml",
       "card_id": "card-123"
     },
     "acceptance_criteria": []
@@ -349,7 +349,7 @@ For the canonical board and task objects used in the workspace schema, see `WORK
     "branch": "main",
     "commit": "abc1234",
     "dirty": false,
-    "worktree_root": "/home/user/aca/runs/repos",
+    "worktree_root": "/home/user/tandem-agents/runs/repos",
     "remote": "origin\tgit@github.com:org/repo.git (fetch)"
   },
   "engine": {
@@ -380,9 +380,9 @@ For the canonical board and task objects used in the workspace schema, see `WORK
     "active": false
   },
   "artifacts": {
-    "run_dir": "/home/user/aca/runs/run-20260321T010101Z-abc123",
-    "status_json": "/home/user/aca/runs/run-20260321T010101Z-abc123/status.json",
-    "events_jsonl": "/home/user/aca/runs/run-20260321T010101Z-abc123/events.jsonl"
+    "run_dir": "/home/user/tandem-agents/runs/run-20260321T010101Z-abc123",
+    "status_json": "/home/user/tandem-agents/runs/run-20260321T010101Z-abc123/status.json",
+    "events_jsonl": "/home/user/tandem-agents/runs/run-20260321T010101Z-abc123/events.jsonl"
   },
   "timestamps": {
     "created_at_ms": 1742515200000,

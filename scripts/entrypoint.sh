@@ -21,23 +21,23 @@ echo
 
 if [ "${ACA_MODE:-}" = "api" ] || [ "${ACA_MODE:-}" = "coordinator" ]; then
     echo "ACA started in coordinator mode — listening on port ${ACA_API_PORT:-39735}"
-    exec python3 -m src.aca.api.main
+    exec python3 -m src.tandem_agents.api.main
 elif [ "${ACA_MODE:-}" = "worker" ]; then
     echo "ACA started in worker mode — running a single worker execution"
-    exec python3 -m src.aca.cli worker
+    exec python3 -m src.tandem_agents.cli worker
 elif [ "${ACA_MODE:-}" = "outbox-dispatcher" ] || [ "${ACA_MODE:-}" = "outbox" ]; then
     echo "ACA started in outbox-dispatcher mode — draining GitHub sync outbox"
-    exec python3 -m src.aca.cli outbox-dispatcher
+    exec python3 -m src.tandem_agents.cli outbox-dispatcher
 elif [ "${ACA_AUTORUN:-false}" = "true" ]; then
     echo "ACA_AUTORUN is set — starting explicit execution mode"
-    exec python3 -m src.aca.cli run
+    exec python3 -m src.tandem_agents.cli run
 else
     echo "ACA started in passive mode — waiting for explicit run command"
     echo "To trigger a run inside the container, use:"
-    echo "  python3 -m src.aca.cli run"
+    echo "  python3 -m src.tandem_agents.cli run"
     echo ""
     echo "For next-task preview, use:"
-    echo "  python3 -m src.aca.cli next-task"
+    echo "  python3 -m src.tandem_agents.cli next-task"
     echo ""
     echo "Container staying alive. Exec in with: docker compose exec aca bash"
     exec sleep infinity

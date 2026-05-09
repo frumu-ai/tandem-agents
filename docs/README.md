@@ -8,22 +8,22 @@ Project files live one level up in the repository tree:
 - [../AGENTS.md](../AGENTS.md) - agent instructions
 - [../config/agent.yaml](../config/agent.yaml) - machine-readable operator profile
 - [../config/board.yaml](../config/board.yaml) - default Kanban board template
-- [../src/aca/cli.py](../src/aca/cli.py) - CLI entry point
-- [../src/aca/config.py](../src/aca/config.py) - config resolution and validation
-- [../src/aca/config_loader.py](../src/aca/config_loader.py) - config loading and validation logic
-- [../src/aca/config_types.py](../src/aca/config_types.py) - config dataclasses and helpers
-- [../src/aca/utils.py](../src/aca/utils.py) - shared filesystem and timestamp helpers
-- [../src/aca/board.py](../src/aca/board.py) - board file helpers
-- [../src/aca/runstate.py](../src/aca/runstate.py) - run-state and blackboard helpers
-- [../src/aca/task_sources.py](../src/aca/task_sources.py) - task-source normalization
-- [../src/aca/prompts.py](../src/aca/prompts.py) - role prompt builders
-- [../src/aca/worker.py](../src/aca/worker.py) - worker execution helpers
-- [../src/aca/run_output.py](../src/aca/run_output.py) - status, snapshot, and summary writers
-- [../src/aca/runner_core.py](../src/aca/runner_core.py) - orchestration logic
-- [../src/aca/engine.py](../src/aca/engine.py) - Tandem engine and repo helpers
-- [../src/aca/runner.py](../src/aca/runner.py) - orchestration and swarm runner
-- [../src/aca/monitor.py](../src/aca/monitor.py) - run monitor and live follow mode
-- [../src/aca/state.py](../src/aca/state.py) - board, run-state, and artifact helpers
+- [../src/tandem_agents/cli.py](../src/tandem_agents/cli.py) - CLI entry point
+- [../src/tandem_agents/config.py](../src/tandem_agents/config.py) - config resolution and validation
+- [../src/tandem_agents/config_loader.py](../src/tandem_agents/config_loader.py) - config loading and validation logic
+- [../src/tandem_agents/config_types.py](../src/tandem_agents/config_types.py) - config dataclasses and helpers
+- [../src/tandem_agents/utils.py](../src/tandem_agents/utils.py) - shared filesystem and timestamp helpers
+- [../src/tandem_agents/board.py](../src/tandem_agents/board.py) - board file helpers
+- [../src/tandem_agents/runstate.py](../src/tandem_agents/runstate.py) - run-state and blackboard helpers
+- [../src/tandem_agents/task_sources.py](../src/tandem_agents/task_sources.py) - task-source normalization
+- [../src/tandem_agents/prompts.py](../src/tandem_agents/prompts.py) - role prompt builders
+- [../src/tandem_agents/worker.py](../src/tandem_agents/worker.py) - worker execution helpers
+- [../src/tandem_agents/run_output.py](../src/tandem_agents/run_output.py) - status, snapshot, and summary writers
+- [../src/tandem_agents/runner_core.py](../src/tandem_agents/runner_core.py) - orchestration logic
+- [../src/tandem_agents/engine.py](../src/tandem_agents/engine.py) - Tandem engine and repo helpers
+- [../src/tandem_agents/runner.py](../src/tandem_agents/runner.py) - orchestration and swarm runner
+- [../src/tandem_agents/monitor.py](../src/tandem_agents/monitor.py) - run monitor and live follow mode
+- [../src/tandem_agents/state.py](../src/tandem_agents/state.py) - board, run-state, and artifact helpers
 - [../requirements.txt](../requirements.txt) - Python dependencies
 - [../scripts/run.sh](../scripts/run.sh) - local launcher stub
 - [../scripts/setup.sh](../scripts/setup.sh) - bootstrap and migration helper for `.env` and control-panel config
