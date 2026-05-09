@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim
+
+ARG HOST_UID=1000
+ARG HOST_GID=1000
+ARG VERSION=dev
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN addgroup --system --gid "${HOST_GID}" tandem \
+  && adduser --system --uid "${HOST_UID}" --ingroup tandem tandem
+
+WORKDIR /workspace/aca
+
+COPY requirements.txt /workspace/aca/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip \
+  && pip install -r /workspace/aca/requirements.txt
+
+COPY src /workspace/aca/src
+COPY scripts/kb-server-serve.sh /usr/local/bin/kb-server-serve.sh
+RUN chmod +x /usr/local/bin/kb-server-serve.sh
+
+COPY LICENSE /LICENSE
+COPY NOTICE /NOTICE
+
+LABEL org.opencontainers.image.title="Tandem Knowledgebase MCP" \
+      org.opencontainers.image.description="Local-only MCP server for business knowledgebase uploads and retrieval" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+EXPOSE 39736
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=20 \
+  CMD curl -fsS http://127.0.0.1:39736/health >/dev/null
+
+CMD ["/usr/local/bin/kb-server-serve.sh"]

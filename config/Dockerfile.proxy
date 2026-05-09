@@ -1,0 +1,8 @@
+ARG HOSTED_PROXY_BASE_IMAGE=caddy:2-alpine
+
+FROM ${HOSTED_PROXY_BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="Tandem hosted proxy" \
+      org.opencontainers.image.description="Reverse proxy front door for hosted Tandem deployments"
+
+# The deployment-specific Caddyfile is mounted at runtime.

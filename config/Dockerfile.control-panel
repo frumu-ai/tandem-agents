@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.7
+FROM node:20-bookworm-slim
+
+ARG TANDEM_RELEASE_VERSION=latest
+ARG TANDEM_CONTROL_PANEL_RELEASE_VERSION=${TANDEM_RELEASE_VERSION}
+ARG VERSION=dev
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+ENV DEBIAN_FRONTEND=noninteractive \
+  npm_config_update_notifier=false \
+  npm_config_fund=false \
+  npm_config_audit=false
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g "@frumu/tandem-panel@${TANDEM_CONTROL_PANEL_RELEASE_VERSION}"
+
+COPY scripts/tandem-control-panel-serve.sh /usr/local/bin/tandem-control-panel-serve.sh
+RUN chmod +x /usr/local/bin/tandem-control-panel-serve.sh
+
+COPY LICENSE /LICENSE
+COPY NOTICE /NOTICE
+
+LABEL org.opencontainers.image.title="Tandem Control Panel" \
+      org.opencontainers.image.description="Tandem control-panel companion UI" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+EXPOSE 39734
+
+CMD ["/usr/local/bin/tandem-control-panel-serve.sh"]

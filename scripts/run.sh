@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ROOT_DIR}/.env"
+  set +a
+fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  run.sh [--setup] [--validate] [--check-engine] [--print-config] [--init-board] [--dry-run]
+  run.sh [worker|outbox-dispatcher]
+  run.sh [run]
+
+If no arguments are provided, the portable runner starts a run.
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  exec python3 -m src.aca.cli run
+fi
+
+case "$1" in
+  --setup)
+    exec "${ROOT_DIR}/scripts/setup.sh"
+    ;;
+  --validate)
+    exec python3 -m src.aca.cli validate
+    ;;
+  --check-engine)
+    exec python3 -m src.aca.cli check-engine
+    ;;
+  --print-config|--show-config)
+    exec python3 -m src.aca.cli print-config
+    ;;
+  --init-board)
+    exec python3 -m src.aca.cli init-board
+    ;;
+  --dry-run)
+    exec python3 -m src.aca.cli run --dry-run
+    ;;
+  -h|--help)
+    usage
+    ;;
+  run|worker|outbox-dispatcher|validate|check-engine|print-config|init-board|monitor)
+    exec python3 -m src.aca.cli "$@"
+    ;;
+  *)
+    exec python3 -m src.aca.cli run "$@"
+    ;;
+esac

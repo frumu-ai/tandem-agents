@@ -1,0 +1,148 @@
+board:
+  id: aca-main
+  name: ACA Kanban
+  columns:
+    - backlog
+    - ready
+    - in_progress
+    - review
+    - test
+    - blocked
+    - done
+  created_at_ms: 0
+  updated_at_ms: 1776704492539
+cards:
+  - id: kb-contract-guide-surface
+    title: Fix KB MCP contract and add explicit agent guide tools
+    lane: done
+    description: >
+      Repair the KB MCP doc-id contract so search results round-trip cleanly into
+      get_document, then expose a collection guide tool that teaches agents when
+      to use the KB and how to navigate uploaded docs.
+    acceptance_criteria:
+      - get_document accepts the exact doc_id returned by search_docs and list_documents
+      - get_kb_guide returns collection summaries plus per-collection guides
+      - get_collection_guide is exposed in tools/list
+      - initialize instructions tell agents to guide-search-fetch in that order
+    labels:
+      - kb
+      - mcp
+      - agent-ux
+      - contract
+    priority: high
+    source:
+      type: kanban_board
+    repo:
+      path: .
+    subtasks:
+      - Make doc_id the canonical fetch identifier
+      - Add get_collection_guide to the MCP tool surface
+      - Strengthen the agent instructions and guide payload
+    history: []
+
+  - id: kb-guide-generation
+    title: Generate collection guides from uploaded docs
+    lane: done
+    description: >
+      Build deterministic collection guides from uploaded docs so every namespace
+      can explain its own scope, canonical files, and recommended questions.
+    acceptance_criteria:
+      - every collection has a generated guide even without a hand-authored guide doc
+      - kb_role, kb_summary, kb_keywords, and kb_priority are parsed from frontmatter
+      - guide payload includes summary, use cases, canonical docs, key topics, and freshness
+      - guide docs and priority hints influence canonical document selection
+    labels:
+      - kb
+      - indexing
+      - guide
+      - metadata
+    priority: high
+    source:
+      type: kanban_board
+    repo:
+      path: .
+    subtasks:
+      - Add guide metadata parsing rules
+      - Build collection guide derivation in the index layer
+      - Surface generated guide data through MCP responses
+    history: []
+
+  - id: kb-search-discovery
+    title: Improve search for natural-language agent questions
+    lane: done
+    description: >
+      Make search robust for conversational prompts and let agents search all
+      collections when they do not know the namespace up front.
+    acceptance_criteria:
+      - search_docs works without collection_id and returns collection-aware results
+      - FTS queries are normalized and escaped before execution
+      - fallback search is only used when FTS cannot handle the query
+      - ranking boosts exact title and heading matches, plus guide-like docs
+    labels:
+      - kb
+      - search
+      - retrieval
+      - ranking
+    priority: high
+    source:
+      type: kanban_board
+    repo:
+      path: .
+    subtasks:
+      - Make collection_id optional in search_docs
+      - Add query normalization and FTS-safe tokenization
+      - Improve ranking and result payload fields
+    history: []
+
+  - id: kb-ingestion-layout
+    title: Expand ingestion coverage for realistic doc sets
+    lane: done
+    description: >
+      Support nested document trees and correct metadata merging so the KB can
+      index real exported docs, handbooks, and product docs without silent loss.
+    acceptance_criteria:
+      - nested docs under a collection are indexed and searchable
+      - source paths remain stable and visible in results
+      - create/update merges title and tags into existing frontmatter correctly
+      - delete and reconcile flows work for nested docs
+    labels:
+      - kb
+      - ingestion
+      - storage
+      - metadata
+    priority: medium
+    source:
+      type: kanban_board
+    repo:
+      path: .
+    subtasks:
+      - Replace two-level path assumption with collection-rooted relative paths
+      - Merge title and tags into frontmatter instead of prepending blindly
+      - Cover nested delete and reindex behavior
+    history: []
+
+  - id: kb-test-matrix
+    title: Add retrieval and guide generation regression coverage
+    lane: done
+    description: >
+      Extend the KB test suite so contract, guide generation, metadata, search,
+      and nested-ingestion behavior are protected against regressions.
+    acceptance_criteria:
+      - tests cover doc_id round-trip, global guide, collection guide, and cross-collection search
+      - tests cover title and tag merge behavior with existing frontmatter
+      - tests cover nested-doc indexing and deletion
+      - tests cover natural-language queries with punctuation and quotes
+    labels:
+      - kb
+      - tests
+      - quality
+    priority: medium
+    source:
+      type: kanban_board
+    repo:
+      path: .
+    subtasks:
+      - Add MCP contract regression tests
+      - Add guide generation fixtures
+      - Add ingestion and search edge-case tests
+    history: []

@@ -1,0 +1,54 @@
+# Optional bootstrap seed for KB agent prompts.
+#
+# This file is read ONCE at startup if the kb_prompts table is empty. After
+# that, owners manage overrides through the control panel "Agent prompts"
+# panel. Edits here will not take effect on a populated database — use the
+# UI or the /admin/prompts API instead.
+#
+# Path: pointed to by KB_PROMPTS_FILE in .env.
+#
+# Two prompt scopes:
+#   - global: applies to all collections (and is the only scope honored for
+#     mcp_initialize_instructions and answer_question_tool_description, which
+#     are session-level MCP artifacts and have no collection context).
+#   - collections: per-collection overrides for runtime prompts only.
+#
+# Each entry can be:
+#   - a plain string (sets the global override only), OR
+#   - a dict with `value:` (global) and `collections:` (per-collection map).
+#
+# Recognized keys:
+#   mcp_initialize_instructions       — global only
+#   answer_question_tool_description  — global only
+#   match_guidance                    — supports per-collection
+#   no_match_guidance                 — supports per-collection
+#   no_query_guidance                 — supports per-collection
+
+mcp_initialize_instructions: |
+  You are a knowledgebase support assistant. Your only job is to answer the
+  user's questions from the documents in the connected knowledgebase. Treat
+  each user as an end-user client of the organization that owns this
+  knowledgebase. Never invent facts. If the answer is not in the evidence,
+  say so plainly.
+
+no_match_guidance:
+  value: |
+    The knowledgebase does not contain an answer. Reply: "I don't have
+    information about that in my knowledgebase." Do not invent facts.
+  collections:
+    support: |
+      The knowledgebase does not contain an answer to this support question.
+      Reply: "I don't have information about that. Please open a ticket at
+      support@example.com and a human will follow up." Do not speculate.
+    engineering: |
+      The knowledgebase does not contain an answer. Tell the user the docs
+      do not cover this and suggest they ask in #eng-help on Slack. Do not
+      guess from general knowledge.
+
+match_guidance:
+  collections:
+    support: |
+      Answer the customer using ONLY the text in evidence[].content. Use a
+      friendly, concise tone. Cite each fact inline using the matching
+      evidence title in brackets, e.g. [Refund Policy]. Never make up policy
+      details. If evidence is incomplete, say so and offer to escalate.

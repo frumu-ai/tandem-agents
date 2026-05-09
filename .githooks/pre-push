@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+run_gitleaks_detect() {
+  local range="$1"
+  if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks detect --log-opts "$range" --redact --no-banner --exit-code 1
+  elif command -v docker >/dev/null 2>&1; then
+    docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:latest detect --log-opts "$range" --redact --no-banner --exit-code 1
+  else
+    echo "gitleaks not found. Install gitleaks or Docker to run the fallback image." >&2
+    exit 1
+  fi
+}
+
+range=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ -z "${local_sha:-}" ]; then
+    continue
+  fi
+  if [ "${remote_sha:-}" = "0000000000000000000000000000000000000000" ] || [ -z "${remote_sha:-}" ]; then
+    range="${local_sha}"
+  else
+    range="${remote_sha}..${local_sha}"
+  fi
+  break
+done
+
+if [ -z "$range" ]; then
+  range="$(git rev-parse HEAD)"
+fi
+
+run_gitleaks_detect "$range"

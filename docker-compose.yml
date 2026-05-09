@@ -1,0 +1,286 @@
+name: ${COMPOSE_PROJECT_NAME:-tandem-aca}
+
+services:
+  tandem-engine:
+    build:
+      context: .
+      dockerfile: config/Dockerfile.engine
+      args:
+        HOST_UID: "${ACA_HOST_UID:-1000}"
+        HOST_GID: "${ACA_HOST_GID:-1000}"
+        TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
+        TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      TANDEM_PORT: ${TANDEM_PORT:-39733}
+      TANDEM_ENGINE_PORT: ${TANDEM_PORT:-39733}
+      TANDEM_BASE_URL: ""
+      TANDEM_STATE_DIR: /home/node/.local/share/tandem/data
+      TANDEM_API_TOKEN_FILE: /workspace/tandem-data/tandem_api_token
+      TANDEM_API_TOKEN: ""
+      TANDEM_TOKEN: ""
+      TANDEM_ENGINE_COMMAND: scripts/tandem-engine-serve.sh
+      TANDEM_OUTPUT_ROOT: /workspace/tandem-data
+      TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
+      CODEX_HOME: /workspace/tandem-data/codex
+      NPM_CONFIG_PREFIX: /home/node/npm
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_PERSONAL_ACCESS_TOKEN_FILE: /run/secrets/github_token
+      GITHUB_TOKEN_FILE: /run/secrets/github_token
+      ACA_GITHUB_MCP_ENABLED: ${ACA_GITHUB_MCP_ENABLED:-true}
+      ACA_GITHUB_MCP_URL: ${ACA_GITHUB_MCP_URL:-}
+      ACA_GITHUB_MCP_TOOLSETS: ${ACA_GITHUB_MCP_TOOLSETS:-}
+      TANDEM_BROWSER_EXECUTABLE: ${TANDEM_BROWSER_EXECUTABLE:-/usr/bin/chromium}
+      TANDEM_BROWSER_NO_SANDBOX: "true"
+      ACA_BROWSER_ENABLED: ${ACA_BROWSER_ENABLED:-true}
+      ACA_BROWSER_HEADLESS: ${ACA_BROWSER_HEADLESS:-true}
+    volumes:
+      - ./tandem-engine-state:/home/node/.local/share/tandem
+      - ./tandem-data:/workspace/tandem-data
+      - ${ACA_WORKSPACE_HOST_DIR:-./workspace}/repos:/workspace/repos
+      - ./runs:/workspace/aca/runs
+      - ./secrets:/run/secrets
+    ports:
+      - "${TANDEM_PORT:-39733}:${TANDEM_PORT:-39733}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          TOKEN_FILE="$$TANDEM_API_TOKEN_FILE";
+          if [ -z "$$TOKEN_FILE" ]; then TOKEN_FILE="/run/secrets/tandem_api_token"; fi;
+          TOKEN="";
+          if [ -r "$$TOKEN_FILE" ]; then TOKEN="$$(tr -d '\r\n' < "$$TOKEN_FILE")"; fi;
+          if [ -z "$$TOKEN" ]; then TOKEN="$$TANDEM_API_TOKEN"; fi;
+          if [ -z "$$TOKEN" ]; then TOKEN="$$TANDEM_TOKEN"; fi;
+          URL="http://127.0.0.1:$$TANDEM_PORT";
+          if [ -n "$$TOKEN" ]; then
+            curl -fsS -H "Authorization: Bearer $$TOKEN" "$$URL/global/health" >/dev/null ||
+            curl -fsS -H "Authorization: Bearer $$TOKEN" "$$URL/health" >/dev/null
+          else
+            curl -fsS "$$URL/global/health" >/dev/null ||
+            curl -fsS "$$URL/health" >/dev/null
+          fi
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  tandem-control-panel:
+    build:
+      context: .
+      dockerfile: config/Dockerfile.control-panel
+      args:
+        TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
+        TANDEM_CONTROL_PANEL_RELEASE_VERSION: "${TANDEM_CONTROL_PANEL_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      TANDEM_CONTROL_PANEL_HOST: 0.0.0.0
+      TANDEM_CONTROL_PANEL_PORT: ${TANDEM_CONTROL_PANEL_PORT:-39734}
+      TANDEM_ENGINE_URL: http://tandem-engine:${TANDEM_PORT:-39733}
+      TANDEM_CONTROL_PANEL_AUTO_START_ENGINE: "0"
+      TANDEM_STATE_DIR: /var/lib/tandem/panel
+      TANDEM_CONTROL_PANEL_STATE_DIR: /var/lib/tandem/panel/control-panel
+      TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
+      TANDEM_CONTROL_PANEL_MODE: ${TANDEM_CONTROL_PANEL_MODE:-auto}
+      ACA_BASE_URL: http://aca:${ACA_API_PORT:-39735}
+      ACA_API_TOKEN_FILE: /workspace/tandem-data/aca_api_token
+      TANDEM_KB_ADMIN_URL: http://tandem-kb-mcp:${KB_PORT:-39736}
+      TANDEM_KB_ADMIN_API_KEY_FILE: /run/secrets/kb_admin_api_key
+      TANDEM_KB_DEFAULT_COLLECTION_ID: ${TANDEM_KB_DEFAULT_COLLECTION_ID:-}
+    volumes:
+      - tandem-panel-state:/var/lib/tandem/panel
+      - ./tandem-data:/workspace/tandem-data:ro
+      - ./secrets:/run/secrets:ro
+    ports:
+      - "${TANDEM_CONTROL_PANEL_PORT:-39734}:${TANDEM_CONTROL_PANEL_PORT:-39734}"
+    depends_on:
+      tandem-engine:
+        condition: service_healthy
+      tandem-kb-mcp:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://127.0.0.1:${TANDEM_CONTROL_PANEL_PORT:-39734}/api/system/health >/dev/null",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  tandem-kb-mcp:
+    build:
+      context: .
+      dockerfile: config/Dockerfile.kb
+      args:
+        HOST_UID: "${ACA_HOST_UID:-1000}"
+        HOST_GID: "${ACA_HOST_GID:-1000}"
+    user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      KB_PORT: ${KB_PORT:-39736}
+      KB_PUBLIC_BASE_URL: ${KB_PUBLIC_BASE_URL:-http://127.0.0.1:${KB_PORT:-39736}/mcp}
+      KB_DOCS_ROOT: /workspace/kb-data/docs
+      KB_INDEX_ROOT: /workspace/kb-data/index
+      KB_ADMIN_API_KEY_FILE: /run/secrets/kb_admin_api_key
+      KB_SERVER_NAME: ${KB_SERVER_NAME:-ac.tandem/kb-mcp}
+      KB_SERVER_TITLE: ${KB_SERVER_TITLE:-Tandem Knowledgebase MCP}
+      KB_SERVER_DESCRIPTION: ${KB_SERVER_DESCRIPTION:-Local MCP server for private business knowledgebase retrieval and admin uploads.}
+      KB_SERVER_VERSION: ${KB_SERVER_VERSION:-0.1.0}
+    volumes:
+      - ./kb-data/docs:/workspace/kb-data/docs
+      - kb-index-data:/workspace/kb-data/index
+      - ./secrets:/run/secrets
+    ports:
+      - "127.0.0.1:${KB_PORT:-39736}:${KB_PORT:-39736}"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:${KB_PORT:-39736}/health >/dev/null",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  coordination-postgres:
+    image: postgres:16-alpine
+    profiles:
+      - shared
+    environment:
+      POSTGRES_DB: ${ACA_COORDINATION_POSTGRES_DB:-aca}
+      POSTGRES_USER: ${ACA_COORDINATION_POSTGRES_USER:-aca}
+      POSTGRES_PASSWORD: ${ACA_COORDINATION_POSTGRES_PASSWORD:-aca}
+    volumes:
+      - coordination-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  aca:
+    build:
+      context: .
+      dockerfile: config/Dockerfile
+      args:
+        HOST_UID: "${ACA_HOST_UID:-1000}"
+        HOST_GID: "${ACA_HOST_GID:-1000}"
+        TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
+        TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+    user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      ACA_ROOT: /workspace/aca
+      TANDEM_BASE_URL: http://tandem-engine:${TANDEM_PORT:-39733}
+      TANDEM_ENGINE_PORT: ${TANDEM_PORT:-39733}
+      TANDEM_API_TOKEN_FILE: /workspace/tandem-data/tandem_api_token
+      TANDEM_API_TOKEN: ""
+      TANDEM_TOKEN: ""
+      TANDEM_ENGINE_COMMAND: scripts/tandem-engine-serve.sh
+      TANDEM_ENGINE_STARTUP_MODE: reuse_only
+      TANDEM_OUTPUT_ROOT: ${TANDEM_OUTPUT_ROOT:-/workspace/tandem-data}
+      AUTOCODER_WORKTREE_ROOT: ${AUTOCODER_WORKTREE_ROOT:-/workspace/repos}
+      AUTOCODER_OUTPUT_ROOT: ${AUTOCODER_OUTPUT_ROOT:-/workspace/aca/runs}
+      AUTOCODER_REPO_PATH: ${AUTOCODER_REPO_PATH:-}
+      AUTOCODER_REPO_SLUG: ${AUTOCODER_REPO_SLUG:-}
+      AUTOCODER_REPO_URL: ${AUTOCODER_REPO_URL:-}
+      AUTOCODER_DEFAULT_BRANCH: ${AUTOCODER_DEFAULT_BRANCH:-main}
+      AUTOCODER_REMOTE_NAME: ${AUTOCODER_REMOTE_NAME:-origin}
+      ACA_MODE: ${ACA_MODE:-api}
+      ACA_API_PORT: ${ACA_API_PORT:-39735}
+      ACA_API_TOKEN_FILE: /workspace/tandem-data/aca_api_token
+      TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
+      TANDEM_CONTROL_PANEL_MODE: ${TANDEM_CONTROL_PANEL_MODE:-auto}
+      ACA_COORDINATION_SQLITE_PATH: ${ACA_COORDINATION_SQLITE_PATH:-/workspace/tandem-data/coordination.sqlite3}
+      ACA_COORDINATION_POSTGRES_URL: ${ACA_COORDINATION_POSTGRES_URL:-postgresql://${ACA_COORDINATION_POSTGRES_USER:-aca}:${ACA_COORDINATION_POSTGRES_PASSWORD:-aca}@coordination-postgres:${ACA_COORDINATION_POSTGRES_PORT:-5432}/${ACA_COORDINATION_POSTGRES_DB:-aca}}
+    ports:
+      - "${ACA_API_PORT:-39735}:${ACA_API_PORT:-39735}"
+    volumes:
+      - ./:/workspace/aca:ro
+      - ./.ACA:/workspace/aca/.ACA
+      - ./runs:/workspace/aca/runs
+      - ./tandem-data:/workspace/tandem-data
+      - ./secrets:/run/secrets:ro
+      - ${ACA_LOCAL_REPOS_DIR:-./test-repos}:/workspace/test-repos
+      - ${ACA_WORKSPACE_HOST_DIR:-./workspace}/repos:/workspace/repos
+    working_dir: /workspace/aca
+    tty: true
+    stdin_open: true
+    depends_on:
+      tandem-engine:
+        condition: service_healthy
+    command: ["/workspace/aca/scripts/entrypoint.sh"]
+
+  # aca-outbox runs the coordination outbox dispatcher (no API port).
+  aca-outbox:
+    build:
+      context: .
+      dockerfile: config/Dockerfile
+      args:
+        HOST_UID: "${ACA_HOST_UID:-1000}"
+        HOST_GID: "${ACA_HOST_GID:-1000}"
+        TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
+        TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+    user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      ACA_ROOT: /workspace/aca
+      TANDEM_BASE_URL: http://tandem-engine:${TANDEM_PORT:-39733}
+      TANDEM_ENGINE_PORT: ${TANDEM_PORT:-39733}
+      TANDEM_API_TOKEN_FILE: /workspace/tandem-data/tandem_api_token
+      TANDEM_API_TOKEN: ""
+      TANDEM_TOKEN: ""
+      TANDEM_ENGINE_COMMAND: scripts/tandem-engine-serve.sh
+      TANDEM_ENGINE_STARTUP_MODE: reuse_only
+      TANDEM_OUTPUT_ROOT: ${TANDEM_OUTPUT_ROOT:-/workspace/tandem-data}
+      AUTOCODER_WORKTREE_ROOT: ${AUTOCODER_WORKTREE_ROOT:-/workspace/repos}
+      AUTOCODER_OUTPUT_ROOT: ${AUTOCODER_OUTPUT_ROOT:-/workspace/aca/runs}
+      AUTOCODER_REPO_PATH: ${AUTOCODER_REPO_PATH:-}
+      AUTOCODER_REPO_SLUG: ${AUTOCODER_REPO_SLUG:-}
+      AUTOCODER_REPO_URL: ${AUTOCODER_REPO_URL:-}
+      AUTOCODER_DEFAULT_BRANCH: ${AUTOCODER_DEFAULT_BRANCH:-main}
+      AUTOCODER_REMOTE_NAME: ${AUTOCODER_REMOTE_NAME:-origin}
+      ACA_MODE: outbox-dispatcher
+      TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
+      TANDEM_CONTROL_PANEL_MODE: ${TANDEM_CONTROL_PANEL_MODE:-auto}
+      ACA_COORDINATION_SQLITE_PATH: ${ACA_COORDINATION_SQLITE_PATH:-/workspace/tandem-data/coordination.sqlite3}
+      ACA_COORDINATION_POSTGRES_URL: ${ACA_COORDINATION_POSTGRES_URL:-postgresql://${ACA_COORDINATION_POSTGRES_USER:-aca}:${ACA_COORDINATION_POSTGRES_PASSWORD:-aca}@coordination-postgres:${ACA_COORDINATION_POSTGRES_PORT:-5432}/${ACA_COORDINATION_POSTGRES_DB:-aca}}
+    volumes:
+      - ./:/workspace/aca:ro
+      - ./.ACA:/workspace/aca/.ACA
+      - ./runs:/workspace/aca/runs
+      - ./tandem-data:/workspace/tandem-data
+      - ./secrets:/run/secrets:ro
+      - ${ACA_LOCAL_REPOS_DIR:-./test-repos}:/workspace/test-repos
+      - ${ACA_WORKSPACE_HOST_DIR:-./workspace}/repos:/workspace/repos
+    working_dir: /workspace/aca
+    tty: true
+    stdin_open: true
+    depends_on:
+      tandem-engine:
+        condition: service_healthy
+    command: ["/workspace/aca/scripts/entrypoint.sh"]
+
+volumes:
+  tandem-panel-state:
+  coordination-postgres-data:
+  kb-index-data:

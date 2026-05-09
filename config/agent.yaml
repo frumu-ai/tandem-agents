@@ -1,0 +1,58 @@
+agent:
+  name: ACA
+  dry_run: false
+
+tandem:
+  base_url: http://localhost:39733
+  token_env: TANDEM_API_TOKEN
+  token_file: secrets/tandem_api_token
+  engine_command: scripts/tandem-engine-serve.sh
+
+task_source:
+  type: kanban_board
+  owner: ""
+  repo: ""
+  project: ""
+  item: ""
+  url: ""
+  path: config/board.yaml
+  prompt: ""
+  source_name: ""
+  card_id: ""
+
+repository:
+  path: ""
+  slug: ""
+  clone_url: ""
+  default_branch: main
+  worktree_root: ""
+  remote_name: origin
+
+provider:
+  id: openai
+  model: gpt-4.1-mini
+  fallback_provider: ""
+  fallback_model: ""
+
+storage:
+  profile: local
+
+swarm:
+  enabled: false
+  shared_model: false
+  max_workers: 3
+  manager:
+    provider: ""
+    model: ""
+  worker:
+    provider: ""
+    model: ""
+  reviewer:
+    provider: ""
+    model: ""
+  tester:
+    provider: ""
+    model: ""
+
+output:
+  root: runs
