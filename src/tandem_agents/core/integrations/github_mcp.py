@@ -743,9 +743,6 @@ def _existing_pull_request_url(
     for pr in _fetch_pull_requests(cfg, owner, repo_name):
         if _pull_request_head_ref(pr) != head_branch:
             continue
-        pr_body = str(pr.get("body") or "").strip()
-        if marker and marker not in pr_body and pr_body:
-            continue
         url = _pull_request_url(pr)
         if url:
             return url

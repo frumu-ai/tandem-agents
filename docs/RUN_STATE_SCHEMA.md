@@ -35,7 +35,8 @@ The runner currently writes these files and folders:
     after.txt
 ```
 
-Engine and backend-specific fields (engine connection, worktree paths, MCP binding details) are documented in `docs/internal/TANDEM_INTEGRATION_PLAN.md`, not here.
+This schema only covers the public ACA run-state contract. Private deployment
+and backend implementation details are intentionally outside its scope.
 
 ## `status.json`
 
@@ -121,8 +122,6 @@ Optional fields:
 ### `engine`
 
 This section mirrors the execution backend status report returned during startup.
-
-For Tandem-specific fields, see `docs/internal/TANDEM_INTEGRATION_PLAN.md`.
 
 Common ACA-facing fields:
 
@@ -304,7 +303,7 @@ These files help the monitor and the operator understand the run:
 - `board.yaml` and `board.md` capture the board state for the current run
 - `blackboard.yaml` and `blackboard.md` capture the run-scoped coordination state
 - `logs/` captures per-role streamed output
-- `isolated_workspaces/` isolates worker edits (backend-managed; see `docs/internal/TANDEM_INTEGRATION_PLAN.md`)
+- `isolated_workspaces/` isolates worker edits when the selected backend uses separate worker workspaces
 - `diffs/` captures the before and after repo status summary
 
 For the canonical board and task objects used in the workspace schema, see `WORKSPACE_SCHEMA.md`.

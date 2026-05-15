@@ -10,48 +10,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "tandem-mcp-bootstrap.js"
-HOSTED_RENDERER = ROOT / "scripts" / "hosted" / "render-control-panel-config.sh"
 
 
 class TandemMcpBootstrapTest(unittest.TestCase):
-    def test_renderer_emits_multiple_mcp_servers(self) -> None:
-        env = os.environ.copy()
-        env.update(
-            {
-                "HOSTED_DEPLOYMENT_NAME": "unit-test",
-                "HOSTED_CONTROL_PANEL_PUBLIC_URL": "https://control.example",
-                "HOSTED_ENABLE_GITHUB_MCP": "true",
-                "HOSTED_GITHUB_MCP_URL": "https://api.githubcopilot.com/mcp/",
-                "HOSTED_GITHUB_MCP_TOOLSETS": "default,projects",
-                "HOSTED_GITHUB_MCP_SCOPE": "intake_finalize",
-                "HOSTED_GITHUB_REMOTE_SYNC": "status_comment",
-                "HOSTED_KB_ADMIN_URL": "http://tandem-kb-mcp:39736",
-                "HOSTED_KB_MCP_URL": "http://tandem-kb-mcp:39736/mcp",
-            }
-        )
-
-        rendered = subprocess.run(
-            ["bash", str(HOSTED_RENDERER), "--deployment-name", "unit-test", "--public-url", "https://control.example"],
-            cwd=ROOT,
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        config = json.loads(rendered.stdout)
-
-        self.assertIn("mcp_servers", config)
-        self.assertIn("github", config["mcp_servers"])
-        self.assertIn("kb", config["mcp_servers"])
-        self.assertTrue(config["mcp_servers"]["github"]["enabled"])
-        self.assertTrue(config["mcp_servers"]["kb"]["enabled"])
-        self.assertEqual(config["mcp_servers"]["kb"]["transport"], "http://tandem-kb-mcp:39736/mcp")
-        self.assertEqual(config["github_mcp"]["url"], "https://api.githubcopilot.com/mcp/")
-        self.assertIn("hosted", config)
-        self.assertTrue(config["hosted"]["managed"])
-        self.assertEqual(config["hosted"]["public_url"], "https://control.example")
-        self.assertEqual(config["hosted"]["control_plane_url"], "https://control.example")
-
     def test_bootstrap_preserves_explicit_disable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -29,7 +29,7 @@ The preferred startup order is:
 The canonical config in `CONFIG_SCHEMA.md` should include a `tandem` section with fields like:
 
 - `base_url`: engine URL to check first
-- `token_file`: mounted secret file that holds the Tandem token, preferably `secrets/tandem_api_token` or `/run/secrets/tandem_api_token`
+- `token_file`: mounted secret file that holds the Tandem token, preferably `tandem-data/tandem_api_token` for Compose or `/run/secrets/tandem_api_token` for custom secret mounts
 - `token_env`: env var that holds the Tandem token as a legacy fallback, preferably `TANDEM_API_TOKEN`
 - `required_version`: minimum acceptable Tandem engine version
 - `startup_mode`: `reuse_only` or `reuse_or_start`
@@ -75,7 +75,7 @@ When ACA runs in Docker Compose, the preferred topology is:
 - a dedicated `tandem-control-panel` companion UI that points at that sidecar
 - a persistent engine-state mount at `./tandem-engine-state`
 - a shared Tandem output mount at `./tandem-data`
-- a mounted secret file at `./secrets/tandem_api_token` that appears inside the containers as `/run/secrets/tandem_api_token`
+- a mounted token file at `./tandem-data/tandem_api_token` that appears inside ACA containers as `/workspace/tandem-data/tandem_api_token`
 - an internal sidecar port of `39733` by default so it does not collide with a host Tandem at `39731`
 - a control-panel host port of `39734` by default so the UI and ACA always target the same engine in Compose
 - ACA configured with `TANDEM_ENGINE_STARTUP_MODE=reuse_only`

@@ -231,6 +231,7 @@ docker compose exec aca python3 scripts/test_browser.py https://frumu.ai
 - 持续生产使用或更广泛的商业使用需要单独的商业许可证
 
 商业授权条款见 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)，或联系 info@frumu.ai。
+第三方依赖声明以及资产/商标边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 推荐阅读顺序
 

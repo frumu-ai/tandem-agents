@@ -81,7 +81,7 @@ Required fields:
 
 Optional fields:
 
-- `token_file`: string, path to a mounted secret file that holds the Tandem token; prefer `secrets/tandem_api_token` or `/run/secrets/tandem_api_token`
+- `token_file`: string, path to a mounted secret file that holds the Tandem token; prefer `tandem-data/tandem_api_token` for Compose or `/run/secrets/tandem_api_token` for custom secret mounts
 - `token_env`: string, name of the env var that holds the Tandem token as a legacy fallback; prefer `TANDEM_API_TOKEN`
 - `required_version`: string, minimum acceptable Tandem engine version
 - `startup_mode`: string, one of `reuse_only` or `reuse_or_start`

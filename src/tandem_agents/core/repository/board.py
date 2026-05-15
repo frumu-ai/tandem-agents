@@ -45,7 +45,7 @@ def load_board(path: Path) -> dict[str, Any]:
         board = {
             "board": {
                 "id": "aca-main",
-                "name: "ACA Kanban"",
+                "name": "ACA Kanban",
                 "columns": list(BOARD_COLUMNS),
                 "created_at_ms": now_ms(),
                 "updated_at_ms": now_ms(),

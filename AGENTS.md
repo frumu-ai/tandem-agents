@@ -49,7 +49,7 @@ The agent should:
 
 - Prefer small, focused files. Aim for roughly 200 to 300 lines per file and split files that grow past about 400 lines unless there is a strong reason not to.
 - Keep documentation modular. Use one index doc plus smaller topic docs instead of one oversized reference.
-- Keep backend execution details in `docs/internal/` instead of the public planning docs.
+- Keep private deployment and backend execution details out of tracked public docs.
 - Keep shell scripts simple. If branching or orchestration logic grows, move it into a dedicated helper or module.
 - Keep runtime artifacts out of tracked docs. Generated files belong in `runs/` or another ignored runtime directory.
 - Prefer explicit config, named fields, and fail-closed validation over hidden defaults.
@@ -60,7 +60,7 @@ The agent should:
 
 - Keep remote task-source and execution-backend details out of the public planning docs.
 - Keep `git` for repository checkout, worktrees, branches, commits, and diffs.
-- If you are working on backend integration details, read `docs/internal/TANDEM_INTEGRATION_PLAN.md` first.
+- Do not add private deployment architecture or service credentials to tracked docs.
 
 ## Configuration
 

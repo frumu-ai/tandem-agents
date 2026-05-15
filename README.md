@@ -132,6 +132,9 @@ sequenceDiagram
 
 ## Quick Start
 
+For the full first-time local path, start with
+[docs/LOCAL_QUICKSTART.md](docs/LOCAL_QUICKSTART.md).
+
 1. Read [AGENTS.md](AGENTS.md).
 2. Create runtime config and bootstrap the control-panel config:
 
@@ -174,14 +177,14 @@ docker compose up -d --build
 5. Run one task:
 
 ```bash
-docker compose exec aca python3 -m src.tandem_agents.cli.cli run
+docker compose exec aca python3 -m src.tandem_agents.cli run
 ```
 
 6. Watch the run:
 
 ```bash
 ./scripts/monitor.sh
-docker compose exec aca python3 -m src.tandem_agents.cli.cli monitor --follow
+docker compose exec aca python3 -m src.tandem_agents.cli monitor --follow
 ```
 
 ## Services And Ports
@@ -198,7 +201,7 @@ If `39734` or `39735` is already in use, change the corresponding values in `.en
 
 - Configure GitHub Project intake in the control panel Install settings.
 - Provide `GITHUB_PERSONAL_ACCESS_TOKEN` (or `GITHUB_TOKEN`) in `.env` if you want Tandem's built-in GitHub MCP bootstrap to work non-interactively.
-- Start stack and run `docker compose exec aca python3 -m src.tandem_agents.cli.cli run`.
+- Start stack and run `docker compose exec aca python3 -m src.tandem_agents.cli run`.
 
 ### Run ACA Against A Local Board
 
@@ -240,11 +243,14 @@ This project is licensed under [Business Source License 1.1](LICENSE).
 - continued production or broader commercial use requires a separate commercial license
 
 For commercial terms, see [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) or contact info@frumu.ai.
+For dependency notices and asset/trademark boundaries, see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Recommended Read Order
 
 1. [AGENTS.md](AGENTS.md)
-2. [docs/README.md](docs/README.md)
-3. [docs/DOCKER_COMPOSE.md](docs/DOCKER_COMPOSE.md)
-4. [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md)
-5. [docs/RUN_STATE_SCHEMA.md](docs/RUN_STATE_SCHEMA.md)
+2. [docs/LOCAL_QUICKSTART.md](docs/LOCAL_QUICKSTART.md)
+3. [docs/README.md](docs/README.md)
+4. [docs/DOCKER_COMPOSE.md](docs/DOCKER_COMPOSE.md)
+5. [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md)
+6. [docs/RUN_STATE_SCHEMA.md](docs/RUN_STATE_SCHEMA.md)

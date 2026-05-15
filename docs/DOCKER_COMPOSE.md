@@ -14,7 +14,7 @@ This directory can be run inside Docker Compose to keep the agent environment re
 - the control panel keeps persistent state in a named Docker volume
 - shared Tandem output lives under `./tandem-data`
 - KB docs and the SQLite index live under `./kb-data`
-- the Tandem token lives in `./secrets/tandem_api_token`; the engine sidecar can create it on first start, and the runner mounts it read-only
+- the Tandem token lives in `./tandem-data/tandem_api_token`; the engine sidecar can create it on first start, and the runner mounts it read-only
 - the sidecar stays internal to Compose; ACA and the control panel talk to it over the Compose network
 - the control panel is published to the host on `39734` by default
 - the KB service is published to the host on `39736` by default
@@ -38,9 +38,9 @@ This directory can be run inside Docker Compose to keep the agent environment re
 8. If `39733` or `39734` is already in use, change the matching env var before starting Compose.
 9. If you want a standalone Tandem engine, point `TANDEM_BASE_URL` at it in a non-Compose run or an override file.
 10. Run `./scripts/build-containers.sh`. By default this pulls the latest Tandem engine and control panel releases; set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` first if you want to pin one package. `TANDEM_RELEASE_VERSION` still pins both for backwards compatibility.
-11. On the first boot, the Tandem engine container will create `secrets/tandem_api_token` automatically if it is missing.
+11. On the first boot, the Tandem engine container will create `tandem-data/tandem_api_token` automatically if it is missing.
 12. Open `http://127.0.0.1:39734` on the server host, or `http://<server-ip>:39734` from another device.
-13. Sign in to the control panel with the token from `secrets/tandem_api_token`.
+13. Sign in to the control panel with the token from `tandem-data/tandem_api_token`.
 14. Use `./workspace/repos`, `./runs`, `./tandem-data`, `./secrets`, and the container logs to inspect repo checkouts, artifacts, and engine state from the host.
 15. For local-repo testing, place repos under `./test-repos` or set `ACA_LOCAL_REPOS_DIR` to another host directory.
 16. Keep `ACA_STORAGE_PROFILE=local` for the single-machine SQLite-backed flow, or set it to `shared` when you want the Postgres coordination backend for shared deployments.
@@ -95,7 +95,7 @@ The Tandem API token should live in a mounted secret file instead of `.env`.
 ACA reads `TANDEM_API_TOKEN_FILE` from the container environment, and the Tandem wrapper loads the file and exports `TANDEM_API_TOKEN` only inside the engine process.
 If the secret file is missing, the engine wrapper generates one automatically on first start.
 If you want to inspect the sidecar from the host, use `docker compose exec tandem-engine tandem-engine status`.
-If you want to seed the file manually, you can still run `tandem-engine token generate > secrets/tandem_api_token`.
+If you want to seed the file manually, you can still run `tandem-engine token generate > tandem-data/tandem_api_token`.
 The ACA Compose control panel expects that same token at login, so engine auth and UI auth stay aligned by default.
 
 ## Next Integration Step

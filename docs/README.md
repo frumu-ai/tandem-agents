@@ -25,6 +25,7 @@ Project files live one level up in the repository tree:
 - [../src/tandem_agents/monitor.py](../src/tandem_agents/monitor.py) - run monitor and live follow mode
 - [../src/tandem_agents/state.py](../src/tandem_agents/state.py) - board, run-state, and artifact helpers
 - [../requirements.txt](../requirements.txt) - Python dependencies
+- [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency notices and asset/trademark boundaries
 - [../scripts/run.sh](../scripts/run.sh) - local launcher stub
 - [../scripts/setup.sh](../scripts/setup.sh) - bootstrap and migration helper for `.env` and control-panel config
 - [../scripts/build-containers.sh](../scripts/build-containers.sh) - Compose build helper that resolves the latest Tandem release by default
@@ -41,6 +42,7 @@ Project files live one level up in the repository tree:
 ## Files
 
 - `PORTABLE_AUTOCODER_AGENT_PLAN.md` - design note for the portable auto-coder
+- `LOCAL_QUICKSTART.md` - first-time local Docker Compose setup and run guide
 - `TASK_SOURCES.md` - task source contract and examples
 - `KANBAN_BOARD.md` - board, blackboard, and run coordination contract
 - `REPO_BINDING.md` - repo selection and worktree guidance
@@ -55,26 +57,24 @@ Project files live one level up in the repository tree:
 - `LOCAL_KANBAN_TEST_GUIDE.md` - practical Docker-based test flow using a local board and a small repo
 - `kb_mcp.md` - KB MCP agent-guide upgrade plan and kanban board
 - `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md` - plain-language overview of the Tandem KB MCP and ACA autonomous coder
-- `internal/PYTHON_MCP_BLUEPRINT_PROMPT_SPEC.md` - internal prompt-spec for scaffolding reusable Python MCP server blueprints
-
-Internal implementation details live under `docs/internal/` and are intentionally kept out of the public read order.
 
 ## Suggested Read Order
 
 1. Read `../AGENTS.md`
-2. Read `PORTABLE_AUTOCODER_AGENT_PLAN.md`
-3. Read `TASK_SOURCES.md`
-4. Read `KANBAN_BOARD.md`
-5. Read `REPO_BINDING.md`
-6. Read `CODING_TASKS_WITH_TANDEM.md`
-7. Read `CONFIG_SCHEMA.md`
-8. Read `COMMANDS.md`
-9. Read `RUN_STATE_SCHEMA.md`
-10. Read `ENGINE_MANAGEMENT.md`
-11. Read `DOCKER_COMPOSE.md`
-12. Read `MONITORING.md`
-13. Read `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md`
-14. Run `../scripts/setup.sh` to seed token files and the local control-panel config
+2. Read `LOCAL_QUICKSTART.md`
+3. Read `PORTABLE_AUTOCODER_AGENT_PLAN.md`
+4. Read `TASK_SOURCES.md`
+5. Read `KANBAN_BOARD.md`
+6. Read `REPO_BINDING.md`
+7. Read `CODING_TASKS_WITH_TANDEM.md`
+8. Read `CONFIG_SCHEMA.md`
+9. Read `COMMANDS.md`
+10. Read `RUN_STATE_SCHEMA.md`
+11. Read `ENGINE_MANAGEMENT.md`
+12. Read `DOCKER_COMPOSE.md`
+13. Read `MONITORING.md`
+14. Read `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md`
+15. Run `../scripts/setup.sh` to seed token files and the local control-panel config
 
 ## Typical Setup
 

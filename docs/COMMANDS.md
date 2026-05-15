@@ -83,8 +83,8 @@ These come from Tandem itself and are useful when ACA is attaching to a live eng
 tandem-engine --help
 tandem-engine status
 tandem-engine token generate
-tandem-engine token generate > secrets/tandem_api_token
-chmod 600 secrets/tandem_api_token
+tandem-engine token generate > tandem-data/tandem_api_token
+chmod 600 tandem-data/tandem_api_token
 tandem-engine serve --hostname 127.0.0.1 --port 39733
 tandem-engine run "Check workspace readiness"
 tandem-engine providers
@@ -93,7 +93,7 @@ tandem-engine providers
 For ACA in Docker Compose, `docker compose exec tandem-engine tandem-engine status` checks the internal sidecar directly, and the sidecar defaults to `TANDEM_PORT=39733` so it stays separate from a host Tandem running on `39731` and a control-panel service running on `39732`.
 ACA's bundled control panel defaults to `http://127.0.0.1:39734` and is wired to that same `tandem-engine` sidecar.
 
-`tandem-engine token generate > secrets/tandem_api_token` is usually only needed if you want to pre-seed the secret file manually. ACA can also generate the file automatically on first engine startup.
+`tandem-engine token generate > tandem-data/tandem_api_token` is usually only needed if you want to pre-seed the secret file manually. ACA can also generate the file automatically on first engine startup.
 
 ## Common Operator Loops
 

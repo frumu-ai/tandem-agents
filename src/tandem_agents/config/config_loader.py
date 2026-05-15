@@ -474,7 +474,10 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             ),
         ),
     )
-    github_enabled_value = _nonempty(github_mcp_data.get("enabled", github_mcp_server.get("enabled")))
+    github_enabled_value = pick(
+        "ACA_GITHUB_MCP_ENABLED",
+        yaml_value=github_mcp_data.get("enabled", github_mcp_server.get("enabled")),
+    )
     if github_enabled_value is None:
         github_enabled = github_pat_available
     else:

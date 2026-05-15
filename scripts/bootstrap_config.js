@@ -83,7 +83,7 @@ const DEFAULT_CONTROL_PANEL_CONFIG = {
   tandem: {
     base_url: "http://127.0.0.1:39733",
     token_env: "TANDEM_API_TOKEN",
-    token_file: "secrets/tandem_api_token",
+    token_file: "tandem-data/tandem_api_token",
     required_version: "",
     startup_mode: "reuse_or_start",
     update_policy: "notify",
@@ -392,7 +392,7 @@ function buildControlPanelConfig(existing, example) {
           existing.TANDEM_API_TOKEN_FILE,
           existingConfig.tandem?.token_file,
           base.tandem?.token_file,
-          { default: "secrets/tandem_api_token" }
+          { default: "tandem-data/tandem_api_token" }
         ),
         required_version: firstNonEmpty(
           existing.TANDEM_REQUIRED_VERSION,
