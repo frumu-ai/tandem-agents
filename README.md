@@ -1,15 +1,18 @@
 <p align="center">
-  <img src="assets/aca_logo.png" alt="Tandem Agents logo" width="450">
+  <img src="assets/logo.png" alt="Tandem logo" width="220">
 </p>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-**Tandem Agents** is a project that hosts agent-based runtimes built on the
-[Tandem](https://github.com/frumu-ai/tandem) workflow engine. The flagship
-runtime in this repo is **ACA** (Autonomous Coding Agent), an autonomous
-coding control plane that runs a repeatable software-delivery loop:
+**Tandem Agents** is a self-contained runnable Tandem agent stack. It brings
+the Tandem engine, control panel, ACA autonomous coding runtime, KB MCP server,
+and local orchestration scripts into one repo so developers can inspect, run,
+and test the system without depending on Tandem's internal hosted deployment.
+
+The included **ACA** (Autonomous Coding Agent) runtime runs a repeatable
+software-delivery loop:
 
 - pick the next task from a board or GitHub Project
 - bind that work to the correct repository and workspace
@@ -17,25 +20,30 @@ coding control plane that runs a repeatable software-delivery loop:
 - leave behind a durable execution trail with status, logs, diffs, artifacts, and a coordination ledger
 - optionally ship the result as a branch and pull request
 
-It is designed to run the same way on a laptop, in Docker Compose, or on a hosted Linux box.
+It is designed to run the same way on a laptop, in Docker Compose, or on a
+hosted Linux box.
 
 > **Naming.** This project was previously published as **ACA**. The repo,
 > Python package (`tandem_agents`), and Compose project name are now
-> "Tandem Agents" because the project hosts more than just the coding
-> agent. The coding agent itself is still **ACA** — the CLI is `aca`, the
+> "Tandem Agents" because the project contains the broader Tandem runtime
+> stack. The coding agent itself is still **ACA**: the CLI is `aca`, the
 > Compose service is `aca`, the agent's MCP server is `ac.tandem/aca-mcp`,
-> and the agent's git artifacts (branches, PR markers, commit prefixes)
-> still use the `aca/` and `aca:` prefixes.
+> and the agent's git artifacts still use the `aca/` and `aca:` prefixes.
 
-ACA is built on top of Tandem, the workflow engine we also developed.
-Tandem provides the durable runtime underneath: engine-owned state,
-coordination primitives, provider-agnostic execution, and backend APIs
-that let ACA run governed coding workflows without treating a chat
-transcript as the source of truth.
+## What Is Included
 
-## What ACA Changes
+- Tandem engine sidecar for durable workflow execution and provider access
+- Tandem control panel for local setup, status, and operator controls
+- ACA runtime for governed coding tasks against local boards or GitHub Projects
+- KB MCP server for knowledge-base backed agent context
+- Docker Compose topology, setup scripts, local config templates, and run docs
 
-ACA is not just a coding demo or a thin wrapper around prompting. It is an operator-controlled execution system for real software work: take a task from a real source, bind it to the correct repository, run a bounded coding workflow, and leave behind a durable record of what happened.
+## What Tandem Changes
+
+Tandem Agents is not just a coding demo or a thin wrapper around prompting. It
+is an operator-controlled execution system for real software work: take a task
+from a real source, bind it to the correct repository, run a bounded coding
+workflow, and leave behind a durable record of what happened.
 
 - It turns one-off prompting into a durable execution system with task intake, repository binding, orchestration, validation, and run output.
 - It emphasizes deterministic control points over "agent vibes": explicit task selection, explicit repo binding, explicit provider/model selection, explicit run phases, and explicit artifacts.
@@ -47,7 +55,7 @@ ACA is not just a coding demo or a thin wrapper around prompting. It is an opera
 - It lets you swap providers, models, and execution backends without rewriting the workflow itself.
 - It supports bounded multi-agent work and browser-assisted QA when the task needs them, without making that complexity mandatory for every run.
 
-## Why Tandem Matters
+## Why The Engine Matters
 
 ACA is built on Tandem so orchestration lives in durable engine state instead of being improvised inside a prompt thread.
 
@@ -72,9 +80,12 @@ flowchart LR
     O --> E[Tandem Engine]
     E --> M[Model Provider]
     E --> BR[Browser Tools]
+    O --> KB[KB MCP Server]
     O --> RS[(Run State + Blackboard)]
     O --> LG[(Logs + Events + Summary)]
     O --> CP[Tandem Control Panel]
+    CP --> E
+    CP --> KB
 ```
 
 ## Runtime Topology (Docker Compose)
@@ -87,6 +98,7 @@ flowchart TB
       WS[./workspace/repos]
       TD[./tandem-data]
       TES[./tandem-engine-state]
+      KBD[./kb-data]
       SEC[./secrets]
     end
 
@@ -94,18 +106,24 @@ flowchart TB
       ACA[aca service]
       ENG[tandem-engine service]
       UI[tandem-control-panel service]
+      KB[tandem-kb-mcp service]
+      OUT[aca-outbox service]
     end
 
     OP --> ACA
     ACA --> ENG
     UI --> ENG
+    UI --> KB
+    OUT --> ENG
     ACA --> RUNS
     ACA --> WS
     ACA --> TD
     ENG --> TES
     ENG --> TD
+    KB --> KBD
     ACA --> SEC
     ENG --> SEC
+    KB --> SEC
 ```
 
 ## Execution Flow
@@ -192,6 +210,7 @@ docker compose exec aca python3 -m src.tandem_agents.cli monitor --follow
 - `tandem-engine` runs inside Compose and is consumed by ACA and control panel.
 - `tandem-control-panel` is exposed on `${TANDEM_CONTROL_PANEL_PORT:-39734}`.
 - `aca` API mode is exposed on `${ACA_API_PORT:-39735}`.
+- `tandem-kb-mcp` is bound to localhost on `${KB_PORT:-39736}`.
 
 If `39734` or `39735` is already in use, change the corresponding values in `.env`.
 

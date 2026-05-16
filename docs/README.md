@@ -1,6 +1,8 @@
-# ACA Docs
+# Tandem Agents Docs
 
-This directory contains the planning, schema, and workflow docs for ACA.
+This directory contains the setup, schema, and workflow docs for the local
+Tandem Agents stack: Tandem engine, control panel, ACA runtime, KB MCP, and
+supporting operator scripts.
 
 Project files live one level up in the repository tree:
 

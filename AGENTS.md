@@ -1,9 +1,10 @@
 # Tandem Agents — Repo Agent Instructions
 
-This repo (Tandem Agents) hosts the **ACA** (Autonomous Coding Agent)
-runtime alongside other agent-related features. ACA is the autonomous
-coding agent inside this project — when this doc says "the agent" or
-"ACA", it means that runtime specifically.
+This repo (Tandem Agents) hosts a self-contained local Tandem runtime stack:
+the Tandem engine, control panel integration, **ACA** (Autonomous Coding Agent)
+runtime, KB MCP service, and supporting operator scripts. ACA is the autonomous
+coding agent inside this project; when this doc says "the agent" or "ACA", it
+means that runtime specifically.
 
 ## Read First
 
@@ -20,7 +21,8 @@ coding agent inside this project — when this doc says "the agent" or
 
 ## Purpose
 
-Use this directory as the local control plane for running a repo-agnostic ACA.
+Use this directory as the local control plane for running the Tandem agent
+stack, including a repo-agnostic ACA.
 
 The agent should:
 

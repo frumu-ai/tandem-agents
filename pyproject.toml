@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tandem-agents"
 version = "0.1.0"
-description = "Tandem Agents: autonomous coding agent control plane"
+description = "Tandem Agents: local Tandem engine, control panel, ACA, and KB stack"
 requires-python = ">=3.10"
 license = "LicenseRef-Business-Source-License-1.1"
 license-files = ["LICENSE", "NOTICE", "COMMERCIAL_LICENSE.md", "THIRD_PARTY_NOTICES.md"]

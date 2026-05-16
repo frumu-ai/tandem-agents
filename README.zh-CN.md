@@ -1,14 +1,17 @@
 <p align="center">
-  <img src="assets/aca_logo.png" alt="Tandem Agents 标识" width="450">
+  <img src="assets/logo.png" alt="Tandem 标识" width="220">
 </p>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-**Tandem Agents** 是一个承载基于 [Tandem](https://github.com/frumu-ai/tandem)
-工作流引擎的多种代理运行时的项目。本仓库的旗舰运行时是 **ACA**
-（Autonomous Coding Agent，自主编码代理）——一个用于运行可重复软件交付流程的自主编码控制平面：
+**Tandem Agents** 是一个自包含、可运行的 Tandem agent stack。它把
+Tandem engine、control panel、ACA 自主编码运行时、KB MCP server 和本地
+编排脚本放在同一个仓库中，方便开发者在不依赖 Tandem 内部托管部署的情况下
+检查、运行和测试系统。
+
+其中的 **ACA**（Autonomous Coding Agent，自主编码代理）运行可重复的软件交付流程：
 
 - 从看板或 GitHub Project 中选择下一个任务
 - 将该任务绑定到正确的代码仓库和工作区
@@ -19,16 +22,22 @@
 它被设计为可以在笔记本电脑、Docker Compose 环境或托管 Linux 主机上以相同方式运行。
 
 > **关于命名**：本项目以前发布为 **ACA**。仓库、Python 包（`tandem_agents`）
-> 和 Compose 项目名现在统一为 "Tandem Agents"，因为本项目承载的内容已不止
-> 编码代理本身。编码代理依然叫 **ACA** ——CLI 仍然是 `aca`，Compose 服务
-> 仍然是 `aca`，代理的 MCP 服务标识仍然是 `ac.tandem/aca-mcp`，代理生成的
-> Git 产物（分支、PR 标记、commit 前缀）也依旧使用 `aca/` 与 `aca:` 前缀。
+> 和 Compose 项目名现在统一为 "Tandem Agents"，因为本项目包含更完整的
+> Tandem runtime stack。编码代理依然叫 **ACA**：CLI 仍然是 `aca`，Compose
+> 服务仍然是 `aca`，代理的 MCP 服务标识仍然是 `ac.tandem/aca-mcp`，代理生成的
+> Git 产物也依旧使用 `aca/` 与 `aca:` 前缀。
 
-ACA 构建在 Tandem 之上。Tandem 是我们开发的工作流引擎，作为 ACA 的持久运行时基础：它提供引擎拥有的状态、协调原语、与模型提供商无关的执行层，以及后端 API，使 ACA 能够运行受治理的编码工作流，而不必把聊天记录当作事实来源。
+## 包含内容
 
-## ACA 带来的变化
+- Tandem engine sidecar，用于持久工作流执行和 provider 访问
+- Tandem control panel，用于本地设置、状态查看和操作员控制
+- ACA runtime，用于从本地看板或 GitHub Project 执行受治理的编码任务
+- KB MCP server，用于知识库支持的 agent 上下文
+- Docker Compose 拓扑、设置脚本、本地配置模板和运行文档
 
-ACA 不只是一个编码演示，也不是对提示词的轻量封装。它是一个面向真实软件工作的、由操作员控制的执行系统：从真实任务源接收任务，绑定到正确仓库，运行有边界的编码工作流，并留下清晰、可追溯的执行记录。
+## Tandem 带来的变化
+
+Tandem Agents 不只是一个编码演示，也不是对提示词的轻量封装。它是一个面向真实软件工作的、由操作员控制的执行系统：从真实任务源接收任务，绑定到正确仓库，运行有边界的编码工作流，并留下清晰、可追溯的执行记录。
 
 - 它把一次性提示交互升级为具备任务接入、仓库绑定、编排、校验和运行输出的持久执行系统。
 - 它强调确定性的控制点，而不是“代理凭感觉工作”：显式任务选择、显式仓库绑定、显式 provider/model 选择、显式运行阶段和显式产物。
