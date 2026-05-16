@@ -276,6 +276,18 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
 
             self.assertEqual(items[0]["status_name"], "TODOS")
 
+    def test_github_token_uses_hosted_secret_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            with patch("src.tandem_agents.runtime.task_sources.Path.read_text", autospec=True, return_value="ghp_hosted\n") as read_text:
+                from src.tandem_agents.runtime.task_sources import _github_token
+
+                token = _github_token(cfg)
+
+            self.assertEqual(token, "ghp_hosted")
+            self.assertEqual(str(read_text.call_args.args[0]), "/run/secrets/github_token")
+
 
 if __name__ == "__main__":
     unittest.main()

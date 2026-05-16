@@ -441,6 +441,7 @@ def _github_token(cfg: ResolvedConfig) -> str:
         cfg.env.get("GITHUB_TOKEN_FILE"),
         cfg.env.get("ACA_REPO_TOKEN_FILE"),
         cfg.repository.credential_file,
+        "/run/secrets/github_token",
     ]
     for raw_path in token_files:
         path_text = str(raw_path or "").strip()
