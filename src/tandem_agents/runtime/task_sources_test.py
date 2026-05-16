@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
     _collect_project_items,
     _hydrate_project_item_statuses_from_graphql,
+    _load_github_project_live_data,
     _select_github_project_item,
     _task_from_project,
     github_project_board_snapshot,
@@ -229,6 +231,36 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
         self.assertEqual(collected[0]["project_item_id"], "PVTI_123")
         self.assertEqual(collected[0]["status_name"], "TODOS")
         self.assertEqual(collected[0]["title"], "Tenant isolation task")
+
+    def test_live_project_item_read_requests_status_field_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {"id": 267766852, "name": "Title"},
+                    {"id": 267766854, "name": "Status", "options": [{"id": "ready-id", "name": "Ready"}]},
+                ],
+            }
+            items_payload = {
+                "output": '{"items":[{"id":188421130,"title":"Draft task","fields":[{"id":267766854,"name":"Status","value":"Ready"}]}]}'
+            }
+
+            def fake_tool(_cfg, tool, args):
+                if tool == "mcp.github.projects_get" and args.get("method") == "get_project":
+                    return {"output": json.dumps(schema)}
+                if tool == "mcp.github.projects_list" and args.get("method") == "list_project_items":
+                    self.assertEqual(args.get("fields"), ["267766854"])
+                    return items_payload
+                return {"output": "unknown tool: test"}
+
+            with patch("src.tandem_agents.runtime.task_sources.ensure_github_mcp_connected"):
+                with patch("src.tandem_agents.runtime.task_sources.execute_engine_tool", side_effect=fake_tool):
+                    _, items = _load_github_project_live_data(cfg, owner="frumu-ai", project_number=1)
+
+            self.assertEqual(items[0]["effective_status_name"], "Ready")
+            self.assertEqual(items[0]["effective_status_key"], "ready")
 
     def test_hydrate_project_item_statuses_from_graphql_uses_node_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

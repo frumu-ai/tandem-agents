@@ -64,12 +64,19 @@ def _github_project_schema(cfg: ResolvedConfig, owner: str, project: int) -> dic
     raise RuntimeError("Could not extract GitHub project schema from MCP result.")
 
 
-def _github_project_items(cfg: ResolvedConfig, owner: str, project: int) -> dict[str, Any]:
+def _github_project_items(
+    cfg: ResolvedConfig,
+    owner: str,
+    project: int,
+    *,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    field_args = {"fields": fields} if fields else {}
     attempts = [
-        ("mcp.github.list_project_items", {"owner": owner, "project_number": project}),
-        ("mcp.github.list_project_items", {"owner": owner, "projectNumber": project}),
-        ("mcp.github.projects_list", {"method": "list_project_items", "owner": owner, "project_number": project}),
-        ("mcp.github.projects_list", {"method": "list_project_items", "owner": owner, "projectNumber": project}),
+        ("mcp.github.list_project_items", {"owner": owner, "project_number": project, **field_args}),
+        ("mcp.github.list_project_items", {"owner": owner, "projectNumber": project, **field_args}),
+        ("mcp.github.projects_list", {"method": "list_project_items", "owner": owner, "project_number": project, **field_args}),
+        ("mcp.github.projects_list", {"method": "list_project_items", "owner": owner, "projectNumber": project, **field_args}),
     ]
     for tool, args in attempts:
         result = _try_engine_tool(cfg, tool, args)
@@ -429,6 +436,22 @@ def _normalized_status_option_map(schema: dict[str, Any]) -> tuple[int | None, d
                 option_map[option_name.strip().lower().replace("-", "_").replace(" ", "_")] = option_id
         return int(field_id), option_map
     return None, {}
+
+
+def _project_status_field_ids(schema: dict[str, Any]) -> list[str]:
+    fields = schema.get("fields")
+    if not isinstance(fields, list):
+        return []
+    status_field_ids: list[str] = []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        if _project_field_text(field.get("name")).strip().lower() != "status":
+            continue
+        field_id = str(field.get("id") or "").strip()
+        if field_id:
+            status_field_ids.append(field_id)
+    return status_field_ids
 
 
 def _github_token(cfg: ResolvedConfig) -> str:
@@ -871,7 +894,8 @@ def _load_github_project_live_data(
         except Exception:
             logger.debug("Failed to refresh github MCP server during snapshot", exc_info=True)
     schema = _github_project_schema(cfg, owner, project_number)
-    payload = _github_project_items(cfg, owner, project_number)
+    status_field_ids = _project_status_field_ids(schema)
+    payload = _github_project_items(cfg, owner, project_number, fields=status_field_ids)
     items: list[dict[str, Any]] = []
     for candidate in _tool_result_values(payload):
         _collect_project_items(candidate, items)
@@ -888,7 +912,13 @@ def _load_github_project_live_data(
         )
         if not effective_status_key and item.get("project_item_id") not in (None, ""):
             try:
-                detail = fetch_project_item(cfg, owner, project_number, int(item["project_item_id"]))
+                detail = fetch_project_item(
+                    cfg,
+                    owner,
+                    project_number,
+                    int(item["project_item_id"]),
+                    fields=status_field_ids,
+                )
                 detail_items: list[dict[str, Any]] = []
                 _collect_project_items(detail, detail_items)
                 if detail_items:

@@ -83,7 +83,7 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
                     fetch_mock.return_value = {"status": {"name": "In progress"}}
                     warning = update_project_item_status(cfg, task, "In progress")
             self.assertIsNone(warning)
-            fetch_mock.assert_called_once()
+            fetch_mock.assert_called_once_with(cfg, "frumu-ai", 1, 2, fields=["7"])
             tool_mock.assert_not_called()
 
     def test_add_issue_comment_skips_existing_marker_comment(self) -> None:

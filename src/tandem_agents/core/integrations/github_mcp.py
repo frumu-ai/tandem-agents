@@ -434,6 +434,19 @@ def _pull_request_marker(run_id: str, head_branch: str) -> str:
     return f"<!-- aca:pull-request:{run_text}:{branch_text} -->"
 
 
+def _project_field_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("raw", "html", "text", "title", "name", "value"):
+            text = _project_field_text(value.get(key))
+            if text:
+                return text
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
 def _project_item_status_name(value: Any) -> str:
     if isinstance(value, dict):
         status = value.get("status")
@@ -517,6 +530,7 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
                 str(source.get("owner") or ""),
                 int(source.get("project") or 0),
                 int(project_item_id),
+                fields=[str(status_field_id)],
             )
             live_status = _project_item_status_name(live_item)
             if normalize_status_key(live_status) == normalize_status_key(status_name):
@@ -674,7 +688,15 @@ def build_issue_comment_body(
     return "\n".join(lines).strip()
 
 
-def fetch_project_item(cfg: ResolvedConfig, owner: str, project_number: int, item_id: int) -> dict[str, Any]:
+def fetch_project_item(
+    cfg: ResolvedConfig,
+    owner: str,
+    project_number: int,
+    item_id: int,
+    *,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    field_args = {"fields": fields} if fields else {}
     result = execute_engine_tool(
         cfg,
         "mcp.github.projects_get",
@@ -683,6 +705,7 @@ def fetch_project_item(cfg: ResolvedConfig, owner: str, project_number: int, ite
             "owner": owner,
             "projectNumber": project_number,
             "itemId": item_id,
+            **field_args,
         },
     )
     if _tool_failed(result):

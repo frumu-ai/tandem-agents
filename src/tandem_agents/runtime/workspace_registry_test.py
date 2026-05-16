@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.tandem_agents.runtime.workspace_registry import (
     configured_project_binding,
@@ -13,6 +14,7 @@ from src.tandem_agents.runtime.workspace_registry import (
     save_workspace,
     set_active_project,
     workspace_file,
+    workspace_root,
     workspace_summary,
     workspace_view,
 )
@@ -78,6 +80,74 @@ class WorkspaceRegistryTest(unittest.TestCase):
             self.assertEqual(loaded["workspace"]["active_project_id"], "alpha")
             self.assertEqual(len(loaded["workspace"]["projects"]), 1)
             self.assertEqual(loaded["workspace"]["projects"][0]["id"], "alpha")
+
+    def test_workspace_state_can_live_under_persistent_output_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aca"
+            output_root = Path(tmp) / "runs"
+            with patch.dict("os.environ", {"AUTOCODER_OUTPUT_ROOT": str(output_root)}, clear=False):
+                workspace = {
+                    "workspace": {
+                        "id": "workspace-1",
+                        "name": "Tandem Agents Workspace",
+                        "created_at_ms": 1,
+                        "updated_at_ms": 1,
+                        "projects": [
+                            project_binding_from_compat(
+                                "alpha",
+                                {
+                                    "repo_url": "https://github.com/acme/demo.git",
+                                    "task_source": {
+                                        "type": "github_project",
+                                        "owner": "acme",
+                                        "repo": "demo",
+                                        "project": "1",
+                                    },
+                                },
+                            )
+                        ],
+                        "runs": [],
+                        "active_project_id": "alpha",
+                    }
+                }
+                save_workspace(root, workspace)
+
+                self.assertEqual(workspace_root(root), output_root / "state" / ".tandem-agents")
+                self.assertTrue((output_root / "state" / ".tandem-agents" / "workspace.yaml").exists())
+                self.assertFalse((root / ".tandem-agents" / "workspace.yaml").exists())
+                self.assertEqual(load_workspace(root)["workspace"]["projects"][0]["id"], "alpha")
+
+    def test_legacy_workspace_state_is_migrated_to_persistent_output_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aca"
+            output_root = Path(tmp) / "runs"
+            workspace = {
+                "workspace": {
+                    "id": "workspace-1",
+                    "name": "Tandem Agents Workspace",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1,
+                    "projects": [
+                        project_binding_from_compat(
+                            "alpha",
+                            {
+                                "repo_url": "https://github.com/acme/demo.git",
+                                "task_source": {"type": "github_project", "owner": "acme", "repo": "demo", "project": "1"},
+                            },
+                        )
+                    ],
+                    "runs": [],
+                    "active_project_id": "alpha",
+                }
+            }
+            save_workspace(root, workspace)
+            self.assertTrue((root / ".tandem-agents" / "workspace.yaml").exists())
+
+            with patch.dict("os.environ", {"AUTOCODER_OUTPUT_ROOT": str(output_root)}, clear=False):
+                loaded = load_workspace(root)
+
+                self.assertEqual(loaded["workspace"]["projects"][0]["id"], "alpha")
+                self.assertTrue((output_root / "state" / ".tandem-agents" / "workspace.yaml").exists())
 
     def test_legacy_projects_file_is_migrated(self):
         with tempfile.TemporaryDirectory() as tmp:

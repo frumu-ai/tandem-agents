@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,11 +17,31 @@ DEFAULT_STALE_THRESHOLD_MS = 300_000
 
 
 def workspace_root(root: Path) -> Path:
+    explicit_root = _as_text(os.environ.get("ACA_WORKSPACE_STATE_DIR") or os.environ.get("TANDEM_AGENTS_WORKSPACE_DIR"))
+    if explicit_root:
+        path = Path(explicit_root).expanduser()
+        if not path.is_absolute():
+            path = Path(root).expanduser() / path
+        return path.resolve()
+    output_root = _as_text(os.environ.get("AUTOCODER_OUTPUT_ROOT") or os.environ.get("ACA_OUTPUT_ROOT"))
+    if output_root:
+        path = Path(output_root).expanduser()
+        if not path.is_absolute():
+            path = Path(root).expanduser() / path
+        return (path / "state" / WORKSPACE_DIR_NAME).resolve()
+    return (Path(root).expanduser() / WORKSPACE_DIR_NAME).resolve()
+
+
+def legacy_workspace_root(root: Path) -> Path:
     return (Path(root).expanduser() / WORKSPACE_DIR_NAME).resolve()
 
 
 def workspace_file(root: Path) -> Path:
     return workspace_root(root) / WORKSPACE_FILE_NAME
+
+
+def legacy_workspace_state_file(root: Path) -> Path:
+    return legacy_workspace_root(root) / WORKSPACE_FILE_NAME
 
 
 def projects_dir(root: Path) -> Path:
@@ -391,6 +412,11 @@ def load_workspace(root: Path) -> dict[str, Any]:
     path = workspace_file(root)
     if path.exists():
         return {"workspace": _normalize_workspace(load_yaml(path))}
+    legacy_state = legacy_workspace_state_file(root)
+    if legacy_state.exists() and legacy_state.resolve() != path.resolve():
+        loaded = {"workspace": _normalize_workspace(load_yaml(legacy_state))}
+        save_workspace(root, loaded)
+        return loaded
     legacy = legacy_projects_file(root)
     if legacy.exists():
         loaded = load_yaml(legacy)
