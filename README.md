@@ -172,11 +172,29 @@ The setup step prints the Tandem token you use to sign in to the control panel.
 
 4. Start stack:
 
+Use the published GHCR images for the fastest path:
+
+```bash
+docker compose -f docker-compose.published.yml pull
+docker compose -f docker-compose.published.yml up -d
+```
+
+To pin a different published release:
+
+```bash
+TANDEM_AGENTS_IMAGE_TAG=v0.5.6 docker compose -f docker-compose.published.yml up -d
+```
+
+Or build the images locally from this checkout:
+
 ```bash
 ./scripts/build-containers.sh
 ```
 
-By default, container builds install the latest Tandem engine and control panel releases.
+When you start with `docker-compose.published.yml`, use the same `-f` flag for
+follow-up `docker compose exec`, `logs`, and `down` commands.
+
+By default, local container builds install the latest Tandem engine and control panel releases.
 If you want to pin a specific release for repeatable testing, set `TANDEM_ENGINE_RELEASE_VERSION` and/or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` in `.env` or in your shell before rebuilding. `TANDEM_RELEASE_VERSION` still pins both packages for older configs:
 
 ```bash
@@ -188,21 +206,21 @@ export TANDEM_CONTROL_PANEL_RELEASE_VERSION=<specific-panel-release>
 For a full refresh of the whole stack:
 
 ```bash
-docker compose down
-docker compose up -d --build
+docker compose -f docker-compose.published.yml down
+docker compose -f docker-compose.published.yml up -d
 ```
 
 5. Run one task:
 
 ```bash
-docker compose exec aca python3 -m src.tandem_agents.cli run
+docker compose -f docker-compose.published.yml exec aca python3 -m src.tandem_agents.cli run
 ```
 
 6. Watch the run:
 
 ```bash
 ./scripts/monitor.sh
-docker compose exec aca python3 -m src.tandem_agents.cli monitor --follow
+docker compose -f docker-compose.published.yml exec aca python3 -m src.tandem_agents.cli monitor --follow
 ```
 
 ## Services And Ports
@@ -220,7 +238,7 @@ If `39734` or `39735` is already in use, change the corresponding values in `.en
 
 - Configure GitHub Project intake in the control panel Install settings.
 - Provide `GITHUB_PERSONAL_ACCESS_TOKEN` (or `GITHUB_TOKEN`) in `.env` if you want Tandem's built-in GitHub MCP bootstrap to work non-interactively.
-- Start stack and run `docker compose exec aca python3 -m src.tandem_agents.cli run`.
+- Start stack and run `docker compose -f docker-compose.published.yml exec aca python3 -m src.tandem_agents.cli run`.
 
 ### Run ACA Against A Local Board
 
@@ -230,7 +248,7 @@ If `39734` or `39735` is already in use, change the corresponding values in `.en
 ### Browser QA Smoke Test
 
 ```bash
-docker compose exec aca python3 scripts/test_browser.py https://frumu.ai
+docker compose -f docker-compose.published.yml exec aca python3 scripts/test_browser.py https://frumu.ai
 ```
 
 Screenshot artifacts are written under:

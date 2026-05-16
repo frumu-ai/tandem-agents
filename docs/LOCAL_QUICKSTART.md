@@ -60,11 +60,29 @@ running yet.
 
 ## 4. Start The Stack
 
+Use the published GHCR images for the fastest first run:
+
+```bash
+docker compose -f docker-compose.published.yml pull
+docker compose -f docker-compose.published.yml up -d
+```
+
+To pin a specific published release, set `TANDEM_AGENTS_IMAGE_TAG`:
+
+```bash
+TANDEM_AGENTS_IMAGE_TAG=v0.5.6 docker compose -f docker-compose.published.yml up -d
+```
+
+If you want to build the images locally from this checkout instead, run:
+
 ```bash
 ./scripts/build-containers.sh
 ```
 
-This builds and starts:
+When you start with `docker-compose.published.yml`, use the same `-f` flag for
+follow-up `docker compose exec`, `logs`, and `down` commands.
+
+This starts:
 
 - `tandem-engine`
 - `tandem-control-panel`
@@ -116,14 +134,14 @@ mounted into the ACA container at `/workspace/test-repos`.
 ## 6. Run One Task
 
 ```bash
-docker compose exec aca python3 -m src.tandem_agents.cli run
+docker compose -f docker-compose.published.yml exec aca python3 -m src.tandem_agents.cli run
 ```
 
 Watch progress:
 
 ```bash
 ./scripts/monitor.sh
-docker compose exec aca python3 -m src.tandem_agents.cli monitor --follow
+docker compose -f docker-compose.published.yml exec aca python3 -m src.tandem_agents.cli monitor --follow
 ```
 
 Run artifacts appear under:
@@ -143,7 +161,7 @@ To use GitHub Projects instead of the local board:
 3. Run the same task command:
 
 ```bash
-docker compose exec aca python3 -m src.tandem_agents.cli run
+docker compose -f docker-compose.published.yml exec aca python3 -m src.tandem_agents.cli run
 ```
 
 ## Troubleshooting

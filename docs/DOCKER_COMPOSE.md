@@ -37,16 +37,20 @@ This directory can be run inside Docker Compose to keep the agent environment re
 7. Keep `TANDEM_CONTROL_PANEL_PORT` at `39734` unless that host port is already in use.
 8. If `39733` or `39734` is already in use, change the matching env var before starting Compose.
 9. If you want a standalone Tandem engine, point `TANDEM_BASE_URL` at it in a non-Compose run or an override file.
-10. Run `./scripts/build-containers.sh`. By default this pulls the latest Tandem engine and control panel releases; set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` first if you want to pin one package. `TANDEM_RELEASE_VERSION` still pins both for backwards compatibility.
-11. On the first boot, the Tandem engine container will create `tandem-data/tandem_api_token` automatically if it is missing.
-12. Open `http://127.0.0.1:39734` on the server host, or `http://<server-ip>:39734` from another device.
-13. Sign in to the control panel with the token from `tandem-data/tandem_api_token`.
-14. Use `./workspace/repos`, `./runs`, `./tandem-data`, `./secrets`, and the container logs to inspect repo checkouts, artifacts, and engine state from the host.
-15. For local-repo testing, place repos under `./test-repos` or set `ACA_LOCAL_REPOS_DIR` to another host directory.
-16. Keep `ACA_STORAGE_PROFILE=local` for the single-machine SQLite-backed flow, or set it to `shared` when you want the Postgres coordination backend for shared deployments.
-17. For shared mode, either point `ACA_COORDINATION_POSTGRES_URL` at an external Postgres instance or let Compose use the `coordination-postgres` service by starting with `docker compose --profile shared up`.
-18. The Compose defaults assume a local Postgres database named `aca` with user/password `aca`; override `ACA_COORDINATION_POSTGRES_DB`, `ACA_COORDINATION_POSTGRES_USER`, and `ACA_COORDINATION_POSTGRES_PASSWORD` if you want different credentials.
-19. Keep `KB_DOCS_ROOT` and `KB_INDEX_ROOT` pointed at `./kb-data` unless you need a custom mount location for the knowledgebase service.
+10. For the fastest first run, use the published GHCR images: `docker compose -f docker-compose.published.yml pull` and then `docker compose -f docker-compose.published.yml up -d`. Set `TANDEM_AGENTS_IMAGE_TAG=v0.5.6` to pin a specific published release.
+11. To build the images locally from this checkout instead, run `./scripts/build-containers.sh`. By default this pulls the latest Tandem engine and control panel releases; set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` first if you want to pin one package. `TANDEM_RELEASE_VERSION` still pins both for backwards compatibility.
+12. On the first boot, the Tandem engine container will create `tandem-data/tandem_api_token` automatically if it is missing.
+13. Open `http://127.0.0.1:39734` on the server host, or `http://<server-ip>:39734` from another device.
+14. Sign in to the control panel with the token from `tandem-data/tandem_api_token`.
+15. Use `./workspace/repos`, `./runs`, `./tandem-data`, `./secrets`, and the container logs to inspect repo checkouts, artifacts, and engine state from the host.
+16. For local-repo testing, place repos under `./test-repos` or set `ACA_LOCAL_REPOS_DIR` to another host directory.
+17. Keep `ACA_STORAGE_PROFILE=local` for the single-machine SQLite-backed flow, or set it to `shared` when you want the Postgres coordination backend for shared deployments.
+18. For shared mode, either point `ACA_COORDINATION_POSTGRES_URL` at an external Postgres instance or let Compose use the `coordination-postgres` service by starting with `docker compose --profile shared up`.
+19. The Compose defaults assume a local Postgres database named `aca` with user/password `aca`; override `ACA_COORDINATION_POSTGRES_DB`, `ACA_COORDINATION_POSTGRES_USER`, and `ACA_COORDINATION_POSTGRES_PASSWORD` if you want different credentials.
+20. Keep `KB_DOCS_ROOT` and `KB_INDEX_ROOT` pointed at `./kb-data` unless you need a custom mount location for the knowledgebase service.
+
+If you start with `docker-compose.published.yml`, use the same `-f` flag for
+follow-up `docker compose exec`, `logs`, and `down` commands.
 
 ## Binding Behavior
 
