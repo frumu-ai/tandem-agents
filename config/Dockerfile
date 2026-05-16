@@ -5,9 +5,6 @@ ARG HOST_UID=1000
 ARG HOST_GID=1000
 ARG TANDEM_RELEASE_VERSION=latest
 ARG TANDEM_ENGINE_RELEASE_VERSION=${TANDEM_RELEASE_VERSION}
-ARG VERSION=dev
-ARG VCS_REF=unknown
-ARG BUILD_DATE=unknown
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_PREFIX=/home/node/npm \
@@ -53,6 +50,10 @@ RUN chmod +x /workspace/tandem-agents/scripts/run.sh /workspace/tandem-agents/sc
 
 COPY LICENSE /LICENSE
 COPY NOTICE /NOTICE
+
+ARG VERSION=dev
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="Tandem Agents" \
       org.opencontainers.image.description="Tandem Agents portable autonomous coding runtime" \
