@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from src.tandem_agents.config.config_loader import resolve_config
@@ -264,6 +265,51 @@ class RepositoryNamingTest(unittest.TestCase):
             resolve_repository(cfg)
 
             self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "two\n")
+
+    def test_concurrent_resolve_repository_serializes_shared_checkout_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "checkout"
+            source.mkdir(parents=True, exist_ok=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("one\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "one"])
+            run_command(["git", "clone", str(source), str(target)])
+            (source / "README.md").write_text("two\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-am", "two"])
+            (root / "agent.yaml").write_text(
+                "\n".join(
+                    [
+                        "agent:",
+                        "  name: ACA",
+                        "tandem:",
+                        "  base_url: http://127.0.0.1:39733",
+                        "task_source:",
+                        "  type: manual",
+                        "  prompt: Repository pull",
+                        "repository:",
+                        f"  path: {target}",
+                        f"  clone_url: {source}",
+                        "  default_branch: main",
+                        "provider:",
+                        "  id: openai",
+                        "  model: gpt-4.1-mini",
+                        "output:",
+                        "  root: runs",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cfg = resolve_config(root)
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                repos = list(pool.map(lambda _: resolve_repository(cfg), range(12)))
+
+            self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "two\n")
+            self.assertEqual({Path(repo["path"]).resolve() for repo in repos}, {target.resolve()})
 
     def test_resolve_repository_blocks_pull_when_checkout_is_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

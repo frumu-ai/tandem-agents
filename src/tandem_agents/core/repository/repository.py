@@ -314,7 +314,7 @@ def worker_worktree_name(worker_id: str, subtask_id: str | None = None) -> str:
     return worker_part
 
 
-def resolve_repository(cfg: ResolvedConfig) -> dict[str, Any]:
+def _resolve_repository_unlocked(cfg: ResolvedConfig) -> dict[str, Any]:
     repo_path_hint = cfg.repository_path()
     if repo_path_hint:
         clone_url = _configured_clone_url(cfg)
@@ -374,6 +374,11 @@ def resolve_repository(cfg: ResolvedConfig) -> dict[str, Any]:
     if not (repo_path / ".git").exists():
         raise RuntimeError(f"Resolved repository is not a git checkout: {repo_path}")
     return repository_status(repo_path, cfg.repository.remote_name, cfg.repository.default_branch)
+
+
+def resolve_repository(cfg: ResolvedConfig) -> dict[str, Any]:
+    with REPO_SYNC_LOCK:
+        return _resolve_repository_unlocked(cfg)
 
 
 def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> str:
