@@ -5,6 +5,8 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger("aca.task_sources")
 
@@ -429,6 +431,129 @@ def _normalized_status_option_map(schema: dict[str, Any]) -> tuple[int | None, d
     return None, {}
 
 
+def _github_token(cfg: ResolvedConfig) -> str:
+    for key in ("GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"):
+        value = str(cfg.env.get(key) or "").strip()
+        if value:
+            return value
+    token_files = [
+        cfg.env.get("GITHUB_PERSONAL_ACCESS_TOKEN_FILE"),
+        cfg.env.get("GITHUB_TOKEN_FILE"),
+        cfg.env.get("ACA_REPO_TOKEN_FILE"),
+        cfg.repository.credential_file,
+    ]
+    for raw_path in token_files:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            continue
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = cfg.root_dir / path
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if token:
+            return token
+    return ""
+
+
+def _github_graphql(cfg: ResolvedConfig, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    token = _github_token(cfg)
+    if not token:
+        return {}
+    body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+    request = Request(
+        "https://api.github.com/graphql",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+    except (OSError, HTTPError, URLError, json.JSONDecodeError):
+        logger.debug("Failed to fetch GitHub Project item statuses through GraphQL", exc_info=True)
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _hydrate_project_item_statuses_from_graphql(
+    cfg: ResolvedConfig,
+    schema: dict[str, Any],
+    items: list[dict[str, Any]],
+) -> None:
+    status_names: dict[str, str] = {}
+    fields = schema.get("fields")
+    if isinstance(fields, list):
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            if _project_field_text(field.get("name")).strip().lower() != "status":
+                continue
+            for option in field.get("options") or []:
+                if not isinstance(option, dict):
+                    continue
+                name = _project_field_text(option.get("name"))
+                key = normalize_status_key(name)
+                if key and name:
+                    status_names[key] = name
+    node_to_item: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if str(item.get("status_name") or "").strip():
+            continue
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        node_id = str(raw.get("node_id") or raw.get("nodeId") or "").strip()
+        if node_id:
+            node_to_item[node_id] = item
+    if not node_to_item or not status_names:
+        return
+    query = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProjectV2Item {
+      id
+      fieldValues(first: 50) {
+        nodes {
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            name
+          }
+        }
+      }
+    }
+  }
+}
+"""
+    node_ids = list(node_to_item)
+    for index in range(0, len(node_ids), 50):
+        batch = node_ids[index : index + 50]
+        payload = _github_graphql(cfg, query, {"ids": batch})
+        nodes = ((payload.get("data") or {}).get("nodes") or []) if isinstance(payload, dict) else []
+        if not isinstance(nodes, list):
+            continue
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            item = node_to_item.get(str(node.get("id") or ""))
+            if item is None:
+                continue
+            field_values = ((node.get("fieldValues") or {}).get("nodes") or [])
+            if not isinstance(field_values, list):
+                continue
+            for field_value in field_values:
+                if not isinstance(field_value, dict):
+                    continue
+                key = normalize_status_key(field_value.get("name"))
+                status_name = status_names.get(key)
+                if status_name:
+                    item["status_name"] = status_name
+                    break
+
+
 def _item_text(item: dict[str, Any], key: str) -> str:
     value = item.get(key)
     if isinstance(value, str):
@@ -630,6 +755,8 @@ def _load_github_project_live_data(
         _collect_project_items(candidate, items)
     if not items:
         raise RuntimeError(f"No items returned for GitHub project {owner}/{project_number}")
+    if any(not str(item.get("status_name") or "").strip() for item in items):
+        _hydrate_project_item_statuses_from_graphql(cfg, schema, items)
     for item in items:
         effective_status_name, effective_status_key = _effective_project_status(
             cfg,

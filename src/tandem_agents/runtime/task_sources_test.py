@@ -8,6 +8,7 @@ from unittest.mock import patch
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
     _collect_project_items,
+    _hydrate_project_item_statuses_from_graphql,
     _select_github_project_item,
     _task_from_project,
     github_project_board_snapshot,
@@ -228,6 +229,52 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
         self.assertEqual(collected[0]["project_item_id"], "PVTI_123")
         self.assertEqual(collected[0]["status_name"], "TODOS")
         self.assertEqual(collected[0]["title"], "Tenant isolation task")
+
+    def test_hydrate_project_item_statuses_from_graphql_uses_node_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "fields": [
+                    {
+                        "name": "Status",
+                        "options": [
+                            {"id": "todo-id", "name": "TODOS"},
+                            {"id": "done-id", "name": "Done"},
+                        ],
+                    }
+                ]
+            }
+            items = [
+                {
+                    "project_item_id": "188421130",
+                    "title": "Tenant isolation task",
+                    "status_name": "",
+                    "raw": {"node_id": "PVTI_123"},
+                }
+            ]
+            graphql_payload = {
+                "data": {
+                    "nodes": [
+                        {
+                            "id": "PVTI_123",
+                            "fieldValues": {
+                                "nodes": [
+                                    {"name": "TODOS"},
+                                ]
+                            },
+                        }
+                    ]
+                }
+            }
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._github_graphql",
+                return_value=graphql_payload,
+            ):
+                _hydrate_project_item_statuses_from_graphql(cfg, schema, items)
+
+            self.assertEqual(items[0]["status_name"], "TODOS")
 
 
 if __name__ == "__main__":
