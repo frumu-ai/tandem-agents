@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.integrations.github_mcp import (
+    _project_item_status_name,
     add_issue_comment,
     create_pull_request,
     github_project_status_key_is_actionable,
@@ -138,6 +139,9 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
         self.assertEqual(github_project_status_name_for_outcome("completed"), "In review")
         self.assertEqual(github_project_status_name_for_outcome("blocked"), "Blocked")
         self.assertTrue(github_project_status_key_is_actionable("Ready"))
+
+    def test_project_item_status_name_reads_top_level_string_status(self) -> None:
+        self.assertEqual(_project_item_status_name({"id": "PVTI_123", "status": "TODOS"}), "TODOS")
         self.assertTrue(github_project_status_key_is_actionable("Backlog"))
         self.assertTrue(github_project_status_key_is_actionable("Todo"))
         self.assertTrue(github_project_status_key_is_actionable("TODOS"))

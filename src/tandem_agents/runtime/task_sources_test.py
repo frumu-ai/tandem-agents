@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
+    _collect_project_items,
     _select_github_project_item,
     _task_from_project,
     github_project_board_snapshot,
@@ -203,6 +204,30 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertEqual(item["status_name"], "TODOS")
             self.assertEqual(item["status_key"], "todos")
             self.assertTrue(item["actionable"])
+
+    def test_collect_project_items_reads_top_level_string_status(self) -> None:
+        collected: list[dict[str, object]] = []
+
+        _collect_project_items(
+            {
+                "items": [
+                    {
+                        "id": "PVTI_123",
+                        "status": "TODOS",
+                        "content": {
+                            "type": "DraftIssue",
+                            "title": "Tenant isolation task",
+                        },
+                    }
+                ]
+            },
+            collected,
+        )
+
+        self.assertEqual(len(collected), 1)
+        self.assertEqual(collected[0]["project_item_id"], "PVTI_123")
+        self.assertEqual(collected[0]["status_name"], "TODOS")
+        self.assertEqual(collected[0]["title"], "Tenant isolation task")
 
 
 if __name__ == "__main__":

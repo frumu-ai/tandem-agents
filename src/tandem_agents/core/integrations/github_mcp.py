@@ -441,6 +441,11 @@ def _project_item_status_name(value: Any) -> str:
             name = status.get("name")
             if isinstance(name, str) and name.strip():
                 return name.strip()
+        elif isinstance(status, str) and status.strip():
+            return status.strip()
+        status_name = value.get("status_name") or value.get("statusName")
+        if isinstance(status_name, str) and status_name.strip():
+            return status_name.strip()
         field_values = value.get("field_values") or value.get("fieldValues")
         if isinstance(field_values, dict):
             nested = field_values.get("status")

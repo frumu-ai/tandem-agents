@@ -320,6 +320,10 @@ def _collect_project_items(value: Any, out: list[dict[str, Any]]) -> None:
         status_name = ""
         if isinstance(status, dict):
             status_name = str(status.get("name") or "").strip()
+        elif isinstance(status, str):
+            status_name = status.strip()
+        if not status_name:
+            status_name = str(value.get("status_name") or value.get("statusName") or "").strip()
         if not status_name:
             field_values = value.get("field_values") or value.get("fieldValues")
             if isinstance(field_values, dict):
