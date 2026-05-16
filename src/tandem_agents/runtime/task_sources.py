@@ -483,6 +483,35 @@ def _github_graphql(cfg: ResolvedConfig, query: str, variables: dict[str, Any]) 
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _graphql_project_item_status_name(node: dict[str, Any], status_names: dict[str, str]) -> str:
+    field_values = ((node.get("fieldValues") or {}).get("nodes") or [])
+    if not isinstance(field_values, list):
+        return ""
+    for field_value in field_values:
+        if not isinstance(field_value, dict):
+            continue
+        key = normalize_status_key(field_value.get("name"))
+        status_name = status_names.get(key)
+        if status_name:
+            return status_name
+    return ""
+
+
+def _project_item_database_id(item: dict[str, Any]) -> str:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    for value in (
+        raw.get("database_id"),
+        raw.get("databaseId"),
+        raw.get("item_id"),
+        raw.get("itemId"),
+        item.get("project_item_id"),
+    ):
+        text = str(value or "").strip()
+        if text.isdigit():
+            return str(int(text))
+    return ""
+
+
 def _hydrate_project_item_statuses_from_graphql(
     cfg: ResolvedConfig,
     schema: dict[str, Any],
@@ -504,6 +533,7 @@ def _hydrate_project_item_statuses_from_graphql(
                 if key and name:
                     status_names[key] = name
     node_to_item: dict[str, dict[str, Any]] = {}
+    database_id_to_item: dict[str, dict[str, Any]] = {}
     for item in items:
         if str(item.get("status_name") or "").strip():
             continue
@@ -511,13 +541,17 @@ def _hydrate_project_item_statuses_from_graphql(
         node_id = str(raw.get("node_id") or raw.get("nodeId") or "").strip()
         if node_id:
             node_to_item[node_id] = item
-    if not node_to_item or not status_names:
+        database_id = _project_item_database_id(item)
+        if database_id:
+            database_id_to_item[database_id] = item
+    if not (node_to_item or database_id_to_item) or not status_names:
         return
-    query = """
+    node_query = """
 query($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on ProjectV2Item {
       id
+      databaseId
       fieldValues(first: 50) {
         nodes {
           ... on ProjectV2ItemFieldSingleSelectValue {
@@ -532,27 +566,114 @@ query($ids: [ID!]!) {
     node_ids = list(node_to_item)
     for index in range(0, len(node_ids), 50):
         batch = node_ids[index : index + 50]
-        payload = _github_graphql(cfg, query, {"ids": batch})
+        payload = _github_graphql(cfg, node_query, {"ids": batch})
         nodes = ((payload.get("data") or {}).get("nodes") or []) if isinstance(payload, dict) else []
         if not isinstance(nodes, list):
             continue
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            item = node_to_item.get(str(node.get("id") or ""))
+            item = node_to_item.get(str(node.get("id") or "")) or database_id_to_item.get(
+                str(node.get("databaseId") or "")
+            )
             if item is None:
                 continue
-            field_values = ((node.get("fieldValues") or {}).get("nodes") or [])
-            if not isinstance(field_values, list):
+            status_name = _graphql_project_item_status_name(node, status_names)
+            if status_name:
+                item["status_name"] = status_name
+
+    unresolved_database_ids = {
+        database_id: item
+        for database_id, item in database_id_to_item.items()
+        if not str(item.get("status_name") or "").strip()
+    }
+    owner = str(cfg.task_source.owner or "").strip()
+    try:
+        project_number = int(cfg.task_source.project)
+    except (TypeError, ValueError):
+        project_number = 0
+    if not unresolved_database_ids or not owner or project_number <= 0:
+        return
+
+    project_items_query = """
+query($owner: String!, $number: Int!, $cursor: String) {
+  organization(login: $owner) {
+    projectV2(number: $number) {
+      items(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          databaseId
+          fieldValues(first: 50) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  user(login: $owner) {
+    projectV2(number: $number) {
+      items(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          databaseId
+          fieldValues(first: 50) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+    cursor = None
+    for _ in range(10):
+        payload = _github_graphql(
+            cfg,
+            project_items_query,
+            {"owner": owner, "number": project_number, "cursor": cursor},
+        )
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        project = (((data or {}).get("organization") or {}).get("projectV2") or {}) or (
+            ((data or {}).get("user") or {}).get("projectV2") or {}
+        )
+        page = project.get("items") if isinstance(project, dict) else {}
+        nodes = page.get("nodes") if isinstance(page, dict) else []
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict):
                 continue
-            for field_value in field_values:
-                if not isinstance(field_value, dict):
-                    continue
-                key = normalize_status_key(field_value.get("name"))
-                status_name = status_names.get(key)
-                if status_name:
-                    item["status_name"] = status_name
-                    break
+            item = unresolved_database_ids.get(str(node.get("databaseId") or ""))
+            if item is None:
+                continue
+            status_name = _graphql_project_item_status_name(node, status_names)
+            if status_name:
+                item["status_name"] = status_name
+                unresolved_database_ids.pop(str(node.get("databaseId") or ""), None)
+        if not unresolved_database_ids:
+            return
+        page_info = page.get("pageInfo") if isinstance(page, dict) else {}
+        if not (isinstance(page_info, dict) and page_info.get("hasNextPage")):
+            return
+        cursor = str(page_info.get("endCursor") or "")
+        if not cursor:
+            return
 
 
 def _item_text(item: dict[str, Any], key: str) -> str:
