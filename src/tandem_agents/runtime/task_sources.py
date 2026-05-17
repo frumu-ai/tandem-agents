@@ -741,6 +741,11 @@ def _effective_project_status(
     return effective, normalize_status_key(effective)
 
 
+def _is_github_project_parent_item(title: str | None) -> bool:
+    normalized = str(title or "").strip().lower()
+    return "[aca slice parent]" in normalized or normalized.startswith("aca slice parent")
+
+
 def _select_github_project_item(
     cfg: ResolvedConfig,
     *,
@@ -749,6 +754,12 @@ def _select_github_project_item(
     items: list[dict[str, Any]],
     allow_non_actionable: bool = False,
 ) -> tuple[dict[str, Any] | None, bool, str | None]:
+    def item_is_actionable(item: dict[str, Any]) -> bool:
+        status_key = str(item.get("effective_status_key") or "").strip()
+        status_name = str(item.get("effective_status_name") or item.get("status_name") or "").strip()
+        title = _item_text(item, "title")
+        return github_project_status_key_is_actionable(status_name or status_key) and not _is_github_project_parent_item(title)
+
     selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
     if selector:
         for item in items:
@@ -765,7 +776,7 @@ def _select_github_project_item(
                 continue
             status_key = str(item.get("effective_status_key") or "").strip()
             status_name = str(item.get("effective_status_name") or item.get("status_name") or "").strip()
-            eligible = github_project_status_key_is_actionable(status_name or status_key)
+            eligible = item_is_actionable(item)
             if not eligible and not allow_non_actionable:
                 raise RuntimeError(
                     f"Selected GitHub Project item is not actionable: "
@@ -789,6 +800,7 @@ def _select_github_project_item(
         item
         for item in items
         if normalize_status_key(str(item.get("effective_status_name") or "")) not in skip_statuses
+        and not _is_github_project_parent_item(_item_text(item, "title"))
     ]
 
     def _sort_key(item: dict[str, Any]) -> tuple[int, int]:
@@ -872,7 +884,7 @@ def _select_github_project_item(
 
     status_key = str(chosen.get("effective_status_key") or "").strip()
     status_name = str(chosen.get("effective_status_name") or chosen.get("status_name") or "").strip()
-    eligible = github_project_status_key_is_actionable(status_name or status_key)
+    eligible = item_is_actionable(chosen)
     warning = None
     if not eligible and allow_non_actionable:
         warning = (
@@ -1030,7 +1042,8 @@ def github_project_board_snapshot(
                 "issue_url": str((content or {}).get("html_url") or (content or {}).get("url") or ""),
                 "repo_name": repo_name_value,
                 "content_type": str((content or {}).get("type") or ""),
-                "actionable": github_project_status_key_is_actionable(status_name),
+                "actionable": github_project_status_key_is_actionable(status_name)
+                and not _is_github_project_parent_item(title),
             }
         )
 

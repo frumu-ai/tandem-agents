@@ -549,8 +549,7 @@ def _all_subtasks_verified_existing(
         return False
     source = (task or {}).get("source") if isinstance(task, dict) else {}
     if isinstance(source, dict) and str(source.get("type") or "").strip() == "github_project":
-        if not str(source.get("issue_url") or "").strip() and not str(source.get("issue_number") or "").strip():
-            return False
+        return False
     if repo_validation is not None and not repo_validation.get("ok"):
         return False
     status_by_subtask_id: dict[str, str] = {}

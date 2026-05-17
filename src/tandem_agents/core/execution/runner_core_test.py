@@ -55,7 +55,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_all_subtasks_verified_existing(subtasks, worker_results, {"ok": True}))
         self.assertFalse(_all_subtasks_verified_existing(subtasks, worker_results[:1], {"ok": True}))
 
-    def test_verified_existing_short_circuit_rejects_github_project_drafts(self) -> None:
+    def test_verified_existing_short_circuit_rejects_github_project_tasks(self) -> None:
         subtasks = [{"id": "subtask-1", "files": ["index.html"]}]
         worker_results = [{"subtask_id": "subtask-1", "status": "skipped_existing"}]
 
@@ -67,7 +67,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 {"source": {"type": "github_project", "project_item_id": 123}},
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _all_subtasks_verified_existing(
                 subtasks,
                 worker_results,

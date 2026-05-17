@@ -240,6 +240,39 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertEqual(item["status_key"], "todos")
             self.assertTrue(item["actionable"])
 
+    def test_parent_status_items_are_not_actionable_in_board_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": 2, "name": "TODOS"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 1443,
+                    "title": "[ACA Slice Parent] Launch gate",
+                    "effective_status_name": "TODOS",
+                    "effective_status_key": "todos",
+                    "content": {"number": 1443, "title": "[ACA Slice Parent] Launch gate"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertFalse(snapshot["items"][0]["actionable"])
+
     def test_collect_project_items_reads_top_level_string_status(self) -> None:
         collected: list[dict[str, object]] = []
 
