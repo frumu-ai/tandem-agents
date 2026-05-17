@@ -354,6 +354,64 @@ def _run_summary(run_dir: Path) -> Optional[str]:
         return None
 
 
+def _run_events(run_dir: Path, tail: int = 80) -> list[dict[str, Any]]:
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        return []
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    events: list[dict[str, Any]] = []
+    for line in lines[-max(1, min(tail, 500)):]:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
+def _run_diff_snapshot(run_dir: Path) -> dict[str, Any]:
+    after_path = run_dir / "diffs" / "after.txt"
+    before_path = run_dir / "diffs" / "before.txt"
+    after = ""
+    before = ""
+    try:
+        if after_path.exists():
+            after = after_path.read_text(encoding="utf-8")
+    except Exception:
+        after = ""
+    try:
+        if before_path.exists():
+            before = before_path.read_text(encoding="utf-8")
+    except Exception:
+        before = ""
+
+    changed_files: list[str] = []
+    for line in after.splitlines():
+        text = line.strip()
+        if not text or text.startswith("("):
+            continue
+        if " file changed" in text or " files changed" in text:
+            continue
+        if "|" not in text:
+            continue
+        path = text.split("|", 1)[0].strip()
+        if path:
+            changed_files.append(path)
+
+    return {
+        "before": before,
+        "after": after,
+        "changed_files": changed_files,
+        "available": bool(after.strip() and after.strip() != "(clean)"),
+    }
+
+
 def _persisted_run_status(status_payload: dict[str, Any] | None) -> str:
     run_meta = status_payload.get("run") if isinstance(status_payload, dict) else None
     if not isinstance(run_meta, dict):
@@ -426,6 +484,8 @@ def _build_run_snapshot(run_id: str, run_dir: Path, active_state: Optional["RunS
         "has_error": bool(error),
         "error": error,
         "summary_available": _run_summary(run_dir) is not None,
+        "events": _run_events(run_dir),
+        "diff": _run_diff_snapshot(run_dir),
         "artifacts": {
             "run_dir": str(run_dir),
             "logs_dir": str(run_dir / "logs"),
@@ -802,10 +862,22 @@ async def get_run(run_id: str, token: str = Depends(get_token)):
         "is_running": snapshot.get("is_running", False),
         "status": status_payload,
         "blackboard": load_blackboard(run_dir / "blackboard.yaml"),
+        "events": _run_events(run_dir),
+        "diff": _run_diff_snapshot(run_dir),
         "error": snapshot.get("error"),
         "summary": _run_summary(run_dir),
         "snapshot": snapshot,
     }
+
+
+@app.get("/runs/{run_id}/events/history")
+async def get_run_events_history(run_id: str, tail: int = 80, token: str = Depends(get_token)):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    run_dir = _run_dir(cfg, run_id)
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"events": _run_events(run_dir, tail=tail)}
 
 
 @app.get("/runs/{run_id}/summary")

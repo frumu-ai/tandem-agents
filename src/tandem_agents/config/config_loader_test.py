@@ -320,6 +320,45 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
             self.assertEqual(cfg.execution.coder_supervisor_batch_size, 25)
             self.assertFalse(cfg.execution.coder_cancel_on_source_terminal)
 
+    def test_github_mcp_token_file_does_not_become_repo_credential_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token_file = root / "github_token"
+            token_file.write_text("secret\n", encoding="utf-8")
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: github_project
+                      owner: frumu-ai
+                      repo: tandem
+                      project: 1
+                    repository:
+                      slug: frumu-ai/tandem
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(
+                root,
+                env={
+                    "GITHUB_TOKEN_FILE": str(token_file),
+                    "ACA_GITHUB_MCP_ENABLED": "true",
+                },
+            )
+
+            self.assertTrue(cfg.github_mcp.enabled)
+            self.assertEqual(cfg.repository.credential_file, "")
+
 
 if __name__ == "__main__":
     unittest.main()

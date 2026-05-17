@@ -69,6 +69,8 @@ from src.tandem_agents.config.config_types import (
     _load_yaml,
     _nonempty,
     _jsonable,
+    _read_text_file,
+    _resolve_path,
 )
 
 
@@ -223,8 +225,6 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
     repo_remote_name = pick("ACA_REMOTE_NAME", "AUTOCODER_REMOTE_NAME", yaml_value=repo_data.get("remote_name"), default=DEFAULT_REMOTE_NAME)
     repo_credential_file = pick(
         "ACA_REPO_TOKEN_FILE",
-        "GITHUB_PERSONAL_ACCESS_TOKEN_FILE",
-        "GITHUB_TOKEN_FILE",
         yaml_value=repo_data.get("credential_file"),
         default="",
     )

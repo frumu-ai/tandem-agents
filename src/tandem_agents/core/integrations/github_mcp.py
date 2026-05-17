@@ -55,7 +55,7 @@ def github_project_status_name_for_task_state(task_state: str | None) -> str:
 def github_project_status_name_for_outcome(outcome: str | None) -> str:
     key = normalize_status_key(outcome)
     if key == "completed":
-        return "In review"
+        return "Review"
     if key == "blocked":
         return "Blocked"
     if key in {"failed", "cancelled"}:

@@ -116,6 +116,38 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertIsNotNone(warning)
             self.assertEqual(chosen["project_item_id"], 1)
 
+    def test_forced_selection_matches_project_item_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.task_source.item = "188421137"
+            items = [
+                {
+                    "project_item_id": "188421130",
+                    "title": "First ready item",
+                    "effective_status_name": "TODOS",
+                    "effective_status_key": "todos",
+                },
+                {
+                    "project_item_id": "188421137",
+                    "title": "Selected ready item",
+                    "effective_status_name": "TODOS",
+                    "effective_status_key": "todos",
+                },
+            ]
+
+            chosen, eligible, warning = _select_github_project_item(
+                cfg,
+                owner="frumu-ai",
+                project=1,
+                items=items,
+                allow_non_actionable=False,
+            )
+
+            self.assertTrue(eligible)
+            self.assertIsNone(warning)
+            self.assertEqual(chosen["project_item_id"], "188421137")
+
     def test_github_project_task_carries_full_repo_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

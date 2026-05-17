@@ -136,7 +136,7 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
     def test_github_project_status_mapping_is_explicit(self) -> None:
         self.assertEqual(github_project_status_name_for_task_state("active"), "In progress")
         self.assertEqual(github_project_status_name_for_task_state("blocked"), "Blocked")
-        self.assertEqual(github_project_status_name_for_outcome("completed"), "In review")
+        self.assertEqual(github_project_status_name_for_outcome("completed"), "Review")
         self.assertEqual(github_project_status_name_for_outcome("blocked"), "Blocked")
         self.assertTrue(github_project_status_key_is_actionable("Ready"))
 

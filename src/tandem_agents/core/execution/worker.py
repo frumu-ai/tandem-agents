@@ -350,6 +350,12 @@ def summarize_worker_notes(
     worktree: Path,
     index: int,
 ) -> dict[str, Any]:
+    diff_stat = git_diff_stat(worktree).strip()
+    changed_files = [
+        line.split("|", 1)[0].strip()
+        for line in diff_stat.splitlines()
+        if "|" in line and " file changed" not in line and " files changed" not in line
+    ]
     return {
         "worker_id": worker_id,
         "subtask_index": index,
@@ -366,6 +372,8 @@ def summarize_worker_notes(
         "output_excerpt": result["stdout"][:2000],
         "write_required": bool(result.get("write_required", True)),
         "verified_existing": bool(result.get("verified_existing")),
+        "changed_files": [path for path in changed_files if path],
+        "diff_stat": diff_stat,
     }
 
 

@@ -753,6 +753,8 @@ def _select_github_project_item(
     if selector:
         for item in items:
             haystacks = [
+                str(item.get("project_item_id", "")),
+                str(item.get("item_id", "")),
                 str(item.get("id", "")),
                 str(item.get("number", "")),
                 str(item.get("url", "")),

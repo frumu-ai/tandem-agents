@@ -283,6 +283,31 @@ def run_task_intake(
     ctx.source_type = source_type
     ctx.source_scope = github_mcp_scope(ctx.cfg, source_type)
     ctx.remote_sync = github_remote_sync_mode(ctx.cfg, source_type)
+    configured_remote_sync = str(ctx.cfg.github_mcp.remote_sync or "off").strip().lower()
+    configured_scope = str(ctx.cfg.github_mcp.scope or "none").strip().lower()
+    if (
+        source_type == "github_project"
+        and configured_remote_sync != "off"
+        and configured_scope in {"intake_finalize", "always"}
+        and (ctx.source_scope == "none" or ctx.remote_sync == "off")
+    ):
+        return block_run(
+            run_id=ctx.run_id,
+            run_dir=ctx.run_dir,
+            layout=ctx.layout,
+            cfg=ctx.cfg,
+            task=task,
+            repo=ctx.repo,
+            engine=ctx.engine,
+            phase="github_sync",
+            kind="github_mcp_disabled",
+            message=(
+                "GitHub Project remote sync is configured for this ACA task source, "
+                "but GitHub MCP is not enabled. Refusing to mark the task complete "
+                "without updating GitHub."
+            ),
+            coordination=ctx.coordination,
+        )
 
     # 10. Initial status dict
     ctx.status = initial_status(
