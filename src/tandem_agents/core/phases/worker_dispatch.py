@@ -216,6 +216,10 @@ def _apply_tolerated_failures(ctx: RunContext) -> None:
     from src.tandem_agents.core.repository.repo_truth import subtask_satisfied
     from src.tandem_agents.core.execution import runner_core as _rc
 
+    task_source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+    if isinstance(task_source, dict) and str(task_source.get("type") or "").strip() == "github_project":
+        return
+
     for result in ctx.worker_results:
         if result.get("status") != "failed":
             continue
