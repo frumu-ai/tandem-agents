@@ -42,6 +42,74 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertTrue(subtasks)
             self.assertTrue(subtasks[0]["files"])
 
+    def test_github_project_contract_target_files_override_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            (repo_path / "src").mkdir()
+            (repo_path / "src" / "unrelated.rs").write_text("fn unrelated() {}\n", encoding="utf-8")
+            (repo_path / "crates").mkdir()
+            task = {
+                "title": "Add tenant helpers",
+                "description": "\n".join(
+                    [
+                        "Add reusable tenant denial helpers",
+                        "",
+                        "## Files Likely Touched",
+                        "- `crates/tandem-server/src/http/tests/mod.rs`",
+                        "- `crates/tandem-server/src/app/state/tests/mod.rs`",
+                    ]
+                ),
+                "source": {"type": "github_project", "issue_number": 1},
+            }
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "title": "wrong slice",
+                        "files": ["src/unrelated.rs"],
+                    }
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(task, manager_plan, repo_path, 1)
+
+            self.assertEqual(
+                subtasks[0]["files"],
+                [
+                    "crates/tandem-server/src/http/tests/mod.rs",
+                    "crates/tandem-server/src/app/state/tests/mod.rs",
+                ],
+            )
+
+    def test_github_project_fallback_subtask_keeps_contract_target_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            (repo_path / "src").mkdir()
+            (repo_path / "src" / "unrelated.rs").write_text("fn unrelated() {}\n", encoding="utf-8")
+            task = {
+                "title": "Filter sessions by tenant",
+                "description": "\n".join(
+                    [
+                        "Filter session CRUD routes by tenant.",
+                        "",
+                        "## Files Likely Touched",
+                        "- `crates/tandem-server/src/http/sessions.rs`",
+                        "- `crates/tandem-core/src/storage_parts/`",
+                    ]
+                ),
+                "source": {"type": "github_project", "issue_number": 1428},
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(task, {"subtasks": []}, repo_path, 1)
+
+            self.assertEqual(
+                subtasks[0]["files"],
+                [
+                    "crates/tandem-server/src/http/sessions.rs",
+                    "crates/tandem-core/src/storage_parts/",
+                ],
+            )
+            self.assertEqual(subtasks[0]["target_files"], subtasks[0]["files"])
+
     def test_verified_existing_short_circuit_requires_all_subtasks_satisfied(self) -> None:
         subtasks = [
             {"id": "subtask-1", "files": ["index.html", "styles.css"]},

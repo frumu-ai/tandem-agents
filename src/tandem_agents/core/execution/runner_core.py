@@ -36,6 +36,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     update_project_item_status,
 )
 from src.tandem_agents.core.repository.repository import repository_binding_issues
+from src.tandem_agents.core.task_contract import task_contract_payload
 from src.tandem_agents.core.scheduling.outbox_dispatcher import dispatch_outbox_tick
 from src.tandem_agents.core.scheduling.coder_supervisor import apply_coder_result
 from src.tandem_agents.core.verification.review_policy import evaluate_review_policy
@@ -284,6 +285,22 @@ def _normalize_manager_subtasks(
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     repo_prefix = str(Path(repo_path)).rstrip("/") + "/"
+    contract = task_contract_payload(task)
+    task_target_files = [
+        str(entry).strip()
+        for entry in _as_list(contract.get("target_files") or task.get("target_files"))
+        if str(entry).strip()
+    ]
+    contract_constrained = bool(task_target_files)
+
+    def _normalize_repo_file(entry: str) -> str:
+        if entry.startswith(repo_prefix):
+            return entry[len(repo_prefix) :]
+        if entry.startswith("/"):
+            return Path(entry).name
+        return entry
+
+    normalized_task_target_files = [_normalize_repo_file(entry) for entry in task_target_files]
     for index, item in enumerate(raw_subtasks, start=1):
         if not isinstance(item, dict):
             continue
@@ -327,23 +344,19 @@ def _normalize_manager_subtasks(
         ]
         normalized_files: list[str] = []
         for entry in raw_files:
-            if entry.startswith(repo_prefix):
-                normalized_files.append(entry[len(repo_prefix) :])
-            elif entry.startswith("/"):
-                normalized_files.append(Path(entry).name)
-            else:
-                normalized_files.append(entry)
+            normalized_files.append(_normalize_repo_file(entry))
         normalized_target_files: list[str] = []
         for entry in raw_target_files:
-            if entry.startswith(repo_prefix):
-                normalized_target_files.append(entry[len(repo_prefix) :])
-            elif entry.startswith("/"):
-                normalized_target_files.append(Path(entry).name)
-            else:
-                normalized_target_files.append(entry)
+            normalized_target_files.append(_normalize_repo_file(entry))
         if not normalized_files and normalized_target_files:
             normalized_files = list(normalized_target_files)
-        if not normalized_target_files and normalized_files:
+        if contract_constrained:
+            allowed = set(normalized_task_target_files)
+            if not normalized_files or any(entry not in allowed for entry in normalized_files):
+                normalized_files = list(normalized_task_target_files)
+        if contract_constrained:
+            normalized_target_files = list(normalized_task_target_files)
+        elif not normalized_target_files and normalized_files:
             normalized_target_files = list(normalized_files)
         normalized.append(
             {
@@ -374,7 +387,11 @@ def _normalize_manager_subtasks(
         return normalized
     fallback = derive_subtasks(task, 1)
     if discovered_files and fallback:
-        fallback[0]["files"] = list(discovered_files)
+        if contract_constrained:
+            fallback[0]["files"] = list(normalized_task_target_files)
+            fallback[0]["target_files"] = list(normalized_task_target_files)
+        else:
+            fallback[0]["files"] = list(discovered_files)
     return fallback
 
 
@@ -393,7 +410,16 @@ def _prepare_subtasks_with_discovery(
     )
     if not subtasks:
         subtasks = derive_subtasks(task, max_workers)
-        if discovered_files:
+        contract = task_contract_payload(task)
+        task_target_files = [
+            str(entry).strip()
+            for entry in _as_list(contract.get("target_files") or task.get("target_files"))
+            if str(entry).strip()
+        ]
+        if task_target_files:
+            subtasks[0]["files"] = list(task_target_files)
+            subtasks[0]["target_files"] = list(task_target_files)
+        elif discovered_files:
             subtasks[0]["files"] = list(discovered_files)
     return discovered_files, subtasks
 
@@ -1330,6 +1356,9 @@ def _run_once_internal_impl(
         dispatch_workers(ctx)
 
         if ctx.status["metrics"]["failed_workers"]:
+            source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+            if isinstance(source, dict) and str(source.get("type") or "").strip() == "github_project":
+                return _block_worker_failure(ctx)
             repo_blocker = _repo_validation_blocker_message(ctx.repo_validation)
             if repo_blocker:
                 return _block_worker_failure(ctx)
@@ -1549,7 +1578,8 @@ def _block_no_targets(ctx: "_PhaseRunContext") -> dict[str, Any]:
     write_board_snapshot(ctx.run_dir, ctx.board)
     save_run_text(ctx.layout["summary"], build_blocked_summary(task_title=ctx.task["title"], message=msg))
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
-                          status=ctx.status, blackboard=ctx.blackboard, outcome="blocked", summary=msg)
+                          status=ctx.status, blackboard=ctx.blackboard, outcome="blocked",
+                          summary=msg, coordination=ctx.coordination)
     append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "no_targets"})
     return ctx.make_result()
 
@@ -1569,7 +1599,7 @@ def _block_manager_failed(ctx: "_PhaseRunContext") -> dict[str, Any]:
     save_run_text(ctx.layout["summary"], build_blocked_summary(task_title=ctx.task["title"], message=msg))
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,
-                          outcome="blocked", summary=msg)
+                          outcome="blocked", summary=msg, coordination=ctx.coordination)
     append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": kind, "detail": phase_detail})
     return ctx.make_result()
 
@@ -1606,6 +1636,7 @@ def _complete_pre_satisfied(ctx: "_PhaseRunContext") -> dict[str, Any]:
         status=ctx.status, blackboard=ctx.blackboard,
         outcome="completed", summary="Repository already satisfied the requested task.",
         diff_snapshot=diff, review_returncode=0, test_returncode=0,
+        coordination=ctx.coordination,
     )
     if sync_failed:
         return block_run(
@@ -1643,10 +1674,12 @@ def _block_worker_failure(ctx: "_PhaseRunContext") -> dict[str, Any]:
         ctx.status, ctx.layout, phase="worker_execution",
         phase_detail="one or more workers failed", run_status="blocked",
         blocker=(True, "worker", "One or more workers failed", "worker"),
+        run_completed=True,
     )
     _touch_coordination(ctx.coordination, run_id=ctx.run_id, lease_id=ctx.lease_id,
                         lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
-                        status="blocked", phase="worker_execution", error="One or more workers failed")
+                        status="blocked", phase="worker_execution",
+                        error="One or more workers failed", completed=True)
     _move_task_card_if_present(ctx.board, ctx.task, "blocked", "manager", "worker failure")
     save_board(ctx.board_path, ctx.board)
     write_board_snapshot(ctx.run_dir, ctx.board)
@@ -1657,7 +1690,8 @@ def _block_worker_failure(ctx: "_PhaseRunContext") -> dict[str, Any]:
     ))
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,
-                          outcome="blocked", summary="One or more worker executions failed.")
+                          outcome="blocked", summary="One or more worker executions failed.",
+                          coordination=ctx.coordination)
     append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "worker"})
     return ctx.make_result()
 
@@ -1688,7 +1722,8 @@ def _block_integration_failed(ctx: "_PhaseRunContext") -> dict[str, Any]:
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,
                           outcome="blocked", summary="Integration prompt failed after worker completion.",
-                          review_returncode=None, test_returncode=None)
+                          review_returncode=None, test_returncode=None,
+                          coordination=ctx.coordination)
     append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "integration"})
     return ctx.make_result()
 
@@ -1727,7 +1762,8 @@ def _block_verification_failed(ctx: "_PhaseRunContext", verification: Any) -> di
                           outcome="blocked", summary=f"{label}: {blocker_msg}",
                           diff_snapshot=ctx.pending_diff_snapshot,
                           review_returncode=ctx.review_result.get("returncode"),
-                          test_returncode=ctx.test_result.get("returncode"))
+                          test_returncode=ctx.test_result.get("returncode"),
+                          coordination=ctx.coordination)
     append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": failure_category})
     return ctx.make_result()
 
@@ -1753,6 +1789,7 @@ def _block_from_decision(ctx: "_PhaseRunContext", decision: "RepairDecision") ->
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,
                           outcome="blocked", summary=msg,
-                          review_returncode=None, test_returncode=None)
+                          review_returncode=None, test_returncode=None,
+                          coordination=ctx.coordination)
     append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": decision.kind or "unknown"})
     return ctx.make_result()

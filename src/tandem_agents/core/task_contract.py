@@ -24,6 +24,7 @@ _SECTION_ALIASES = {
     "deliverables": "deliverables",
     "target_files": "target_files",
     "files_likely_involved": "target_files",
+    "files_likely_touched": "target_files",
     "likely_files": "target_files",
     "likely_files_to_edit": "target_files",
     "verification": "verification_commands",
@@ -66,6 +67,14 @@ def _coerce_text_list(value: Any) -> list[str]:
 
 def _normalize_repo_relative_path(value: Any) -> str:
     text = _normalize_text(value).replace("\\", "/")
+    backtick_match = re.search(r"`([^`]+)`", text)
+    if backtick_match:
+        text = backtick_match.group(1)
+    else:
+        path_match = re.search(r"([A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+-]+)+)", text)
+        if path_match:
+            text = path_match.group(1)
+    text = text.strip().strip("`'\"")
     while text.startswith("./"):
         text = text[2:]
     return text

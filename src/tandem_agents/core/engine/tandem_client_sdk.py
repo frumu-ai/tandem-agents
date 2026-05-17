@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import asyncio
 import time
+from urllib.parse import quote
 
 from src.tandem_agents.config.config import ResolvedConfig
 
@@ -307,16 +308,43 @@ def sdk_sessions_prompt_async(
     tool_mode: str | None = None,
     tool_allowlist: list[str] | None = None,
     context_mode: str | None = None,
+    write_required: bool | None = None,
 ) -> Any:
     def _call(client: Any) -> Any:
-        res = client.sessions.prompt_async(
-            session_id,
-            prompt,
-            tool_mode=tool_mode,
-            tool_allowlist=tool_allowlist,
-            context_mode=context_mode,
+        payload: dict[str, Any] = {"parts": [{"type": "text", "text": prompt}]}
+        if tool_mode is not None:
+            payload["toolMode"] = tool_mode
+        if tool_allowlist:
+            payload["toolAllowlist"] = tool_allowlist
+        if context_mode is not None:
+            payload["contextMode"] = context_mode
+        if write_required is not None:
+            payload["writeRequired"] = write_required
+        response = asyncio.run(
+            client._async._http.post(
+                f"/session/{quote(session_id)}/prompt_async",
+                params={"return": "run"},
+                json=payload,
+            )
         )
-        return res.model_dump(exclude_none=True) if hasattr(res, "model_dump") else res
+        if response.status_code == 409:
+            conflict = response.json() or {}
+            active = conflict.get("activeRun") or {}
+            run_id = active.get("runID") or active.get("runId") or active.get("run_id")
+            if run_id:
+                return {"run_id": str(run_id)}
+        response.raise_for_status()
+        data = response.json() or {}
+        run_id = (
+            data.get("id")
+            or data.get("runID")
+            or data.get("runId")
+            or data.get("run_id")
+            or (data.get("run") or {}).get("id")
+        )
+        if not run_id:
+            raise RuntimeError(f"prompt_async response did not include run id: {data}")
+        return {"run_id": str(run_id)}
     return with_sync_tandem_client(cfg, _call)
 
 
@@ -334,6 +362,60 @@ def sdk_run_events(
             for e in client.run_events(run_id, since_seq=since_seq, tail=tail)
         ],
     )
+
+
+def _extract_event_text_delta(evt: Any) -> str:
+    properties = getattr(evt, "properties", None) or {}
+    if not isinstance(properties, dict):
+        properties = {}
+    event_type = str(getattr(evt, "type", "") or properties.get("type") or "").strip()
+    if event_type == "session.response":
+        return str(properties.get("delta") or "")
+    if event_type != "message.part.updated":
+        return ""
+
+    delta = properties.get("delta")
+    if isinstance(delta, str):
+        return delta
+    if isinstance(delta, dict):
+        text = delta.get("text")
+        if isinstance(text, str):
+            return text
+        nested = delta.get("delta")
+        if isinstance(nested, dict) and isinstance(nested.get("text"), str):
+            return str(nested.get("text"))
+    if isinstance(delta, list):
+        chunks: list[str] = []
+        for item in delta:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+                else:
+                    nested = item.get("delta")
+                    if isinstance(nested, dict) and isinstance(nested.get("text"), str):
+                        chunks.append(str(nested.get("text")))
+        return "".join(chunks)
+
+    part = properties.get("part")
+    if isinstance(part, dict):
+        text = part.get("text")
+        if isinstance(text, str):
+            return text
+        content = part.get("content")
+        if isinstance(content, list):
+            chunks = []
+            for item in content:
+                if isinstance(item, str):
+                    chunks.append(item)
+                elif isinstance(item, dict):
+                    value = item.get("text") or item.get("value")
+                    if isinstance(value, str):
+                        chunks.append(value)
+            return "".join(chunks)
+    return ""
 
 
 def _browser_request(cfg: ResolvedConfig, method: str, path: str, **kwargs) -> Any:
@@ -448,15 +530,14 @@ def sdk_stream_run_text(
             deadline = time.time() + timeout_seconds
             async for evt in client.stream(session_id, run_id):
                 t = str(getattr(evt, "type", "") or "").strip()
-                if t == "session.response":
-                    delta = str((getattr(evt, "properties", {}) or {}).get("delta") or "")
-                    if delta:
-                        parts.append(delta)
-                        if log_writer is not None:
-                            try:
-                                log_writer(delta)
-                            except Exception:
-                                pass
+                delta = _extract_event_text_delta(evt)
+                if delta:
+                    parts.append(delta)
+                    if log_writer is not None:
+                        try:
+                            log_writer(delta)
+                        except Exception:
+                            pass
                 if t in {"run.complete", "run.completed", "run.failed", "session.run.finished"}:
                     completed = True
                     break

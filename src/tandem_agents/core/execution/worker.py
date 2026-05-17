@@ -294,6 +294,7 @@ def stream_tandem_prompt(
                     tool_mode="required" if require_tool_use else "auto",
                     tool_allowlist=SESSION_TOOL_ALLOWLIST,
                     context_mode=None,
+                    write_required=write_required,
                 )
                 run_id = ""
                 try:

@@ -53,6 +53,25 @@ Deduplicate issue creation before publishing.
         self.assertIn("Deduplicate issue creation before publishing.", task["notes_for_agent"])
         self.assertIsNone(task["tandem_coder_handoff"])
 
+    def test_files_likely_touched_maps_to_target_files_and_strips_notes(self) -> None:
+        body = """## Files Likely Touched
+
+- `crates/tandem-enterprise-contract/src/lib.rs`
+- `crates/tandem-server/src/http/middleware.rs` only if needed
+- `crates/tandem-server/src/http/tests/enterprise.rs` only if needed
+"""
+
+        task = apply_task_contract({"title": "Add tenant constructors", "description": body})
+
+        self.assertEqual(
+            task["target_files"],
+            [
+                "crates/tandem-enterprise-contract/src/lib.rs",
+                "crates/tandem-server/src/http/middleware.rs",
+                "crates/tandem-server/src/http/tests/enterprise.rs",
+            ],
+        )
+
     def test_tandem_coder_handoff_enriches_without_being_required(self) -> None:
         body = """## What happened?
 
