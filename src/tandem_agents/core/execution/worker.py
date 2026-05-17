@@ -192,6 +192,8 @@ def _coerce_worker_failure(
     log_path: Path,
     worktree: Path,
     subtask: dict[str, Any],
+    *,
+    require_filesystem_changes: bool = False,
 ) -> dict[str, Any]:
     stdout_text = str(result.get("stdout") or "")
     targets_exist = _target_files_exist(worktree, subtask)
@@ -210,7 +212,12 @@ def _coerce_worker_failure(
         result["returncode"] = 0
         result["recovered_success"] = True
         return result
-    if result.get("returncode", 0) != 0 and readable_targets and not diff_text:
+    if (
+        result.get("returncode", 0) != 0
+        and readable_targets
+        and not diff_text
+        and not require_filesystem_changes
+    ):
         message = "Worker returned a nonzero status, but all target files were readable in the worktree. Treating as verification success.\n"
         log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
         result["stdout"] = f"{stdout_text}{message}"
@@ -434,8 +441,14 @@ def run_worker_subtask(
     log_path = layout["logs"] / f"{worker_id}.log"
     config_path = None
     
-    worktree_satisfied = bool(subtask.get("pre_satisfied"))
-    if not worktree_satisfied:
+    task_source = task.get("source") if isinstance(task, dict) else {}
+    require_filesystem_changes = (
+        isinstance(task_source, dict)
+        and str(task_source.get("type") or "").strip() == "github_project"
+    )
+
+    worktree_satisfied = bool(subtask.get("pre_satisfied")) and not require_filesystem_changes
+    if not worktree_satisfied and not require_filesystem_changes:
         worktree_satisfied = _target_files_exist(worktree, subtask) and bool(_readable_target_files(worktree, subtask))
     
     write_required = not worktree_satisfied
@@ -467,7 +480,13 @@ def run_worker_subtask(
     # Sync artifacts after turn
     sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
     
-    result = _coerce_worker_failure(result, log_path, worktree, subtask)
+    result = _coerce_worker_failure(
+        result,
+        log_path,
+        worktree,
+        subtask,
+        require_filesystem_changes=require_filesystem_changes,
+    )
     
     if result["returncode"] != 0:
         retry_prompt = prompt + _worker_prompt_retry_suffix(subtask)
@@ -489,7 +508,13 @@ def run_worker_subtask(
         # Sync artifacts after retry turn
         sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
         
-        retry_result = _coerce_worker_failure(retry_result, log_path, worktree, subtask)
+        retry_result = _coerce_worker_failure(
+            retry_result,
+            log_path,
+            worktree,
+            subtask,
+            require_filesystem_changes=require_filesystem_changes,
+        )
         if retry_result["returncode"] == 0:
             result = retry_result
             

@@ -139,6 +139,11 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     ctx.pending_subtasks = []
     plan_validation = task_plan_validation(ctx.task, subtasks)
     ctx.blackboard["task_plan_validation"] = plan_validation
+    task_source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+    force_worker_execution = (
+        isinstance(task_source, dict)
+        and str(task_source.get("type") or "").strip() == "github_project"
+    )
     if not plan_validation.get("ok", True):
         blocker_kind = str(plan_validation.get("blocker_kind") or "contract_incomplete")
         blocker_message = str(plan_validation.get("blocker_message") or "Subtask plan is incomplete or unsafe.")
@@ -169,7 +174,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
             and file_is_readable(repo_path / str(rel_path).strip())
         ]
         subtask["existing_files"] = readable_existing
-        subtask["pre_satisfied"] = subtask_satisfied(repo_path, subtask)
+        subtask["pre_satisfied"] = False if force_worker_execution else subtask_satisfied(repo_path, subtask)
         subtask["write_required"] = not subtask["pre_satisfied"]
 
         if subtask["pre_satisfied"]:
