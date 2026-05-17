@@ -796,9 +796,53 @@ async def list_runs(token: str = Depends(get_token)):
     return {"runs": _list_run_snapshots(cfg)}
 
 
+def _scheduler_filtered_github_items(root: Path, project_slug: Optional[str], items: list[str]) -> list[str]:
+    _, cfg = _project_config(root, project_slug) if project_slug else (None, resolve_config(root))
+    if str(cfg.task_source.type or "").strip() != "github_project":
+        return items
+
+    from src.tandem_agents.runtime.task_sources import github_project_board_snapshot
+
+    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+    requested = set(items)
+
+    def matches_requested(row: dict[str, Any]) -> bool:
+        haystacks = {
+            str(row.get("id") or ""),
+            str(row.get("project_item_id") or ""),
+            str(row.get("issue_number") or ""),
+            str(row.get("issue_url") or ""),
+            str(row.get("title") or ""),
+        }
+        return any(item == hay or (item and item in hay) for item in requested for hay in haystacks if hay)
+
+    scheduled_items = [
+        str(row.get("project_item_id") or row.get("id") or "").strip()
+        for row in snapshot.get("items", [])
+        if matches_requested(row) and row.get("actionable") is True
+    ]
+    scheduled_items = [item for item in dict.fromkeys(scheduled_items) if item]
+    if not scheduled_items:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "No selected GitHub Project items are currently scheduler-actionable.",
+                "scheduler": snapshot.get("scheduler") or {},
+            },
+        )
+    return scheduled_items
+
+
 @app.post("/runs/trigger")
 async def trigger_run(project_slug: Optional[str] = None, task_source_type: Optional[str] = None, item: Optional[str] = None, overrides: Dict[str, str] = {}, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
+    if item:
+        try:
+            item = _scheduler_filtered_github_items(root, project_slug, [str(item).strip()])[0]
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not apply ACA scheduler policy: {exc}") from exc
     return _start_run(
         root,
         project_slug=project_slug,
@@ -828,38 +872,7 @@ async def trigger_runs_batch(
 
     if respect_scheduler:
         try:
-            _, cfg = _project_config(root, project_slug) if project_slug else (None, resolve_config(root))
-            if str(cfg.task_source.type or "").strip() == "github_project":
-                from src.tandem_agents.runtime.task_sources import github_project_board_snapshot
-
-                snapshot = github_project_board_snapshot(cfg, force_refresh=True)
-                requested = set(items)
-
-                def matches_requested(row: dict[str, Any]) -> bool:
-                    haystacks = {
-                        str(row.get("id") or ""),
-                        str(row.get("project_item_id") or ""),
-                        str(row.get("issue_number") or ""),
-                        str(row.get("issue_url") or ""),
-                        str(row.get("title") or ""),
-                    }
-                    return any(item == hay or (item and item in hay) for item in requested for hay in haystacks if hay)
-
-                scheduled_items = [
-                    str(row.get("project_item_id") or row.get("id") or "").strip()
-                    for row in snapshot.get("items", [])
-                    if matches_requested(row) and row.get("actionable") is True
-                ]
-                scheduled_items = [item for item in dict.fromkeys(scheduled_items) if item]
-                if not scheduled_items:
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "message": "No selected GitHub Project items are currently scheduler-actionable.",
-                            "scheduler": snapshot.get("scheduler") or {},
-                        },
-                    )
-                items = scheduled_items
+            items = _scheduler_filtered_github_items(root, project_slug, items)
         except HTTPException:
             raise
         except Exception as exc:
