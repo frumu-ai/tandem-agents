@@ -218,7 +218,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
 
     all_pre_satisfied = (
         not ctx.pending_subtasks
-        and _rc._all_subtasks_verified_existing(ctx.planned_subtasks, ctx.worker_results, ctx.repo_validation)
+        and _rc._all_subtasks_verified_existing(ctx.planned_subtasks, ctx.worker_results, ctx.repo_validation, ctx.task)
     )
     if all_pre_satisfied:
         logger.info(

@@ -55,6 +55,33 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_all_subtasks_verified_existing(subtasks, worker_results, {"ok": True}))
         self.assertFalse(_all_subtasks_verified_existing(subtasks, worker_results[:1], {"ok": True}))
 
+    def test_verified_existing_short_circuit_rejects_github_project_drafts(self) -> None:
+        subtasks = [{"id": "subtask-1", "files": ["index.html"]}]
+        worker_results = [{"subtask_id": "subtask-1", "status": "skipped_existing"}]
+
+        self.assertFalse(
+            _all_subtasks_verified_existing(
+                subtasks,
+                worker_results,
+                {"ok": True},
+                {"source": {"type": "github_project", "project_item_id": 123}},
+            )
+        )
+        self.assertTrue(
+            _all_subtasks_verified_existing(
+                subtasks,
+                worker_results,
+                {"ok": True},
+                {
+                    "source": {
+                        "type": "github_project",
+                        "project_item_id": 123,
+                        "issue_url": "https://github.com/frumu-ai/tandem/issues/1",
+                    }
+                },
+            )
+        )
+
     def test_worker_results_are_deduplicated_by_subtask(self) -> None:
         worker_results: list[dict[str, object]] = []
         blackboard = {"workers": []}
