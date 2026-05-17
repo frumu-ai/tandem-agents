@@ -273,6 +273,67 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
 
             self.assertFalse(snapshot["items"][0]["actionable"])
 
+    def test_board_scheduler_exposes_only_next_child_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": 2, "name": "TODOS"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 1440,
+                    "title": "[ACA Slice Parent] Phase 0 - Foundations",
+                    "effective_status_name": "TODOS",
+                    "effective_status_key": "todos",
+                    "content": {"number": 1440, "title": "[ACA Slice Parent] Phase 0 - Foundations"},
+                },
+                {
+                    "project_item_id": 1429,
+                    "title": "[Tenant Isolation] Add explicit tenant/principal constructors for hosted automation",
+                    "effective_status_name": "TODOS",
+                    "effective_status_key": "todos",
+                    "content": {
+                        "number": 1429,
+                        "title": "[Tenant Isolation] Add explicit tenant/principal constructors for hosted automation",
+                        "body": "Parent: [ACA Slice Parent] Phase 0 - Foundations\n",
+                    },
+                },
+                {
+                    "project_item_id": 1430,
+                    "title": "[Tenant Isolation] Add shared two-tenant denial test helpers and matrix",
+                    "effective_status_name": "TODOS",
+                    "effective_status_key": "todos",
+                    "content": {
+                        "number": 1430,
+                        "title": "[Tenant Isolation] Add shared two-tenant denial test helpers and matrix",
+                        "body": "Parent: [ACA Slice Parent] Phase 0 - Foundations\n",
+                    },
+                },
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            by_issue = {item["issue_number"]: item for item in snapshot["items"]}
+            self.assertFalse(by_issue[1440]["actionable"])
+            self.assertTrue(by_issue[1429]["actionable"])
+            self.assertEqual(by_issue[1429]["launch_state"], "next")
+            self.assertFalse(by_issue[1430]["actionable"])
+            self.assertEqual(by_issue[1430]["launch_state"], "queued")
+            self.assertEqual(snapshot["scheduler"]["active_phase"], 0)
+
     def test_collect_project_items_reads_top_level_string_status(self) -> None:
         collected: list[dict[str, object]] = []
 

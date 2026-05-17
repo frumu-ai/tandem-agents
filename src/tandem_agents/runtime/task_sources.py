@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -746,6 +747,149 @@ def _is_github_project_parent_item(title: str | None) -> bool:
     return "[aca slice parent]" in normalized or normalized.startswith("aca slice parent")
 
 
+def _github_project_phase(title: str | None, body: str | None = None) -> int | None:
+    text = "\n".join(part for part in (str(title or ""), str(body or "")) if part)
+    match = re.search(r"\bphase\s+(\d+)\b", text, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    if re.search(r"\blaunch\s+gate\b", text, flags=re.IGNORECASE):
+        return 99
+    return None
+
+
+def _github_project_parent_title(body: str | None) -> str:
+    text = str(body or "")
+    match = re.search(r"^\s*Parent:\s*(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _github_project_depends_on(body: str | None) -> list[str]:
+    text = str(body or "")
+    refs: list[str] = []
+    for match in re.finditer(r"^\s*(?:depends on|dependencies|blocked by)\s*:\s*(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE):
+        refs.extend(f"#{number}" for number in re.findall(r"#(\d+)", match.group(1)))
+    return list(dict.fromkeys(refs))
+
+
+def _github_project_order(title: str | None, body: str | None = None) -> int:
+    title_text = str(title or "").lower()
+    body_text = str(body or "").lower()
+    explicit = re.search(r"^\s*(?:order|sequence|rank)\s*:\s*(\d+)\s*$", body_text, flags=re.IGNORECASE | re.MULTILINE)
+    if explicit:
+        return int(explicit.group(1))
+    ordered_patterns = [
+        (10, ("constructors", "tenant/principal constructors", "session crud")),
+        (20, ("test helpers", "denial test helpers", "automation v2 crud", "provider auth", "scheduler")),
+        (30, ("hosted signed tenant resolver", "context runs", "mcp secrets")),
+        (40, ("memory search", "artifacts", "files, logs")),
+        (50, ("event streams",)),
+        (90, ("launch gate",)),
+    ]
+    for rank, needles in ordered_patterns:
+        if any(needle in title_text for needle in needles):
+            return rank
+    for rank, needles in ordered_patterns:
+        if any(needle in body_text for needle in needles):
+            return rank
+    return 50
+
+
+def _github_project_issue_ref(item: dict[str, Any]) -> str:
+    content = item.get("content") if isinstance(item.get("content"), dict) else {}
+    issue_number = content.get("number") if isinstance(content, dict) else item.get("issue_number")
+    if issue_number not in (None, ""):
+        return f"#{issue_number}"
+    return str(item.get("project_item_id") or item.get("id") or "").strip()
+
+
+def _github_project_scheduler_projection(board_items: list[dict[str, Any]]) -> dict[str, Any]:
+    parents_by_title: dict[str, dict[str, Any]] = {}
+    for item in board_items:
+        if item.get("is_parent"):
+            parents_by_title[str(item.get("title") or "").strip().lower()] = item
+
+    for item in board_items:
+        parent_title = str(item.get("parent_title") or "").strip()
+        parent = parents_by_title.get(parent_title.lower()) if parent_title else None
+        if parent:
+            item["parent_issue_number"] = parent.get("issue_number")
+            item["parent_project_item_id"] = parent.get("project_item_id")
+        if item.get("phase") is None and parent and parent.get("phase") is not None:
+            item["phase"] = parent.get("phase")
+
+    completed_statuses = {"done", "completed", "closed"}
+    active_statuses = {"in_progress", "in review", "review", "blocked"}
+    completed_keys = {
+        _github_project_issue_ref(item).lower()
+        for item in board_items
+        if str(item.get("status_key") or "").lower() in completed_statuses
+    }
+
+    children = [item for item in board_items if not item.get("is_parent")]
+    phases = sorted({int(item["phase"]) for item in children if item.get("phase") is not None})
+    active_phase = next(
+        (
+            phase
+            for phase in phases
+            if any(
+                int(item.get("phase") if item.get("phase") is not None else -1) == phase
+                and str(item.get("status_key") or "").lower() not in completed_statuses
+                for item in children
+            )
+        ),
+        None,
+    )
+
+    candidates: list[dict[str, Any]] = []
+    for item in board_items:
+        status_key = str(item.get("status_key") or "").lower()
+        blocked_by: list[str] = []
+        if item.get("is_parent"):
+            launch_state = "parent"
+        elif status_key in completed_statuses:
+            launch_state = "done"
+        elif status_key in active_statuses:
+            launch_state = status_key.replace(" ", "_")
+        elif active_phase is not None and item.get("phase") not in (None, active_phase):
+            launch_state = "future_phase"
+            blocked_by.append(f"phase {active_phase} must finish first")
+        else:
+            for dependency in item.get("depends_on") or []:
+                dep = str(dependency or "").strip().lower()
+                if dep and dep not in completed_keys:
+                    blocked_by.append(str(dependency))
+            if blocked_by:
+                launch_state = "blocked"
+            else:
+                launch_state = "next"
+                candidates.append(item)
+        item["blocked_by"] = blocked_by
+        item["launch_state"] = launch_state
+        item["actionable"] = launch_state == "next"
+
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("phase") if item.get("phase") is not None else 999),
+            int(item.get("order") or 999),
+            int(item.get("issue_number") or 999999),
+            str(item.get("title") or "").lower(),
+        )
+    )
+    next_items = candidates[:1]
+    next_ids = {str(item.get("project_item_id") or item.get("id") or "") for item in next_items}
+    for item in candidates:
+        if str(item.get("project_item_id") or item.get("id") or "") not in next_ids:
+            item["launch_state"] = "queued"
+            item["actionable"] = False
+
+    return {
+        "active_phase": active_phase,
+        "next_item_ids": list(next_ids),
+        "next_issue_numbers": [item.get("issue_number") for item in next_items if item.get("issue_number")],
+        "policy": "one_next_item_by_phase_order",
+    }
+
+
 def _select_github_project_item(
     cfg: ResolvedConfig,
     *,
@@ -1024,6 +1168,9 @@ def github_project_board_snapshot(
         counts[status_key] = counts.get(status_key, 0) + 1
         issue_number = content.get("number") if isinstance(content, dict) else None
         title = str(item.get("title") or (content or {}).get("title") or "Untitled item").strip() or "Untitled item"
+        body = str((content or {}).get("body") or item.get("body") or item.get("notes") or "")
+        is_parent = _is_github_project_parent_item(title)
+        phase = _github_project_phase(title, body)
         repository = (content or {}).get("repository") if isinstance(content, dict) else None
         if isinstance(repository, dict):
             repo_name_value = str(repository.get("full_name") or repository.get("name") or repo_name or "").strip()
@@ -1042,10 +1189,19 @@ def github_project_board_snapshot(
                 "issue_url": str((content or {}).get("html_url") or (content or {}).get("url") or ""),
                 "repo_name": repo_name_value,
                 "content_type": str((content or {}).get("type") or ""),
-                "actionable": github_project_status_key_is_actionable(status_name)
-                and not _is_github_project_parent_item(title),
+                "is_parent": is_parent,
+                "parent_title": _github_project_parent_title(body),
+                "parent_issue_number": None,
+                "phase": phase,
+                "order": _github_project_order(title, body),
+                "depends_on": _github_project_depends_on(body),
+                "blocked_by": [],
+                "launch_state": "candidate",
+                "actionable": github_project_status_key_is_actionable(status_name) and not is_parent,
             }
         )
+
+    scheduler = _github_project_scheduler_projection(board_items)
 
     # GitHub MCP can intermittently omit the status field for the next actionable card.
     # When that happens, align the board snapshot with ACA.s actual intake choice so the
@@ -1107,6 +1263,7 @@ def github_project_board_snapshot(
         "status_option_map": status_option_map,
         "columns": columns,
         "items": board_items,
+        "scheduler": scheduler,
         "source": "live",
         "is_stale": False,
         "warning": "",

@@ -817,6 +817,7 @@ async def trigger_runs_batch(
     project_slug = str(payload.get("project_slug") or "").strip() or None
     task_source_type = str(payload.get("task_source_type") or "").strip() or None
     overrides = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else {}
+    respect_scheduler = payload.get("respect_scheduler") is not False
     raw_items = payload.get("items")
     if not isinstance(raw_items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
@@ -824,6 +825,45 @@ async def trigger_runs_batch(
     items = [str(item or "").strip() for item in raw_items if str(item or "").strip()]
     if not items:
         raise HTTPException(status_code=400, detail="At least one item is required")
+
+    if respect_scheduler:
+        try:
+            _, cfg = _project_config(root, project_slug) if project_slug else (None, resolve_config(root))
+            if str(cfg.task_source.type or "").strip() == "github_project":
+                from src.tandem_agents.runtime.task_sources import github_project_board_snapshot
+
+                snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+                requested = set(items)
+
+                def matches_requested(row: dict[str, Any]) -> bool:
+                    haystacks = {
+                        str(row.get("id") or ""),
+                        str(row.get("project_item_id") or ""),
+                        str(row.get("issue_number") or ""),
+                        str(row.get("issue_url") or ""),
+                        str(row.get("title") or ""),
+                    }
+                    return any(item == hay or (item and item in hay) for item in requested for hay in haystacks if hay)
+
+                scheduled_items = [
+                    str(row.get("project_item_id") or row.get("id") or "").strip()
+                    for row in snapshot.get("items", [])
+                    if matches_requested(row) and row.get("actionable") is True
+                ]
+                scheduled_items = [item for item in dict.fromkeys(scheduled_items) if item]
+                if not scheduled_items:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": "No selected GitHub Project items are currently scheduler-actionable.",
+                            "scheduler": snapshot.get("scheduler") or {},
+                        },
+                    )
+                items = scheduled_items
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not apply ACA scheduler policy: {exc}") from exc
 
     started = [
         _start_run(
