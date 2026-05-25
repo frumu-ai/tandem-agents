@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/root/.npm \
-    npm install -g "@frumu/tandem@${TANDEM_ENGINE_RELEASE_VERSION}"
+    npm install -g "@frumu/tandem-enterprise@${TANDEM_ENGINE_RELEASE_VERSION}"
 
 RUN mkdir -p /home/node/.local/share/tandem /workspace/tandem-data \
   && chown node:node /home/node/.local/share/tandem /workspace/tandem-data
