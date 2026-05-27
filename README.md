@@ -194,12 +194,20 @@ Or build the images locally from this checkout:
 When you start with `docker-compose.published.yml`, use the same `-f` flag for
 follow-up `docker compose exec`, `logs`, and `down` commands.
 
-By default, local container builds install the latest Tandem engine and control panel releases.
+By default, local container builds install the latest public Tandem engine package (`@frumu/tandem`) and control panel release. Hosted/managed builds can opt into the enterprise engine package by setting `TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise` before rebuilding.
 If you want to pin a specific release for repeatable testing, set `TANDEM_ENGINE_RELEASE_VERSION` and/or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` in `.env` or in your shell before rebuilding. `TANDEM_RELEASE_VERSION` still pins both packages for older configs:
 
 ```bash
 export TANDEM_ENGINE_RELEASE_VERSION=<specific-engine-release>
 export TANDEM_CONTROL_PANEL_RELEASE_VERSION=<specific-panel-release>
+./scripts/build-containers.sh
+```
+
+For a hosted enterprise image build, use the same version pin with the enterprise engine package:
+
+```bash
+export TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise
+export TANDEM_ENGINE_RELEASE_VERSION=<specific-engine-release>
 ./scripts/build-containers.sh
 ```
 

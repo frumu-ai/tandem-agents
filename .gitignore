@@ -14,7 +14,6 @@ tandem-data/
 tandem-engine-state/
 kb-data/
 docs/internal/
-scripts/hosted/
 out/
 
 .docker-build-cache/

@@ -10,6 +10,7 @@ services:
         HOST_GID: "${ACA_HOST_GID:-1000}"
         TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
         TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+        TANDEM_ENGINE_PACKAGE: "${TANDEM_ENGINE_PACKAGE:-@frumu/tandem}"
     env_file:
       - path: ./.env
         required: false
@@ -182,6 +183,7 @@ services:
         HOST_GID: "${ACA_HOST_GID:-1000}"
         TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
         TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+        TANDEM_ENGINE_PACKAGE: "${TANDEM_ENGINE_PACKAGE:-@frumu/tandem}"
     user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
     env_file:
       - path: ./.env
@@ -238,6 +240,7 @@ services:
         HOST_GID: "${ACA_HOST_GID:-1000}"
         TANDEM_RELEASE_VERSION: "${TANDEM_RELEASE_VERSION:-latest}"
         TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
+        TANDEM_ENGINE_PACKAGE: "${TANDEM_ENGINE_PACKAGE:-@frumu/tandem}"
     user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
     env_file:
       - path: ./.env

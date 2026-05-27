@@ -249,7 +249,8 @@ Behavior:
 - `TANDEM_STARTUP_MODE` -> `tandem.startup_mode`
 - `TANDEM_UPDATE_POLICY` -> `tandem.update_policy`
 - `TANDEM_ENGINE_COMMAND` -> `tandem.engine_command`
-- `TANDEM_ENGINE_RELEASE_VERSION` -> build-time `@frumu/tandem` package pin for engine and ACA container images; when unset, Compose builds use `latest`
+- `TANDEM_ENGINE_PACKAGE` -> build-time engine npm package for engine and ACA container images; defaults to `@frumu/tandem`; hosted/managed builds can set `@frumu/tandem-enterprise`
+- `TANDEM_ENGINE_RELEASE_VERSION` -> build-time engine package version pin for engine and ACA container images; when unset, Compose builds use `latest`
 - `TANDEM_CONTROL_PANEL_RELEASE_VERSION` -> build-time `@frumu/tandem-panel` package pin for the control panel container image; when unset, Compose builds use `latest`
 - `TANDEM_RELEASE_VERSION` -> backwards-compatible build-time pin used for both package-specific pins when they are unset
 

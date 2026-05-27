@@ -55,7 +55,7 @@ docker compose logs -f tandem-control-panel
 ```
 
 `./scripts/run.sh` and `./scripts/build-containers.sh` will auto-bootstrap the Tandem token file on first start if it is missing.
-`./scripts/build-containers.sh` resolves the latest Tandem engine and control panel releases independently by default; set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` if you want to lock one package. `TANDEM_RELEASE_VERSION` still locks both for backwards compatibility.
+`./scripts/build-containers.sh` resolves the latest Tandem engine and control panel releases independently by default. Local builds install `@frumu/tandem`; hosted builds can set `TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise`. Set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` if you want to lock one package. `TANDEM_RELEASE_VERSION` still locks both for backwards compatibility.
 `./scripts/run.sh coordination-status` prints the durable coordination ledger for tasks, leases, workers, and outbox events.
 `./scripts/run.sh worker` starts the explicit worker-mode entrypoint and tags the run as worker-coordination identity.
 `./scripts/run.sh outbox-dispatcher` starts the standalone GitHub outbox drain loop.

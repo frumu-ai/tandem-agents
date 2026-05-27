@@ -10,8 +10,10 @@ Usage:
 
 By default, this resolves the latest Tandem engine and control panel releases
 unless TANDEM_ENGINE_RELEASE_VERSION or TANDEM_CONTROL_PANEL_RELEASE_VERSION is
-already pinned to a specific version. TANDEM_RELEASE_VERSION remains a
-backwards-compatible pin for both packages.
+already pinned to a specific version. TANDEM_ENGINE_PACKAGE selects the engine
+npm package and defaults to @frumu/tandem; hosted builds can set it to
+@frumu/tandem-enterprise. TANDEM_RELEASE_VERSION remains a backwards-compatible
+pin for both packages.
 EOF
 }
 
@@ -47,13 +49,16 @@ case "${1:-}" in
     ;;
 esac
 
-engine_release_version="$(resolve_release_version "@frumu/tandem" "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-}}")"
+engine_package="${TANDEM_ENGINE_PACKAGE:-@frumu/tandem}"
+engine_release_version="$(resolve_release_version "$engine_package" "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-}}")"
 control_panel_release_version="$(resolve_release_version "@frumu/tandem-panel" "${TANDEM_CONTROL_PANEL_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-}}")"
 
+export TANDEM_ENGINE_PACKAGE="$engine_package"
 export TANDEM_ENGINE_RELEASE_VERSION="$engine_release_version"
 export TANDEM_CONTROL_PANEL_RELEASE_VERSION="$control_panel_release_version"
 export TANDEM_RELEASE_VERSION="${TANDEM_RELEASE_VERSION:-$engine_release_version}"
 
+echo "Using TANDEM_ENGINE_PACKAGE=${TANDEM_ENGINE_PACKAGE}"
 echo "Using TANDEM_ENGINE_RELEASE_VERSION=${TANDEM_ENGINE_RELEASE_VERSION}"
 echo "Using TANDEM_CONTROL_PANEL_RELEASE_VERSION=${TANDEM_CONTROL_PANEL_RELEASE_VERSION}"
 

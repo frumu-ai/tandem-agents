@@ -1,0 +1,205 @@
+name: Publish Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Container tag to publish, for example v0.5.9"
+        required: true
+        type: string
+      tandem_release_version:
+        description: "Tandem npm release version to install, for example 0.5.9"
+        required: true
+        type: string
+      registry:
+        description: "Container registry/repository prefix"
+        required: true
+        default: ghcr.io/frumu-ai/tandem-agents
+        type: string
+      push_latest:
+        description: "Also push latest tags"
+        required: true
+        default: false
+        type: boolean
+      register_hosted_release:
+        description: "Register a hosted release in Tandem Web after images publish"
+        required: true
+        default: false
+        type: boolean
+      tandem_web_base_url:
+        description: "Tandem Web base URL used when registering a hosted release"
+        required: false
+        default: https://tandem.ac
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_REGISTRY: ${{ github.event.inputs.registry || 'ghcr.io/frumu-ai/tandem-agents' }}
+
+jobs:
+  resolve:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      push_latest: ${{ steps.resolve.outputs.push_latest }}
+    steps:
+      - id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+            version="${{ inputs.tandem_release_version }}"
+            push_latest="${{ inputs.push_latest }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+            push_latest="false"
+          fi
+
+          if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid image tag: $tag" >&2
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid Tandem release version: $version" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "push_latest=$push_latest" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: engine
+            dockerfile: config/Dockerfile.engine
+            engine_package: "@frumu/tandem"
+            latest_alias: engine:latest
+          - image: engine-enterprise
+            dockerfile: config/Dockerfile.engine
+            engine_package: "@frumu/tandem-enterprise"
+            latest_alias: engine-enterprise:latest
+          - image: aca
+            dockerfile: config/Dockerfile
+            engine_package: "@frumu/tandem"
+            latest_alias: aca:latest
+          - image: aca-enterprise
+            dockerfile: config/Dockerfile
+            engine_package: "@frumu/tandem-enterprise"
+            latest_alias: aca-enterprise:latest
+          - image: tandem-control-panel
+            dockerfile: config/Dockerfile.control-panel
+            latest_alias: tandem-control-panel:latest
+          - image: tandem-kb-mcp
+            dockerfile: config/Dockerfile.kb
+            latest_alias: tandem-kb-mcp:latest
+          - image: tandem-proxy
+            dockerfile: config/Dockerfile.proxy
+            latest_alias: tandem-proxy:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build tag list
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE_REGISTRY}/${{ matrix.image }}:${{ needs.resolve.outputs.tag }}"
+            if [[ "${{ needs.resolve.outputs.push_latest }}" == "true" ]]; then
+              echo "${IMAGE_REGISTRY}/${{ matrix.latest_alias }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            TANDEM_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
+            TANDEM_ENGINE_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
+            TANDEM_CONTROL_PANEL_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
+            TANDEM_ENGINE_PACKAGE=${{ matrix.engine_package || '@frumu/tandem' }}
+            VERSION=${{ needs.resolve.outputs.tag }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+
+  register-hosted-release:
+    name: Register Hosted Release
+    runs-on: ubuntu-latest
+    needs:
+      - resolve
+      - publish
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.register_hosted_release }}
+    steps:
+      - name: Register release in Tandem Web
+        shell: bash
+        env:
+          TANDEM_WEB_BASE_URL: ${{ inputs.tandem_web_base_url }}
+          HOSTED_RELEASE_PUBLISH_TOKEN: ${{ secrets.TANDEM_WEB_HOSTED_RELEASE_PUBLISH_TOKEN }}
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$HOSTED_RELEASE_PUBLISH_TOKEN" ]]; then
+            echo "Missing TANDEM_WEB_HOSTED_RELEASE_PUBLISH_TOKEN secret." >&2
+            exit 1
+          fi
+
+          payload="$(mktemp)"
+          cat >"$payload" <<JSON
+          {
+            "version": "${RELEASE_VERSION}",
+            "channel": "stable",
+            "engine_image_ref": "${IMAGE_REGISTRY}/engine-enterprise:${RELEASE_TAG}",
+            "aca_image_ref": "${IMAGE_REGISTRY}/aca-enterprise:${RELEASE_TAG}",
+            "control_panel_image_ref": "${IMAGE_REGISTRY}/tandem-control-panel:${RELEASE_TAG}",
+            "proxy_image_ref": "${IMAGE_REGISTRY}/tandem-proxy:${RELEASE_TAG}",
+            "kb_image_ref": "${IMAGE_REGISTRY}/tandem-kb-mcp:${RELEASE_TAG}",
+            "manifest_json": {
+              "source": "tandem-agents publish-images",
+              "image_registry": "${IMAGE_REGISTRY}",
+              "image_tag": "${RELEASE_TAG}"
+            },
+            "published": true
+          }
+JSON
+
+          curl -fsS \
+            -X POST "${TANDEM_WEB_BASE_URL%/}/api/v1/internal/hosted/releases" \
+            -H "Authorization: Bearer ${HOSTED_RELEASE_PUBLISH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${payload}"

@@ -38,7 +38,7 @@ This directory can be run inside Docker Compose to keep the agent environment re
 8. If `39733` or `39734` is already in use, change the matching env var before starting Compose.
 9. If you want a standalone Tandem engine, point `TANDEM_BASE_URL` at it in a non-Compose run or an override file.
 10. For the fastest first run, use the published GHCR images: `docker compose -f docker-compose.published.yml pull` and then `docker compose -f docker-compose.published.yml up -d`. Set `TANDEM_AGENTS_IMAGE_TAG=v0.5.6` to pin a specific published release.
-11. To build the images locally from this checkout instead, run `./scripts/build-containers.sh`. By default this pulls the latest Tandem engine and control panel releases; set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` first if you want to pin one package. `TANDEM_RELEASE_VERSION` still pins both for backwards compatibility.
+11. To build the images locally from this checkout instead, run `./scripts/build-containers.sh`. By default this pulls the latest public Tandem engine package (`@frumu/tandem`) and control panel release. Hosted builds can set `TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise`; set `TANDEM_ENGINE_RELEASE_VERSION` or `TANDEM_CONTROL_PANEL_RELEASE_VERSION` first if you want to pin one package. `TANDEM_RELEASE_VERSION` still pins both for backwards compatibility.
 12. On the first boot, the Tandem engine container will create `tandem-data/tandem_api_token` automatically if it is missing.
 13. Open `http://127.0.0.1:39734` on the server host, or `http://<server-ip>:39734` from another device.
 14. Sign in to the control panel with the token from `tandem-data/tandem_api_token`.

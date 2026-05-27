@@ -35,6 +35,7 @@ Project files live one level up in the repository tree:
 - [../scripts/tandem-engine-serve.sh](../scripts/tandem-engine-serve.sh) - Tandem sidecar wrapper that reads the token file
 - [../docker-compose.yml](../docker-compose.yml) - containerized runtime draft
 - [../docker-compose.published.yml](../docker-compose.published.yml) - Compose stack that pulls published GHCR images
+- [IMAGE_PUBLISHING.md](IMAGE_PUBLISHING.md) - GHCR image publish flow for public and hosted enterprise images
 - [../config/Dockerfile](../config/Dockerfile) - container image draft
 - [../config/Dockerfile.engine](../config/Dockerfile.engine) - engine-only sidecar image
 - [../.dockerignore](../.dockerignore) - Docker build context exclusions
