@@ -13,6 +13,13 @@ from src.tandem_agents.core.integrations.github_mcp import (
     create_pull_request,
     update_project_item_status,
 )
+from src.tandem_agents.core.integrations.linear_mcp import (
+    build_linear_comment_body,
+    ensure_linear_mcp_connected,
+    ensure_linear_mcp_disconnected,
+    linear_update_issue,
+    linear_add_comment,
+)
 
 DEFAULT_OUTBOX_BATCH_LIMIT = 25
 DEFAULT_OUTBOX_MAX_ATTEMPTS = 5
@@ -145,6 +152,93 @@ def _dispatch_pull_request_create(cfg: ResolvedConfig, outbox: dict[str, Any]) -
     }
 
 
+def _dispatch_linear_status_update(cfg: ResolvedConfig, outbox: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(outbox.get("payload") or {})
+    task = dict(payload.get("task") or {})
+    target_status = str(payload.get("target_status") or payload.get("status") or "").strip()
+    labels = payload.get("labels")
+    fields: dict[str, Any] = {}
+    if target_status:
+        fields.update({"status": target_status, "state": target_status, "state_name": target_status})
+    if isinstance(labels, list):
+        clean_labels = [str(label).strip() for label in labels if str(label).strip()]
+        if clean_labels:
+            fields["labels"] = clean_labels
+            fields["label_names"] = clean_labels
+    if not fields:
+        return {
+            "outbox_id": outbox.get("id"),
+            "kind": outbox.get("kind"),
+            "payload": payload,
+            "status": "failed",
+            "terminal": True,
+            "error": "Outbox payload missing target_status or labels for Linear issue update.",
+        }
+    warning = linear_update_issue(cfg, task, fields)
+    if warning:
+        return {
+            "outbox_id": outbox.get("id"),
+            "kind": outbox.get("kind"),
+            "payload": payload,
+            "status": "failed",
+            "terminal": True,
+            "error": warning,
+        }
+    return {
+        "outbox_id": outbox.get("id"),
+        "kind": outbox.get("kind"),
+        "payload": payload,
+        "status": "dispatched",
+        "terminal": False,
+        "error": "",
+    }
+
+
+def _dispatch_linear_comment(cfg: ResolvedConfig, outbox: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(outbox.get("payload") or {})
+    task = dict(payload.get("task") or {})
+    if payload.get("run_id") not in (None, "") and task.get("run_id") in (None, ""):
+        task["run_id"] = payload.get("run_id")
+    body = str(payload.get("body") or "").strip()
+    if not body:
+        body = build_linear_comment_body(
+            run_id=str(payload.get("run_id") or ""),
+            task_title=str((task or {}).get("title") or "Linear task"),
+            outcome=str(payload.get("outcome") or "completed"),
+            summary=str(payload.get("summary") or ""),
+            diff_snapshot=payload.get("diff_snapshot"),
+            review_returncode=payload.get("review_returncode"),
+            test_returncode=payload.get("test_returncode"),
+        )
+    if not body.strip():
+        return {
+            "outbox_id": outbox.get("id"),
+            "kind": outbox.get("kind"),
+            "payload": payload,
+            "status": "failed",
+            "terminal": True,
+            "error": "Outbox payload missing Linear comment body.",
+        }
+    warning = linear_add_comment(cfg, task, body)
+    if warning:
+        return {
+            "outbox_id": outbox.get("id"),
+            "kind": outbox.get("kind"),
+            "payload": payload,
+            "status": "failed",
+            "terminal": True,
+            "error": warning,
+        }
+    return {
+        "outbox_id": outbox.get("id"),
+        "kind": outbox.get("kind"),
+        "payload": payload,
+        "status": "dispatched",
+        "terminal": False,
+        "error": "",
+    }
+
+
 def dispatch_outbox_item(cfg: ResolvedConfig, outbox: dict[str, Any]) -> dict[str, Any]:
     kind = str(outbox.get("kind") or "").strip()
     outbox_id = int(outbox.get("id") or 0)
@@ -160,6 +254,14 @@ def dispatch_outbox_item(cfg: ResolvedConfig, outbox: dict[str, Any]) -> dict[st
         return result
     if kind == "github_pull_request.create":
         result = _dispatch_pull_request_create(cfg, outbox)
+        result.setdefault("payload", payload)
+        return result
+    if kind == "linear_issue.status_update":
+        result = _dispatch_linear_status_update(cfg, outbox)
+        result.setdefault("payload", payload)
+        return result
+    if kind == "linear_issue.comment":
+        result = _dispatch_linear_comment(cfg, outbox)
         result.setdefault("payload", payload)
         return result
     return {
@@ -196,12 +298,19 @@ def dispatch_outbox_tick(
             "items": [],
         }
 
+    github_needed = any(str(outbox.get("kind") or "").startswith("github_") for outbox in claimed)
+    linear_needed = any(str(outbox.get("kind") or "").startswith("linear_") for outbox in claimed)
     github_connected = False
+    linear_connected = False
     try:
-        ensure_github_mcp_connected(cfg)
-        github_connected = True
+        if github_needed:
+            ensure_github_mcp_connected(cfg)
+            github_connected = True
+        if linear_needed:
+            ensure_linear_mcp_connected(cfg)
+            linear_connected = True
     except Exception as exc:
-        error = str(exc).strip() or "Failed to connect GitHub MCP"
+        error = str(exc).strip() or "Failed to connect MCP server"
         for outbox in claimed:
             outbox_id = int(outbox.get("id") or 0)
             attempts = int(outbox.get("attempts") or 0)
@@ -252,6 +361,11 @@ def dispatch_outbox_tick(
         if github_connected:
             try:
                 ensure_github_mcp_disconnected(cfg)
+            except Exception:
+                pass
+        if linear_connected:
+            try:
+                ensure_linear_mcp_disconnected(cfg)
             except Exception:
                 pass
 

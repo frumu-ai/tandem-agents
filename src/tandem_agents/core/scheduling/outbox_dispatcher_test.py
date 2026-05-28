@@ -176,6 +176,51 @@ class OutboxDispatcherTest(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["dispatched_outbox"], 1)
             self.assertEqual(snapshot["summary"]["pending_outbox"], 0)
 
+    def test_dispatches_linear_status_and_comment_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "ENG-2",
+                "title": "Linear Task",
+                "source": {
+                    "type": "linear",
+                    "team": "ENG",
+                    "issue_id": "lin-2",
+                    "identifier": "ENG-2",
+                },
+                "repo": {"slug": "frumu-ai/example", "path": str(root / "repo")},
+            }
+            store.enqueue_outbox(
+                kind="linear_issue.status_update",
+                aggregate_type="task",
+                aggregate_id="ENG-2",
+                payload={"task": task, "target_status": "In Progress", "labels": ["aca-running"]},
+                dedupe_key="run-1:linear-status",
+            )
+            store.enqueue_outbox(
+                kind="linear_issue.comment",
+                aggregate_type="task",
+                aggregate_id="ENG-2",
+                payload={"task": task, "run_id": "run-1", "outcome": "completed", "summary": "Finished", "body": "done"},
+                dedupe_key="run-1:linear-comment",
+            )
+
+            with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_connected", return_value=None):
+                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_disconnected", return_value=None):
+                    with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_update_issue", return_value=None) as status_mock:
+                        with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_add_comment", return_value=None) as comment_mock:
+                            summary = dispatch_outbox_tick(cfg, coordination=store)
+
+            self.assertEqual(summary["dispatched"], 2)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(status_mock.call_count, 1)
+            self.assertEqual(comment_mock.call_count, 1)
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["summary"]["dispatched_outbox"], 2)
+            self.assertEqual(snapshot["summary"]["pending_outbox"], 0)
+
     def test_dispatch_tick_runs_for_postgres_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

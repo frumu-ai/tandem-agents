@@ -8,6 +8,7 @@ Project files live one level up in the repository tree:
 
 - [../README.md](../README.md) - root pointer to this docs index
 - [../AGENTS.md](../AGENTS.md) - agent instructions
+- [../RELEASE_NOTES.md](../RELEASE_NOTES.md) - release notes for ACA runtime changes
 - [../config/agent.yaml](../config/agent.yaml) - machine-readable operator profile
 - [../config/board.yaml](../config/board.yaml) - default Kanban board template
 - [../src/tandem_agents/cli.py](../src/tandem_agents/cli.py) - CLI entry point

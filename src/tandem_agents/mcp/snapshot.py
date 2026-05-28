@@ -12,6 +12,12 @@ from src.tandem_agents.core.integrations.github_mcp import (
     github_mcp_scope,
     github_remote_sync_mode,
 )
+from src.tandem_agents.core.integrations.linear_mcp import (
+    get_mcp_server as get_linear_mcp_server,
+    linear_mcp_scope,
+    linear_mcp_server_name,
+    linear_remote_sync_mode,
+)
 from src.tandem_agents.runtime.runstate import load_status
 from src.tandem_agents.runtime.workspace_registry import configured_project_binding, load_workspace, workspace_summary
 
@@ -31,7 +37,11 @@ def _task_source_snapshot(cfg: ResolvedConfig) -> dict[str, Any]:
         "type": str(cfg.task_source.type or "").strip(),
         "owner": str(cfg.task_source.owner or "").strip(),
         "repo": str(cfg.task_source.repo or "").strip(),
+        "team": str(cfg.task_source.team or "").strip(),
         "project": str(cfg.task_source.project or "").strip(),
+        "statuses": str(cfg.task_source.statuses or "").strip(),
+        "labels": str(cfg.task_source.labels or "").strip(),
+        "query": str(cfg.task_source.query or "").strip(),
         "item": str(cfg.task_source.item or "").strip(),
         "url": str(cfg.task_source.url or "").strip(),
         "path": str(cfg.task_source.path or "").strip(),
@@ -120,6 +130,27 @@ def _github_mcp_snapshot(cfg: ResolvedConfig) -> dict[str, Any]:
     }
 
 
+def _linear_mcp_snapshot(cfg: ResolvedConfig) -> dict[str, Any]:
+    enabled = bool(cfg.linear_mcp.enabled)
+    source_type = str(cfg.task_source.type or "").strip()
+    server_name = linear_mcp_server_name(cfg)
+    server: dict[str, Any] | None = None
+    if enabled:
+        try:
+            server = get_linear_mcp_server(cfg, server_name)
+        except Exception:
+            server = None
+    connected = bool(server and server.get("connected"))
+    return {
+        "enabled": enabled,
+        "connected": connected,
+        "server": server_name,
+        "scope": linear_mcp_scope(cfg, source_type),
+        "remote_sync": linear_remote_sync_mode(cfg, source_type),
+        "transport": str((server or {}).get("transport") or "").strip(),
+    }
+
+
 def _workspace_snapshot(root: Path, cfg: ResolvedConfig) -> dict[str, Any]:
     workspace = workspace_summary(load_workspace(root))
     configured = configured_project_binding(cfg)
@@ -174,7 +205,15 @@ def _latest_run_snapshot(cfg: ResolvedConfig) -> dict[str, Any] | None:
     }
 
 
-def _allowed_next_actions(cfg: ResolvedConfig, *, validation_ok: bool, engine: dict[str, Any], github_mcp: dict[str, Any], latest_run: dict[str, Any] | None) -> list[str]:
+def _allowed_next_actions(
+    cfg: ResolvedConfig,
+    *,
+    validation_ok: bool,
+    engine: dict[str, Any],
+    github_mcp: dict[str, Any],
+    linear_mcp: dict[str, Any],
+    latest_run: dict[str, Any] | None,
+) -> list[str]:
     actions: list[str] = []
     repo = _repository_snapshot(cfg)
     if not validation_ok:
@@ -188,6 +227,10 @@ def _allowed_next_actions(cfg: ResolvedConfig, *, validation_ok: bool, engine: d
         if github_mcp.get("enabled") and not github_mcp.get("connected"):
             actions.append("connect_github_mcp")
         actions.append("intake_next_github_project_task")
+    elif source_type == "linear":
+        if linear_mcp.get("enabled") and not linear_mcp.get("connected"):
+            actions.append("connect_linear_mcp")
+        actions.append("intake_next_linear_issue")
     elif source_type == "kanban_board":
         actions.append("preview_kanban_task")
     elif source_type == "manual":
@@ -213,6 +256,7 @@ def build_aca_overview(root: Path | None = None) -> dict[str, Any]:
     validation_errors = validate_config(cfg)
     engine = _engine_snapshot(cfg)
     github_mcp = _github_mcp_snapshot(cfg)
+    linear_mcp = _linear_mcp_snapshot(cfg)
     latest_run = _latest_run_snapshot(cfg)
     overview = {
         "summary": (
@@ -239,6 +283,7 @@ def build_aca_overview(root: Path | None = None) -> dict[str, Any]:
         },
         "engine": engine,
         "github_mcp": github_mcp,
+        "linear_mcp": linear_mcp,
         "workspace": _workspace_snapshot(root_dir, cfg),
         "latest_run": latest_run,
         "allowed_next_actions": _allowed_next_actions(
@@ -246,6 +291,7 @@ def build_aca_overview(root: Path | None = None) -> dict[str, Any]:
             validation_ok=not bool(validation_errors),
             engine=engine,
             github_mcp=github_mcp,
+            linear_mcp=linear_mcp,
             latest_run=latest_run,
         ),
         "doc_refs": [

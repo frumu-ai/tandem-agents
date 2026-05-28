@@ -28,6 +28,18 @@ from src.tandem_agents.core.integrations.github_mcp import (
     normalize_status_key,
     remember_project_item_status,
 )
+from src.tandem_agents.core.integrations.linear_mcp import (
+    LINEAR_ACTIVE_STATUS_KEYS,
+    LINEAR_DONE_STATUS_KEYS,
+    ensure_linear_mcp_connected,
+    linear_fetch_issue,
+    linear_list_issue_labels,
+    linear_list_issue_statuses,
+    linear_list_issues,
+    linear_mcp_server_name,
+    linear_status_key_is_actionable,
+    normalize_linear_key,
+)
 
 
 def _tool_unknown(result: dict[str, Any]) -> bool:
@@ -1038,6 +1050,456 @@ def _select_github_project_item(
     return chosen, eligible, warning
 
 
+def _split_csv(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _linear_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("name", "title", "identifier", "id", "key", "url"):
+            text = _linear_text(value.get(key))
+            if text:
+                return text
+    return ""
+
+
+def _linear_issue_identifier(issue: dict[str, Any]) -> str:
+    for key in ("identifier", "number", "key"):
+        text = _linear_text(issue.get(key))
+        if text:
+            return text
+    return _linear_text(issue.get("id"))
+
+
+def _linear_issue_id(issue: dict[str, Any]) -> str:
+    return _linear_text(issue.get("id")) or _linear_issue_identifier(issue)
+
+
+def _linear_issue_url(issue: dict[str, Any]) -> str:
+    for key in ("url", "web_url", "html_url", "app_url"):
+        text = _linear_text(issue.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _linear_issue_body(issue: dict[str, Any]) -> str:
+    for key in ("description", "body", "content"):
+        text = _linear_text(issue.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _linear_issue_status(issue: dict[str, Any]) -> str:
+    for key in ("state", "status", "workflow_state", "workflowState"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            text = _linear_text(value.get("name") or value.get("title") or value.get("type"))
+        else:
+            text = _linear_text(value)
+        if text:
+            return text
+    return "Unknown"
+
+
+def _linear_issue_state_type(issue: dict[str, Any]) -> str:
+    for key in ("state", "status", "workflow_state", "workflowState"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            text = _linear_text(value.get("type") or value.get("category"))
+            if text:
+                return text
+    return ""
+
+
+def _linear_issue_project_name(issue: dict[str, Any], fallback: str = "") -> str:
+    for key in ("project", "project_name", "projectName"):
+        value = issue.get(key)
+        text = _linear_text(value)
+        if text:
+            return text
+    return fallback
+
+
+def _linear_issue_priority(issue: dict[str, Any]) -> int | None:
+    value = issue.get("priority")
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("priority") or value.get("level")
+    try:
+        priority = int(value)
+    except (TypeError, ValueError):
+        return None
+    return priority
+
+
+def _linear_issue_labels(issue: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    for key in ("labels", "label_names", "labelNames"):
+        value = issue.get(key)
+        if isinstance(value, list):
+            for entry in value:
+                text = _linear_text(entry)
+                if text:
+                    labels.append(text)
+        elif isinstance(value, dict):
+            for entry in value.get("nodes") or value.get("items") or []:
+                text = _linear_text(entry)
+                if text:
+                    labels.append(text)
+        else:
+            text = _linear_text(value)
+            if text:
+                labels.append(text)
+    return list(dict.fromkeys(labels))
+
+
+def _linear_status_is_actionable(cfg: ResolvedConfig, status_name: str, state_type: str = "") -> bool:
+    configured = {normalize_linear_key(value) for value in _split_csv(cfg.task_source.statuses)}
+    status_key = normalize_linear_key(status_name)
+    state_key = normalize_linear_key(state_type)
+    if configured:
+        return status_key in configured or state_key in configured
+    return linear_status_key_is_actionable(status_name, state_type)
+
+
+def _linear_issue_to_task(
+    cfg: ResolvedConfig,
+    issue: dict[str, Any],
+    *,
+    coordination: CoordinationStore | None = None,
+) -> dict[str, Any]:
+    title = str(issue.get("title") or issue.get("name") or "Linear issue").strip()
+    body = _linear_issue_body(issue)
+    _, criteria = _normalize_issue_body(body)
+    issue_id = _linear_issue_id(issue)
+    identifier = _linear_issue_identifier(issue)
+    issue_url = _linear_issue_url(issue)
+    status_name = _linear_issue_status(issue)
+    status_key = normalize_linear_key(status_name) or "unknown"
+    project_name = _linear_issue_project_name(issue, cfg.task_source.project)
+    repo_binding = {
+        "path": str(cfg.repository_path() or ""),
+        "slug": str(cfg.repository.slug or ""),
+        "clone_url": str(cfg.repository.clone_url or ""),
+        "default_branch": str(cfg.repository.default_branch or ""),
+        "remote_name": str(cfg.repository.remote_name or ""),
+        "credential_file": str(cfg.repository.credential_file or ""),
+    }
+    task = apply_task_contract(
+        {
+            "task_id": identifier or issue_id or title,
+            "title": title,
+            "description": body,
+            "acceptance_criteria": criteria,
+            "labels": _linear_issue_labels(issue),
+            "priority": _linear_issue_priority(issue),
+            "project_name": project_name,
+            "project_column": status_name,
+            "source": {
+                "type": "linear",
+                "team": cfg.task_source.team,
+                "project": cfg.task_source.project,
+                "project_name": project_name,
+                "project_column": status_name,
+                "item": identifier or issue_id,
+                "url": issue_url or cfg.task_source.url,
+                "status": status_name,
+                "status_key": status_key,
+                "state_type": _linear_issue_state_type(issue),
+                "initial_status_name": status_name,
+                "issue_id": issue_id,
+                "identifier": identifier,
+                "issue_url": issue_url,
+                "mcp_server": linear_mcp_server_name(cfg),
+            },
+            "repo": repo_binding,
+            "raw_issue_body": body,
+        }
+    )
+    return _annotate_task_contract(task, coordination=coordination)
+
+
+def _linear_known_tasks(
+    cfg: ResolvedConfig,
+    issues: list[dict[str, Any]],
+    *,
+    coordination: CoordinationStore | None = None,
+) -> list[dict[str, Any]]:
+    known_tasks = [_linear_issue_to_task(cfg, issue, coordination=None) for issue in issues]
+    if coordination is not None:
+        try:
+            known_tasks.extend(coordination.list_tasks(limit=1000))
+        except Exception:
+            logger.debug("Failed to load known Linear tasks for dependency resolution", exc_info=True)
+    return known_tasks
+
+
+def _annotate_linear_dependency_status(
+    cfg: ResolvedConfig,
+    *,
+    task: dict[str, Any],
+    issues: list[dict[str, Any]],
+    coordination: CoordinationStore | None = None,
+) -> dict[str, Any]:
+    known_tasks = _linear_known_tasks(cfg, issues, coordination=coordination)
+    task = apply_task_contract(task)
+    task["dependency_status"] = dependency_status_for_task(task, known_tasks)
+    task["contract_completeness"] = task_contract_completeness(task)
+    return task
+
+
+def _load_linear_live_data(
+    cfg: ResolvedConfig,
+    *,
+    refresh_server: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    ensure_linear_mcp_connected(cfg)
+    server_name = linear_mcp_server_name(cfg)
+    if refresh_server:
+        try:
+            refresh_mcp_server(cfg, server_name)
+        except Exception:
+            logger.debug("Failed to refresh Linear MCP server during snapshot", exc_info=True)
+    statuses: list[dict[str, Any]] = []
+    labels: list[dict[str, Any]] = []
+    try:
+        statuses = linear_list_issue_statuses(cfg, team=cfg.task_source.team)
+    except Exception:
+        logger.debug("Failed to list Linear statuses during task intake", exc_info=True)
+    try:
+        labels = linear_list_issue_labels(cfg, team=cfg.task_source.team)
+    except Exception:
+        logger.debug("Failed to list Linear labels during task intake", exc_info=True)
+    issues = linear_list_issues(
+        cfg,
+        team=cfg.task_source.team,
+        project=cfg.task_source.project,
+        statuses=cfg.task_source.statuses,
+        labels=cfg.task_source.labels,
+        query=cfg.task_source.query,
+        limit=50,
+    )
+    selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
+    if selector and not issues:
+        fetched = linear_fetch_issue(cfg, selector)
+        if fetched:
+            issues = [fetched]
+    if not issues:
+        raise RuntimeError(
+            f"No Linear issues returned for team '{cfg.task_source.team}'"
+            f"{f' project {cfg.task_source.project!r}' if cfg.task_source.project else ''}."
+        )
+    return statuses, labels, issues
+
+
+def _linear_scheduler_projection(cfg: ResolvedConfig, board_items: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for item in board_items:
+        status_key = str(item.get("status_key") or "").strip()
+        state_key = str(item.get("state_type_key") or "").strip()
+        blocked_by: list[str] = []
+        if status_key in LINEAR_DONE_STATUS_KEYS or state_key in {"completed", "canceled", "cancelled"}:
+            launch_state = "done"
+        elif status_key in LINEAR_ACTIVE_STATUS_KEYS or state_key == "started":
+            launch_state = status_key or "in_progress"
+        elif _linear_status_is_actionable(cfg, str(item.get("status_name") or ""), str(item.get("state_type") or "")):
+            launch_state = "next"
+            candidates.append(item)
+        else:
+            launch_state = "waiting"
+        item["blocked_by"] = blocked_by
+        item["launch_state"] = launch_state
+        item["actionable"] = launch_state == "next"
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
+        priority = item.get("priority")
+        try:
+            priority_rank = int(priority)
+        except (TypeError, ValueError):
+            priority_rank = 99
+        return (
+            priority_rank,
+            str(item.get("identifier") or item.get("id") or "").lower(),
+            str(item.get("title") or "").lower(),
+        )
+
+    candidates.sort(key=sort_key)
+    next_items = candidates[:1]
+    next_ids = {str(item.get("id") or "") for item in next_items}
+    for item in candidates:
+        if str(item.get("id") or "") not in next_ids:
+            item["launch_state"] = "queued"
+            item["actionable"] = False
+    return {
+        "next_item_ids": list(next_ids),
+        "next_issue_numbers": [item.get("identifier") for item in next_items if item.get("identifier")],
+        "policy": "one_next_linear_issue_by_priority",
+    }
+
+
+def _select_linear_issue(
+    cfg: ResolvedConfig,
+    *,
+    issues: list[dict[str, Any]],
+    allow_non_actionable: bool = False,
+) -> tuple[dict[str, Any] | None, bool, str | None]:
+    selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
+    if selector:
+        for issue in issues:
+            haystacks = [
+                _linear_issue_id(issue),
+                _linear_issue_identifier(issue),
+                _linear_issue_url(issue),
+                str(issue.get("title") or ""),
+            ]
+            if not any(selector == hay or selector in hay for hay in haystacks if hay):
+                continue
+            status_name = _linear_issue_status(issue)
+            state_type = _linear_issue_state_type(issue)
+            eligible = _linear_status_is_actionable(cfg, status_name, state_type)
+            if not eligible and not allow_non_actionable:
+                raise RuntimeError(f"Selected Linear issue is not actionable: status is '{status_name}'.")
+            warning = None if eligible else f"Selected Linear issue is not actionable: status is '{status_name}'."
+            return issue, eligible, warning
+
+    candidates = [
+        issue
+        for issue in issues
+        if _linear_status_is_actionable(cfg, _linear_issue_status(issue), _linear_issue_state_type(issue))
+    ]
+    candidates.sort(
+        key=lambda issue: (
+            _linear_issue_priority(issue) if _linear_issue_priority(issue) is not None else 99,
+            _linear_issue_identifier(issue).lower(),
+            str(issue.get("title") or "").lower(),
+        )
+    )
+    if candidates:
+        return candidates[0], True, None
+    if allow_non_actionable and issues:
+        return issues[0], False, "No actionable Linear issues were found; showing the first returned issue."
+    found_statuses = sorted({_linear_issue_status(issue) for issue in issues if _linear_issue_status(issue)})
+    raise RuntimeError(
+        f"No actionable Linear issues for team '{cfg.task_source.team}'. "
+        "Expected a launchable status like Backlog, Todo, Triage, or Ready. "
+        f"Found statuses: {found_statuses}"
+    )
+
+
+def linear_board_snapshot(
+    cfg: ResolvedConfig,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    statuses, _labels, issues = _load_linear_live_data(cfg, refresh_server=force_refresh)
+    columns: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for status in statuses:
+        name = _linear_text(status.get("name") or status.get("title") or status.get("type"))
+        key = normalize_linear_key(name)
+        if not name or not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        columns.append(
+            {
+                "id": _linear_text(status.get("id")) or key,
+                "name": name,
+                "key": key,
+                "type": _linear_text(status.get("type")),
+            }
+        )
+
+    board_items: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for issue in issues:
+        issue_id = _linear_issue_id(issue)
+        identifier = _linear_issue_identifier(issue)
+        status_name = _linear_issue_status(issue)
+        status_key = normalize_linear_key(status_name) or "unknown"
+        state_type = _linear_issue_state_type(issue)
+        state_type_key = normalize_linear_key(state_type)
+        if status_key not in seen_keys:
+            seen_keys.add(status_key)
+            columns.append({"id": status_key, "name": status_name, "key": status_key, "type": state_type})
+        counts[status_key] = counts.get(status_key, 0) + 1
+        board_items.append(
+            {
+                "id": identifier or issue_id or str(issue.get("title") or "linear-issue"),
+                "project_item_id": issue_id,
+                "issue_id": issue_id,
+                "identifier": identifier,
+                "title": str(issue.get("title") or issue.get("name") or "Untitled issue").strip(),
+                "project_name": _linear_issue_project_name(issue, cfg.task_source.project),
+                "project_column": status_name,
+                "status_name": status_name,
+                "status_key": status_key,
+                "state_type": state_type,
+                "state_type_key": state_type_key,
+                "issue_number": identifier,
+                "issue_url": _linear_issue_url(issue),
+                "repo_name": str(cfg.repository.slug or ""),
+                "content_type": "LinearIssue",
+                "is_parent": False,
+                "parent_title": "",
+                "parent_issue_number": None,
+                "phase": None,
+                "order": 50,
+                "depends_on": [],
+                "blocked_by": [],
+                "launch_state": "candidate",
+                "actionable": _linear_status_is_actionable(cfg, status_name, state_type),
+                "priority": _linear_issue_priority(issue),
+                "labels": _linear_issue_labels(issue),
+            }
+        )
+    scheduler = _linear_scheduler_projection(cfg, board_items)
+    board_items.sort(
+        key=lambda item: (
+            next((index for index, column in enumerate(columns) if column.get("key") == item.get("status_key")), 999),
+            str(item.get("identifier") or item.get("id") or "").lower(),
+            str(item.get("title") or "").lower(),
+        )
+    )
+    for column in columns:
+        column["item_count"] = counts.get(str(column.get("key") or ""), 0)
+    return {
+        "project": {
+            "team": cfg.task_source.team,
+            "project": cfg.task_source.project,
+            "name": cfg.task_source.project or cfg.task_source.team,
+        },
+        "columns": columns,
+        "items": board_items,
+        "scheduler": scheduler,
+        "source": "live",
+        "is_stale": False,
+        "warning": "",
+        "last_synced_at_ms": now_ms,
+        "cache_age_ms": 0,
+    }
+
+
+def task_source_board_snapshot(
+    cfg: ResolvedConfig,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    source_type = str(cfg.task_source.type or "").strip()
+    if source_type == "github_project":
+        return github_project_board_snapshot(cfg, force_refresh=force_refresh)
+    if source_type == "linear":
+        return linear_board_snapshot(cfg, force_refresh=force_refresh)
+    raise RuntimeError(f"Project is not configured with a live board task source: {source_type or '<missing>'}")
+
+
 def _load_github_project_live_data(
     cfg: ResolvedConfig,
     *,
@@ -1501,6 +1963,46 @@ def _task_from_project(
     return returned, board, None
 
 
+def _task_from_linear(
+    cfg: ResolvedConfig,
+    *,
+    coordination: CoordinationStore | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Path | None]:
+    try:
+        _statuses, _labels, issues = _load_linear_live_data(cfg, refresh_server=False)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Could not read Linear issues through Tandem's connected Linear MCP path. "
+            f"Team: {cfg.task_source.team}. "
+            "Verify Tandem has a connected Linear MCP server authorized through the control panel. "
+            f"Engine error: {exc}"
+        ) from exc
+    chosen, eligible, warning = _select_linear_issue(cfg, issues=issues, allow_non_actionable=False)
+    if not eligible or chosen is None:
+        raise RuntimeError(warning or "Could not determine an actionable Linear issue.")
+    task = _linear_issue_to_task(cfg, chosen, coordination=coordination)
+    task = _annotate_linear_dependency_status(cfg, task=task, issues=issues, coordination=coordination)
+    board = default_board()
+    card = task_to_card(task, lane="ready")
+    board["cards"].append(card)
+    returned = apply_task_contract(card_to_task(card))
+    returned["dependency_status"] = task.get("dependency_status") or {}
+    returned["contract_completeness"] = task.get("contract_completeness") or {}
+    returned["task_contract"] = task.get("task_contract") or returned.get("task_contract") or {}
+    returned["program_goal"] = task.get("program_goal") or returned.get("program_goal")
+    returned["local_goal"] = task.get("local_goal") or returned.get("local_goal")
+    returned["in_scope"] = list(task.get("in_scope") or returned.get("in_scope") or [])
+    returned["out_of_scope"] = list(task.get("out_of_scope") or returned.get("out_of_scope") or [])
+    returned["dependencies"] = list(task.get("dependencies") or returned.get("dependencies") or [])
+    returned["deliverables"] = list(task.get("deliverables") or returned.get("deliverables") or [])
+    returned["target_files"] = list(task.get("target_files") or returned.get("target_files") or [])
+    returned["verification_commands"] = list(task.get("verification_commands") or returned.get("verification_commands") or [])
+    returned["acceptance_criteria"] = list(task.get("acceptance_criteria") or returned.get("acceptance_criteria") or [])
+    returned["notes_for_agent"] = task.get("notes_for_agent") or returned.get("notes_for_agent")
+    returned["subtasks"] = list(task.get("subtasks") or returned.get("subtasks") or [])
+    return returned, board, None
+
+
 def _task_from_custom(
     cfg: ResolvedConfig,
     *,
@@ -1548,6 +2050,8 @@ def normalize_task(
         return _task_from_kanban_board(cfg, coordination=coordination)
     if source_type == "github_project":
         return _task_from_project(cfg, coordination=coordination)
+    if source_type == "linear":
+        return _task_from_linear(cfg, coordination=coordination)
     if source_type == "custom":
         return _task_from_custom(cfg, coordination=coordination)
     raise RuntimeError(f"Unsupported task source type: {source_type}")
@@ -1674,6 +2178,75 @@ def preview_task(cfg: ResolvedConfig, coordination: CoordinationStore | None = N
         if blocked_reason:
             preview["blocked_reason"] = blocked_reason
         preview["task"]["task_id"] = selected_task.get("task_id")
+        return preview
+    if source_type == "linear":
+        try:
+            _statuses, _labels, issues = _load_linear_live_data(cfg, refresh_server=False)
+            chosen, eligible, warning = _select_linear_issue(
+                cfg,
+                issues=issues,
+                allow_non_actionable=True,
+            )
+        except RuntimeError as error:
+            raise error
+        if chosen is None:
+            raise RuntimeError("Could not determine a Linear issue preview.")
+        selected_task = _linear_issue_to_task(cfg, chosen, coordination=coordination)
+        selected_task = _annotate_linear_dependency_status(
+            cfg,
+            task=selected_task,
+            issues=issues,
+            coordination=coordination,
+        )
+        board_summary: dict[str, int] = {}
+        for issue in issues:
+            status_name = _linear_issue_status(issue)
+            status_key = normalize_linear_key(status_name) or "unknown"
+            board_summary[status_key] = board_summary.get(status_key, 0) + 1
+        status_name = _linear_issue_status(chosen)
+        status_key = normalize_linear_key(status_name) or "unknown"
+        blocked_reason = (selected_task.get("dependency_status") or {}).get("blocked_reason")
+        if not (selected_task.get("contract_completeness") or {}).get("ok", True):
+            blocked_reason = blocked_reason or (selected_task.get("contract_completeness") or {}).get("blocker_message")
+        preview = {
+            "eligible": bool(
+                eligible
+                and (selected_task.get("contract_completeness") or {}).get("ok", True)
+                and not (selected_task.get("dependency_status") or {}).get("blocked")
+            ),
+            "task": {
+                "title": selected_task.get("title"),
+                "id": selected_task.get("task_id"),
+                "project_name": selected_task.get("project_name"),
+                "project_column": status_name or None,
+                "source": selected_task.get("source"),
+                "lane": status_key or "ready",
+                "labels": selected_task.get("labels", []),
+                "description": selected_task.get("description"),
+                "task_contract": selected_task.get("task_contract"),
+                "program_goal": selected_task.get("program_goal"),
+                "local_goal": selected_task.get("local_goal"),
+                "in_scope": selected_task.get("in_scope"),
+                "out_of_scope": selected_task.get("out_of_scope"),
+                "dependencies": selected_task.get("dependencies"),
+                "deliverables": selected_task.get("deliverables"),
+                "target_files": selected_task.get("target_files"),
+                "verification_commands": selected_task.get("verification_commands"),
+                "acceptance_criteria": selected_task.get("acceptance_criteria"),
+                "notes_for_agent": selected_task.get("notes_for_agent"),
+                "dependency_status": selected_task.get("dependency_status"),
+                "contract_completeness": selected_task.get("contract_completeness"),
+                "raw_issue_body": selected_task.get("raw_issue_body"),
+                "task_id": selected_task.get("task_id"),
+            },
+            "source_type": source_type,
+            "board_path": None,
+            "board_summary": board_summary,
+        }
+        if warning:
+            preview["warning"] = warning
+        if blocked_reason:
+            preview["blocked_reason"] = blocked_reason
         return preview
     task, board, board_path = normalize_task(cfg, coordination=coordination)
     blocked_reason = (task.get("dependency_status") or {}).get("blocked_reason")

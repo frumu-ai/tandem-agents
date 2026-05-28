@@ -24,6 +24,11 @@ def task_project_key(task: dict[str, Any]) -> str:
         project = _nonempty(source.get("project")) or _nonempty(source.get("project_name"))
         if owner or project:
             return f"github_project:{owner}/{project}".strip()
+    if source_type == "linear":
+        team = _nonempty(source.get("team"))
+        project = _nonempty(source.get("project")) or _nonempty(source.get("project_name"))
+        if team or project:
+            return f"linear:{team}/{project or 'issues'}".strip()
     if source_type in {"kanban_board", "local_backlog"}:
         path = _nonempty(source.get("board_path")) or _nonempty(source.get("path"))
         if path:

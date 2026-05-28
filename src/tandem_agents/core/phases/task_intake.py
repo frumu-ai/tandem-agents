@@ -45,6 +45,7 @@ def run_task_intake(
         task_run_branch_name,
     )
     from src.tandem_agents.core.integrations.github_mcp import github_mcp_scope, github_remote_sync_mode
+    from src.tandem_agents.core.integrations.linear_mcp import linear_mcp_scope, linear_remote_sync_mode
     from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
     from src.tandem_agents.core.repository.board import card_to_task, claim_card, save_board, select_card
     from src.tandem_agents.core.execution.run_lifecycle import block_run
@@ -59,8 +60,11 @@ def run_task_intake(
     from src.tandem_agents.core.task_contract import task_contract_completeness
     from src.tandem_agents.core.execution.run_lifecycle import build_provider_config_dict, build_swarm_config_dict
 
-    # 1. GitHub MCP for intake
-    source_scope_pre = github_mcp_scope(ctx.cfg, ctx.cfg.task_source.type)
+    # 1. Source MCP for intake
+    if ctx.cfg.task_source.type == "linear":
+        source_scope_pre = linear_mcp_scope(ctx.cfg, ctx.cfg.task_source.type)
+    else:
+        source_scope_pre = github_mcp_scope(ctx.cfg, ctx.cfg.task_source.type)
     if source_scope_pre in {"intake_only", "intake_finalize", "always"} and ctx.cfg.task_source.type == "github_project":
         _rc._connect_github_for_phase(
             cfg=ctx.cfg,
@@ -69,6 +73,16 @@ def run_task_intake(
             status=None,
             blackboard=None,
             event_type="github_mcp.connected_for_intake",
+            required=True,
+        )
+    if source_scope_pre in {"intake_only", "intake_finalize", "always"} and ctx.cfg.task_source.type == "linear":
+        _rc._connect_linear_for_phase(
+            cfg=ctx.cfg,
+            run_id=ctx.run_id,
+            layout=ctx.layout,
+            status=None,
+            blackboard=None,
+            event_type="linear_mcp.connected_for_intake",
             required=True,
         )
 
@@ -281,8 +295,12 @@ def run_task_intake(
     task = ctx.task
     source_type = str((task.get("source") or {}).get("type") or ctx.cfg.task_source.type)
     ctx.source_type = source_type
-    ctx.source_scope = github_mcp_scope(ctx.cfg, source_type)
-    ctx.remote_sync = github_remote_sync_mode(ctx.cfg, source_type)
+    if source_type == "linear":
+        ctx.source_scope = linear_mcp_scope(ctx.cfg, source_type)
+        ctx.remote_sync = linear_remote_sync_mode(ctx.cfg, source_type)
+    else:
+        ctx.source_scope = github_mcp_scope(ctx.cfg, source_type)
+        ctx.remote_sync = github_remote_sync_mode(ctx.cfg, source_type)
     configured_remote_sync = str(ctx.cfg.github_mcp.remote_sync or "off").strip().lower()
     configured_scope = str(ctx.cfg.github_mcp.scope or "none").strip().lower()
     if (
@@ -308,6 +326,31 @@ def run_task_intake(
             ),
             coordination=ctx.coordination,
         )
+    configured_linear_remote_sync = str(ctx.cfg.linear_mcp.remote_sync or "off").strip().lower()
+    configured_linear_scope = str(ctx.cfg.linear_mcp.scope or "none").strip().lower()
+    if (
+        source_type == "linear"
+        and configured_linear_remote_sync != "off"
+        and configured_linear_scope in {"intake_finalize", "always"}
+        and (ctx.source_scope == "none" or ctx.remote_sync == "off")
+    ):
+        return block_run(
+            run_id=ctx.run_id,
+            run_dir=ctx.run_dir,
+            layout=ctx.layout,
+            cfg=ctx.cfg,
+            task=task,
+            repo=ctx.repo,
+            engine=ctx.engine,
+            phase="linear_sync",
+            kind="linear_mcp_disabled",
+            message=(
+                "Linear remote sync is configured for this ACA task source, "
+                "but Linear MCP is not enabled. Refusing to mark the task complete "
+                "without updating Linear."
+            ),
+            coordination=ctx.coordination,
+        )
 
     # 10. Initial status dict
     ctx.status = initial_status(
@@ -328,9 +371,14 @@ def run_task_intake(
             claim_result["lease"].get("expires_at_ms") if claim_result.get("lease") else None
         ),
     }
-    ctx.status = _rc._init_github_mcp_status(
-        ctx.status, ctx.layout, scope=ctx.source_scope, remote_sync=ctx.remote_sync
-    )
+    if source_type == "linear":
+        ctx.status = _rc._init_linear_mcp_status(
+            ctx.status, ctx.layout, scope=ctx.source_scope, remote_sync=ctx.remote_sync
+        )
+    else:
+        ctx.status = _rc._init_github_mcp_status(
+            ctx.status, ctx.layout, scope=ctx.source_scope, remote_sync=ctx.remote_sync
+        )
     ctx.status = set_status(
         ctx.status, ctx.layout, phase="task_resolution", run_status="running", run_started=True
     )
@@ -366,7 +414,7 @@ def run_task_intake(
     # 11. Source and runtime notes
     _rc._append_blackboard_note(
         ctx.blackboard,
-        f"GitHub MCP scope: `{ctx.source_scope}`; remote sync: `{ctx.remote_sync}`.",
+        f"{'Linear' if source_type == 'linear' else 'GitHub'} MCP scope: `{ctx.source_scope}`; remote sync: `{ctx.remote_sync}`.",
     )
 
     # 12. Execution backend

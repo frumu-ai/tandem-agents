@@ -29,7 +29,11 @@ const MOVED_ENV_KEYS = new Set([
   "ACA_TASK_SOURCE_TYPE",
   "ACA_TASK_SOURCE_OWNER",
   "ACA_TASK_SOURCE_REPO",
+  "ACA_TASK_SOURCE_TEAM",
   "ACA_TASK_SOURCE_PROJECT",
+  "ACA_TASK_SOURCE_STATUSES",
+  "ACA_TASK_SOURCE_LABELS",
+  "ACA_TASK_SOURCE_QUERY",
   "ACA_TASK_SOURCE_ITEM",
   "ACA_TASK_SOURCE_URL",
   "ACA_TASK_SOURCE_PATH",
@@ -65,6 +69,17 @@ const MOVED_ENV_KEYS = new Set([
   "ACA_GITHUB_MCP_TOOLSETS",
   "ACA_GITHUB_MCP_SCOPE",
   "ACA_GITHUB_REMOTE_SYNC",
+  "ACA_LINEAR_MCP_ENABLED",
+  "ACA_LINEAR_MCP_SERVER",
+  "ACA_LINEAR_MCP_SCOPE",
+  "ACA_LINEAR_REMOTE_SYNC",
+  "ACA_LINEAR_CLAIM_LABEL",
+  "ACA_LINEAR_DONE_LABEL",
+  "ACA_LINEAR_BLOCKED_LABEL",
+  "ACA_LINEAR_CLAIM_STATUS",
+  "ACA_LINEAR_REVIEW_STATUS",
+  "ACA_LINEAR_DONE_STATUS",
+  "ACA_LINEAR_BLOCKED_STATUS",
   "GITHUB_PERSONAL_ACCESS_TOKEN_FILE",
   "GITHUB_TOKEN_FILE",
   "ACA_KB_MCP_ENABLED",
@@ -93,7 +108,11 @@ const DEFAULT_CONTROL_PANEL_CONFIG = {
     type: "kanban_board",
     owner: "",
     repo: "",
+    team: "",
     project: "",
+    statuses: "",
+    labels: "",
+    query: "",
     item: "",
     url: "",
     path: "config/board.yaml",
@@ -145,6 +164,19 @@ const DEFAULT_CONTROL_PANEL_CONFIG = {
     toolsets: "default,projects",
     scope: "intake_finalize",
     remote_sync: "status_comment",
+  },
+  linear_mcp: {
+    enabled: false,
+    server: "linear",
+    scope: "intake_finalize",
+    remote_sync: "rich",
+    claim_label: "aca-running",
+    done_label: "aca-done",
+    blocked_label: "aca-blocked",
+    claim_status: "In Progress",
+    review_status: "In Review",
+    done_status: "Done",
+    blocked_status: "Blocked",
   },
   hosted: {
     managed: false,
@@ -352,6 +384,11 @@ function buildControlPanelConfig(existing, example) {
     rawExistingConfig.mcp_servers?.github?.enabled,
     rawExistingConfig.github_mcp?.enabled
   );
+  const linearEnabledRaw = firstNonEmpty(
+    existing.ACA_LINEAR_MCP_ENABLED,
+    rawExistingConfig.mcp_servers?.linear?.enabled,
+    rawExistingConfig.linear_mcp?.enabled
+  );
 
   return normalizeControlPanelConfig(
     deepMerge(config, {
@@ -420,7 +457,11 @@ function buildControlPanelConfig(existing, example) {
         type: taskSourceType,
         owner: firstNonEmpty(existing.ACA_TASK_SOURCE_OWNER, existingConfig.task_source?.owner),
         repo: firstNonEmpty(existing.ACA_TASK_SOURCE_REPO, existingConfig.task_source?.repo),
+        team: firstNonEmpty(existing.ACA_TASK_SOURCE_TEAM, existingConfig.task_source?.team),
         project: firstNonEmpty(existing.ACA_TASK_SOURCE_PROJECT, existingConfig.task_source?.project),
+        statuses: firstNonEmpty(existing.ACA_TASK_SOURCE_STATUSES, existingConfig.task_source?.statuses),
+        labels: firstNonEmpty(existing.ACA_TASK_SOURCE_LABELS, existingConfig.task_source?.labels),
+        query: firstNonEmpty(existing.ACA_TASK_SOURCE_QUERY, existingConfig.task_source?.query),
         item: firstNonEmpty(existing.ACA_TASK_SOURCE_ITEM, existingConfig.task_source?.item),
         url: firstNonEmpty(existing.ACA_TASK_SOURCE_URL, existingConfig.task_source?.url),
         path: taskSourcePath,
@@ -565,6 +606,69 @@ function buildControlPanelConfig(existing, example) {
           auto_connect: true,
         },
       },
+      linear_mcp: {
+        ...(linearEnabledRaw ? { enabled: boolValue(linearEnabledRaw, false) } : {}),
+        server: firstNonEmpty(
+          existing.ACA_LINEAR_MCP_SERVER,
+          rawExistingConfig.linear_mcp?.server,
+          rawExistingConfig.mcp_servers?.linear?.name,
+          { default: "linear" }
+        ),
+        scope: firstNonEmpty(
+          existing.ACA_LINEAR_MCP_SCOPE,
+          rawExistingConfig.linear_mcp?.scope,
+          rawExistingConfig.mcp_servers?.linear?.scope,
+          { default: "intake_finalize" }
+        ),
+        remote_sync: firstNonEmpty(
+          existing.ACA_LINEAR_REMOTE_SYNC,
+          rawExistingConfig.linear_mcp?.remote_sync,
+          rawExistingConfig.mcp_servers?.linear?.remote_sync,
+          { default: "rich" }
+        ),
+        claim_label: firstNonEmpty(
+          existing.ACA_LINEAR_CLAIM_LABEL,
+          rawExistingConfig.linear_mcp?.claim_label,
+          rawExistingConfig.mcp_servers?.linear?.claim_label,
+          { default: "aca-running" }
+        ),
+        done_label: firstNonEmpty(
+          existing.ACA_LINEAR_DONE_LABEL,
+          rawExistingConfig.linear_mcp?.done_label,
+          rawExistingConfig.mcp_servers?.linear?.done_label,
+          { default: "aca-done" }
+        ),
+        blocked_label: firstNonEmpty(
+          existing.ACA_LINEAR_BLOCKED_LABEL,
+          rawExistingConfig.linear_mcp?.blocked_label,
+          rawExistingConfig.mcp_servers?.linear?.blocked_label,
+          { default: "aca-blocked" }
+        ),
+        claim_status: firstNonEmpty(
+          existing.ACA_LINEAR_CLAIM_STATUS,
+          rawExistingConfig.linear_mcp?.claim_status,
+          rawExistingConfig.mcp_servers?.linear?.claim_status,
+          { default: "In Progress" }
+        ),
+        review_status: firstNonEmpty(
+          existing.ACA_LINEAR_REVIEW_STATUS,
+          rawExistingConfig.linear_mcp?.review_status,
+          rawExistingConfig.mcp_servers?.linear?.review_status,
+          { default: "In Review" }
+        ),
+        done_status: firstNonEmpty(
+          existing.ACA_LINEAR_DONE_STATUS,
+          rawExistingConfig.linear_mcp?.done_status,
+          rawExistingConfig.mcp_servers?.linear?.done_status,
+          { default: "Done" }
+        ),
+        blocked_status: firstNonEmpty(
+          existing.ACA_LINEAR_BLOCKED_STATUS,
+          rawExistingConfig.linear_mcp?.blocked_status,
+          rawExistingConfig.mcp_servers?.linear?.blocked_status,
+          { default: "Blocked" }
+        ),
+      },
       github_mcp: {
         ...(githubEnabledRaw ? { enabled: boolValue(githubEnabledRaw, false) } : {}),
         url: firstNonEmpty(
@@ -696,6 +800,8 @@ function main() {
     ["ACA_WORKSPACE_HOST_DIR", firstNonEmpty(existingEnv.ACA_WORKSPACE_HOST_DIR, exampleEnv.ACA_WORKSPACE_HOST_DIR, { default: "./workspace" })],
     ["ACA_LOCAL_REPOS_DIR", firstNonEmpty(existingEnv.ACA_LOCAL_REPOS_DIR, exampleEnv.ACA_LOCAL_REPOS_DIR, { default: "./test-repos" })],
     ["ACA_GITHUB_MCP_ENABLED", firstNonEmpty(existingEnv.ACA_GITHUB_MCP_ENABLED, exampleEnv.ACA_GITHUB_MCP_ENABLED)],
+    ["ACA_LINEAR_MCP_ENABLED", firstNonEmpty(existingEnv.ACA_LINEAR_MCP_ENABLED, exampleEnv.ACA_LINEAR_MCP_ENABLED)],
+    ["ACA_LINEAR_MCP_SERVER", firstNonEmpty(existingEnv.ACA_LINEAR_MCP_SERVER, exampleEnv.ACA_LINEAR_MCP_SERVER)],
     ["GITHUB_PERSONAL_ACCESS_TOKEN_FILE", firstNonEmpty(existingEnv.GITHUB_PERSONAL_ACCESS_TOKEN_FILE, exampleEnv.GITHUB_PERSONAL_ACCESS_TOKEN_FILE, { default: "./secrets/github_token" })],
     ["GITHUB_TOKEN_FILE", firstNonEmpty(existingEnv.GITHUB_TOKEN_FILE, exampleEnv.GITHUB_TOKEN_FILE, { default: "./secrets/github_token" })],
     ["ACA_KB_MCP_ENABLED", firstNonEmpty(existingEnv.ACA_KB_MCP_ENABLED, exampleEnv.ACA_KB_MCP_ENABLED, { default: "true" })],
