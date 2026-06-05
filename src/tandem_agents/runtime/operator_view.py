@@ -114,11 +114,13 @@ def build_run_snapshot(run_id: str, run_dir: Path) -> dict[str, Any]:
     if isinstance(repo_meta, dict):
         branch_name = repo_meta.get("branch") or repo_meta.get("branch_name")
     pull_request = None
+    pull_request_lifecycle = {}
     execution_backend = None
     review_policy = None
     blockers = []
     if isinstance(blackboard, dict):
         pull_request = blackboard.get("pull_request")
+        pull_request_lifecycle = blackboard.get("pull_request_lifecycle") or {}
         execution_backend = blackboard.get("execution_backend")
         review_policy = blackboard.get("review_policy")
         blockers = blackboard.get("blockers") or []
@@ -142,6 +144,7 @@ def build_run_snapshot(run_id: str, run_dir: Path) -> dict[str, Any]:
             "phase": phase_meta if isinstance(phase_meta, dict) else {},
             "branch": branch_name,
             "pull_request": pull_request,
+            "pull_request_lifecycle": pull_request_lifecycle if isinstance(pull_request_lifecycle, dict) else {},
             "execution_backend": execution_backend,
             "github_mcp": github_mcp if isinstance(github_mcp, dict) else {},
             "review_policy": review_policy if isinstance(review_policy, dict) else {},
@@ -173,6 +176,7 @@ def build_run_snapshot(run_id: str, run_dir: Path) -> dict[str, Any]:
         "phase": phase_meta if isinstance(phase_meta, dict) else {},
         "branch": branch_name,
         "pull_request": pull_request,
+        "pull_request_lifecycle": pull_request_lifecycle if isinstance(pull_request_lifecycle, dict) else {},
         "execution_backend": execution_backend,
         "github_mcp": github_mcp if isinstance(github_mcp, dict) else {},
         "review_policy": review_policy if isinstance(review_policy, dict) else {},

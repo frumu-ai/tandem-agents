@@ -165,13 +165,23 @@ class OutboxDispatcherTest(unittest.TestCase):
                 dedupe_key="run-1:pr",
             )
 
+            pr_metadata = {
+                "url": "https://github.com/frumu-ai/example/pull/7",
+                "number": 7,
+                "head_branch": "aca/task-1",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+                "lifecycle_state": "waiting-for-review",
+                "terminal": False,
+            }
             with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_github_mcp_connected", return_value=None):
                 with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_github_mcp_disconnected", return_value=None):
-                    with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.create_pull_request", return_value="https://github.com/frumu-ai/example/pull/7") as pr_mock:
+                    with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.create_pull_request_metadata", return_value=pr_metadata) as pr_mock:
                         summary = dispatch_outbox_tick(cfg, coordination=store)
 
             self.assertEqual(summary["dispatched"], 1)
             self.assertEqual(pr_mock.call_count, 1)
+            self.assertEqual(summary["items"][0]["pull_request"]["number"], 7)
             snapshot = store.snapshot()
             self.assertEqual(snapshot["summary"]["dispatched_outbox"], 1)
             self.assertEqual(snapshot["summary"]["pending_outbox"], 0)

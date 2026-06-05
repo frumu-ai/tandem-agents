@@ -88,6 +88,34 @@ def _seed_active_coder_run(cfg, store: CoordinationStore, *, run_id: str = "run-
     save_blackboard(run_dir / "blackboard.yaml", blackboard)
 
 
+def _seed_completed_run_with_pr(cfg, store: CoordinationStore, *, run_id: str = "run-pr") -> None:
+    _seed_active_coder_run(cfg, store, run_id=run_id)
+    run_dir = cfg.output_root() / run_id
+    status = load_status(run_dir / "status.json")
+    status["run"]["status"] = "completed"
+    status["phase"] = {"name": "handoff", "detail": "task completed", "role": "manager", "updated_at_ms": 1}
+    status["pull_request"] = "https://github.com/acme/demo/pull/7"
+    status["pull_request_lifecycle"] = {
+        "url": "https://github.com/acme/demo/pull/7",
+        "number": 7,
+        "head_branch": "aca/run-pr",
+        "base_branch": "main",
+        "base_repo": "acme/demo",
+        "lifecycle_state": "waiting-for-review",
+        "terminal": False,
+    }
+    write_status(run_dir / "status.json", status)
+    blackboard = load_blackboard(run_dir / "blackboard.yaml")
+    blackboard["pull_request"] = "https://github.com/acme/demo/pull/7"
+    blackboard["pull_request_lifecycle"] = dict(status["pull_request_lifecycle"])
+    save_blackboard(run_dir / "blackboard.yaml", blackboard)
+    run = store.get_run(run_id) or {}
+    metadata = dict(run.get("metadata") or {})
+    metadata["pull_request"] = "https://github.com/acme/demo/pull/7"
+    metadata["pull_request_lifecycle"] = dict(status["pull_request_lifecycle"])
+    store.update_run(run_id, status="completed", phase="handoff", metadata=metadata, completed=True)
+
+
 class CoderSupervisorTest(unittest.TestCase):
     def test_non_terminal_run_stays_running_and_heartbeats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,6 +201,38 @@ class CoderSupervisorTest(unittest.TestCase):
             cancel_run.assert_called_once()
             status = load_status(cfg.output_root() / "run-1" / "status.json")
             self.assertEqual(status["run"]["status"], "cancelled")
+
+    def test_completed_run_refreshes_pull_request_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(cfg, store)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "ready-to-merge",
+                "terminal": False,
+            }
+            with patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed) as refresh:
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            refresh.assert_called_once()
+            self.assertEqual(result["status"], "ready-to-merge")
+            status = load_status(cfg.output_root() / "run-pr" / "status.json")
+            blackboard = load_blackboard(cfg.output_root() / "run-pr" / "blackboard.yaml")
+            run_meta = (store.get_run("run-pr") or {}).get("metadata") or {}
+            self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
+            self.assertEqual(blackboard["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
+            self.assertEqual(run_meta["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
 
 
 if __name__ == "__main__":

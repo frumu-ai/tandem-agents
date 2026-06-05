@@ -407,6 +407,164 @@ def _pull_request_url(pr: dict[str, Any]) -> str:
     return ""
 
 
+def _pull_request_number(pr: dict[str, Any]) -> int | None:
+    for key in ("number", "pull_number", "pullNumber"):
+        value = pr.get(key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _pull_request_base_ref(pr: dict[str, Any]) -> str:
+    base = pr.get("base")
+    if isinstance(base, dict):
+        for key in ("ref", "name", "branch"):
+            value = base.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for key in ("baseRefName", "base_ref_name", "base_branch", "base"):
+        value = pr.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _pull_request_base_repo(pr: dict[str, Any], fallback: str = "") -> str:
+    base = pr.get("base")
+    repo = base.get("repo") if isinstance(base, dict) else None
+    if isinstance(repo, dict):
+        for key in ("full_name", "nameWithOwner", "name_with_owner"):
+            value = repo.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        owner = repo.get("owner")
+        owner_name = ""
+        if isinstance(owner, dict):
+            owner_name = str(owner.get("login") or owner.get("name") or "").strip()
+        repo_name = str(repo.get("name") or "").strip()
+        if owner_name and repo_name:
+            return f"{owner_name}/{repo_name}"
+    for key in ("base_repo", "baseRepo", "repository", "repo"):
+        value = pr.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
+
+
+def _pull_request_reviews_state(pr: dict[str, Any]) -> str:
+    for key in ("reviewDecision", "review_decision", "review_state", "reviewState"):
+        value = normalize_status_key(str(pr.get(key) or ""))
+        if value:
+            if value in {"changes_requested", "requested_changes"}:
+                return "changes_requested"
+            if value in {"approved", "approve"}:
+                return "approved"
+            if value in {"review_required", "requires_review"}:
+                return "review_required"
+            return value
+    reviews = pr.get("reviews") or pr.get("reviewThreads") or []
+    if isinstance(reviews, dict):
+        reviews = reviews.get("nodes") or reviews.get("items") or []
+    states: list[str] = []
+    if isinstance(reviews, list):
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            state = normalize_status_key(str(review.get("state") or review.get("status") or ""))
+            if state:
+                states.append(state)
+    if any(state in {"changes_requested", "requested_changes"} for state in states):
+        return "changes_requested"
+    if any(state in {"approved", "approve"} for state in states):
+        return "approved"
+    return "review_required"
+
+
+def _pull_request_checks_state(pr: dict[str, Any]) -> str:
+    for key in ("checks_status", "check_status", "checksState", "checks_state"):
+        value = normalize_status_key(str(pr.get(key) or ""))
+        if value:
+            if value in {"success", "successful", "passed", "pass"}:
+                return "success"
+            if value in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"}:
+                return "failure"
+            if value in {"pending", "queued", "in_progress", "running", "waiting"}:
+                return "pending"
+            return value
+    rollup = pr.get("statusCheckRollup") or pr.get("status_check_rollup") or pr.get("combined_status")
+    if isinstance(rollup, dict):
+        value = normalize_status_key(str(rollup.get("state") or rollup.get("status") or rollup.get("conclusion") or ""))
+        if value in {"success", "successful", "passed", "pass"}:
+            return "success"
+        if value in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"}:
+            return "failure"
+        if value in {"pending", "queued", "in_progress", "running", "waiting", "expected"}:
+            return "pending"
+    checks = pr.get("checks") or pr.get("check_runs") or pr.get("checkSuites") or []
+    if isinstance(checks, dict):
+        checks = checks.get("nodes") or checks.get("items") or []
+    if isinstance(checks, list) and checks:
+        states = [
+            normalize_status_key(str((check or {}).get("conclusion") or (check or {}).get("status") or ""))
+            for check in checks
+            if isinstance(check, dict)
+        ]
+        if any(state in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"} for state in states):
+            return "failure"
+        known_states = [state for state in states if state]
+        if known_states and all(state in {"success", "successful", "passed", "completed"} for state in known_states):
+            return "success"
+        return "pending"
+    return "unknown"
+
+
+def pull_request_lifecycle_state(pr: dict[str, Any]) -> str:
+    state = normalize_status_key(str(pr.get("state") or "open"))
+    merged = bool(pr.get("merged") or pr.get("merged_at") or pr.get("mergedAt"))
+    draft = bool(pr.get("draft") or pr.get("isDraft"))
+    review_state = _pull_request_reviews_state(pr)
+    checks_state = _pull_request_checks_state(pr)
+    if merged:
+        return "merged"
+    if state in {"closed", "cancelled", "canceled"}:
+        return "blocked"
+    if review_state == "changes_requested" or checks_state == "failure":
+        return "needs-repair"
+    if draft or checks_state == "pending":
+        return "running"
+    if review_state == "approved" and checks_state == "success":
+        return "ready-to-merge"
+    return "waiting-for-review"
+
+
+def normalize_pull_request_metadata(
+    pr: dict[str, Any],
+    *,
+    head_branch: str = "",
+    base_repo: str = "",
+    base_branch: str = "",
+) -> dict[str, Any]:
+    number = _pull_request_number(pr)
+    url = _pull_request_url(pr)
+    normalized: dict[str, Any] = {
+        "url": url,
+        "number": number,
+        "head_branch": _pull_request_head_ref(pr) or head_branch,
+        "base_branch": _pull_request_base_ref(pr) or base_branch,
+        "base_repo": _pull_request_base_repo(pr, fallback=base_repo),
+        "state": str(pr.get("state") or "open").strip().lower() or "open",
+        "draft": bool(pr.get("draft") or pr.get("isDraft")),
+        "merged": bool(pr.get("merged") or pr.get("merged_at") or pr.get("mergedAt")),
+        "review_state": _pull_request_reviews_state(pr),
+        "checks_state": _pull_request_checks_state(pr),
+    }
+    normalized["lifecycle_state"] = pull_request_lifecycle_state(pr)
+    normalized["terminal"] = normalized["lifecycle_state"] in {"merged", "blocked"}
+    return normalized
+
+
 def _tool_result_payloads(result: dict[str, Any]) -> list[Any]:
     values: list[Any] = []
     metadata = result.get("metadata")
@@ -777,40 +935,70 @@ def _existing_pull_request_url(
     return ""
 
 
-def create_pull_request(
+def _existing_pull_request_metadata(
+    cfg: ResolvedConfig,
+    *,
+    owner: str,
+    repo_name: str,
+    head_branch: str,
+    base_repo: str,
+    base_branch: str,
+    marker: str,
+) -> dict[str, Any]:
+    if not owner or not repo_name or not head_branch:
+        return {}
+    for pr in _fetch_pull_requests(cfg, owner, repo_name):
+        if _pull_request_head_ref(pr) != head_branch:
+            continue
+        metadata = normalize_pull_request_metadata(
+            pr,
+            head_branch=head_branch,
+            base_repo=base_repo,
+            base_branch=base_branch,
+        )
+        if metadata.get("url"):
+            metadata["reused"] = True
+            return metadata
+    return {}
+
+
+def create_pull_request_metadata(
     cfg: ResolvedConfig,
     task: dict[str, Any],
     head_branch: str,
     title: str,
     body: str,
-) -> str | None:
+) -> dict[str, Any]:
     source = dict(task.get("source") or {})
     owner = str(source.get("owner") or "").strip()
     repo_name = str(source.get("repo_name") or "").strip()
-    
+
     if not owner or not repo_name:
         slug = cfg.repository.slug
         if slug and "/" in slug:
             owner, repo_name = slug.split("/", 1)
-            
-    if not owner or not repo_name:
-        return "Missing repository owner/name for PR creation."
 
+    if not owner or not repo_name:
+        return {"error": "Missing repository owner/name for PR creation."}
+
+    base_branch = cfg.repository.default_branch or "main"
+    base_repo = f"{owner}/{repo_name}"
     marker = _pull_request_marker(str(task.get("run_id") or ""), head_branch)
-    existing_url = _existing_pull_request_url(
+    existing = _existing_pull_request_metadata(
         cfg,
         owner=owner,
         repo_name=repo_name,
         head_branch=head_branch,
+        base_repo=base_repo,
+        base_branch=base_branch,
         marker=marker,
     )
-    if existing_url:
-        return existing_url
-        
-    base_branch = cfg.repository.default_branch or "main"
+    if existing:
+        return existing
+
     if marker and marker not in body:
         body = f"{body.rstrip()}\n\n{marker}".strip()
-    
+
     result = execute_engine_tool(
         cfg,
         "mcp.github.create_pull_request",
@@ -825,6 +1013,46 @@ def create_pull_request(
     )
     if _tool_failed(result):
         raise RuntimeError(_tool_error_message(result))
-    
+
     data = _parse_json_output(result)
-    return str(data.get("html_url") or data.get("url") or "created")
+    metadata = normalize_pull_request_metadata(
+        data,
+        head_branch=head_branch,
+        base_repo=base_repo,
+        base_branch=base_branch,
+    )
+    metadata["reused"] = False
+    return metadata
+
+
+def refresh_pull_request_lifecycle(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
+    base_repo = str(pull_request.get("base_repo") or cfg.repository.slug or "").strip()
+    number = pull_request.get("number")
+    if not base_repo or "/" not in base_repo or number in (None, ""):
+        return {**pull_request, "lifecycle_state": "blocked", "terminal": True, "error": "Missing PR base repo or number."}
+    owner, repo_name = base_repo.split("/", 1)
+    pr = get_pull_request(cfg, owner, repo_name, int(number))
+    refreshed = normalize_pull_request_metadata(
+        pr,
+        head_branch=str(pull_request.get("head_branch") or ""),
+        base_repo=base_repo,
+        base_branch=str(pull_request.get("base_branch") or ""),
+    )
+    return refreshed
+
+
+def create_pull_request(
+    cfg: ResolvedConfig,
+    task: dict[str, Any],
+    head_branch: str,
+    title: str,
+    body: str,
+) -> str | None:
+    metadata = create_pull_request_metadata(
+        cfg,
+        task,
+        head_branch=head_branch,
+        title=title,
+        body=body,
+    )
+    return str(metadata.get("url") or metadata.get("error") or "created")
