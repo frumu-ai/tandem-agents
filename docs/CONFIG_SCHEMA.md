@@ -92,11 +92,12 @@ Optional fields:
 
 Required fields:
 
-- `type`: one of `github_project`, `local_backlog`, `manual`, `custom`, `kanban_board`
+- `type`: one of `github_project`, `linear`, `local_backlog`, `manual`, `custom`, `kanban_board`
 
 Variant-specific fields:
 
 - `github_project`: `owner`, `project`, and either `item` or `url`
+- `linear`: `team`; optional `project`, `statuses`, `labels`, `query`, and either `item` or `url`
 - `local_backlog`: `path`
 - `manual`: `prompt`
 - `custom`: `source_name`, `payload`
@@ -271,7 +272,11 @@ Behavior:
 - `ACA_TASK_SOURCE_TYPE` -> `task_source.type`
 - `ACA_TASK_SOURCE_OWNER` -> `task_source.owner`
 - `ACA_TASK_SOURCE_REPO` -> `task_source.repo`
+- `ACA_TASK_SOURCE_TEAM` -> `task_source.team`
 - `ACA_TASK_SOURCE_PROJECT` -> `task_source.project`
+- `ACA_TASK_SOURCE_STATUSES` -> `task_source.statuses`
+- `ACA_TASK_SOURCE_LABELS` -> `task_source.labels`
+- `ACA_TASK_SOURCE_QUERY` -> `task_source.query`
 - `ACA_TASK_SOURCE_ITEM` -> `task_source.item`
 - `ACA_TASK_SOURCE_URL` -> `task_source.url`
 - `ACA_TASK_SOURCE_PATH` -> `task_source.path`
@@ -371,6 +376,22 @@ If a provider-specific secret env var is missing, ACA will populate the matching
 - `ACA_KB_MCP_ENABLED` -> when `true`, ACA prepares the persisted `kb` MCP entry on engine boot
 - `ACA_GITHUB_REMOTE_SYNC` -> finalize-time GitHub write policy for GitHub Project tasks: `off`, `status`, or `status_comment`
 
+### Linear Access
+
+- `ACA_LINEAR_MCP_ENABLED` -> when `true`, ACA expects a Linear MCP server in the Tandem engine registry
+- `ACA_LINEAR_MCP_SERVER` -> server name to use for Linear MCP calls; default `linear`
+- `ACA_LINEAR_MCP_SCOPE` -> runtime policy for when Linear MCP should stay connected: `none`, `intake_only`, `intake_finalize`, or `always`
+- `ACA_LINEAR_REMOTE_SYNC` -> finalize-time Linear write policy for Linear tasks: `off`, `status`, `status_comment`, or `rich`
+- `ACA_LINEAR_CLAIM_LABEL` -> label ACA adds while claiming/running a Linear issue
+- `ACA_LINEAR_DONE_LABEL` -> label ACA adds when a run completes
+- `ACA_LINEAR_BLOCKED_LABEL` -> label ACA adds when a run blocks/fails
+- `ACA_LINEAR_CLAIM_STATUS` -> Linear status to set after claim; default `In Progress`
+- `ACA_LINEAR_REVIEW_STATUS` -> Linear status to set on completed runs; default `In Review`
+- `ACA_LINEAR_DONE_STATUS` -> reserved done status mapping; default `Done`
+- `ACA_LINEAR_BLOCKED_STATUS` -> Linear status to set on blocked/failed runs; default `Blocked`
+
+Linear OAuth and workspace authorization live in the Tandem control panel MCP connection. Do not put Linear API tokens in ACA config.
+
 ## Validation Rules
 
 - the agent must reject runs without a task source
@@ -378,6 +399,7 @@ If a provider-specific secret env var is missing, ACA will populate the matching
 - the agent must reject runs without a provider/model selection
 - the agent must reject invalid task source combinations
 - the agent must reject `kanban_board` sources without a board path
+- the agent must reject `linear` sources without a team
 - the agent must reject role-specific swarm overrides when `shared_model` is true
 - the agent must prefer a running Tandem engine when it is reachable
 - the agent must notify when the running Tandem engine is older than the configured requirement

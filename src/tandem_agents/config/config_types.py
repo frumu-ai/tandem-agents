@@ -29,6 +29,12 @@ DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 DEFAULT_GITHUB_MCP_TOOLSETS = "default,projects"
 DEFAULT_GITHUB_MCP_SCOPE = "intake_finalize"
 DEFAULT_GITHUB_REMOTE_SYNC = "status_comment"
+DEFAULT_LINEAR_MCP_SERVER = "linear"
+DEFAULT_LINEAR_MCP_SCOPE = "intake_finalize"
+DEFAULT_LINEAR_REMOTE_SYNC = "rich"
+DEFAULT_LINEAR_CLAIM_LABEL = "aca-running"
+DEFAULT_LINEAR_DONE_LABEL = "aca-done"
+DEFAULT_LINEAR_BLOCKED_LABEL = "aca-blocked"
 DEFAULT_EXECUTION_BACKEND = "auto"
 DEFAULT_CODER_WAIT_TIMEOUT_SECONDS = 3600
 DEFAULT_CODER_POLL_INTERVAL_SECONDS = 15
@@ -39,6 +45,7 @@ DEFAULT_CODER_CANCEL_ON_SOURCE_TERMINAL = True
 DEFAULT_REVIEW_POLICY = "human_review"
 TASK_SOURCE_TYPES = {
     "github_project",
+    "linear",
     "local_backlog",
     "manual",
     "custom",
@@ -48,6 +55,8 @@ VALID_STARTUP_MODES = {"reuse_only", "reuse_or_start"}
 VALID_UPDATE_POLICIES = {"notify", "block", "ignore"}
 VALID_GITHUB_MCP_SCOPES = {"none", "intake_only", "intake_finalize", "always"}
 VALID_GITHUB_REMOTE_SYNC = {"off", "status", "status_comment"}
+VALID_LINEAR_MCP_SCOPES = {"none", "intake_only", "intake_finalize", "always"}
+VALID_LINEAR_REMOTE_SYNC = {"off", "status", "status_comment", "rich"}
 VALID_EXECUTION_BACKENDS = {"auto", "legacy", "coder"}
 VALID_STORAGE_PROFILES = {"local", "shared"}
 VALID_REVIEW_POLICIES = {"human_review", "auto_merge"}
@@ -183,7 +192,11 @@ class TaskSourceConfig:
     type: str = ""
     owner: str = ""
     repo: str = ""
+    team: str = ""
     project: str = ""
+    statuses: str = ""
+    labels: str = ""
+    query: str = ""
     item: str = ""
     url: str = ""
     path: str = ""
@@ -286,6 +299,21 @@ class GithubMcpConfig:
 
 
 @dataclass
+class LinearMcpConfig:
+    enabled: bool = False
+    server: str = DEFAULT_LINEAR_MCP_SERVER
+    scope: str = DEFAULT_LINEAR_MCP_SCOPE
+    remote_sync: str = DEFAULT_LINEAR_REMOTE_SYNC
+    claim_label: str = DEFAULT_LINEAR_CLAIM_LABEL
+    done_label: str = DEFAULT_LINEAR_DONE_LABEL
+    blocked_label: str = DEFAULT_LINEAR_BLOCKED_LABEL
+    claim_status: str = "In Progress"
+    review_status: str = "In Review"
+    done_status: str = "Done"
+    blocked_status: str = "Blocked"
+
+
+@dataclass
 class ResolvedConfig:
     root_dir: Path
     control_panel: ControlPanelConfig
@@ -303,6 +331,7 @@ class ResolvedConfig:
     coordination: CoordinationConfig
     scheduler: SchedulerConfig
     github_mcp: GithubMcpConfig
+    linear_mcp: LinearMcpConfig
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
 
@@ -434,5 +463,6 @@ class ResolvedConfig:
                 "queue_depth_limit": self.scheduler.queue_depth_limit,
             },
             "github_mcp": _jsonable(self.github_mcp),
+            "linear_mcp": _jsonable(self.linear_mcp),
             "mcp_servers": _jsonable(self.mcp_servers),
         }

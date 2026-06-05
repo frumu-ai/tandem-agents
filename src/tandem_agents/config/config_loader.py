@@ -12,6 +12,7 @@ from src.tandem_agents.config.config_types import (
     CoordinationConfig,
     ExecutionConfig,
     GithubMcpConfig,
+    LinearMcpConfig,
     OutputConfig,
     ProviderConfig,
     RepositoryConfig,
@@ -36,6 +37,12 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_GITHUB_MCP_TOOLSETS,
     DEFAULT_GITHUB_MCP_URL,
     DEFAULT_GITHUB_REMOTE_SYNC,
+    DEFAULT_LINEAR_BLOCKED_LABEL,
+    DEFAULT_LINEAR_CLAIM_LABEL,
+    DEFAULT_LINEAR_DONE_LABEL,
+    DEFAULT_LINEAR_MCP_SCOPE,
+    DEFAULT_LINEAR_MCP_SERVER,
+    DEFAULT_LINEAR_REMOTE_SYNC,
     DEFAULT_MAX_WORKERS,
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_ROOT,
@@ -58,6 +65,8 @@ from src.tandem_agents.config.config_types import (
     VALID_UPDATE_POLICIES,
     VALID_GITHUB_MCP_SCOPES,
     VALID_GITHUB_REMOTE_SYNC,
+    VALID_LINEAR_MCP_SCOPES,
+    VALID_LINEAR_REMOTE_SYNC,
     VALID_EXECUTION_BACKENDS,
     DEFAULT_STORAGE_PROFILE,
     VALID_STORAGE_PROFILES,
@@ -150,7 +159,9 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
     scheduler_data = data.get("scheduler", {}) or {}
     mcp_servers = dict(data.get("mcp_servers") or {})
     github_mcp_data = data.get("github_mcp", {}) or {}
+    linear_mcp_data = data.get("linear_mcp", {}) or {}
     github_mcp_server = mcp_servers.get("github", {}) if isinstance(mcp_servers, dict) else {}
+    linear_mcp_server = mcp_servers.get("linear", {}) if isinstance(mcp_servers, dict) else {}
 
     def github_pat_present() -> bool:
         direct_token = _nonempty(merged_env.get("GITHUB_PERSONAL_ACCESS_TOKEN")) or _nonempty(
@@ -208,7 +219,11 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         type=str(pick("ACA_TASK_SOURCE_TYPE", "AUTOCODER_TASK_SOURCE_TYPE", yaml_value=task_data.get("type"), default="")),
         owner=str(pick("ACA_TASK_SOURCE_OWNER", "AUTOCODER_TASK_SOURCE_OWNER", yaml_value=task_data.get("owner"), default="")),
         repo=str(pick("ACA_TASK_SOURCE_REPO", "AUTOCODER_TASK_SOURCE_REPO", yaml_value=task_data.get("repo"), default="")),
+        team=str(pick("ACA_TASK_SOURCE_TEAM", yaml_value=task_data.get("team"), default="")),
         project=str(pick("ACA_TASK_SOURCE_PROJECT", "AUTOCODER_TASK_SOURCE_PROJECT", yaml_value=task_data.get("project"), default="")),
+        statuses=str(pick("ACA_TASK_SOURCE_STATUSES", yaml_value=task_data.get("statuses"), default="")),
+        labels=str(pick("ACA_TASK_SOURCE_LABELS", yaml_value=task_data.get("labels"), default="")),
+        query=str(pick("ACA_TASK_SOURCE_QUERY", yaml_value=task_data.get("query"), default="")),
         item=str(pick("ACA_TASK_SOURCE_ITEM", "AUTOCODER_TASK_SOURCE_ITEM", yaml_value=task_data.get("item"), default="")),
         url=str(pick("ACA_TASK_SOURCE_URL", "AUTOCODER_TASK_SOURCE_URL", yaml_value=task_data.get("url"), default="")),
         path=str(pick("ACA_TASK_SOURCE_PATH", "AUTOCODER_TASK_SOURCE_PATH", yaml_value=task_data.get("path"), default="")),
@@ -513,6 +528,87 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             )
         ),
     )
+    linear_enabled_value = pick(
+        "ACA_LINEAR_MCP_ENABLED",
+        yaml_value=linear_mcp_data.get("enabled", linear_mcp_server.get("enabled")),
+    )
+    if linear_enabled_value is None:
+        linear_enabled = str(task_source.type or "").strip() == "linear"
+    else:
+        linear_enabled = _as_bool(linear_enabled_value, default=False)
+    linear_mcp = LinearMcpConfig(
+        enabled=linear_enabled,
+        server=str(
+            pick(
+                "ACA_LINEAR_MCP_SERVER",
+                yaml_value=linear_mcp_data.get("server", linear_mcp_server.get("name")),
+                default=DEFAULT_LINEAR_MCP_SERVER,
+            )
+        ),
+        scope=str(
+            pick(
+                "ACA_LINEAR_MCP_SCOPE",
+                yaml_value=linear_mcp_data.get("scope", linear_mcp_server.get("scope")),
+                default=DEFAULT_LINEAR_MCP_SCOPE,
+            )
+        ),
+        remote_sync=str(
+            pick(
+                "ACA_LINEAR_REMOTE_SYNC",
+                yaml_value=linear_mcp_data.get("remote_sync", linear_mcp_server.get("remote_sync")),
+                default=DEFAULT_LINEAR_REMOTE_SYNC,
+            )
+        ),
+        claim_label=str(
+            pick(
+                "ACA_LINEAR_CLAIM_LABEL",
+                yaml_value=linear_mcp_data.get("claim_label", linear_mcp_server.get("claim_label")),
+                default=DEFAULT_LINEAR_CLAIM_LABEL,
+            )
+        ),
+        done_label=str(
+            pick(
+                "ACA_LINEAR_DONE_LABEL",
+                yaml_value=linear_mcp_data.get("done_label", linear_mcp_server.get("done_label")),
+                default=DEFAULT_LINEAR_DONE_LABEL,
+            )
+        ),
+        blocked_label=str(
+            pick(
+                "ACA_LINEAR_BLOCKED_LABEL",
+                yaml_value=linear_mcp_data.get("blocked_label", linear_mcp_server.get("blocked_label")),
+                default=DEFAULT_LINEAR_BLOCKED_LABEL,
+            )
+        ),
+        claim_status=str(
+            pick(
+                "ACA_LINEAR_CLAIM_STATUS",
+                yaml_value=linear_mcp_data.get("claim_status", linear_mcp_server.get("claim_status")),
+                default="In Progress",
+            )
+        ),
+        review_status=str(
+            pick(
+                "ACA_LINEAR_REVIEW_STATUS",
+                yaml_value=linear_mcp_data.get("review_status", linear_mcp_server.get("review_status")),
+                default="In Review",
+            )
+        ),
+        done_status=str(
+            pick(
+                "ACA_LINEAR_DONE_STATUS",
+                yaml_value=linear_mcp_data.get("done_status", linear_mcp_server.get("done_status")),
+                default="Done",
+            )
+        ),
+        blocked_status=str(
+            pick(
+                "ACA_LINEAR_BLOCKED_STATUS",
+                yaml_value=linear_mcp_data.get("blocked_status", linear_mcp_server.get("blocked_status")),
+                default="Blocked",
+            )
+        ),
+    )
     if not mcp_servers and github_mcp.enabled:
         mcp_servers = {
             "github": {
@@ -545,6 +641,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         coordination=coordination,
         scheduler=scheduler,
         github_mcp=github_mcp,
+        linear_mcp=linear_mcp,
         mcp_servers=mcp_servers,
         env=merged_env,
     )
@@ -569,6 +666,10 @@ def validate_config(cfg: ResolvedConfig) -> list[str]:
         errors.append(f"Invalid github_mcp.scope: {cfg.github_mcp.scope}")
     if cfg.github_mcp.remote_sync not in VALID_GITHUB_REMOTE_SYNC:
         errors.append(f"Invalid github_mcp.remote_sync: {cfg.github_mcp.remote_sync}")
+    if cfg.linear_mcp.scope not in VALID_LINEAR_MCP_SCOPES:
+        errors.append(f"Invalid linear_mcp.scope: {cfg.linear_mcp.scope}")
+    if cfg.linear_mcp.remote_sync not in VALID_LINEAR_REMOTE_SYNC:
+        errors.append(f"Invalid linear_mcp.remote_sync: {cfg.linear_mcp.remote_sync}")
     if cfg.execution.backend not in VALID_EXECUTION_BACKENDS:
         errors.append(f"Invalid execution.backend: {cfg.execution.backend}")
     if cfg.review.policy not in VALID_REVIEW_POLICIES:
@@ -641,6 +742,8 @@ def validate_config(cfg: ResolvedConfig) -> list[str]:
         errors.append("Kanban board task source requires task_source.path.")
     if cfg.task_source.type == "github_project" and not (cfg.task_source.owner and cfg.task_source.project):
         errors.append("GitHub project task source requires task_source.owner and task_source.project.")
+    if cfg.task_source.type == "linear" and not cfg.task_source.team:
+        errors.append("Linear task source requires task_source.team.")
     if cfg.task_source.type == "custom" and not (cfg.task_source.source_name and cfg.task_source.payload):
         errors.append("Custom task source requires task_source.source_name and task_source.payload.")
     if cfg.provider.fallback_model and not cfg.provider.fallback_provider:

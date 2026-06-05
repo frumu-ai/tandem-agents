@@ -35,6 +35,19 @@ from src.tandem_agents.core.integrations.github_mcp import (
     list_pull_requests,
     update_project_item_status,
 )
+from src.tandem_agents.core.integrations.linear_mcp import (
+    build_linear_comment_body,
+    ensure_linear_mcp_connected,
+    ensure_linear_mcp_disconnected,
+    get_mcp_server as get_linear_mcp_server,
+    linear_add_comment,
+    linear_mcp_scope,
+    linear_mcp_server_name,
+    linear_remote_sync_mode,
+    linear_status_name_for_outcome,
+    linear_status_name_for_task_state,
+    linear_update_issue,
+)
 from src.tandem_agents.core.repository.repository import repository_binding_issues
 from src.tandem_agents.core.task_contract import task_contract_payload
 from src.tandem_agents.core.scheduling.outbox_dispatcher import dispatch_outbox_tick
@@ -658,6 +671,133 @@ def _record_github_warning(
         write_blackboard_snapshot(layout["run_dir"], blackboard)
 
 
+def _init_linear_mcp_status(
+    status: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    scope: str,
+    remote_sync: str,
+) -> dict[str, Any]:
+    status["linear_mcp"] = {
+        "server": "",
+        "scope": scope,
+        "remote_sync": remote_sync,
+        "connected": None,
+        "last_action": "initialized",
+        "warnings": [],
+    }
+    write_status(layout["status"], status)
+    return status
+
+
+def _update_linear_mcp_status(
+    status: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    connected: bool | None,
+    last_action: str,
+    warning: str | None = None,
+    server: str = "",
+) -> dict[str, Any]:
+    linear_state = status.setdefault(
+        "linear_mcp",
+        {"server": "", "scope": "none", "remote_sync": "off", "connected": None, "last_action": "initialized", "warnings": []},
+    )
+    if server:
+        linear_state["server"] = server
+    linear_state["connected"] = connected
+    linear_state["last_action"] = last_action
+    if warning:
+        linear_state.setdefault("warnings", []).append(warning)
+    write_status(layout["status"], status)
+    return status
+
+
+def _record_linear_warning(
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status: dict[str, Any],
+    blackboard: dict[str, Any] | None,
+    message: str,
+) -> None:
+    append_event(layout["events"], "linear_mcp.warning", run_id, {"message": message})
+    _update_linear_mcp_status(status, layout, connected=None, last_action="warning", warning=message)
+    if blackboard is not None:
+        _append_blackboard_note(blackboard, f"Linear MCP warning: {message}")
+        save_blackboard(layout["blackboard"], blackboard)
+        write_blackboard_snapshot(layout["run_dir"], blackboard)
+
+
+def _connect_linear_for_phase(
+    *,
+    cfg: ResolvedConfig,
+    run_id: str,
+    layout: dict[str, Path],
+    status: dict[str, Any] | None,
+    blackboard: dict[str, Any] | None,
+    event_type: str,
+    required: bool,
+) -> bool:
+    server_name = linear_mcp_server_name(cfg)
+    try:
+        ensure_linear_mcp_connected(cfg)
+    except Exception as exc:
+        if required:
+            raise
+        if status is not None:
+            _record_linear_warning(
+                run_id=run_id,
+                layout=layout,
+                status=status,
+                blackboard=blackboard,
+                message=str(exc),
+            )
+        return False
+    append_event(layout["events"], event_type, run_id, {"connected": True, "server": server_name})
+    if status is not None:
+        _update_linear_mcp_status(status, layout, connected=True, last_action=event_type, server=server_name)
+    if blackboard is not None:
+        _append_blackboard_note(blackboard, f"Linear MCP connected for phase `{event_type}`.")
+        save_blackboard(layout["blackboard"], blackboard)
+        write_blackboard_snapshot(layout["run_dir"], blackboard)
+    return True
+
+
+def _disconnect_linear_for_coding(
+    *,
+    cfg: ResolvedConfig,
+    run_id: str,
+    layout: dict[str, Path],
+    status: dict[str, Any] | None,
+    blackboard: dict[str, Any] | None,
+    event_type: str,
+) -> None:
+    server_name = linear_mcp_server_name(cfg)
+    server = get_linear_mcp_server(cfg, server_name)
+    if not server or not server.get("connected"):
+        return
+    try:
+        ensure_linear_mcp_disconnected(cfg)
+    except Exception as exc:
+        if status is not None:
+            _record_linear_warning(
+                run_id=run_id,
+                layout=layout,
+                status=status,
+                blackboard=blackboard,
+                message=str(exc),
+            )
+        return
+    append_event(layout["events"], event_type, run_id, {"connected": False, "server": server_name})
+    if status is not None:
+        _update_linear_mcp_status(status, layout, connected=False, last_action=event_type, server=server_name)
+    if blackboard is not None:
+        _append_blackboard_note(blackboard, f"Linear MCP disconnected for phase `{event_type}`.")
+        save_blackboard(layout["blackboard"], blackboard)
+        write_blackboard_snapshot(layout["run_dir"], blackboard)
+
+
 def _connect_github_for_phase(
     *,
     cfg: ResolvedConfig,
@@ -799,6 +939,231 @@ def _sync_github_claim_status(
     write_blackboard_snapshot(layout["run_dir"], blackboard)
 
 
+def _linear_update_fields_for_status(cfg: ResolvedConfig, target_status: str, labels: list[str] | None = None) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "status": target_status,
+        "state": target_status,
+        "state_name": target_status,
+    }
+    clean_labels = [str(label).strip() for label in (labels or []) if str(label).strip()]
+    if clean_labels:
+        fields["labels"] = clean_labels
+        fields["label_names"] = clean_labels
+    return fields
+
+
+def _sync_linear_claim_status(
+    *,
+    cfg: ResolvedConfig,
+    task: dict[str, Any],
+    run_id: str,
+    layout: dict[str, Path],
+    status: dict[str, Any],
+    blackboard: dict[str, Any],
+    remote_sync: str,
+    coordination: CoordinationStore | None = None,
+) -> None:
+    if remote_sync == "off":
+        return
+    target_status = linear_status_name_for_task_state(cfg, "active")
+    labels = [cfg.linear_mcp.claim_label] if str(cfg.linear_mcp.claim_label or "").strip() else []
+    if coordination is not None:
+        coordination.enqueue_outbox(
+            kind="linear_issue.status_update",
+            aggregate_type="task",
+            aggregate_id=str(task.get("task_id") or run_id),
+            payload={
+                "run_id": run_id,
+                "target_status": target_status,
+                "labels": labels,
+                "task": task,
+            },
+            dedupe_key=f"{run_id}:linear:claim",
+        )
+        summary = _dispatch_outbox_now(cfg, coordination, limit=25)
+        terminal_failure = False
+        for result in summary.get("items") or []:
+            payload = dict(result.get("payload") or {})
+            if str(payload.get("run_id") or "") != run_id:
+                continue
+            if str(result.get("kind") or "") != "linear_issue.status_update":
+                continue
+            if str(result.get("status") or "").strip().lower() != "dispatched":
+                terminal_failure = terminal_failure or bool(result.get("terminal"))
+                continue
+            append_event(layout["events"], "linear_issue.status_updated", run_id, {"status": payload.get("target_status") or target_status})
+            _append_blackboard_note(blackboard, f"Linear issue status updated to `{payload.get('target_status') or target_status}`.")
+        if terminal_failure:
+            _record_linear_warning(
+                run_id=run_id,
+                layout=layout,
+                status=status,
+                blackboard=blackboard,
+                message="Linear claim status could not be dispatched from the outbox.",
+            )
+        return
+    warning = linear_update_issue(cfg, task, _linear_update_fields_for_status(cfg, target_status, labels))
+    if warning:
+        _record_linear_warning(run_id=run_id, layout=layout, status=status, blackboard=blackboard, message=warning)
+        return
+    append_event(layout["events"], "linear_issue.status_updated", run_id, {"status": target_status})
+    _append_blackboard_note(blackboard, f"Linear issue status updated to `{target_status}`.")
+    save_blackboard(layout["blackboard"], blackboard)
+    write_blackboard_snapshot(layout["run_dir"], blackboard)
+
+
+def _finalize_linear_sync(
+    *,
+    cfg: ResolvedConfig,
+    task: dict[str, Any],
+    run_id: str,
+    layout: dict[str, Path],
+    status: dict[str, Any],
+    blackboard: dict[str, Any] | None,
+    outcome: str,
+    summary: str,
+    diff_snapshot: str | None = None,
+    review_returncode: int | None = None,
+    test_returncode: int | None = None,
+    coordination: CoordinationStore | None = None,
+) -> bool:
+    source_type = str((task.get("source") or {}).get("type") or cfg.task_source.type)
+    remote_sync = linear_remote_sync_mode(cfg, source_type)
+    scope = linear_mcp_scope(cfg, source_type)
+    if remote_sync == "off" or scope not in {"intake_finalize", "always"}:
+        return False
+    target_status = linear_status_name_for_outcome(cfg, outcome)
+    labels: list[str] = []
+    if outcome == "completed" and str(cfg.linear_mcp.done_label or "").strip():
+        labels.append(cfg.linear_mcp.done_label)
+    elif outcome != "completed" and str(cfg.linear_mcp.blocked_label or "").strip():
+        labels.append(cfg.linear_mcp.blocked_label)
+    if coordination is not None:
+        coordination.enqueue_outbox(
+            kind="linear_issue.status_update",
+            aggregate_type="task",
+            aggregate_id=str(task.get("task_id") or run_id),
+            payload={
+                "run_id": run_id,
+                "outcome": outcome,
+                "summary": summary,
+                "target_status": target_status,
+                "labels": labels,
+                "task": task,
+            },
+            dedupe_key=f"{run_id}:linear:finalize-status",
+        )
+        if remote_sync in {"status_comment", "rich"}:
+            comment_body = build_linear_comment_body(
+                run_id=run_id,
+                task_title=task.get("title") or "Linear task",
+                outcome=outcome,
+                summary=summary,
+                diff_snapshot=diff_snapshot,
+                review_returncode=review_returncode,
+                test_returncode=test_returncode,
+            )
+            coordination.enqueue_outbox(
+                kind="linear_issue.comment",
+                aggregate_type="task",
+                aggregate_id=str(task.get("task_id") or run_id),
+                payload={
+                    "run_id": run_id,
+                    "outcome": outcome,
+                    "summary": summary,
+                    "diff_snapshot": diff_snapshot,
+                    "review_returncode": review_returncode,
+                    "test_returncode": test_returncode,
+                    "body": comment_body,
+                    "task": task,
+                },
+                dedupe_key=f"{run_id}:linear:finalize-comment",
+            )
+        summary_result = _dispatch_outbox_now(cfg, coordination, limit=25)
+        terminal_failure = False
+        for result in summary_result.get("items") or []:
+            payload = dict(result.get("payload") or {})
+            if str(payload.get("run_id") or "") != run_id:
+                continue
+            kind = str(result.get("kind") or "").strip()
+            if str(result.get("status") or "").strip().lower() != "dispatched":
+                terminal_failure = terminal_failure or bool(result.get("terminal"))
+                continue
+            if kind == "linear_issue.status_update":
+                status_name = payload.get("target_status") or target_status
+                append_event(layout["events"], "linear_issue.status_updated", run_id, {"status": status_name})
+                if blackboard is not None:
+                    _append_blackboard_note(blackboard, f"Linear issue status updated to `{status_name}`.")
+            elif kind == "linear_issue.comment":
+                append_event(layout["events"], "linear_issue.comment_added", run_id, {"outcome": outcome})
+                if blackboard is not None:
+                    _append_blackboard_note(blackboard, "Linear issue summary comment added.")
+        if terminal_failure:
+            _record_linear_warning(
+                run_id=run_id,
+                layout=layout,
+                status=status,
+                blackboard=blackboard,
+                message="Linear finalize sync could not be fully dispatched from the outbox.",
+            )
+        if blackboard is not None:
+            _append_blackboard_note(blackboard, "Linear sync enqueued through the coordination outbox.")
+            save_blackboard(layout["blackboard"], blackboard)
+            write_blackboard_snapshot(layout["run_dir"], blackboard)
+        if scope != "always":
+            _disconnect_linear_for_coding(
+                cfg=cfg,
+                run_id=run_id,
+                layout=layout,
+                status=status,
+                blackboard=blackboard,
+                event_type="linear_mcp.disconnected_after_finalize",
+            )
+        return terminal_failure
+    if not _connect_linear_for_phase(
+        cfg=cfg,
+        run_id=run_id,
+        layout=layout,
+        status=status,
+        blackboard=blackboard,
+        event_type="linear_mcp.connected_for_finalize",
+        required=False,
+    ):
+        return False
+    warning = linear_update_issue(cfg, task, _linear_update_fields_for_status(cfg, target_status, labels))
+    if warning:
+        _record_linear_warning(run_id=run_id, layout=layout, status=status, blackboard=blackboard, message=warning)
+        return False
+    if remote_sync in {"status_comment", "rich"}:
+        comment_body = build_linear_comment_body(
+            run_id=run_id,
+            task_title=task.get("title") or "Linear task",
+            outcome=outcome,
+            summary=summary,
+            diff_snapshot=diff_snapshot,
+            review_returncode=review_returncode,
+            test_returncode=test_returncode,
+        )
+        comment_warning = linear_add_comment(cfg, task, comment_body)
+        if comment_warning:
+            _record_linear_warning(run_id=run_id, layout=layout, status=status, blackboard=blackboard, message=comment_warning)
+    append_event(layout["events"], "linear_issue.status_updated", run_id, {"status": target_status})
+    if blackboard is not None:
+        _append_blackboard_note(blackboard, f"Linear issue status updated to `{target_status}`.")
+        save_blackboard(layout["blackboard"], blackboard)
+        write_blackboard_snapshot(layout["run_dir"], blackboard)
+    if scope != "always":
+        _disconnect_linear_for_coding(
+            cfg=cfg,
+            run_id=run_id,
+            layout=layout,
+            status=status,
+            blackboard=blackboard,
+            event_type="linear_mcp.disconnected_after_finalize",
+        )
+    return False
+
+
 def _finalize_github_sync(
     *,
     cfg: ResolvedConfig,
@@ -826,6 +1191,21 @@ def _finalize_github_sync(
     task is already in a non-completion state.
     """
     source_type = str((task.get("source") or {}).get("type") or cfg.task_source.type)
+    if source_type == "linear":
+        return _finalize_linear_sync(
+            cfg=cfg,
+            task=task,
+            run_id=run_id,
+            layout=layout,
+            status=status,
+            blackboard=blackboard,
+            outcome=outcome,
+            summary=summary,
+            diff_snapshot=diff_snapshot,
+            review_returncode=review_returncode,
+            test_returncode=test_returncode,
+            coordination=coordination,
+        )
     remote_sync = github_remote_sync_mode(cfg, source_type)
     scope = github_mcp_scope(cfg, source_type)
     if remote_sync == "off" or scope not in {"intake_finalize", "always"}:

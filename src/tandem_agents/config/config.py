@@ -3,6 +3,7 @@ from __future__ import annotations
 from src.tandem_agents.config.config_loader import print_json, resolve_config, validate_config
 from src.tandem_agents.config.config_types import (
     AgentConfig,
+    LinearMcpConfig,
     OutputConfig,
     ProviderConfig,
     RepositoryConfig,
@@ -30,6 +31,7 @@ from src.tandem_agents.config.config_types import (
 
 __all__ = [
     "AgentConfig",
+    "LinearMcpConfig",
     "OutputConfig",
     "ProviderConfig",
     "RepositoryConfig",

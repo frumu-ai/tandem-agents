@@ -761,13 +761,10 @@ async def sync_project_repo(slug: str, token: str = Depends(get_token)):
 async def get_project_board(slug: str, refresh: bool = False, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     _, cfg = _project_config(root, slug)
-    from src.tandem_agents.runtime.task_sources import github_project_board_snapshot
-
-    if str(cfg.task_source.type or "").strip() != "github_project":
-        raise HTTPException(status_code=400, detail="Project is not configured with a GitHub Project task source")
+    from src.tandem_agents.runtime.task_sources import task_source_board_snapshot
 
     try:
-        snapshot = await asyncio.to_thread(github_project_board_snapshot, cfg, force_refresh=refresh)
+        snapshot = await asyncio.to_thread(task_source_board_snapshot, cfg, force_refresh=refresh)
         snapshot["project_slug"] = slug
         snapshot["task_source_type"] = cfg.task_source.type
         return snapshot
@@ -796,20 +793,23 @@ async def list_runs(token: str = Depends(get_token)):
     return {"runs": _list_run_snapshots(cfg)}
 
 
-def _scheduler_filtered_github_items(root: Path, project_slug: Optional[str], items: list[str]) -> list[str]:
+def _scheduler_filtered_source_items(root: Path, project_slug: Optional[str], items: list[str]) -> list[str]:
     _, cfg = _project_config(root, project_slug) if project_slug else (None, resolve_config(root))
-    if str(cfg.task_source.type or "").strip() != "github_project":
+    source_type = str(cfg.task_source.type or "").strip()
+    if source_type not in {"github_project", "linear"}:
         return items
 
-    from src.tandem_agents.runtime.task_sources import github_project_board_snapshot
+    from src.tandem_agents.runtime.task_sources import task_source_board_snapshot
 
-    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+    snapshot = task_source_board_snapshot(cfg, force_refresh=True)
     requested = set(items)
 
     def matches_requested(row: dict[str, Any]) -> bool:
         haystacks = {
             str(row.get("id") or ""),
             str(row.get("project_item_id") or ""),
+            str(row.get("issue_id") or ""),
+            str(row.get("identifier") or ""),
             str(row.get("issue_number") or ""),
             str(row.get("issue_url") or ""),
             str(row.get("title") or ""),
@@ -817,7 +817,7 @@ def _scheduler_filtered_github_items(root: Path, project_slug: Optional[str], it
         return any(item == hay or (item and item in hay) for item in requested for hay in haystacks if hay)
 
     scheduled_items = [
-        str(row.get("project_item_id") or row.get("id") or "").strip()
+        str(row.get("identifier") or row.get("project_item_id") or row.get("issue_id") or row.get("id") or "").strip()
         for row in snapshot.get("items", [])
         if matches_requested(row) and row.get("actionable") is True
     ]
@@ -826,7 +826,7 @@ def _scheduler_filtered_github_items(root: Path, project_slug: Optional[str], it
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "No selected GitHub Project items are currently scheduler-actionable.",
+                "message": "No selected task-source items are currently scheduler-actionable.",
                 "scheduler": snapshot.get("scheduler") or {},
             },
         )
@@ -838,7 +838,7 @@ async def trigger_run(project_slug: Optional[str] = None, task_source_type: Opti
     root = Path(os.environ.get("ACA_ROOT", "."))
     if item:
         try:
-            item = _scheduler_filtered_github_items(root, project_slug, [str(item).strip()])[0]
+            item = _scheduler_filtered_source_items(root, project_slug, [str(item).strip()])[0]
         except HTTPException:
             raise
         except Exception as exc:
@@ -872,7 +872,7 @@ async def trigger_runs_batch(
 
     if respect_scheduler:
         try:
-            items = _scheduler_filtered_github_items(root, project_slug, items)
+            items = _scheduler_filtered_source_items(root, project_slug, items)
         except HTTPException:
             raise
         except Exception as exc:

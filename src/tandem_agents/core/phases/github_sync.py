@@ -1,4 +1,4 @@
-"""phases/github_sync.py -- GitHub MCP connect/disconnect/claim/finalize.
+"""phases/github_sync.py -- Source MCP connect/disconnect/claim/finalize.
 
 This module owns the GitHub MCP lifecycle within a coding run:
 - ``connect_for_intake``   -- Connect before task normalization
@@ -60,6 +60,18 @@ def disconnect_for_coding(ctx: RunContext) -> None:
         return
     from src.tandem_agents.core.execution import runner_core as _rc
 
+    if ctx.source_type == "linear":
+        _rc._disconnect_linear_for_coding(
+            cfg=ctx.cfg,
+            run_id=ctx.run_id,
+            layout=ctx.layout,
+            status=ctx.status,
+            blackboard=ctx.blackboard,
+            event_type="linear_mcp.disconnected_for_coding",
+        )
+        logger.debug("Linear MCP disconnected for coding (run_id=%s)", ctx.run_id)
+        return
+
     _rc._disconnect_github_for_coding(
         cfg=ctx.cfg,
         run_id=ctx.run_id,
@@ -78,9 +90,23 @@ def sync_claim_status(ctx: RunContext) -> None:
 
     Mutates ctx.blackboard.
     """
+    from src.tandem_agents.core.execution import runner_core as _rc
+
+    if ctx.source_type == "linear":
+        _rc._sync_linear_claim_status(
+            cfg=ctx.cfg,
+            task=ctx.task,
+            run_id=ctx.run_id,
+            layout=ctx.layout,
+            status=ctx.status,
+            blackboard=ctx.blackboard,
+            remote_sync=ctx.remote_sync,
+            coordination=ctx.coordination,
+        )
+        logger.debug("Linear claim status synced (run_id=%s)", ctx.run_id)
+        return
     if ctx.source_type != "github_project":
         return
-    from src.tandem_agents.core.execution import runner_core as _rc
 
     _rc._sync_github_claim_status(
         cfg=ctx.cfg,

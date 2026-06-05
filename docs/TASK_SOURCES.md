@@ -30,6 +30,35 @@ Example:
 }
 ```
 
+## Linear Issue
+
+Use when the task comes from Linear. Tandem resolves this source through the Linear MCP server connected in the Tandem control panel. ACA does not store a Linear API token; it uses the engine MCP registry and the OAuth-backed `linear` server.
+
+Required fields:
+
+- team key or team name
+
+Optional fields:
+
+- project name or id
+- statuses to treat as launchable, comma-separated
+- labels to filter intake, comma-separated
+- query text
+- item identifier, issue id, or issue URL for a specific issue
+
+Example:
+
+```json
+{
+  "type": "linear",
+  "team": "ENG",
+  "project": "Runtime",
+  "statuses": "Backlog,Todo,Triage,Ready",
+  "labels": "bug",
+  "item": "ENG-123"
+}
+```
+
 ## Kanban Board
 
 Use when the task comes from a local or persistent board file.
@@ -139,6 +168,27 @@ python3 -m src.tandem_agents.cli next-task
 ```
 
 **Fallback:** Use `kanban_board` task source to test ACA without GitHub integration.
+
+### Linear
+
+**Requirements:**
+
+- Tandem engine running and reachable from ACA
+- Tandem control panel has a connected Linear MCP server, usually named `linear`
+- Linear OAuth grants access to the selected team and project
+- `task_source.team` is set; `task_source.project`, `statuses`, `labels`, and `query` can narrow intake
+- If `task_source.item` is not set, ACA auto-picks one scheduler-approved issue from launchable statuses
+- ACA can scope Linear MCP to intake/finalize only via `ACA_LINEAR_MCP_SCOPE`
+- Finalize-time Linear status/label/comment sync is controlled by `ACA_LINEAR_REMOTE_SYNC`
+
+**How to check:**
+
+```bash
+python3 -m src.tandem_agents.cli check-engine
+python3 -m src.tandem_agents.cli next-task
+```
+
+**Fallback:** Use `kanban_board` task source to test ACA without Linear integration.
 
 ### Kanban Board
 

@@ -10,10 +10,14 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
     _collect_project_items,
     _hydrate_project_item_statuses_from_graphql,
+    _linear_status_is_actionable,
     _load_github_project_live_data,
     _select_github_project_item,
+    _select_linear_issue,
     _task_from_project,
+    _task_from_linear,
     github_project_board_snapshot,
+    linear_board_snapshot,
 )
 
 
@@ -500,6 +504,157 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
 
             self.assertEqual(token, "ghp_hosted")
             self.assertEqual(str(read_text.call_args.args[0]), "/run/secrets/github_token")
+
+
+class LinearTaskSourceTest(unittest.TestCase):
+    def _config(self, root: Path):
+        (root / "runs").mkdir(parents=True, exist_ok=True)
+        (root / "agent.yaml").write_text(
+            "\n".join(
+                [
+                    "agent:",
+                    "  name: ACA",
+                    "task_source:",
+                    "  type: linear",
+                    "  team: ENG",
+                    "  project: Runtime",
+                    "  statuses: Backlog,Todo,Triage,Ready",
+                    "repository:",
+                    "  slug: frumu-ai/tandem",
+                    "  clone_url: https://github.com/frumu-ai/tandem",
+                    "  path: /workspace/repos/tandem",
+                    "  default_branch: main",
+                    "provider:",
+                    "  id: openai",
+                    "  model: gpt-4.1-mini",
+                    "linear_mcp:",
+                    "  enabled: true",
+                    "  server: linear",
+                    "  scope: intake_finalize",
+                    "  remote_sync: rich",
+                    "swarm:",
+                    "  enabled: false",
+                    "output:",
+                    "  root: runs",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return resolve_config(root)
+
+    def test_linear_selection_prefers_configured_actionable_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issues = [
+                {"id": "lin-1", "identifier": "ENG-1", "title": "Started", "state": {"name": "In Progress", "type": "started"}},
+                {"id": "lin-2", "identifier": "ENG-2", "title": "Ready", "state": {"name": "Todo", "type": "unstarted"}},
+            ]
+
+            chosen, eligible, warning = _select_linear_issue(cfg, issues=issues)
+
+            self.assertTrue(eligible)
+            self.assertIsNone(warning)
+            self.assertEqual(chosen["identifier"], "ENG-2")
+
+    def test_linear_status_mapping_matches_tandem_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.statuses = ""
+
+            expected = {
+                "Backlog": True,
+                "Todo": True,
+                "In Progress": False,
+                "In Review": False,
+                "Done": False,
+                "Canceled": False,
+            }
+
+            for status_name, actionable in expected.items():
+                with self.subTest(status=status_name):
+                    self.assertEqual(_linear_status_is_actionable(cfg, status_name), actionable)
+
+    def test_linear_selection_reports_no_eligible_issue_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issues = [
+                {"id": "lin-1", "identifier": "ENG-1", "title": "Started", "state": {"name": "In Progress", "type": "started"}},
+                {"id": "lin-2", "identifier": "ENG-2", "title": "Done", "state": {"name": "Done", "type": "completed"}},
+            ]
+
+            with self.assertRaisesRegex(RuntimeError, "No actionable Linear issues.*(Done.*In Progress|In Progress.*Done)"):
+                _select_linear_issue(cfg, issues=issues)
+
+    def test_linear_board_snapshot_marks_only_scheduler_next_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issues = [
+                {"id": "lin-1", "identifier": "ENG-1", "title": "Second", "priority": 3, "state": {"name": "Todo", "type": "unstarted"}},
+                {"id": "lin-2", "identifier": "ENG-2", "title": "First", "priority": 1, "state": {"name": "Backlog", "type": "backlog"}},
+            ]
+            statuses = [
+                {"id": "st-1", "name": "Backlog", "type": "backlog"},
+                {"id": "st-2", "name": "Todo", "type": "unstarted"},
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=(statuses, [], issues),
+            ):
+                snapshot = linear_board_snapshot(cfg, force_refresh=True)
+
+            by_identifier = {item["identifier"]: item for item in snapshot["items"]}
+            self.assertTrue(by_identifier["ENG-2"]["actionable"])
+            self.assertEqual(by_identifier["ENG-2"]["launch_state"], "next")
+            self.assertFalse(by_identifier["ENG-1"]["actionable"])
+            self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
+
+    def test_linear_task_carries_repo_and_issue_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "Make Linear intake work\n- Add tests",
+                "url": "https://linear.app/acme/issue/ENG-2/fix-runtime",
+                "state": {"name": "Todo", "type": "unstarted"},
+                "stateId": "ignored",
+                "team": "ENG",
+                "teamId": "team-1",
+                "project": "Runtime",
+                "projectId": "project-1",
+                "labels": [{"name": "bug"}],
+            }
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=([{"name": "Todo", "type": "unstarted"}], [], [issue]),
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+
+            self.assertEqual(task["source"]["type"], "linear")
+            self.assertEqual(task["source"]["team"], "ENG")
+            self.assertEqual(task["source"]["team_id"], "team-1")
+            self.assertEqual(task["source"]["project_id"], "project-1")
+            self.assertEqual(task["source"]["identifier"], "ENG-2")
+            self.assertEqual(task["source"]["issue_id"], "lin-2")
+            self.assertEqual(task["source"]["status_id"], "ignored")
+            self.assertEqual(task["source"]["initial_status_key"], "todo")
+            self.assertEqual(task["repo"]["slug"], "frumu-ai/tandem")
+            self.assertIn("Add tests", task["acceptance_criteria"])
+
+    def test_linear_task_source_reports_connector_failure_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                side_effect=RuntimeError("Linear MCP server 'linear' is not configured"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Could not read Linear issues.*connected Linear MCP path.*ENG"):
+                    _task_from_linear(cfg)
 
 
 if __name__ == "__main__":

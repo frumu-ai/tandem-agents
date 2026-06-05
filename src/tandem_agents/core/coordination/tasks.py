@@ -38,6 +38,11 @@ class CoordinationTasksMixin:
             issue_number = _nonempty(source.get("issue_number"))
             project_item_id = _nonempty(source.get("project_item_id")) or _nonempty(source.get("item_id"))
             ref = f"{owner}/{project}:{project_item_id or issue_number or task_id or slugify(task.get('title', 'task'))}"
+        elif source_type == "linear":
+            team = _nonempty(source.get("team"))
+            project = _nonempty(source.get("project")) or _nonempty(source.get("project_name"))
+            issue_id = _nonempty(source.get("issue_id")) or _nonempty(source.get("identifier"))
+            ref = f"{team}/{project or 'issues'}:{issue_id or task_id or slugify(task.get('title', 'task'))}"
         elif source_type == "kanban_board":
             board_path = _nonempty(source.get("board_path")) or _nonempty(source.get("path"))
             ref = f"{board_path}:{task_id or slugify(task.get('title', 'task'))}"
