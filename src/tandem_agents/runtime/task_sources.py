@@ -1128,6 +1128,44 @@ def _linear_issue_project_name(issue: dict[str, Any], fallback: str = "") -> str
     return fallback
 
 
+def _linear_issue_project_id(issue: dict[str, Any]) -> str:
+    for key in ("project_id", "projectId", "project"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            text = _linear_text(value.get("id"))
+        else:
+            text = _linear_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _linear_issue_team_id(issue: dict[str, Any]) -> str:
+    for key in ("team_id", "teamId", "team"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            text = _linear_text(value.get("id"))
+        else:
+            text = _linear_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _linear_issue_status_id(issue: dict[str, Any]) -> str:
+    for key in ("state_id", "stateId", "status_id", "statusId", "workflow_state_id", "workflowStateId"):
+        text = _linear_text(issue.get(key))
+        if text:
+            return text
+    for key in ("state", "status", "workflow_state", "workflowState"):
+        value = issue.get(key)
+        if isinstance(value, dict):
+            text = _linear_text(value.get("id"))
+            if text:
+                return text
+    return ""
+
+
 def _linear_issue_priority(issue: dict[str, Any]) -> int | None:
     value = issue.get("priority")
     if isinstance(value, dict):
@@ -1183,7 +1221,11 @@ def _linear_issue_to_task(
     issue_url = _linear_issue_url(issue)
     status_name = _linear_issue_status(issue)
     status_key = normalize_linear_key(status_name) or "unknown"
+    state_type = _linear_issue_state_type(issue)
     project_name = _linear_issue_project_name(issue, cfg.task_source.project)
+    project_id = _linear_issue_project_id(issue)
+    team_id = _linear_issue_team_id(issue)
+    status_id = _linear_issue_status_id(issue)
     repo_binding = {
         "path": str(cfg.repository_path() or ""),
         "slug": str(cfg.repository.slug or ""),
@@ -1205,15 +1247,20 @@ def _linear_issue_to_task(
             "source": {
                 "type": "linear",
                 "team": cfg.task_source.team,
+                "team_id": team_id,
                 "project": cfg.task_source.project,
+                "project_id": project_id,
                 "project_name": project_name,
                 "project_column": status_name,
                 "item": identifier or issue_id,
                 "url": issue_url or cfg.task_source.url,
                 "status": status_name,
                 "status_key": status_key,
-                "state_type": _linear_issue_state_type(issue),
+                "status_id": status_id,
+                "state_type": state_type,
+                "state_type_key": normalize_linear_key(state_type),
                 "initial_status_name": status_name,
+                "initial_status_key": status_key,
                 "issue_id": issue_id,
                 "identifier": identifier,
                 "issue_url": issue_url,

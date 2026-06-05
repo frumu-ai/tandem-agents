@@ -300,22 +300,44 @@ def linear_list_issues(
         base_args["project"] = project
     if query:
         base_args["query"] = query
-    attempts: list[dict[str, Any]] = [dict(base_args)]
-    if statuses:
-        attempts.append({**base_args, "statuses": _split_csv(statuses)})
-        attempts.append({**base_args, "status": statuses})
-    if labels:
-        attempts.append({**base_args, "labels": _split_csv(labels)})
-        attempts.append({**base_args, "label": labels})
+    status_values = _split_csv(statuses)
+    label_values = _split_csv(labels)
+    attempts: list[dict[str, Any]] = []
     if statuses or labels:
         combined = dict(base_args)
         if statuses:
-            combined["statuses"] = _split_csv(statuses)
+            combined["state"] = statuses
         if labels:
-            combined["labels"] = _split_csv(labels)
-        attempts.insert(0, combined)
-    last_error: Exception | None = None
+            combined["label"] = labels
+        attempts.append(combined)
+    if statuses and labels:
+        attempts.extend(
+            [
+                {**base_args, "state": statuses, "label": labels},
+                {**base_args, "status": statuses, "label": labels},
+                {**base_args, "statuses": status_values, "labels": label_values},
+            ]
+        )
+    if statuses:
+        attempts.append({**base_args, "state": statuses})
+        attempts.append({**base_args, "status": statuses})
+        attempts.append({**base_args, "statuses": status_values})
+    if labels:
+        attempts.append({**base_args, "label": labels})
+        attempts.append({**base_args, "labels": label_values})
+    attempts.append(dict(base_args))
+
+    deduped_attempts: list[dict[str, Any]] = []
+    seen_attempts: set[str] = set()
     for args in attempts:
+        key = json.dumps(args, sort_keys=True, default=str)
+        if key in seen_attempts:
+            continue
+        seen_attempts.add(key)
+        deduped_attempts.append(args)
+
+    last_error: Exception | None = None
+    for args in deduped_attempts:
         try:
             result = _execute_linear_tool(cfg, ["list_issues", "issues"], args)
         except Exception as exc:
