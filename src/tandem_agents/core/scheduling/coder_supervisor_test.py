@@ -32,6 +32,10 @@ def _config(root: Path, *, review_policy: str = "human_review"):
             github_mcp:
               scope: none
               remote_sync: off
+            linear_mcp:
+              enabled: true
+              scope: intake_finalize
+              remote_sync: rich
             review:
               policy: {review_policy}
               auto_merge_strategy: squash
@@ -166,6 +170,71 @@ class CoderSupervisorTest(unittest.TestCase):
             status = load_status(cfg.output_root() / "run-1" / "status.json")
             self.assertEqual(status["run"]["status"], "completed")
             self.assertEqual((store.get_run("run-1") or {})["status"], "completed")
+
+    def test_linear_completed_coder_run_enqueues_review_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_active_coder_run(
+                cfg,
+                store,
+                source={
+                    "type": "linear",
+                    "issue_id": "lin-122",
+                    "identifier": "TAN-122",
+                    "team": "Tandem",
+                },
+            )
+
+            coder_result = {
+                "coder_run": {"coder_run_id": "run-1", "status": "completed", "phase": "handoff"},
+                "run": {"status": "completed", "phase": "handoff"},
+                "status": "completed",
+                "phase": "handoff",
+                "artifacts": [],
+            }
+            result = coder_supervisor.apply_coder_result(cfg, store, run_id="run-1", coder_result=coder_result)
+
+            self.assertTrue(result["terminal"])
+            rows = store.list_pending_outbox()
+            self.assertEqual([row["kind"] for row in rows], ["linear_issue.status_update"])
+            payload = rows[0]["payload"]
+            self.assertEqual(payload["target_status"], "In Review")
+            self.assertEqual(payload["labels"], [])
+            self.assertEqual(payload["task"]["source"]["identifier"], "TAN-122")
+
+    def test_linear_blocked_coder_run_enqueues_blocked_status_and_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_active_coder_run(
+                cfg,
+                store,
+                source={
+                    "type": "linear",
+                    "issue_id": "lin-122",
+                    "identifier": "TAN-122",
+                    "team": "Tandem",
+                },
+            )
+
+            coder_result = {
+                "coder_run": {"coder_run_id": "run-1", "status": "blocked", "phase": "coding"},
+                "run": {"status": "blocked", "phase": "coding", "last_error": "tests failed"},
+                "status": "blocked",
+                "phase": "coding",
+                "last_error": "tests failed",
+                "artifacts": [],
+            }
+            result = coder_supervisor.apply_coder_result(cfg, store, run_id="run-1", coder_result=coder_result)
+
+            self.assertEqual(result["status"], "blocked")
+            rows = store.list_pending_outbox()
+            self.assertEqual([row["kind"] for row in rows], ["linear_issue.status_update", "linear_issue.comment"])
+            self.assertEqual(rows[0]["payload"]["target_status"], "Blocked")
+            self.assertEqual(rows[0]["payload"]["labels"], ["aca-blocked"])
+            self.assertIn("tests failed", rows[1]["payload"]["body"])
+            self.assertIn("Next expected action", rows[1]["payload"]["body"])
 
     def test_poll_error_does_not_block_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,6 +415,59 @@ class CoderSupervisorTest(unittest.TestCase):
             self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "merged")
             self.assertTrue(blackboard["pull_request_lifecycle"]["branch_deleted"])
             self.assertEqual(run_meta["pull_request_merge"]["strategy"], "squash")
+
+    def test_linear_ready_to_merge_auto_merge_enqueues_done_status_and_merge_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp), review_policy="auto_merge")
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(
+                cfg,
+                store,
+                source={
+                    "type": "linear",
+                    "issue_id": "lin-122",
+                    "identifier": "TAN-122",
+                    "team": "Tandem",
+                },
+            )
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "ready-to-merge",
+                "terminal": False,
+            }
+            merge = {
+                "status": "merged",
+                "merged": True,
+                "branch_deleted": True,
+                "strategy": "squash",
+                "pull_request": refreshed,
+                "merge_result": {"merged": True},
+                "delete_result": {"deleted": True},
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "guarded_auto_merge", return_value=merge),
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            self.assertEqual(result["status"], "merged")
+            rows = store.list_pending_outbox()
+            self.assertEqual([row["kind"] for row in rows], ["linear_issue.status_update", "linear_issue.comment"])
+            self.assertEqual(rows[0]["payload"]["target_status"], "Done")
+            self.assertEqual(rows[0]["payload"]["labels"], ["aca-done"])
+            self.assertEqual(rows[0]["payload"]["merge"]["strategy"], "squash")
+            self.assertIn("https://github.com/acme/demo/pull/7", rows[1]["payload"]["body"])
+            self.assertIn("Remote branch deleted: `yes`", rows[1]["payload"]["body"])
 
 
 if __name__ == "__main__":
