@@ -385,6 +385,34 @@ def _flatten_pull_request_entries(payload: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def _flatten_review_entries(payload: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    if isinstance(payload, dict):
+        for key in ("reviews", "pullRequestReviews", "pull_request_reviews", "items", "nodes", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                entries.extend(entry for entry in value if isinstance(entry, dict))
+            elif isinstance(value, dict) and isinstance(value.get("nodes"), list):
+                entries.extend(entry for entry in value["nodes"] if isinstance(entry, dict))
+    return entries
+
+
+def _flatten_review_comment_entries(payload: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    if isinstance(payload, dict):
+        for key in ("comments", "reviewComments", "pull_request_review_comments", "items", "nodes", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                entries.extend(entry for entry in value if isinstance(entry, dict))
+            elif isinstance(value, dict) and isinstance(value.get("nodes"), list):
+                entries.extend(entry for entry in value["nodes"] if isinstance(entry, dict))
+    return entries
+
+
 def _pull_request_head_ref(pr: dict[str, Any]) -> str:
     head = pr.get("head")
     if isinstance(head, dict):
@@ -577,6 +605,21 @@ def _tool_result_payloads(result: dict[str, Any]) -> list[Any]:
         except Exception:
             pass
     return values
+
+
+def _execute_github_tool_attempts(
+    cfg: ResolvedConfig,
+    attempts: list[tuple[str, dict[str, Any]]],
+) -> list[Any]:
+    for tool, args in attempts:
+        try:
+            result = execute_engine_tool(cfg, tool, args)
+        except RuntimeError:
+            continue
+        if _tool_failed(result):
+            continue
+        return _tool_result_payloads(result)
+    return []
 
 
 def _issue_comment_marker(run_id: str) -> str:
@@ -1039,6 +1082,227 @@ def refresh_pull_request_lifecycle(cfg: ResolvedConfig, pull_request: dict[str, 
         base_branch=str(pull_request.get("base_branch") or ""),
     )
     return refreshed
+
+
+def _github_actor_name(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("login", "name", "email"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+    return str(value or "").strip()
+
+
+def _review_body(review: dict[str, Any]) -> str:
+    for key in ("body", "bodyText", "summary", "text"):
+        text = str(review.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _review_comment_body(comment: dict[str, Any]) -> str:
+    for key in ("body", "bodyText", "text"):
+        text = str(comment.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _review_comment_is_stale(comment: dict[str, Any]) -> bool:
+    for key in ("isResolved", "resolved", "outdated", "isOutdated", "stale", "isStale"):
+        value = comment.get(key)
+        if isinstance(value, bool) and value:
+            return True
+    state = normalize_status_key(str(comment.get("state") or comment.get("status") or ""))
+    return state in {"resolved", "outdated", "stale", "dismissed"}
+
+
+def _review_comment_path(comment: dict[str, Any]) -> str:
+    for key in ("path", "file", "filePath"):
+        text = str(comment.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _review_comment_line(comment: dict[str, Any]) -> int | None:
+    for key in ("line", "original_line", "originalLine", "position"):
+        try:
+            return int(comment.get(key))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _review_comment_url(comment: dict[str, Any]) -> str:
+    for key in ("html_url", "url", "web_url"):
+        text = str(comment.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _failed_checks_from_pr(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    checks = pr.get("checks") or pr.get("check_runs") or pr.get("checkSuites") or []
+    if isinstance(checks, dict):
+        checks = checks.get("nodes") or checks.get("items") or []
+    failed: list[dict[str, Any]] = []
+    if isinstance(checks, list):
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            conclusion = normalize_status_key(str(check.get("conclusion") or check.get("status") or ""))
+            if conclusion not in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"}:
+                continue
+            failed.append(
+                {
+                    "kind": "check_failure",
+                    "name": str(check.get("name") or check.get("context") or check.get("title") or "check").strip(),
+                    "state": conclusion,
+                    "summary": str(check.get("summary") or check.get("details") or check.get("output") or "").strip(),
+                    "url": str(check.get("details_url") or check.get("url") or "").strip(),
+                }
+            )
+    return failed
+
+
+def _list_pull_request_reviews(cfg: ResolvedConfig, *, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+    payloads = _execute_github_tool_attempts(
+        cfg,
+        [
+            ("mcp.github.list_pull_request_reviews", {"owner": owner, "repo": repo, "pull_number": number}),
+            ("mcp.github.list_pull_request_reviews", {"owner": owner, "repo": repo, "pullNumber": number}),
+            ("mcp.github.get_pull_request_reviews", {"owner": owner, "repo": repo, "pull_number": number}),
+            ("mcp.github.get_pull_request_reviews", {"owner": owner, "repo": repo, "pullNumber": number}),
+        ],
+    )
+    reviews: list[dict[str, Any]] = []
+    for payload in payloads:
+        reviews.extend(_flatten_review_entries(payload))
+    return reviews
+
+
+def _list_pull_request_review_comments(cfg: ResolvedConfig, *, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+    payloads = _execute_github_tool_attempts(
+        cfg,
+        [
+            ("mcp.github.list_pull_request_review_comments", {"owner": owner, "repo": repo, "pull_number": number}),
+            ("mcp.github.list_pull_request_review_comments", {"owner": owner, "repo": repo, "pullNumber": number}),
+            ("mcp.github.get_pull_request_review_comments", {"owner": owner, "repo": repo, "pull_number": number}),
+            ("mcp.github.get_pull_request_review_comments", {"owner": owner, "repo": repo, "pullNumber": number}),
+        ],
+    )
+    comments: list[dict[str, Any]] = []
+    for payload in payloads:
+        comments.extend(_flatten_review_comment_entries(payload))
+    return comments
+
+
+def collect_pull_request_repair_context(
+    cfg: ResolvedConfig,
+    pull_request: dict[str, Any],
+    *,
+    limit: int = 12,
+) -> dict[str, Any]:
+    base_repo = str(pull_request.get("base_repo") or cfg.repository.slug or "").strip()
+    number = pull_request.get("number")
+    if not base_repo or "/" not in base_repo or number in (None, ""):
+        return {
+            "actionable": False,
+            "reason": "missing_pull_request_identity",
+            "feedback_items": [],
+            "pull_request": pull_request,
+        }
+    owner, repo_name = base_repo.split("/", 1)
+    pr = get_pull_request(cfg, owner, repo_name, int(number))
+    lifecycle = normalize_pull_request_metadata(
+        pr,
+        head_branch=str(pull_request.get("head_branch") or ""),
+        base_repo=base_repo,
+        base_branch=str(pull_request.get("base_branch") or ""),
+    )
+    items: list[dict[str, Any]] = []
+    reviews = _list_pull_request_reviews(cfg, owner=owner, repo=repo_name, number=int(number))
+    for review in reviews:
+        state = normalize_status_key(str(review.get("state") or review.get("status") or ""))
+        if state not in {"changes_requested", "requested_changes"}:
+            continue
+        body = _review_body(review)
+        if not body:
+            continue
+        items.append(
+            {
+                "kind": "requested_changes",
+                "author": _github_actor_name(review.get("user") or review.get("author")),
+                "body": body,
+                "url": _review_comment_url(review),
+            }
+        )
+    comments = _list_pull_request_review_comments(cfg, owner=owner, repo=repo_name, number=int(number))
+    for comment in comments:
+        if _review_comment_is_stale(comment):
+            continue
+        body = _review_comment_body(comment)
+        if not body:
+            continue
+        items.append(
+            {
+                "kind": "review_comment",
+                "author": _github_actor_name(comment.get("user") or comment.get("author")),
+                "body": body,
+                "path": _review_comment_path(comment),
+                "line": _review_comment_line(comment),
+                "url": _review_comment_url(comment),
+            }
+        )
+    items.extend(_failed_checks_from_pr(pr))
+    bounded = items[: max(1, int(limit))]
+    return {
+        "actionable": bool(bounded),
+        "reason": "" if bounded else "no_actionable_review_feedback",
+        "pull_request": lifecycle,
+        "feedback_items": bounded,
+        "truncated": len(items) > len(bounded),
+    }
+
+
+def build_pull_request_repair_prompt(context: dict[str, Any]) -> str:
+    pull_request = dict(context.get("pull_request") or {})
+    lines = [
+        "Repair the existing pull request branch using the bounded feedback below.",
+        "",
+        f"Pull request: {pull_request.get('url') or ''}",
+        f"Branch: {pull_request.get('head_branch') or ''}",
+        f"Lifecycle: {pull_request.get('lifecycle_state') or ''}",
+        "",
+        "Feedback:",
+    ]
+    for index, item in enumerate(context.get("feedback_items") or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        location = ""
+        if item.get("path"):
+            location = str(item.get("path") or "")
+            if item.get("line") is not None:
+                location = f"{location}:{item.get('line')}"
+        prefix = f"{index}. {item.get('kind') or 'feedback'}"
+        if location:
+            prefix = f"{prefix} ({location})"
+        lines.append(prefix)
+        if item.get("name"):
+            lines.append(f"Check: {item.get('name')}")
+        if item.get("author"):
+            lines.append(f"Author: {item.get('author')}")
+        body = str(item.get("body") or item.get("summary") or "").strip()
+        if body:
+            lines.append(body[:1200])
+        if item.get("url"):
+            lines.append(f"URL: {item.get('url')}")
+        lines.append("")
+    if context.get("truncated"):
+        lines.append("Additional feedback existed but was truncated for bounded repair context.")
+    return "\n".join(lines).strip()
 
 
 def create_pull_request(
