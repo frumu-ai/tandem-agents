@@ -43,6 +43,8 @@ DEFAULT_CODER_SUPERVISOR_INTERVAL_SECONDS = 30
 DEFAULT_CODER_SUPERVISOR_BATCH_SIZE = 100
 DEFAULT_CODER_CANCEL_ON_SOURCE_TERMINAL = True
 DEFAULT_REVIEW_POLICY = "human_review"
+DEFAULT_AUTO_MERGE_STRATEGY = "squash"
+DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES = "squash"
 TASK_SOURCE_TYPES = {
     "github_project",
     "linear",
@@ -60,6 +62,7 @@ VALID_LINEAR_REMOTE_SYNC = {"off", "status", "status_comment", "rich"}
 VALID_EXECUTION_BACKENDS = {"auto", "legacy", "coder"}
 VALID_STORAGE_PROFILES = {"local", "shared"}
 VALID_REVIEW_POLICIES = {"human_review", "auto_merge"}
+VALID_MERGE_STRATEGIES = {"merge", "squash", "rebase"}
 
 
 def _nonempty(value: Any) -> Any:
@@ -246,6 +249,8 @@ class StorageConfig:
 @dataclass
 class ReviewPolicyConfig:
     policy: str = DEFAULT_REVIEW_POLICY
+    auto_merge_strategy: str = DEFAULT_AUTO_MERGE_STRATEGY
+    auto_merge_allowed_strategies: str = DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES
 
 
 @dataclass

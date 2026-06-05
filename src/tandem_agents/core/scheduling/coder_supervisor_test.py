@@ -12,11 +12,11 @@ from src.tandem_agents.core.scheduling import coder_supervisor
 from src.tandem_agents.runtime.runstate import initial_blackboard, initial_status, load_blackboard, load_status, save_blackboard, write_status
 
 
-def _config(root: Path):
+def _config(root: Path, *, review_policy: str = "human_review"):
     (root / "tandem-data").mkdir(parents=True, exist_ok=True)
     (root / "agent.yaml").write_text(
         dedent(
-            """
+            f"""
             agent:
               name: ACA
             tandem:
@@ -32,6 +32,10 @@ def _config(root: Path):
             github_mcp:
               scope: none
               remote_sync: off
+            review:
+              policy: {review_policy}
+              auto_merge_strategy: squash
+              auto_merge_allowed_strategies: squash
             output:
               root: runs
             coordination:
@@ -296,6 +300,52 @@ class CoderSupervisorTest(unittest.TestCase):
             blackboard = load_blackboard(cfg.output_root() / "run-pr" / "blackboard.yaml")
             self.assertEqual(status["pull_request_repair"]["status"], "completed")
             self.assertEqual(blackboard["pull_request_repair"]["context"]["feedback_items"][0]["path"], "src/app.py")
+
+    def test_ready_to_merge_auto_merge_persists_merge_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp), review_policy="auto_merge")
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(cfg, store)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "ready-to-merge",
+                "terminal": False,
+            }
+            merge = {
+                "status": "merged",
+                "merged": True,
+                "branch_deleted": True,
+                "strategy": "squash",
+                "pull_request": refreshed,
+                "merge_result": {"merged": True},
+                "delete_result": {"deleted": True},
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "guarded_auto_merge", return_value=merge) as auto_merge,
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            auto_merge.assert_called_once_with(cfg, refreshed)
+            self.assertEqual(result["status"], "merged")
+            self.assertTrue(result["terminal"])
+            self.assertEqual(result["merge"]["status"], "merged")
+            status = load_status(cfg.output_root() / "run-pr" / "status.json")
+            blackboard = load_blackboard(cfg.output_root() / "run-pr" / "blackboard.yaml")
+            run_meta = (store.get_run("run-pr") or {}).get("metadata") or {}
+            self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "merged")
+            self.assertTrue(blackboard["pull_request_lifecycle"]["branch_deleted"])
+            self.assertEqual(run_meta["pull_request_merge"]["strategy"], "squash")
 
 
 if __name__ == "__main__":

@@ -223,10 +223,19 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            cfg = resolve_config(root, env={"ACA_REVIEW_POLICY": "auto_merge"})
+            cfg = resolve_config(
+                root,
+                env={
+                    "ACA_REVIEW_POLICY": "auto_merge",
+                    "ACA_AUTO_MERGE_STRATEGY": "squash",
+                    "ACA_AUTO_MERGE_ALLOWED_STRATEGIES": "squash,rebase",
+                },
+            )
 
             self.assertEqual(cfg.review.policy, "auto_merge")
-            self.assertTrue(any("auto_merge" in error for error in validate_config(cfg)))
+            self.assertEqual(cfg.review.auto_merge_strategy, "squash")
+            self.assertEqual(cfg.review.auto_merge_allowed_strategies, "squash,rebase")
+            self.assertEqual(validate_config(cfg), [])
 
     def test_github_mcp_defaults_off_without_token_or_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
