@@ -100,6 +100,52 @@ response_file="$(mktemp)"
 trap 'rm -f "${payload_file}" "${response_file}"' EXIT
 printf '%s\n' "${payload}" > "${payload_file}"
 
+if [[ "${HOSTED_SKIP_IMAGE_VALIDATION:-false}" != "true" ]]; then
+  mapfile -t image_refs < <(
+    python3 - "${payload_file}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+keys = [
+    "engine_image_ref",
+    "aca_image_ref",
+    "control_panel_image_ref",
+    "proxy_image_ref",
+    "kb_image_ref",
+]
+manifest = payload.get("manifest_json") or {}
+keys_from_manifest = [
+    ("public_engine_image_ref", manifest),
+    ("public_aca_image_ref", manifest),
+]
+seen = set()
+for key in keys:
+    value = str(payload.get(key) or "").strip()
+    if value and value not in seen:
+        seen.add(value)
+        print(value)
+for key, source in keys_from_manifest:
+    value = str(source.get(key) or "").strip()
+    if value and value not in seen:
+        seen.add(value)
+        print(value)
+PY
+  )
+  missing=()
+  for image_ref in "${image_refs[@]}"; do
+    hosted::log "checking image ${image_ref}"
+    if ! docker buildx imagetools inspect "${image_ref}" >/dev/null 2>&1; then
+      missing+=("${image_ref}")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf 'Missing hosted release image(s):\n' >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    hosted::die "refusing to publish hosted release with missing image refs"
+  fi
+fi
+
 if [[ -z "${publish_base_url}" || -z "${publish_token}" ]]; then
   local_web_root="$(resolve_web_root 2>/dev/null || true)"
   if [[ -n "${local_web_root:-}" ]]; then

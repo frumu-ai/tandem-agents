@@ -67,11 +67,25 @@ if ! command -v docker >/dev/null 2>&1; then
   hosted::die "docker is required"
 fi
 docker buildx version >/dev/null 2>&1 || hosted::die "docker buildx is required"
+hosted::require npm
 
 if [[ -n "${auto_bump_part}" ]]; then
   source <("${SCRIPT_DIR}/bump-release.sh" "${auto_bump_part}")
 fi
 source <("${SCRIPT_DIR}/release-manifest.sh")
+
+preflight_npm_package() {
+  local package_name="$1"
+  local package_version="$2"
+
+  hosted::log "checking npm package ${package_name}@${package_version}"
+  npm view "${package_name}@${package_version}" version >/dev/null 2>&1 || hosted::die \
+    "npm package not found or inaccessible: ${package_name}@${package_version}. Publish it first or choose an existing version."
+}
+
+preflight_npm_package "@frumu/tandem" "${HOSTED_TANDEM_ENGINE_RELEASE_VERSION}"
+preflight_npm_package "@frumu/tandem-enterprise" "${HOSTED_TANDEM_ENGINE_RELEASE_VERSION}"
+preflight_npm_package "@frumu/tandem-panel" "${HOSTED_TANDEM_CONTROL_PANEL_RELEASE_VERSION}"
 
 public_engine_image_repository="${HOSTED_PUBLIC_ENGINE_IMAGE_REPOSITORY:-${HOSTED_PUBLIC_ENGINE_IMAGE%:*}}"
 public_aca_image_repository="${HOSTED_PUBLIC_ACA_IMAGE_REPOSITORY:-${HOSTED_PUBLIC_ACA_IMAGE%:*}}"
