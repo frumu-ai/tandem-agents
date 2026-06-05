@@ -10,7 +10,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     build_issue_comment_body,
     ensure_github_mcp_connected,
     ensure_github_mcp_disconnected,
-    create_pull_request,
+    create_pull_request_metadata,
     update_project_item_status,
 )
 from src.tandem_agents.core.integrations.linear_mcp import (
@@ -131,7 +131,8 @@ def _dispatch_pull_request_create(cfg: ResolvedConfig, outbox: dict[str, Any]) -
             "terminal": True,
             "error": "Outbox payload missing PR head branch or title.",
         }
-    pr_url = create_pull_request(cfg, task, head_branch=head_branch, title=title, body=body)
+    pull_request = create_pull_request_metadata(cfg, task, head_branch=head_branch, title=title, body=body)
+    pr_url = str(pull_request.get("url") or "").strip()
     if pr_url is None or str(pr_url).strip() == "":
         return {
             "outbox_id": outbox.get("id"),
@@ -149,6 +150,7 @@ def _dispatch_pull_request_create(cfg: ResolvedConfig, outbox: dict[str, Any]) -
         "terminal": False,
         "error": "",
         "pr_url": pr_url,
+        "pull_request": pull_request,
     }
 
 

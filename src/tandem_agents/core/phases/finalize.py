@@ -216,7 +216,7 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
 def _enqueue_and_dispatch_pr(ctx: RunContext, final_diff_snapshot: str) -> None:
     """Enqueue a github_pull_request.create outbox event and dispatch it now."""
     from src.tandem_agents.core.execution import runner_core as _rc
-    from src.tandem_agents.runtime.runstate import append_event
+    from src.tandem_agents.runtime.runstate import append_event, write_status
 
     summary_path = ctx.layout["summary"]
     pr_body = (
@@ -248,12 +248,36 @@ def _enqueue_and_dispatch_pr(ctx: RunContext, final_diff_snapshot: str) -> None:
             continue
         pr_url = str(result.get("pr_url") or "").strip()
         if pr_url:
+            pull_request = dict(result.get("pull_request") or {})
+            if not pull_request:
+                pull_request = {
+                    "url": pr_url,
+                    "head_branch": ctx.branch_name,
+                    "base_branch": ctx.cfg.repository.default_branch or "main",
+                    "base_repo": ctx.cfg.repository.slug,
+                    "lifecycle_state": "waiting-for-review",
+                    "terminal": False,
+                }
             ctx.blackboard["pull_request"] = pr_url
+            ctx.blackboard["pull_request_lifecycle"] = pull_request
+            ctx.status["pull_request"] = pr_url
+            ctx.status["pull_request_lifecycle"] = pull_request
+            ctx.status.setdefault("task", {})["pull_request"] = pr_url
+            ctx.status["task"]["pull_request_lifecycle"] = pull_request
+            try:
+                run = ctx.coordination.get_run(ctx.run_id) or {}
+                metadata = dict(run.get("metadata") or {})
+                metadata["pull_request"] = pr_url
+                metadata["pull_request_lifecycle"] = pull_request
+                ctx.coordination.update_run(ctx.run_id, metadata=metadata)
+            except Exception:
+                logger.debug("Failed to persist PR lifecycle metadata for run %s", ctx.run_id, exc_info=True)
+            write_status(ctx.layout["status"], ctx.status)
             _rc._append_blackboard_note(ctx.blackboard, f"Created Pull Request: {pr_url}")
             append_event(
                 ctx.layout["events"],
                 "github_pull_request.created",
                 ctx.run_id,
-                {"url": pr_url},
+                {"url": pr_url, "pull_request": pull_request},
             )
             logger.info("Pull request created: %s (run_id=%s)", pr_url, ctx.run_id)

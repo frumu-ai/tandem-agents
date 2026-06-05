@@ -13,6 +13,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     github_mcp_scope,
     github_project_status_name_for_outcome,
     github_remote_sync_mode,
+    refresh_pull_request_lifecycle,
 )
 from src.tandem_agents.runtime.run_output import build_blocked_summary, save_run_text, set_status
 from src.tandem_agents.runtime.runstate import (
@@ -75,6 +76,22 @@ def _is_coder_execution(status: dict[str, Any], blackboard: dict[str, Any]) -> b
             or isinstance(blackboard.get("coder_run"), dict)
         )
     )
+
+
+def _is_pr_lifecycle_supervisable(status: dict[str, Any], blackboard: dict[str, Any]) -> bool:
+    run = status.get("run") if isinstance(status, dict) else {}
+    lifecycle = blackboard.get("pull_request_lifecycle") if isinstance(blackboard, dict) else {}
+    if not isinstance(run, dict) or not isinstance(lifecycle, dict):
+        return False
+    if _normalize_status(run.get("status")) not in {"completed", "running"}:
+        return False
+    state = str(lifecycle.get("lifecycle_state") or "").strip()
+    return bool(lifecycle.get("number")) and state in {
+        "running",
+        "waiting-for-review",
+        "needs-repair",
+        "ready-to-merge",
+    }
 
 
 def _source_task_terminal(task: dict[str, Any]) -> bool:
@@ -156,6 +173,92 @@ def _update_workspace_reference(cfg: ResolvedConfig, run_id: str, status: str) -
         )
     except Exception:
         logger.debug("Failed to update workspace run reference for %s", run_id, exc_info=True)
+
+
+def _persist_pull_request_lifecycle(
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+    pull_request: dict[str, Any],
+) -> dict[str, Any]:
+    pr_url = str(pull_request.get("url") or blackboard.get("pull_request") or status_payload.get("pull_request") or "").strip()
+    blackboard["pull_request"] = pr_url
+    blackboard["pull_request_lifecycle"] = pull_request
+    save_blackboard(layout["blackboard"], blackboard)
+    status_payload["pull_request"] = pr_url
+    status_payload["pull_request_lifecycle"] = pull_request
+    if not isinstance(status_payload.get("task"), dict):
+        status_payload["task"] = {}
+    status_payload["task"]["pull_request"] = pr_url
+    status_payload["task"]["pull_request_lifecycle"] = pull_request
+    write_status(layout["status"], status_payload)
+    run = coordination.get_run(run_id) or {}
+    metadata = dict(run.get("metadata") or {})
+    metadata["pull_request"] = pr_url
+    metadata["pull_request_lifecycle"] = pull_request
+    coordination.update_run(run_id, metadata=metadata)
+    return pull_request
+
+
+def _refresh_pr_lifecycle_for_run(
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+) -> dict[str, Any]:
+    existing = dict(
+        blackboard.get("pull_request_lifecycle")
+        or status_payload.get("pull_request_lifecycle")
+        or {}
+    )
+    if not existing:
+        return {"run_id": run_id, "status": "skipped", "reason": "missing_pull_request_lifecycle"}
+    try:
+        refreshed = refresh_pull_request_lifecycle(cfg, existing)
+    except Exception as exc:
+        message = str(exc).strip() or repr(exc)
+        failed = {
+            **existing,
+            "lifecycle_state": "blocked",
+            "terminal": True,
+            "error": message,
+            "last_checked_at_ms": now_ms(),
+        }
+        _persist_pull_request_lifecycle(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=failed,
+        )
+        append_event(layout["events"], "github_pull_request.lifecycle_refresh_failed", run_id, failed)
+        return {"run_id": run_id, "status": "blocked", "terminal": True, "pull_request": failed, "error": message}
+    refreshed["last_checked_at_ms"] = now_ms()
+    _persist_pull_request_lifecycle(
+        cfg,
+        coordination,
+        run_id=run_id,
+        layout=layout,
+        status_payload=status_payload,
+        blackboard=blackboard,
+        pull_request=refreshed,
+    )
+    append_event(layout["events"], "github_pull_request.lifecycle_refreshed", run_id, refreshed)
+    return {
+        "run_id": run_id,
+        "status": refreshed.get("lifecycle_state") or "unknown",
+        "terminal": bool(refreshed.get("terminal")),
+        "pull_request": refreshed,
+    }
 
 
 def _enqueue_github_finalize(
@@ -450,6 +553,15 @@ def reconcile_coder_run(
     status_payload = load_status(layout["status"])
     blackboard = load_blackboard(layout["blackboard"])
     if not _is_coder_execution(status_payload, blackboard) and not cancel_reason:
+        if _is_pr_lifecycle_supervisable(status_payload, blackboard):
+            return _refresh_pr_lifecycle_for_run(
+                cfg,
+                store,
+                run_id=run_id,
+                layout=layout,
+                status_payload=status_payload,
+                blackboard=blackboard,
+            )
         return {"run_id": run_id, "status": "skipped", "reason": "not_active_coder_execution"}
     coder_run_id = _coder_run_id(run_id, blackboard)
     task = status_payload.get("task") if isinstance(status_payload, dict) else {}
@@ -516,7 +628,7 @@ def list_active_coder_runs(cfg: ResolvedConfig, *, limit: int | None = None) -> 
             continue
         status_payload = load_status(run_dir / "status.json")
         blackboard = load_blackboard(run_dir / "blackboard.yaml")
-        if not _is_coder_execution(status_payload, blackboard):
+        if not _is_coder_execution(status_payload, blackboard) and not _is_pr_lifecycle_supervisable(status_payload, blackboard):
             continue
         run_meta = status_payload.get("run") if isinstance(status_payload, dict) else {}
         task = status_payload.get("task") if isinstance(status_payload, dict) else {}
