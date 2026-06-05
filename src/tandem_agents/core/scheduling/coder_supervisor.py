@@ -23,7 +23,12 @@ from src.tandem_agents.core.integrations.github_mcp import (
     guarded_auto_merge,
     refresh_pull_request_lifecycle,
 )
-from src.tandem_agents.core.integrations.linear_mcp import linear_add_comment
+from src.tandem_agents.core.integrations.linear_mcp import (
+    build_linear_comment_body,
+    linear_add_comment,
+    linear_remote_sync_mode,
+    linear_status_name_for_outcome,
+)
 from src.tandem_agents.runtime.run_output import build_blocked_summary, save_run_text, set_status
 from src.tandem_agents.runtime.runstate import (
     append_event,
@@ -198,6 +203,141 @@ def _maybe_add_linear_repair_comment(cfg: ResolvedConfig, task: dict[str, Any], 
         linear_add_comment(cfg, task, body)
     except Exception:
         logger.debug("Failed to add Linear repair comment", exc_info=True)
+
+
+def _linear_finalize_enabled(cfg: ResolvedConfig, task: dict[str, Any]) -> bool:
+    source_type = _task_source_type(task, cfg)
+    return (
+        source_type == "linear"
+        and linear_remote_sync_mode(cfg, source_type) != "off"
+        and str(cfg.linear_mcp.scope or "").strip().lower() in {"intake_finalize", "always"}
+    )
+
+
+def _linear_task_with_run_id(task: dict[str, Any], run_id: str) -> dict[str, Any]:
+    updated = dict(task)
+    if updated.get("run_id") in (None, ""):
+        updated["run_id"] = run_id
+    return updated
+
+
+def _enqueue_linear_finalize(
+    *,
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    task: dict[str, Any],
+    run_id: str,
+    outcome: str,
+    summary: str,
+) -> None:
+    if not _linear_finalize_enabled(cfg, task):
+        return
+    target_status = linear_status_name_for_outcome(cfg, outcome)
+    labels: list[str] = []
+    if outcome != "completed" and str(cfg.linear_mcp.blocked_label or "").strip():
+        labels.append(cfg.linear_mcp.blocked_label)
+    task_payload = _linear_task_with_run_id(task, run_id)
+    coordination.enqueue_outbox(
+        kind="linear_issue.status_update",
+        aggregate_type="task",
+        aggregate_id=str(task.get("task_id") or run_id),
+        payload={
+            "run_id": run_id,
+            "outcome": outcome,
+            "summary": summary,
+            "target_status": target_status,
+            "labels": labels,
+            "task": task_payload,
+        },
+        dedupe_key=f"{run_id}:linear:finalize-status",
+    )
+    remote_sync = linear_remote_sync_mode(cfg, "linear")
+    if outcome != "completed" and remote_sync in {"status_comment", "rich"}:
+        body = build_linear_comment_body(
+            run_id=run_id,
+            task_title=str(task.get("title") or "Linear task"),
+            outcome=outcome,
+            summary=(
+                f"{summary}\n\n"
+                "Next expected action: inspect the blocked ACA run, resolve the error, "
+                "and restart or repair the task before marking it complete."
+            ).strip(),
+        )
+        coordination.enqueue_outbox(
+            kind="linear_issue.comment",
+            aggregate_type="task",
+            aggregate_id=str(task.get("task_id") or run_id),
+            payload={
+                "run_id": run_id,
+                "outcome": outcome,
+                "summary": summary,
+                "body": body,
+                "task": task_payload,
+            },
+            dedupe_key=f"{run_id}:linear:finalize-comment",
+        )
+
+
+def _enqueue_linear_merge_finalize(
+    *,
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    task: dict[str, Any],
+    run_id: str,
+    pull_request: dict[str, Any],
+    merge: dict[str, Any],
+) -> None:
+    if not _linear_finalize_enabled(cfg, task) or not merge.get("merged"):
+        return
+    target_status = cfg.linear_mcp.done_status or "Done"
+    labels = [cfg.linear_mcp.done_label] if str(cfg.linear_mcp.done_label or "").strip() else []
+    task_payload = _linear_task_with_run_id(task, run_id)
+    coordination.enqueue_outbox(
+        kind="linear_issue.status_update",
+        aggregate_type="task",
+        aggregate_id=str(task.get("task_id") or run_id),
+        payload={
+            "run_id": run_id,
+            "outcome": "merged",
+            "summary": "Pull request merged by ACA guarded auto-merge.",
+            "target_status": target_status,
+            "labels": labels,
+            "task": task_payload,
+            "pull_request": pull_request,
+            "merge": merge,
+        },
+        dedupe_key=f"{run_id}:linear:merge-status",
+    )
+    if linear_remote_sync_mode(cfg, "linear") in {"status_comment", "rich"}:
+        pr_url = str(pull_request.get("url") or "").strip()
+        strategy = str(merge.get("strategy") or "").strip()
+        branch_deleted = "yes" if merge.get("branch_deleted") else "no"
+        body = "\n".join(
+            [
+                f"ACA merged the pull request for run `{run_id}` and moved this issue to `{target_status}`.",
+                "",
+                f"Pull request: {pr_url or 'unknown'}",
+                f"Merge strategy: `{strategy or 'unknown'}`",
+                f"Remote branch deleted: `{branch_deleted}`",
+                "",
+                f"<!-- aca:linear-merge:{run_id} -->",
+            ]
+        ).strip()
+        coordination.enqueue_outbox(
+            kind="linear_issue.comment",
+            aggregate_type="task",
+            aggregate_id=str(task.get("task_id") or run_id),
+            payload={
+                "run_id": run_id,
+                "outcome": "merged",
+                "summary": "Pull request merged by ACA guarded auto-merge.",
+                "body": body,
+                "task": task_payload,
+                "pull_request": pull_request,
+                "merge": merge,
+            },
+            dedupe_key=f"{run_id}:linear:merge-comment",
+        )
 
 
 def _start_pr_repair_pass(
@@ -384,6 +524,7 @@ def _maybe_auto_merge_pr(
     )
     append_event(layout["events"], "github_pull_request.auto_merge_evaluated", run_id, merge)
     if merge.get("merged"):
+        task = dict(status_payload.get("task") or blackboard.get("task") or {})
         merged_pr = {
             **pull_request,
             "lifecycle_state": "merged",
@@ -401,6 +542,14 @@ def _maybe_auto_merge_pr(
             status_payload=status_payload,
             blackboard=blackboard,
             pull_request=merged_pr,
+        )
+        _enqueue_linear_merge_finalize(
+            cfg=cfg,
+            coordination=coordination,
+            task=task,
+            run_id=run_id,
+            pull_request=merged_pr,
+            merge=merge,
         )
     return merge
 
@@ -702,7 +851,17 @@ def _apply_terminal(
             coordination.mark_task_blocked(task_key, run_id=run_id, lease_id=lease_id or None, worker_id=worker_id or None, host_id=host_id or None, reason=phase_detail)
     if lease_id:
         coordination.release_lease(lease_id, status="completed" if terminal_status == "completed" else terminal_status, reason=phase_detail)
-    _enqueue_github_finalize(cfg=cfg, coordination=coordination, task=task, run_id=run_id, outcome=outcome, summary=summary)
+    if _task_source_type(task, cfg) == "linear":
+        _enqueue_linear_finalize(
+            cfg=cfg,
+            coordination=coordination,
+            task=task,
+            run_id=run_id,
+            outcome=outcome,
+            summary=summary,
+        )
+    else:
+        _enqueue_github_finalize(cfg=cfg, coordination=coordination, task=task, run_id=run_id, outcome=outcome, summary=summary)
     append_event(layout["events"], "run.completed" if terminal_status == "completed" else "run.blocked", run_id, {"kind": "coder", "supervised": True, "tandem_status": tandem_status})
     _update_workspace_reference(cfg, run_id, terminal_status)
     return {"run_id": run_id, "status": terminal_status, "terminal": True, "supervision": supervision}
