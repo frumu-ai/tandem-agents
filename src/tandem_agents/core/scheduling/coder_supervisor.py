@@ -7,14 +7,22 @@ from typing import Any
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import build_coder_summary
-from src.tandem_agents.core.engine.tandem_client_sdk import sdk_coder_cancel_run, sdk_coder_get_run
+from src.tandem_agents.core.engine.tandem_client_sdk import (
+    sdk_coder_cancel_run,
+    sdk_coder_create_run,
+    sdk_coder_execute_all,
+    sdk_coder_get_run,
+)
 from src.tandem_agents.core.integrations.github_mcp import (
     build_issue_comment_body,
+    build_pull_request_repair_prompt,
+    collect_pull_request_repair_context,
     github_mcp_scope,
     github_project_status_name_for_outcome,
     github_remote_sync_mode,
     refresh_pull_request_lifecycle,
 )
+from src.tandem_agents.core.integrations.linear_mcp import linear_add_comment
 from src.tandem_agents.runtime.run_output import build_blocked_summary, save_run_text, set_status
 from src.tandem_agents.runtime.runstate import (
     append_event,
@@ -175,6 +183,121 @@ def _update_workspace_reference(cfg: ResolvedConfig, run_id: str, status: str) -
         logger.debug("Failed to update workspace run reference for %s", run_id, exc_info=True)
 
 
+def _task_source_type(task: dict[str, Any], cfg: ResolvedConfig) -> str:
+    source = task.get("source") if isinstance(task, dict) else {}
+    if isinstance(source, dict):
+        return str(source.get("type") or cfg.task_source.type or "").strip().lower()
+    return str(cfg.task_source.type or "").strip().lower()
+
+
+def _maybe_add_linear_repair_comment(cfg: ResolvedConfig, task: dict[str, Any], body: str) -> None:
+    if _task_source_type(task, cfg) != "linear":
+        return
+    try:
+        linear_add_comment(cfg, task, body)
+    except Exception:
+        logger.debug("Failed to add Linear repair comment", exc_info=True)
+
+
+def _start_pr_repair_pass(
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+    pull_request: dict[str, Any],
+) -> dict[str, Any]:
+    task = dict(status_payload.get("task") or blackboard.get("task") or {})
+    context = collect_pull_request_repair_context(cfg, pull_request)
+    prompt = build_pull_request_repair_prompt(context)
+    repair = {
+        "run_id": run_id,
+        "repair_run_id": f"{run_id}-repair-{now_ms()}",
+        "status": "no_action",
+        "pull_request": context.get("pull_request") or pull_request,
+        "context": context,
+        "prompt": prompt,
+        "started_at_ms": now_ms(),
+        "completed_at_ms": None,
+        "summary": "",
+    }
+    blackboard["pull_request_repair"] = repair
+    status_payload["pull_request_repair"] = repair
+    save_blackboard(layout["blackboard"], blackboard)
+    write_status(layout["status"], status_payload)
+    if not context.get("actionable"):
+        repair["summary"] = str(context.get("reason") or "No actionable PR feedback.")
+        blackboard["pull_request_repair"] = repair
+        status_payload["pull_request_repair"] = repair
+        save_blackboard(layout["blackboard"], blackboard)
+        write_status(layout["status"], status_payload)
+        return repair
+
+    _maybe_add_linear_repair_comment(
+        cfg,
+        task,
+        f"ACA is starting a repair pass for PR feedback on {pull_request.get('url') or 'the linked PR'}.\n\nRepair run: `{repair['repair_run_id']}`",
+    )
+    # The Tandem coder endpoint accepts a generic payload; use a distinct
+    # workflow_mode so the engine can route this as a same-branch PR repair.
+    payload = {
+        "coder_run_id": repair["repair_run_id"],
+        "workflow_mode": "pr_repair",
+        "repo_binding": {
+            "workspace_id": "aca",
+            "workspace_root": str((status_payload.get("repo") or {}).get("path") or ""),
+            "repo_slug": str((status_payload.get("repo") or {}).get("slug") or cfg.repository.slug or ""),
+            "default_branch": str(pull_request.get("base_branch") or cfg.repository.default_branch or "main"),
+        },
+        "github_ref": {
+            "kind": "pull_request",
+            "number": pull_request.get("number"),
+            "url": pull_request.get("url"),
+            "head_branch": pull_request.get("head_branch"),
+        },
+        "objective": prompt,
+        "source_client": "aca",
+        "repair_context": context,
+    }
+    try:
+        create_response = sdk_coder_create_run(cfg, payload)
+        execute_response = sdk_coder_execute_all(cfg, repair["repair_run_id"], {"max_steps": 16})
+        repair.update(
+            {
+                "status": "completed",
+                "completed_at_ms": now_ms(),
+                "summary": "Repair pass dispatched to Tandem coder.",
+                "create_response": create_response if isinstance(create_response, dict) else {},
+                "execute_response": execute_response if isinstance(execute_response, dict) else {},
+            }
+        )
+    except Exception as exc:
+        repair.update(
+            {
+                "status": "blocked",
+                "completed_at_ms": now_ms(),
+                "summary": str(exc).strip() or repr(exc),
+            }
+        )
+    blackboard["pull_request_repair"] = repair
+    status_payload["pull_request_repair"] = repair
+    save_blackboard(layout["blackboard"], blackboard)
+    write_status(layout["status"], status_payload)
+    run = coordination.get_run(run_id) or {}
+    metadata = dict(run.get("metadata") or {})
+    metadata["pull_request_repair"] = repair
+    coordination.update_run(run_id, metadata=metadata)
+    _maybe_add_linear_repair_comment(
+        cfg,
+        task,
+        f"ACA repair pass `{repair['repair_run_id']}` finished with status `{repair['status']}`.\n\n{repair.get('summary') or ''}".strip(),
+    )
+    append_event(layout["events"], "github_pull_request.repair_pass_completed", run_id, repair)
+    return repair
+
+
 def _persist_pull_request_lifecycle(
     cfg: ResolvedConfig,
     coordination: CoordinationStore,
@@ -252,13 +375,27 @@ def _refresh_pr_lifecycle_for_run(
         blackboard=blackboard,
         pull_request=refreshed,
     )
+    repair = None
+    if str(refreshed.get("lifecycle_state") or "").strip() == "needs-repair":
+        repair = _start_pr_repair_pass(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=refreshed,
+        )
     append_event(layout["events"], "github_pull_request.lifecycle_refreshed", run_id, refreshed)
-    return {
+    result = {
         "run_id": run_id,
         "status": refreshed.get("lifecycle_state") or "unknown",
         "terminal": bool(refreshed.get("terminal")),
         "pull_request": refreshed,
     }
+    if repair is not None:
+        result["repair"] = repair
+    return result
 
 
 def _enqueue_github_finalize(

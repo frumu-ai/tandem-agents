@@ -44,11 +44,11 @@ def _config(root: Path):
     return resolve_config(root)
 
 
-def _seed_active_coder_run(cfg, store: CoordinationStore, *, run_id: str = "run-1") -> None:
+def _seed_active_coder_run(cfg, store: CoordinationStore, *, run_id: str = "run-1", source: dict | None = None) -> None:
     task = {
         "task_id": "task-1",
         "title": "Fix cache invalidation",
-        "source": {"type": "manual", "prompt": "supervise coder"},
+        "source": source or {"type": "manual", "prompt": "supervise coder"},
         "repo": {"slug": "acme/demo", "path": str(cfg.root_dir / "repo")},
     }
     repo = {"slug": "acme/demo", "path": str(cfg.root_dir / "repo"), "branch": "aca/run-1"}
@@ -88,8 +88,8 @@ def _seed_active_coder_run(cfg, store: CoordinationStore, *, run_id: str = "run-
     save_blackboard(run_dir / "blackboard.yaml", blackboard)
 
 
-def _seed_completed_run_with_pr(cfg, store: CoordinationStore, *, run_id: str = "run-pr") -> None:
-    _seed_active_coder_run(cfg, store, run_id=run_id)
+def _seed_completed_run_with_pr(cfg, store: CoordinationStore, *, run_id: str = "run-pr", source: dict | None = None) -> None:
+    _seed_active_coder_run(cfg, store, run_id=run_id, source=source)
     run_dir = cfg.output_root() / run_id
     status = load_status(run_dir / "status.json")
     status["run"]["status"] = "completed"
@@ -233,6 +233,69 @@ class CoderSupervisorTest(unittest.TestCase):
             self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
             self.assertEqual(blackboard["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
             self.assertEqual(run_meta["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
+
+    def test_needs_repair_starts_pr_repair_pass_and_comments_linear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(
+                cfg,
+                store,
+                source={
+                    "type": "linear",
+                    "issue_id": "lin-1",
+                    "identifier": "TAN-120",
+                    "team": "Tandem",
+                },
+            )
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "review_state": "changes_requested",
+                "checks_state": "success",
+                "lifecycle_state": "needs-repair",
+                "terminal": False,
+            }
+            repair_context = {
+                "actionable": True,
+                "pull_request": refreshed,
+                "feedback_items": [
+                    {
+                        "kind": "review_comment",
+                        "body": "Fix this boundary case.",
+                        "path": "src/app.py",
+                        "line": 12,
+                    }
+                ],
+                "truncated": False,
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "collect_pull_request_repair_context", return_value=repair_context),
+                patch.object(coder_supervisor, "sdk_coder_create_run", return_value={"ok": True}) as create_run,
+                patch.object(coder_supervisor, "sdk_coder_execute_all", return_value={"run": {"status": "completed"}}) as execute_all,
+                patch.object(coder_supervisor, "linear_add_comment", return_value=None) as linear_comment,
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            self.assertEqual(result["status"], "needs-repair")
+            self.assertEqual(result["repair"]["status"], "completed")
+            create_run.assert_called_once()
+            payload = create_run.call_args.args[1]
+            self.assertEqual(payload["workflow_mode"], "pr_repair")
+            self.assertEqual(payload["github_ref"]["head_branch"], "aca/run-pr")
+            self.assertIn("Fix this boundary case", payload["objective"])
+            execute_all.assert_called_once()
+            self.assertEqual(linear_comment.call_count, 2)
+            status = load_status(cfg.output_root() / "run-pr" / "status.json")
+            blackboard = load_blackboard(cfg.output_root() / "run-pr" / "blackboard.yaml")
+            self.assertEqual(status["pull_request_repair"]["status"], "completed")
+            self.assertEqual(blackboard["pull_request_repair"]["context"]["feedback_items"][0]["path"], "src/app.py")
 
 
 if __name__ == "__main__":

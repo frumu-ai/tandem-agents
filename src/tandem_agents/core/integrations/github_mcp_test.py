@@ -9,6 +9,8 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.integrations.github_mcp import (
     _project_item_status_name,
     add_issue_comment,
+    build_pull_request_repair_prompt,
+    collect_pull_request_repair_context,
     create_pull_request,
     create_pull_request_metadata,
     github_project_status_key_is_actionable,
@@ -207,6 +209,94 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             )["lifecycle_state"],
             "merged",
         )
+
+    def test_collect_pull_request_repair_context_skips_stale_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            pull_request = {
+                "number": 7,
+                "url": "https://github.com/frumu-ai/example/pull/7",
+                "head_branch": "aca/task-123",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+            }
+
+            with (
+                patch(
+                    "src.tandem_agents.core.integrations.github_mcp.get_pull_request",
+                    return_value={
+                        "number": 7,
+                        "state": "open",
+                        "reviewDecision": "CHANGES_REQUESTED",
+                        "checks_status": "success",
+                        "html_url": "https://github.com/frumu-ai/example/pull/7",
+                    },
+                ),
+                patch(
+                    "src.tandem_agents.core.integrations.github_mcp._list_pull_request_reviews",
+                    return_value=[
+                        {
+                            "state": "CHANGES_REQUESTED",
+                            "body": "Please tighten the validation path.",
+                            "user": {"login": "reviewer"},
+                        }
+                    ],
+                ),
+                patch(
+                    "src.tandem_agents.core.integrations.github_mcp._list_pull_request_review_comments",
+                    return_value=[
+                        {
+                            "body": "Fix this boundary case.",
+                            "path": "src/app.py",
+                            "line": 12,
+                            "user": {"login": "reviewer"},
+                            "html_url": "https://github.com/frumu-ai/example/pull/7#discussion_r1",
+                        },
+                        {
+                            "body": "Old comment",
+                            "path": "src/old.py",
+                            "isResolved": True,
+                        },
+                    ],
+                ),
+            ):
+                context = collect_pull_request_repair_context(cfg, pull_request)
+
+            self.assertTrue(context["actionable"])
+            self.assertEqual([item["kind"] for item in context["feedback_items"]], ["requested_changes", "review_comment"])
+            self.assertEqual(context["feedback_items"][1]["path"], "src/app.py")
+            self.assertNotIn("Old comment", build_pull_request_repair_prompt(context))
+
+    def test_collect_pull_request_repair_context_no_action_for_clean_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            pull_request = {
+                "number": 7,
+                "url": "https://github.com/frumu-ai/example/pull/7",
+                "head_branch": "aca/task-123",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+            }
+
+            with (
+                patch(
+                    "src.tandem_agents.core.integrations.github_mcp.get_pull_request",
+                    return_value={
+                        "number": 7,
+                        "state": "open",
+                        "reviewDecision": "APPROVED",
+                        "checks_status": "success",
+                    },
+                ),
+                patch("src.tandem_agents.core.integrations.github_mcp._list_pull_request_reviews", return_value=[]),
+                patch("src.tandem_agents.core.integrations.github_mcp._list_pull_request_review_comments", return_value=[]),
+            ):
+                context = collect_pull_request_repair_context(cfg, pull_request)
+
+            self.assertFalse(context["actionable"])
+            self.assertEqual(context["reason"], "no_actionable_review_feedback")
 
     def test_github_project_status_mapping_is_explicit(self) -> None:
         self.assertEqual(github_project_status_name_for_task_state("active"), "In progress")
