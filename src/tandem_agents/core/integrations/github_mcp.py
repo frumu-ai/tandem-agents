@@ -1305,6 +1305,119 @@ def build_pull_request_repair_prompt(context: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _allowed_merge_strategies(cfg: ResolvedConfig) -> set[str]:
+    return {
+        strategy.strip().lower()
+        for strategy in str(cfg.review.auto_merge_allowed_strategies or "").split(",")
+        if strategy.strip()
+    }
+
+
+def evaluate_auto_merge_gates(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
+    strategy = str(cfg.review.auto_merge_strategy or "squash").strip().lower()
+    allowed = _allowed_merge_strategies(cfg)
+    base_repo = str(pull_request.get("base_repo") or "").strip()
+    head_branch = str(pull_request.get("head_branch") or "").strip()
+    denials: list[str] = []
+    if str(cfg.review.policy or "").strip().lower() != "auto_merge":
+        denials.append("review.policy is not auto_merge")
+    if strategy not in {"merge", "squash", "rebase"}:
+        denials.append(f"merge strategy `{strategy}` is not supported")
+    if strategy not in allowed:
+        denials.append(f"merge strategy `{strategy}` is not allowed by policy")
+    if not head_branch.startswith("aca/"):
+        denials.append("head branch is not ACA-created")
+    expected_repo = str(cfg.repository.slug or "").strip()
+    if expected_repo and base_repo and base_repo != expected_repo:
+        denials.append(f"PR base repo `{base_repo}` does not match configured repo `{expected_repo}`")
+    if str(pull_request.get("lifecycle_state") or "").strip() != "ready-to-merge":
+        denials.append("PR lifecycle state is not ready-to-merge")
+    if str(pull_request.get("checks_state") or "").strip() != "success":
+        denials.append("PR checks are not proven clean")
+    if str(pull_request.get("review_state") or "").strip() != "approved":
+        denials.append("PR review state is not approved")
+    if pull_request.get("terminal") or pull_request.get("merged"):
+        denials.append("PR is already terminal")
+    if pull_request.get("number") in (None, ""):
+        denials.append("PR number is missing")
+    if not base_repo or "/" not in base_repo:
+        denials.append("PR base repo is missing")
+    return {
+        "allowed": not denials,
+        "denials": denials,
+        "strategy": strategy,
+        "head_branch": head_branch,
+        "base_repo": base_repo,
+        "pull_request": pull_request,
+    }
+
+
+def merge_pull_request(cfg: ResolvedConfig, pull_request: dict[str, Any], *, strategy: str) -> dict[str, Any]:
+    base_repo = str(pull_request.get("base_repo") or cfg.repository.slug or "").strip()
+    number = int(pull_request.get("number"))
+    owner, repo_name = base_repo.split("/", 1)
+    result = execute_engine_tool(
+        cfg,
+        "mcp.github.merge_pull_request",
+        {
+            "owner": owner,
+            "repo": repo_name,
+            "pull_number": number,
+            "merge_method": strategy,
+        },
+    )
+    if _tool_failed(result):
+        raise RuntimeError(_tool_error_message(result))
+    data = _parse_json_output(result)
+    return data if isinstance(data, dict) else {"merged": True}
+
+
+def delete_remote_branch(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
+    base_repo = str(pull_request.get("base_repo") or cfg.repository.slug or "").strip()
+    head_branch = str(pull_request.get("head_branch") or "").strip()
+    if not base_repo or "/" not in base_repo or not head_branch:
+        return {"deleted": False, "error": "Missing base repo or head branch."}
+    owner, repo_name = base_repo.split("/", 1)
+    attempts = [
+        ("mcp.github.delete_branch", {"owner": owner, "repo": repo_name, "branch": head_branch}),
+        ("mcp.github.delete_ref", {"owner": owner, "repo": repo_name, "ref": f"heads/{head_branch}"}),
+    ]
+    for tool, args in attempts:
+        try:
+            result = execute_engine_tool(cfg, tool, args)
+        except RuntimeError:
+            continue
+        if _tool_failed(result):
+            continue
+        data = _parse_json_output(result)
+        return data if isinstance(data, dict) else {"deleted": True}
+    return {"deleted": False, "error": "Could not delete remote branch through GitHub MCP."}
+
+
+def guarded_auto_merge(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
+    gates = evaluate_auto_merge_gates(cfg, pull_request)
+    if not gates["allowed"]:
+        return {
+            "status": "denied",
+            "merged": False,
+            "branch_deleted": False,
+            "denials": gates["denials"],
+            "strategy": gates["strategy"],
+            "pull_request": pull_request,
+        }
+    merge_result = merge_pull_request(cfg, pull_request, strategy=str(gates["strategy"]))
+    delete_result = delete_remote_branch(cfg, pull_request)
+    return {
+        "status": "merged",
+        "merged": True,
+        "branch_deleted": bool(delete_result.get("deleted", True) or not delete_result.get("error")),
+        "strategy": gates["strategy"],
+        "pull_request": pull_request,
+        "merge_result": merge_result,
+        "delete_result": delete_result,
+    }
+
+
 def create_pull_request(
     cfg: ResolvedConfig,
     task: dict[str, Any],

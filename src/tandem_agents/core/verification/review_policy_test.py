@@ -50,17 +50,18 @@ class ReviewPolicyTest(unittest.TestCase):
             self.assertTrue(any("human" in rule.lower() for rule in decision.handoff_rules))
             self.assertEqual(validate_config(cfg), [])
 
-    def test_auto_merge_policy_is_blocked(self) -> None:
+    def test_auto_merge_policy_is_supported_and_guarded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cfg = self._config(root, policy="auto_merge")
             decision = evaluate_review_policy(cfg)
-            errors = validate_config(cfg)
 
-            self.assertFalse(decision.supported)
+            self.assertTrue(decision.supported)
+            self.assertFalse(decision.human_review_required)
             self.assertTrue(decision.auto_merge_requested)
-            self.assertIsNotNone(decision.blocker)
-            self.assertTrue(any("auto_merge" in error for error in errors))
+            self.assertIsNone(decision.blocker)
+            self.assertTrue(any("guard" in rule.lower() or "clean" in rule.lower() for rule in decision.handoff_rules))
+            self.assertEqual(validate_config(cfg), [])
 
 
 if __name__ == "__main__":

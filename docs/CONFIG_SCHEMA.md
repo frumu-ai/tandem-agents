@@ -147,11 +147,14 @@ Behavior:
 Optional fields:
 
 - `policy`: human handoff policy, one of `human_review` or `auto_merge`
+- `auto_merge_strategy`: merge method ACA may use when `policy` is `auto_merge`; one of `merge`, `squash`, or `rebase`
+- `auto_merge_allowed_strategies`: comma-separated allow-list of merge methods
 
 Behavior:
 
-- `human_review` is the current supported policy and keeps merge approval with a human gate
-- `auto_merge` is reserved for later and currently fails closed during config validation because ACA does not implement merge automation yet
+- `human_review` keeps merge approval with a human gate
+- `auto_merge` is opt-in and guarded: ACA only merges ACA-created branches for the configured repository when checks are successful, review is approved, the lifecycle is `ready-to-merge`, and the configured strategy is allowed
+- ACA refuses to merge when review or check state cannot be proven clean; successful auto-merges record merge metadata and then request deletion of the remote ACA branch
 
 ### `scheduler`
 

@@ -20,6 +20,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     github_mcp_scope,
     github_project_status_name_for_outcome,
     github_remote_sync_mode,
+    guarded_auto_merge,
     refresh_pull_request_lifecycle,
 )
 from src.tandem_agents.core.integrations.linear_mcp import linear_add_comment
@@ -327,6 +328,83 @@ def _persist_pull_request_lifecycle(
     return pull_request
 
 
+def _persist_pull_request_merge(
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+    merge: dict[str, Any],
+) -> dict[str, Any]:
+    blackboard["pull_request_merge"] = merge
+    status_payload["pull_request_merge"] = merge
+    save_blackboard(layout["blackboard"], blackboard)
+    write_status(layout["status"], status_payload)
+    run = coordination.get_run(run_id) or {}
+    metadata = dict(run.get("metadata") or {})
+    metadata["pull_request_merge"] = merge
+    coordination.update_run(run_id, metadata=metadata)
+    return merge
+
+
+def _maybe_auto_merge_pr(
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+    pull_request: dict[str, Any],
+) -> dict[str, Any] | None:
+    if str(cfg.review.policy or "").strip().lower() != "auto_merge":
+        return None
+    try:
+        merge = guarded_auto_merge(cfg, pull_request)
+    except Exception as exc:
+        merge = {
+            "status": "blocked",
+            "merged": False,
+            "branch_deleted": False,
+            "strategy": str(cfg.review.auto_merge_strategy or "").strip().lower(),
+            "pull_request": pull_request,
+            "error": str(exc).strip() or repr(exc),
+            "completed_at_ms": now_ms(),
+        }
+    else:
+        merge["completed_at_ms"] = now_ms()
+    _persist_pull_request_merge(
+        coordination,
+        run_id=run_id,
+        layout=layout,
+        status_payload=status_payload,
+        blackboard=blackboard,
+        merge=merge,
+    )
+    append_event(layout["events"], "github_pull_request.auto_merge_evaluated", run_id, merge)
+    if merge.get("merged"):
+        merged_pr = {
+            **pull_request,
+            "lifecycle_state": "merged",
+            "terminal": True,
+            "merged": True,
+            "merge_strategy": merge.get("strategy"),
+            "branch_deleted": merge.get("branch_deleted"),
+            "last_checked_at_ms": now_ms(),
+        }
+        _persist_pull_request_lifecycle(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=merged_pr,
+        )
+    return merge
+
+
 def _refresh_pr_lifecycle_for_run(
     cfg: ResolvedConfig,
     coordination: CoordinationStore,
@@ -386,15 +464,33 @@ def _refresh_pr_lifecycle_for_run(
             blackboard=blackboard,
             pull_request=refreshed,
         )
+    merge = None
+    if str(refreshed.get("lifecycle_state") or "").strip() == "ready-to-merge":
+        merge = _maybe_auto_merge_pr(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=refreshed,
+        )
     append_event(layout["events"], "github_pull_request.lifecycle_refreshed", run_id, refreshed)
+    current_lifecycle = dict(
+        blackboard.get("pull_request_lifecycle")
+        or status_payload.get("pull_request_lifecycle")
+        or refreshed
+    )
     result = {
         "run_id": run_id,
-        "status": refreshed.get("lifecycle_state") or "unknown",
-        "terminal": bool(refreshed.get("terminal")),
-        "pull_request": refreshed,
+        "status": current_lifecycle.get("lifecycle_state") or refreshed.get("lifecycle_state") or "unknown",
+        "terminal": bool(current_lifecycle.get("terminal")),
+        "pull_request": current_lifecycle,
     }
     if repair is not None:
         result["repair"] = repair
+    if merge is not None:
+        result["merge"] = merge
     return result
 
 

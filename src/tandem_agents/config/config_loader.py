@@ -58,6 +58,8 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_PROVIDER,
     DEFAULT_REMOTE_NAME,
     DEFAULT_REVIEW_POLICY,
+    DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES,
+    DEFAULT_AUTO_MERGE_STRATEGY,
     DEFAULT_STARTUP_MODE,
     DEFAULT_UPDATE_POLICY,
     TASK_SOURCE_TYPES,
@@ -71,6 +73,7 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_STORAGE_PROFILE,
     VALID_STORAGE_PROFILES,
     VALID_REVIEW_POLICIES,
+    VALID_MERGE_STRATEGIES,
     _as_bool,
     _as_int,
     _env_or_file,
@@ -350,7 +353,21 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
                 yaml_value=data.get("review", {}).get("policy"),
                 default=DEFAULT_REVIEW_POLICY,
             )
-        )
+        ),
+        auto_merge_strategy=str(
+            pick(
+                "ACA_AUTO_MERGE_STRATEGY",
+                yaml_value=data.get("review", {}).get("auto_merge_strategy"),
+                default=DEFAULT_AUTO_MERGE_STRATEGY,
+            )
+        ),
+        auto_merge_allowed_strategies=str(
+            pick(
+                "ACA_AUTO_MERGE_ALLOWED_STRATEGIES",
+                yaml_value=data.get("review", {}).get("auto_merge_allowed_strategies"),
+                default=DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES,
+            )
+        ),
     )
     swarm = SwarmConfig(
         enabled=_as_bool(pick("ACA_ENABLE_SWARM", "AUTOCODER_ENABLE_SWARM", yaml_value=swarm_data.get("enabled"), default=False)),
@@ -691,8 +708,25 @@ def validate_config(cfg: ResolvedConfig) -> list[str]:
             errors.append("storage.profile=shared requires ACA_COORDINATION_POSTGRES_URL or storage.postgres_url.")
         if cfg.coordination.backend != "postgres":
             errors.append("storage.profile=shared requires coordination.backend=postgres.")
+    auto_merge_strategy = str(cfg.review.auto_merge_strategy or "").strip().lower()
+    allowed_merge_strategies = {
+        strategy.strip().lower()
+        for strategy in str(cfg.review.auto_merge_allowed_strategies or "").split(",")
+        if strategy.strip()
+    }
     if cfg.review.policy == "auto_merge":
-        errors.append("review.policy=auto_merge is not implemented yet; human_review is the only supported policy.")
+        if auto_merge_strategy not in VALID_MERGE_STRATEGIES:
+            errors.append(
+                f"Invalid review.auto_merge_strategy: {cfg.review.auto_merge_strategy}. "
+                f"Expected one of: {', '.join(sorted(VALID_MERGE_STRATEGIES))}."
+            )
+        if not allowed_merge_strategies:
+            errors.append("review.auto_merge_allowed_strategies must list at least one allowed strategy.")
+        elif auto_merge_strategy not in allowed_merge_strategies:
+            errors.append(
+                "review.auto_merge_strategy must be included in "
+                "review.auto_merge_allowed_strategies."
+            )
     if cfg.coordination.heartbeat_interval_seconds <= 0:
         errors.append("coordination.heartbeat_interval_seconds must be positive.")
     if cfg.coordination.lease_ttl_seconds <= 0:

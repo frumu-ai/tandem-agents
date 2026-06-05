@@ -22,18 +22,28 @@ class ReviewPolicyDecision:
 def evaluate_review_policy(cfg: ResolvedConfig) -> ReviewPolicyDecision:
     policy = str(cfg.review.policy or "human_review").strip().lower() or "human_review"
     auto_merge_requested = policy == "auto_merge"
-    supported = not auto_merge_requested
+    supported = True
     blocker = None
-    handoff_rules = [
-        "Pull requests must be reviewed by a human before merge.",
-        "ACA does not auto-merge pull requests in the current implementation.",
-    ]
+    handoff_rules = []
     if auto_merge_requested:
-        blocker = "review.policy=auto_merge is not implemented yet; use human_review."
-        handoff_rules.append("Requested auto-merge is blocked until merge support is implemented.")
+        strategy = str(cfg.review.auto_merge_strategy or "squash").strip().lower()
+        handoff_rules.extend(
+            [
+                "Auto-merge is opt-in and must pass guarded PR lifecycle gates.",
+                f"Configured merge strategy: `{strategy}`.",
+                "ACA must prove checks are clean and review state is approved before merge.",
+            ]
+        )
+    else:
+        handoff_rules.extend(
+            [
+                "Pull requests must be reviewed by a human before merge.",
+                "ACA will not auto-merge pull requests while review.policy=human_review.",
+            ]
+        )
     return ReviewPolicyDecision(
         policy=policy,
-        human_review_required=True,
+        human_review_required=not auto_merge_requested,
         auto_merge_requested=auto_merge_requested,
         supported=supported,
         blocker=blocker,
