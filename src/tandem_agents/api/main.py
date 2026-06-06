@@ -1193,6 +1193,56 @@ async def reject_external_action(
     return {"approval": approval}
 
 
+@app.post("/approvals/{approval_id}/retry")
+async def retry_external_action(
+    approval_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    actor = str(payload.get("actor") or "operator").strip()
+    reason = str(payload.get("reason") or "retry failed external action").strip()
+    approval = store.retry_external_action_approval(approval_id, actor=actor, reason=reason)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return {"approval": approval}
+
+
+@app.post("/runs/{run_id}/approvals/approve-pending")
+async def approve_pending_external_actions(
+    run_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    actor = str(payload.get("actor") or "operator").strip()
+    reason = str(payload.get("reason") or "batch approve pending external actions").strip()
+    approvals = store.approve_pending_external_action_approvals(run_id=run_id, actor=actor, reason=reason)
+    return {"run_id": run_id, "approvals": approvals, "count": len(approvals)}
+
+
+@app.post("/runs/{run_id}/approvals/retry-failed")
+async def retry_failed_external_actions(
+    run_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    actor = str(payload.get("actor") or "operator").strip()
+    reason = str(payload.get("reason") or "retry failed external actions").strip()
+    approvals = store.retry_failed_external_action_approvals(run_id=run_id, actor=actor, reason=reason)
+    return {"run_id": run_id, "approvals": approvals, "count": len(approvals)}
+
+
 @app.post("/runs/{run_id}/resume-approved-actions")
 async def resume_approved_external_actions(run_id: str, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))

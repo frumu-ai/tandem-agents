@@ -152,6 +152,105 @@ class CoordinationApprovalsMixin:
             ).fetchone()
         return self._row_to_external_action_approval(row)
 
+    def approve_pending_external_action_approvals(
+        self,
+        *,
+        run_id: str,
+        actor: str,
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        now = now_ms()
+        with self.connection() as conn:
+            self.ensure_schema()
+            conn.execute(
+                """
+                UPDATE external_action_approvals
+                SET status = 'approved',
+                    decided_by = ?,
+                    decision_reason = ?,
+                    decided_at_ms = ?,
+                    updated_at_ms = ?,
+                    error = NULL
+                WHERE run_id = ? AND status = 'pending'
+                """,
+                (actor, reason, now, now, run_id),
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM external_action_approvals
+                WHERE run_id = ? AND status = 'approved'
+                ORDER BY created_at_ms ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [self._row_to_external_action_approval(row) for row in rows]
+
+    def retry_external_action_approval(
+        self,
+        approval_id: str,
+        *,
+        actor: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        now = now_ms()
+        with self.connection() as conn:
+            self.ensure_schema()
+            conn.execute(
+                """
+                UPDATE external_action_approvals
+                SET status = 'approved',
+                    decided_by = ?,
+                    decision_reason = ?,
+                    decided_at_ms = ?,
+                    executed_at_ms = NULL,
+                    result_json = '{}',
+                    error = NULL,
+                    updated_at_ms = ?
+                WHERE approval_id = ? AND status = 'failed'
+                """,
+                (actor, reason, now, now, approval_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM external_action_approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+        return self._row_to_external_action_approval(row)
+
+    def retry_failed_external_action_approvals(
+        self,
+        *,
+        run_id: str,
+        actor: str,
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        now = now_ms()
+        with self.connection() as conn:
+            self.ensure_schema()
+            conn.execute(
+                """
+                UPDATE external_action_approvals
+                SET status = 'approved',
+                    decided_by = ?,
+                    decision_reason = ?,
+                    decided_at_ms = ?,
+                    executed_at_ms = NULL,
+                    result_json = '{}',
+                    error = NULL,
+                    updated_at_ms = ?
+                WHERE run_id = ? AND status = 'failed'
+                """,
+                (actor, reason, now, now, run_id),
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM external_action_approvals
+                WHERE run_id = ? AND status = 'approved'
+                ORDER BY created_at_ms ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return [self._row_to_external_action_approval(row) for row in rows]
+
     def mark_external_action_executed(
         self,
         approval_id: str,

@@ -367,6 +367,7 @@ def execute_approved_action(cfg: ResolvedConfig, approval: dict[str, Any]) -> di
 
 def execute_approved_actions(cfg: ResolvedConfig, coordination: CoordinationStore, *, run_id: str) -> dict[str, Any]:
     rows = coordination.list_external_action_approvals(run_id=run_id, status="approved", limit=250)
+    rows = sorted(rows, key=lambda row: int(row.get("created_at_ms") or 0))
     results: list[dict[str, Any]] = []
     for row in rows:
         try:
