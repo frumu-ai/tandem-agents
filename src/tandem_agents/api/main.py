@@ -1259,7 +1259,10 @@ async def resume_approved_external_actions(run_id: str, token: str = Depends(get
             status_payload.setdefault("run", {})["status"] = "completed"
             status_payload.setdefault("phase", {})["name"] = "handoff"
             status_payload.setdefault("phase", {})["detail"] = "external actions executed and verified"
-            status_payload.setdefault("blocker", {})["active"] = False
+            blocker = status_payload.setdefault("blocker", {})
+            blocker["active"] = False
+            blocker["kind"] = None
+            blocker["message"] = None
             status_payload.setdefault("metrics", {})["tests_passed"] = True
             write_status(status_path, status_payload)
             save_run_text(
