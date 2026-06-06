@@ -85,7 +85,8 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
 
         self.assertEqual(env["ACA_REPO_SLUG"], "frumu-ai/tandem")
         self.assertEqual(env["ACA_REPO_URL"], "https://github.com/frumu-ai/tandem")
-        self.assertEqual(env["ACA_REPO_PATH"], "/workspace/repos/tandem")
+        self.assertEqual(env["ACA_REPO_PATH"], "workspace/repos/tandem")
+        self.assertEqual(env["ACA_WORKTREE_ROOT"], "workspace/repos")
         self.assertEqual(env["ACA_TASK_SOURCE_REPO"], "tandem")
 
     def test_project_repo_sync_initializes_local_workspace_repo(self) -> None:

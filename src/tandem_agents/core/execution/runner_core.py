@@ -71,6 +71,11 @@ from src.tandem_agents.core.execution.run_lifecycle import (
     build_swarm_config_dict,
     make_run_result,
 )
+from src.tandem_agents.core.external_actions.github_pr import (
+    default_action_plan,
+    enqueue_approvals_for_plan,
+    fetch_pr_contexts,
+)
 from src.tandem_agents.core.phases.engine_check import (
     check_engine_at_startup,
     check_engine_health,
@@ -517,6 +522,18 @@ def _has_verifiable_worker_success(worker_results: list[dict[str, Any]]) -> bool
     return False
 
 
+def _has_unresolved_write_required_worker_failure(worker_results: list[dict[str, Any]]) -> bool:
+    for result in worker_results:
+        if _normalized_text(result.get("status")) != "failed":
+            continue
+        if result.get("write_required") is False:
+            continue
+        if result.get("verified_existing"):
+            continue
+        return True
+    return False
+
+
 def _execute_local_worker_pool(
     cfg: ResolvedConfig,
     run_id: str,
@@ -570,7 +587,8 @@ def _execute_local_worker_pool(
             result.setdefault("title", subtask["title"])
             result.setdefault("status", "failed" if result.get("returncode", 1) else "completed")
             result.setdefault("returncode", 0 if _normalized_text(result.get("status")) == "completed" else 1)
-            result.setdefault("write_required", bool(subtask.get("write_required", True)))
+            subtask_write_required = bool(subtask.get("write_required", True))
+            result["write_required"] = subtask_write_required or bool(result.get("write_required"))
             result.setdefault("verified_existing", False)
             results.append(result)
             if on_result is not None:
@@ -1651,6 +1669,12 @@ def _run_once_internal_impl(
     if ctx.execution_backend == "legacy" and ctx.source_scope != "always":
         disconnect_for_coding(ctx)
 
+    if ctx.execution_backend == "linear_comment":
+        return _run_linear_comment_backend(ctx)
+
+    if ctx.execution_backend == "github_pr_action":
+        return _run_github_pr_action_backend(ctx)
+
     if ctx.execution_backend == "coder":
         return _run_coder_backend(ctx)
 
@@ -1737,6 +1761,8 @@ def _run_once_internal_impl(
 
         if ctx.status["metrics"]["failed_workers"]:
             source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+            if _has_unresolved_write_required_worker_failure(ctx.worker_results):
+                return _block_worker_failure(ctx)
             if isinstance(source, dict) and str(source.get("type") or "").strip() == "github_project":
                 return _block_worker_failure(ctx)
             repo_blocker = _repo_validation_blocker_message(ctx.repo_validation)
@@ -1834,6 +1860,286 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
         log_path=ctx.layout["logs"] / "manager-integration.log",
         config_path=None,
     )
+
+
+def _linear_comment_task_summary(task: dict[str, Any]) -> str:
+    body = str(task.get("raw_issue_body") or task.get("description") or "").strip()
+    criteria = [str(entry).strip() for entry in (task.get("acceptance_criteria") or []) if str(entry).strip()]
+    lines = body.splitlines()
+    current_section = ""
+    decisions: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def add_decision(pr_number: str, decision: str, note: str) -> None:
+        key = str(pr_number).strip().lstrip("#")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        decisions.append((f"#{key}", decision, note))
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        lowered = line.lower()
+        if not line:
+            continue
+        if "green-ish" in lowered or "cherry-pickable" in lowered:
+            current_section = "green"
+            continue
+        if "large or suspicious" in lowered:
+            current_section = "large"
+            continue
+        if "failing" in lowered:
+            current_section = "failing"
+            continue
+        numbers = re.findall(r"#(\d+)", line)
+        if not numbers:
+            continue
+        if current_section == "green":
+            decision = "cherry-pick"
+            note = "Candidate only after current-main validation; keep small and cherry-pick rather than merging directly."
+        elif current_section == "large":
+            decision = "needs-manual-review"
+            note = "Too large or broad for automatic merge; inspect manually before taking any code."
+        elif current_section == "failing":
+            decision = "close"
+            note = "Failing generated PR; close unless a maintainer identifies unique value for a consolidated follow-up."
+        else:
+            decision = "needs-manual-review"
+            note = "Issue body did not provide enough status context for an automatic decision."
+        for number in numbers:
+            add_decision(number, decision, note)
+
+    summary_lines = [
+        "Linear-only ACA task completed.",
+        "",
+        "No repository changes, commit, push, or PR were expected for this task; the requested artifact is this Linear decision note.",
+    ]
+    if decisions:
+        summary_lines.extend(["", "PR decisions:"])
+        for pr_number, decision, note in decisions:
+            summary_lines.append(f"- {pr_number}: {decision} - {note}")
+    if criteria:
+        summary_lines.extend(["", "Acceptance handled:"])
+        summary_lines.extend(f"- {entry}" for entry in criteria)
+    if not decisions and not criteria:
+        summary_lines.extend(["", "Summary:", task.get("title") or "Linear task reviewed."])
+    return "\n".join(summary_lines).strip()
+
+
+def _run_linear_comment_backend(ctx: "_PhaseRunContext") -> dict[str, Any]:
+    from src.tandem_agents.core.repository.board import save_board
+    from src.tandem_agents.runtime.run_output import save_run_text, write_board_snapshot
+    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+
+    summary = _linear_comment_task_summary(ctx.task)
+    ctx.status = set_status(
+        ctx.status,
+        ctx.layout,
+        phase="linear_comment",
+        phase_detail="posting Linear decision note",
+        phase_role="manager",
+        run_status="running",
+        metrics={
+            "planned_workers": 0,
+            "completed_workers": 0,
+            "failed_workers": 0,
+            "skipped_workers": 0,
+            "tolerated_workers": 0,
+            "tests_passed": True,
+        },
+    )
+    _touch_coordination(
+        ctx.coordination,
+        run_id=ctx.run_id,
+        lease_id=ctx.lease_id,
+        lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+        status="running",
+        phase="linear_comment",
+        ctx=ctx,
+    )
+    append_event(
+        ctx.layout["events"],
+        "linear_comment.started",
+        ctx.run_id,
+        {"execution_backend": "linear_comment"},
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    ctx.blackboard["linear_comment_summary"] = summary
+    ctx.blackboard["workers"] = []
+    ctx.blackboard["review"] = {"role": "reviewer", "returncode": 0, "stdout": "Linear-only task; no code diff to review."}
+    ctx.blackboard["test"] = {"role": "tester", "returncode": 0, "stdout": "Linear-only task; no repository tests required."}
+    _append_blackboard_note(ctx.blackboard, "Linear-only task classified as a decision/comment update; skipped repo workers.")
+
+    ctx.status = set_status(
+        ctx.status,
+        ctx.layout,
+        phase="handoff",
+        phase_detail="linear decision note posted",
+        phase_role="manager",
+        run_status="completed",
+        run_completed=True,
+        metrics={
+            "planned_workers": 0,
+            "completed_workers": 0,
+            "failed_workers": 0,
+            "skipped_workers": 0,
+            "tolerated_workers": 0,
+            "tests_passed": True,
+        },
+    )
+    _touch_coordination(
+        ctx.coordination,
+        run_id=ctx.run_id,
+        lease_id=ctx.lease_id,
+        lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+        status="completed",
+        phase="handoff",
+        completed=True,
+    )
+    task_key, lease_id, worker_id, host_id, _ = ctx.coordination_task_context()
+    if task_key and lease_id and worker_id and host_id:
+        ctx.coordination.mark_task_done(
+            task_key,
+            run_id=ctx.run_id,
+            lease_id=lease_id,
+            worker_id=worker_id,
+            host_id=host_id,
+            reason="linear decision note posted",
+        )
+    _move_task_card_if_present(ctx.board, ctx.task, "review", "manager", "linear decision note posted")
+    save_board(ctx.board_path, ctx.board)
+    write_board_snapshot(ctx.run_dir, ctx.board)
+    save_run_text(
+        ctx.layout["summary"],
+        "\n".join(
+            [
+                "# Run completed",
+                "",
+                f"- Run ID: `{ctx.run_id}`",
+                f"- Task: {ctx.task.get('title') or 'Linear task'}",
+                "- Execution backend: `linear_comment`",
+                "",
+                summary,
+            ]
+        ).strip()
+        + "\n",
+    )
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    sync_failed = _finalize_github_sync(
+        cfg=ctx.cfg,
+        task=ctx.task,
+        run_id=ctx.run_id,
+        layout=ctx.layout,
+        status=ctx.status,
+        blackboard=ctx.blackboard,
+        outcome="completed",
+        summary=summary,
+        diff_snapshot="(linear-only task; no repository diff)",
+        review_returncode=0,
+        test_returncode=0,
+        coordination=ctx.coordination,
+    )
+    if sync_failed:
+        return block_run(
+            run_id=ctx.run_id,
+            run_dir=ctx.run_dir,
+            layout=ctx.layout,
+            cfg=ctx.cfg,
+            task=ctx.task,
+            repo=ctx.repo,
+            engine=ctx.engine,
+            phase="linear_sync",
+            kind="linear_sync_failed",
+            message="Linear decision note could not be dispatched.",
+            phase_detail="Linear finalize sync hit terminal outbox failure",
+            coordination=ctx.coordination,
+            existing_status=ctx.status,
+        )
+    append_event(
+        ctx.layout["events"],
+        "run.completed",
+        ctx.run_id,
+        {"result": "completed", "execution_backend": "linear_comment"},
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    return ctx.make_result(worker_results=[], board=ctx.board)
+
+
+def _run_github_pr_action_backend(ctx: "_PhaseRunContext") -> dict[str, Any]:
+    """Create approval-gated GitHub PR actions through the external-action runner."""
+    message = (
+        "GitHub PR actions were proposed and are waiting for operator approval. "
+        "No GitHub write will execute until approval is granted."
+    )
+    pr_contexts = fetch_pr_contexts(ctx.cfg, ctx.task)
+    actions = default_action_plan(ctx.run_id, ctx.task, pr_contexts)
+    approvals = enqueue_approvals_for_plan(
+        ctx.coordination,
+        run_id=ctx.run_id,
+        task=ctx.task,
+        actions=actions,
+    )
+    pending_count = len([row for row in approvals if row.get("status") == "pending"])
+    ctx.blackboard["external_action"] = {
+        "execution_backend": "github_pr_action",
+        "adapter": "github_pr",
+        "pr_contexts": pr_contexts,
+        "proposed_actions": actions,
+        "approvals": approvals,
+    }
+    ctx.status["metrics"]["planned_external_actions"] = len(actions)
+    ctx.status["metrics"]["pending_external_approvals"] = pending_count
+    _append_blackboard_note(ctx.blackboard, message)
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    save_run_text(
+        ctx.layout["summary"],
+        build_blocked_summary(
+            task_title=ctx.task["title"],
+            message=f"{message}\n\nPending approvals: {pending_count}.",
+        ),
+    )
+    append_event(
+        ctx.layout["events"],
+        "github_pr_action.approvals_pending",
+        ctx.run_id,
+        {"execution_backend": "github_pr_action", "approval_count": len(approvals), "pending_count": pending_count},
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    result = block_run(
+        run_id=ctx.run_id,
+        run_dir=ctx.run_dir,
+        layout=ctx.layout,
+        cfg=ctx.cfg,
+        task=ctx.task,
+        repo=ctx.repo,
+        engine=ctx.engine,
+        phase="github_pr_action",
+        kind="pending_approval",
+        message=message,
+        phase_detail="GitHub PR actions are waiting for approval",
+        coordination=ctx.coordination,
+        existing_status=ctx.status,
+    )
+    _finalize_github_sync(
+        cfg=ctx.cfg,
+        task=ctx.task,
+        run_id=ctx.run_id,
+        layout=ctx.layout,
+        status=result["status"],
+        blackboard=ctx.blackboard,
+        outcome="blocked",
+        summary=message,
+        coordination=ctx.coordination,
+    )
+    return result
 
 
 def _run_coder_backend(ctx: "_PhaseRunContext") -> dict[str, Any]:

@@ -46,6 +46,9 @@ from src.tandem_agents.runtime.workspace_registry import (
     workspace_summary,
 )
 from src.tandem_agents.runtime.runstate import load_status, load_blackboard, set_event_broadcast_callback, new_run_id
+from src.tandem_agents.runtime.runstate import append_event, write_status
+from src.tandem_agents.runtime.run_output import save_run_text
+from src.tandem_agents.core.external_actions.github_pr import execute_approved_actions
 from src.tandem_agents.cli.monitor import latest_run_dir
 
 # Setup logging
@@ -295,7 +298,9 @@ def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: 
         if not repo_name and repo_url:
             repo_name = repo_url.rstrip("/").removesuffix(".git").split("/")[-1].strip()
         if repo_name:
-            repo_path = f"/workspace/repos/{repo_name}"
+            repo_path = f"workspace/repos/{repo_name}"
+    if not worktree_root and repo_path.startswith("workspace/repos/"):
+        worktree_root = "workspace/repos"
     if repo_path:
         env["ACA_REPO_PATH"] = repo_path
     if worktree_root:
@@ -688,6 +693,189 @@ async def get_workspace_guide(token: str = Depends(get_token)):
     }
 
 
+def _linear_catalog_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("key", "name", "displayName", "title", "id", "slug"):
+            text = _linear_catalog_text(value.get(key))
+            if text:
+                return text
+        return ""
+    return str(value).strip()
+
+
+def _normalize_linear_team(team: Dict[str, Any]) -> Dict[str, Any]:
+    key = _linear_catalog_text(team.get("key") or team.get("teamKey"))
+    name = _linear_catalog_text(team.get("name") or team.get("displayName") or key)
+    team_id = _linear_catalog_text(team.get("id"))
+    return {
+        "id": team_id or key or name,
+        "key": key,
+        "name": name or key or team_id,
+        "display": f"{name} ({key})" if name and key and name != key else name or key or team_id,
+        "raw": team,
+    }
+
+
+def _normalize_linear_project(project: Dict[str, Any]) -> Dict[str, Any]:
+    project_id = _linear_catalog_text(project.get("id"))
+    name = _linear_catalog_text(project.get("name") or project.get("title"))
+    slug = _linear_catalog_text(project.get("slug") or project.get("urlKey"))
+    team = project.get("team") if isinstance(project.get("team"), dict) else {}
+    teams = project.get("teams") if isinstance(project.get("teams"), list) else []
+    first_team = next((entry for entry in teams if isinstance(entry, dict)), {})
+    team_id = _linear_catalog_text(project.get("teamId") or project.get("team_id") or team.get("id") or first_team.get("id"))
+    team_key = _linear_catalog_text(project.get("teamKey") or project.get("team_key") or team.get("key") or first_team.get("key"))
+    team_name = _linear_catalog_text(
+        project.get("teamName") or project.get("team_name") or team.get("name") or first_team.get("name")
+    )
+    return {
+        "id": project_id or slug or name,
+        "name": name or slug or project_id,
+        "slug": slug,
+        "team_id": team_id,
+        "team_key": team_key,
+        "team_name": team_name,
+        "issue_count": project.get("issueCount") or project.get("issue_count") or project.get("issuesCount"),
+        "raw": project,
+    }
+
+
+def _dedupe_linear_catalog_entries(entries: list[Dict[str, Any]], keys: tuple[str, ...]) -> list[Dict[str, Any]]:
+    deduped: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        parts = [str(entry.get(key) or "").strip().lower() for key in keys]
+        identity = next((part for part in parts if part), json.dumps(entry, sort_keys=True, default=str))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(entry)
+    return deduped
+
+
+def _linear_auth_challenge(server: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(server, dict):
+        return {}
+    challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
+    if not isinstance(challenge, dict):
+        pending = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+        if isinstance(pending, dict):
+            for value in pending.values():
+                if isinstance(value, dict):
+                    challenge = value
+                    break
+    return challenge if isinstance(challenge, dict) else {}
+
+
+@app.get("/linear/catalog")
+async def linear_catalog(
+    team: Optional[str] = None,
+    query: Optional[str] = None,
+    include_archived: bool = False,
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    try:
+        from src.tandem_agents.core.integrations.linear_mcp import (
+            get_mcp_server,
+            linear_count_issues,
+            linear_list_issues,
+            linear_list_projects,
+            linear_list_teams,
+            linear_mcp_server_name,
+        )
+
+        server_name = linear_mcp_server_name(cfg)
+        server = await asyncio.to_thread(get_mcp_server, cfg, server_name)
+        if server is None:
+            return {
+                "ok": False,
+                "server": server_name,
+                "connected": False,
+                "auth_required": False,
+                "teams": [],
+                "projects": [],
+                "message": (
+                    f"Linear MCP server '{server_name}' is not configured in the connected "
+                    "Tandem engine. Add it in the MCP settings first."
+                ),
+            }
+        if not bool(server.get("connected")):
+            challenge = _linear_auth_challenge(server)
+            authorization_url = _linear_catalog_text(
+                challenge.get("authorization_url")
+                or challenge.get("authorizationUrl")
+                or server.get("authorizationUrl")
+            )
+            return {
+                "ok": True,
+                "server": server_name,
+                "connected": False,
+                "auth_required": str(server.get("auth_kind") or "").strip().lower() == "oauth",
+                "auth_status": _linear_catalog_text(challenge.get("status") or "pending"),
+                "authorization_url": authorization_url,
+                "last_auth_challenge": challenge,
+                "teams": [],
+                "projects": [],
+                "message": (
+                    "Linear MCP is configured but not connected. Open MCP settings, connect "
+                    "the Linear server, finish OAuth, then refresh the Linear catalog."
+                ),
+            }
+        team_filter = str(team or "").strip()
+        teams_raw = await asyncio.to_thread(linear_list_teams, cfg, query=str(query or "").strip(), limit=100)
+        projects_raw = await asyncio.to_thread(
+            linear_list_projects,
+            cfg,
+            team=team_filter,
+            query=str(query or "").strip(),
+            include_archived=include_archived,
+            limit=100,
+        )
+        teams = _dedupe_linear_catalog_entries(
+            [_normalize_linear_team(entry) for entry in teams_raw],
+            ("id", "key", "name"),
+        )
+        projects = _dedupe_linear_catalog_entries(
+            [_normalize_linear_project(entry) for entry in projects_raw],
+            ("id", "slug", "name"),
+        )
+        for project in projects:
+            if project.get("issue_count") not in (None, ""):
+                continue
+            selector = str(project.get("id") or project.get("name") or "").strip()
+            if not selector:
+                continue
+            try:
+                project["issue_count"] = await asyncio.to_thread(
+                    linear_count_issues,
+                    cfg,
+                    team=team_filter or str(project.get("team_key") or project.get("team_name") or ""),
+                    project=selector,
+                )
+            except Exception:
+                project["issue_count"] = None
+        return {
+            "ok": True,
+            "server": server_name,
+            "connected": bool(server.get("connected")),
+            "auth_required": False,
+            "teams": teams,
+            "projects": projects,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not read Linear teams/projects through Tandem's connected Linear MCP server: "
+                f"{exc}"
+            ),
+        )
+
+
 @app.post("/projects")
 async def add_project(
     slug: str,
@@ -838,7 +1026,14 @@ async def trigger_run(project_slug: Optional[str] = None, task_source_type: Opti
     root = Path(os.environ.get("ACA_ROOT", "."))
     if item:
         try:
-            item = _scheduler_filtered_source_items(root, project_slug, [str(item).strip()])[0]
+            item = (
+                await asyncio.to_thread(
+                    _scheduler_filtered_source_items,
+                    root,
+                    project_slug,
+                    [str(item).strip()],
+                )
+            )[0]
         except HTTPException:
             raise
         except Exception as exc:
@@ -872,7 +1067,7 @@ async def trigger_runs_batch(
 
     if respect_scheduler:
         try:
-            items = _scheduler_filtered_source_items(root, project_slug, items)
+            items = await asyncio.to_thread(_scheduler_filtered_source_items, root, project_slug, items)
         except HTTPException:
             raise
         except Exception as exc:
@@ -921,6 +1116,118 @@ async def get_run(run_id: str, token: str = Depends(get_token)):
         "summary": _run_summary(run_dir),
         "snapshot": snapshot,
     }
+
+
+@app.get("/approvals")
+async def list_external_action_approvals(
+    run_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    approvals = store.list_external_action_approvals(
+        run_id=run_id,
+        status=status_filter,
+        limit=max(1, min(limit, 500)),
+    )
+    return {"approvals": approvals, "count": len(approvals)}
+
+
+@app.get("/approvals/pending")
+async def list_pending_external_action_approvals(limit: int = 100, token: str = Depends(get_token)):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    approvals = store.list_external_action_approvals(status="pending", limit=max(1, min(limit, 500)))
+    return {"approvals": approvals, "count": len(approvals)}
+
+
+@app.get("/runs/{run_id}/approvals")
+async def list_run_external_action_approvals(run_id: str, token: str = Depends(get_token)):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    approvals = store.list_external_action_approvals(run_id=run_id, limit=500)
+    return {"run_id": run_id, "approvals": approvals, "count": len(approvals)}
+
+
+@app.post("/approvals/{approval_id}/approve")
+async def approve_external_action(
+    approval_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    actor = str(payload.get("actor") or "operator").strip()
+    reason = str(payload.get("reason") or "").strip()
+    approval = store.decide_external_action_approval(approval_id, decision="approve", actor=actor, reason=reason)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return {"approval": approval}
+
+
+@app.post("/approvals/{approval_id}/reject")
+async def reject_external_action(
+    approval_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    actor = str(payload.get("actor") or "operator").strip()
+    reason = str(payload.get("reason") or "").strip()
+    approval = store.decide_external_action_approval(approval_id, decision="reject", actor=actor, reason=reason)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return {"approval": approval}
+
+
+@app.post("/runs/{run_id}/resume-approved-actions")
+async def resume_approved_external_actions(run_id: str, token: str = Depends(get_token)):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    store = CoordinationStore.from_config(cfg)
+    store.ensure_schema()
+    result = await asyncio.to_thread(execute_approved_actions, cfg, store, run_id=run_id)
+    run_dir = _run_dir(cfg, run_id)
+    if run_dir.exists():
+        append_event(run_dir / "events.jsonl", "external_actions.resumed", run_id, result)
+        status_path = run_dir / "status.json"
+        status_payload = load_status(status_path)
+        if result.get("complete"):
+            status_payload.setdefault("run", {})["status"] = "completed"
+            status_payload.setdefault("phase", {})["name"] = "handoff"
+            status_payload.setdefault("phase", {})["detail"] = "external actions executed and verified"
+            status_payload.setdefault("blocker", {})["active"] = False
+            status_payload.setdefault("metrics", {})["tests_passed"] = True
+            write_status(status_path, status_payload)
+            save_run_text(
+                run_dir / "summary.md",
+                "# Run completed\n\nExternal GitHub PR actions were approved, executed, and verified.\n",
+            )
+            append_event(run_dir / "events.jsonl", "run.completed", run_id, {"kind": "external_actions"})
+        elif result.get("failed_count"):
+            status_payload.setdefault("run", {})["status"] = "blocked"
+            status_payload.setdefault("phase", {})["name"] = "external_actions"
+            status_payload.setdefault("phase", {})["detail"] = "external action execution failed"
+            blocker = status_payload.setdefault("blocker", {})
+            blocker["active"] = True
+            blocker["kind"] = "external_action_failed"
+            blocker["message"] = "One or more approved external actions failed verification."
+            write_status(status_path, status_payload)
+            append_event(run_dir / "events.jsonl", "run.blocked", run_id, {"kind": "external_action_failed"})
+    return result
 
 
 @app.get("/runs/{run_id}/events/history")

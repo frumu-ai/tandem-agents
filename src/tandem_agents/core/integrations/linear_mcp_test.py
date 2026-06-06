@@ -6,7 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
-from src.tandem_agents.core.integrations.linear_mcp import linear_list_issues
+from src.tandem_agents.core.integrations.linear_mcp import (
+    _tool_failed,
+    linear_count_issues,
+    linear_fetch_issue,
+    linear_list_comments,
+    linear_list_issues,
+)
 
 
 class LinearMcpIntegrationTest(unittest.TestCase):
@@ -69,6 +75,78 @@ class LinearMcpIntegrationTest(unittest.TestCase):
                     "label": "Coder Runtime",
                 },
             )
+
+    def test_linear_list_issues_retries_split_statuses_after_empty_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            calls: list[dict[str, object]] = []
+
+            def fake_execute(_cfg, aliases, args):
+                calls.append(args)
+                if args.get("state") == "Backlog":
+                    return {"metadata": {"result": {"issues": [{"id": "lin-1", "identifier": "TAN-1"}]}}}
+                return {"metadata": {"result": {"issues": []}}}
+
+            with patch("src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool", side_effect=fake_execute):
+                issues = linear_list_issues(cfg, team="Tandem", project="Runtime", statuses="Backlog,Todo")
+
+            self.assertEqual([issue["identifier"] for issue in issues], ["TAN-1"])
+            self.assertTrue(any(call.get("state") == "Backlog,Todo" for call in calls))
+            self.assertTrue(any(call.get("state") == "Backlog" for call in calls))
+
+    def test_linear_count_issues_dedupes_mcp_output_and_content_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            output = '{"issues":[{"id":"lin-1","identifier":"TAN-1"},{"id":"lin-2","identifier":"TAN-2"}],"hasNextPage":false}'
+
+            def fake_execute(_cfg, aliases, args):
+                return {
+                    "metadata": {"result": {"content": [{"type": "text", "text": output}]}},
+                    "output": output,
+                }
+
+            with patch("src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool", side_effect=fake_execute):
+                count = linear_count_issues(cfg, team="Tandem", project="Runtime")
+
+            self.assertEqual(count, 2)
+
+    def test_linear_fetch_issue_prefers_parsed_issue_over_mcp_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            output = (
+                '{"id":"TAN-109","identifier":"TAN-109","title":"Inventory",'
+                '"description":"Full Linear issue body"}'
+            )
+
+            def fake_execute(_cfg, aliases, args):
+                return {"metadata": {"result": {"content": [{"type": "text", "text": output}]}}}
+
+            with patch("src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool", side_effect=fake_execute):
+                issue = linear_fetch_issue(cfg, "TAN-109")
+
+            self.assertEqual(issue["identifier"], "TAN-109")
+            self.assertEqual(issue["description"], "Full Linear issue body")
+
+    def test_tool_failed_recognizes_unknown_tool_output(self) -> None:
+        self.assertTrue(_tool_failed({"output": "Unknown tool: mcp.linear.listComments"}))
+
+    def test_linear_list_comments_uses_issue_id_and_parses_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            calls: list[dict[str, object]] = []
+            output = '{"comments":[{"id":"comment-1","body":"ACA run marker run-1"}]}'
+
+            def fake_execute(_cfg, aliases, args):
+                calls.append(args)
+                return {"metadata": {"result": {"content": [{"type": "text", "text": output}]}}}
+
+            task = {"source": {"type": "linear", "issue_id": "TAN-109", "identifier": "TAN-109"}}
+            with patch("src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool", side_effect=fake_execute):
+                comments = linear_list_comments(cfg, task)
+
+            self.assertEqual(calls[0], {"issueId": "TAN-109"})
+            self.assertEqual(comments[0]["id"], "comment-1")
+            self.assertIn("run-1", comments[0]["body"])
 
 
 if __name__ == "__main__":

@@ -120,6 +120,7 @@ def _normalize_source(source: Any) -> dict[str, Any]:
         "url": _as_text(data.get("url")),
         "path": _as_text(data.get("path")),
         "card_id": _as_text(data.get("card_id")),
+        "payload": deepcopy(data.get("payload") if isinstance(data.get("payload"), dict) else {}),
     }
 
 
@@ -253,9 +254,9 @@ def default_workspace(root: Path) -> dict[str, Any]:
 
 def configured_project_id(cfg: ResolvedConfig) -> str:
     candidates = [
-        cfg.repository.slug,
-        cfg.task_source.repo,
-        cfg.task_source.team,
+        getattr(cfg.repository, "slug", ""),
+        getattr(cfg.task_source, "repo", ""),
+        getattr(cfg.task_source, "team", ""),
         Path(str(cfg.repository_path() or "")).name if cfg.repository_path() else "",
         Path(str(cfg.task_source_path() or "")).stem if cfg.task_source_path() else "",
         "configured-project",
@@ -270,9 +271,10 @@ def configured_project_id(cfg: ResolvedConfig) -> str:
 def configured_project_binding(cfg: ResolvedConfig) -> dict[str, Any]:
     project_id = configured_project_id(cfg)
     repo_slug = _as_text(cfg.repository.slug) or _infer_slug_from_repo_url(cfg.repository.clone_url) or project_id
+    task_source = cfg.task_source
     binding = {
         "id": project_id,
-        "name": _as_text(cfg.task_source.source_name) or _as_text(cfg.repository.slug) or project_id,
+        "name": _as_text(getattr(task_source, "source_name", "")) or _as_text(cfg.repository.slug) or project_id,
         "repo": {
             "slug": repo_slug,
             "default_branch": _as_text(cfg.repository.default_branch, "main"),
@@ -283,20 +285,21 @@ def configured_project_binding(cfg: ResolvedConfig) -> dict[str, Any]:
             "clone_url": _as_text(cfg.repository.clone_url),
         },
         "source": {
-            "type": _as_text(cfg.task_source.type, "manual"),
-            "owner": _as_text(cfg.task_source.owner),
-            "repo": _as_text(cfg.task_source.repo),
-            "team": _as_text(cfg.task_source.team),
-            "project": _as_text(cfg.task_source.project),
-            "statuses": _as_text(cfg.task_source.statuses),
-            "labels": _as_text(cfg.task_source.labels),
-            "query": _as_text(cfg.task_source.query),
-            "item": _as_text(cfg.task_source.item),
-            "url": _as_text(cfg.task_source.url),
-            "path": _as_text(cfg.task_source.path),
-            "card_id": _as_text(cfg.task_source.card_id),
+            "type": _as_text(getattr(task_source, "type", ""), "manual"),
+            "owner": _as_text(getattr(task_source, "owner", "")),
+            "repo": _as_text(getattr(task_source, "repo", "")),
+            "team": _as_text(getattr(task_source, "team", "")),
+            "project": _as_text(getattr(task_source, "project", "")),
+            "statuses": _as_text(getattr(task_source, "statuses", "")),
+            "labels": _as_text(getattr(task_source, "labels", "")),
+            "query": _as_text(getattr(task_source, "query", "")),
+            "item": _as_text(getattr(task_source, "item", "")),
+            "url": _as_text(getattr(task_source, "url", "")),
+            "path": _as_text(getattr(task_source, "path", "")),
+            "card_id": _as_text(getattr(task_source, "card_id", "")),
+            "payload": deepcopy(getattr(task_source, "payload", {}) or {}),
         },
-        "snapshot": _normalize_snapshot({}, project_id=project_id, source_type=_as_text(cfg.task_source.type, "manual")),
+        "snapshot": _normalize_snapshot({}, project_id=project_id, source_type=_as_text(getattr(task_source, "type", ""), "manual")),
         "sync_state": "unknown",
         "last_refresh_ms": now_ms(),
         "created_at_ms": now_ms(),

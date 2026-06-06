@@ -46,6 +46,10 @@ class CoordinationSnapshotMixin:
                 "SELECT * FROM outbox ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+            approvals = conn.execute(
+                "SELECT * FROM external_action_approvals ORDER BY updated_at_ms DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
             scheduler_events = conn.execute(
                 "SELECT * FROM scheduler_events ORDER BY id DESC LIMIT ?",
                 (limit,),
@@ -71,6 +75,8 @@ class CoordinationSnapshotMixin:
                 "processing_outbox": sum(1 for row in outbox if row["status"] == "processing"),
                 "failed_outbox": sum(1 for row in outbox if row["status"] == "failed"),
                 "dispatched_outbox": sum(1 for row in outbox if row["status"] == "dispatched"),
+                "pending_external_approvals": sum(1 for row in approvals if row["status"] == "pending"),
+                "failed_external_approvals": sum(1 for row in approvals if row["status"] == "failed"),
                 "scheduler_events": len(scheduler_events),
             },
             "tasks": tasks,
@@ -78,5 +84,6 @@ class CoordinationSnapshotMixin:
             "leases": [self._row_to_lease(row) for row in leases],
             "workers": [self._row_to_worker(row) for row in workers],
             "outbox": [self._row_to_outbox(row) for row in outbox],
+            "external_action_approvals": [self._row_to_external_action_approval(row) for row in approvals],
             "scheduler_events": [self._row_to_scheduler_event(row) for row in scheduler_events],
         }

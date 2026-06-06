@@ -140,7 +140,12 @@ def _tool_failed(result: dict[str, Any]) -> bool:
         if isinstance(inner, dict) and inner.get("isError") is True:
             return True
     output = str(result.get("output") or "").strip().lower()
-    return output.startswith("failed") or output.startswith("unknown method") or output.startswith("missing required")
+    return (
+        output.startswith("failed")
+        or output.startswith("unknown method")
+        or output.startswith("unknown tool")
+        or output.startswith("missing required")
+    )
 
 
 def _tool_error_message(result: dict[str, Any]) -> str:
@@ -184,7 +189,30 @@ def _tool_result_payloads(result: dict[str, Any]) -> list[Any]:
                         values.append(json.loads(text))
                     except Exception:
                         pass
-    return values
+    unique_values: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            key = json.dumps(value, sort_keys=True, default=str)
+        except Exception:
+            key = repr(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_values.append(value)
+    return unique_values
+
+
+def _tool_payload_page(payload: Any) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, ""
+    has_next = bool(payload.get("hasNextPage") or payload.get("has_next_page"))
+    cursor = str(payload.get("cursor") or payload.get("nextCursor") or payload.get("next_cursor") or "").strip()
+    page_info = payload.get("pageInfo") or payload.get("page_info")
+    if isinstance(page_info, dict):
+        has_next = has_next or bool(page_info.get("hasNextPage") or page_info.get("has_next_page"))
+        cursor = cursor or str(page_info.get("endCursor") or page_info.get("end_cursor") or "").strip()
+    return has_next, cursor
 
 
 def _alias_variants(alias: str) -> list[str]:
@@ -277,14 +305,38 @@ def flatten_label_entries(payload: Any) -> list[dict[str, Any]]:
     return _flatten_entries(payload, ("labels", "issueLabels", "items", "nodes", "data"))
 
 
+def flatten_team_entries(payload: Any) -> list[dict[str, Any]]:
+    return _flatten_entries(payload, ("teams", "items", "nodes", "data", "results"))
+
+
+def flatten_project_entries(payload: Any) -> list[dict[str, Any]]:
+    return _flatten_entries(payload, ("projects", "items", "nodes", "data", "results"))
+
+
 def _split_csv(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
-def linear_list_issues(
-    cfg: ResolvedConfig,
+def _dedupe_linear_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        identity = str(entry.get("id") or entry.get("identifier") or entry.get("url") or "").strip()
+        if not identity:
+            try:
+                identity = json.dumps(entry, sort_keys=True, default=str)
+            except Exception:
+                identity = repr(entry)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(entry)
+    return deduped
+
+
+def _linear_issue_attempts(
     *,
     team: str,
     project: str = "",
@@ -292,8 +344,11 @@ def linear_list_issues(
     labels: str = "",
     query: str = "",
     limit: int = 50,
+    cursor: str = "",
 ) -> list[dict[str, Any]]:
-    base_args: dict[str, Any] = {"limit": max(1, int(limit))}
+    base_args: dict[str, Any] = {"limit": min(250, max(1, int(limit)))}
+    if cursor:
+        base_args["cursor"] = cursor
     if team:
         base_args["team"] = team
     if project:
@@ -322,9 +377,17 @@ def linear_list_issues(
         attempts.append({**base_args, "state": statuses})
         attempts.append({**base_args, "status": statuses})
         attempts.append({**base_args, "statuses": status_values})
+        for status in status_values:
+            if labels:
+                attempts.append({**base_args, "state": status, "label": labels})
+                attempts.append({**base_args, "status": status, "label": labels})
+            attempts.append({**base_args, "state": status})
+            attempts.append({**base_args, "status": status})
     if labels:
         attempts.append({**base_args, "label": labels})
         attempts.append({**base_args, "labels": label_values})
+        for label in label_values:
+            attempts.append({**base_args, "label": label})
     attempts.append(dict(base_args))
 
     deduped_attempts: list[dict[str, Any]] = []
@@ -335,9 +398,29 @@ def linear_list_issues(
             continue
         seen_attempts.add(key)
         deduped_attempts.append(args)
+    return deduped_attempts
 
+
+def linear_list_issues(
+    cfg: ResolvedConfig,
+    *,
+    team: str,
+    project: str = "",
+    statuses: str = "",
+    labels: str = "",
+    query: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
     last_error: Exception | None = None
-    for args in deduped_attempts:
+    attempts = _linear_issue_attempts(
+        team=team,
+        project=project,
+        statuses=statuses,
+        labels=labels,
+        query=query,
+        limit=limit,
+    )
+    for index, args in enumerate(attempts):
         try:
             result = _execute_linear_tool(cfg, ["list_issues", "issues"], args)
         except Exception as exc:
@@ -346,10 +429,101 @@ def linear_list_issues(
         issues: list[dict[str, Any]] = []
         for payload in _tool_result_payloads(result):
             issues.extend(flatten_issue_entries(payload))
-        return issues
+        issues = _dedupe_linear_entries(issues)
+        if issues or index == len(attempts) - 1:
+            return issues
     if last_error is not None:
         raise last_error
     return []
+
+
+def linear_count_issues(
+    cfg: ResolvedConfig,
+    *,
+    team: str,
+    project: str = "",
+    statuses: str = "",
+    labels: str = "",
+    query: str = "",
+    max_pages: int = 20,
+) -> int:
+    total = 0
+    cursor = ""
+    seen_issue_ids: set[str] = set()
+    for _ in range(max(1, int(max_pages))):
+        last_error: Exception | None = None
+        page_handled = False
+        for args in _linear_issue_attempts(
+            team=team,
+            project=project,
+            statuses=statuses,
+            labels=labels,
+            query=query,
+            limit=250,
+            cursor=cursor,
+        ):
+            try:
+                result = _execute_linear_tool(cfg, ["list_issues", "issues"], args)
+            except Exception as exc:
+                last_error = exc
+                continue
+            issues: list[dict[str, Any]] = []
+            has_next = False
+            next_cursor = ""
+            for payload in _tool_result_payloads(result):
+                issues.extend(flatten_issue_entries(payload))
+                payload_has_next, payload_cursor = _tool_payload_page(payload)
+                has_next = has_next or payload_has_next
+                next_cursor = next_cursor or payload_cursor
+            for issue in _dedupe_linear_entries(issues):
+                issue_id = str(issue.get("id") or issue.get("identifier") or issue.get("url") or "").strip()
+                if not issue_id:
+                    issue_id = json.dumps(issue, sort_keys=True, default=str)
+                if issue_id in seen_issue_ids:
+                    continue
+                seen_issue_ids.add(issue_id)
+                total += 1
+            page_handled = True
+            cursor = next_cursor
+            if not has_next or not cursor:
+                return total
+            break
+        if not page_handled:
+            if last_error is not None:
+                raise last_error
+            return total
+    return total
+
+
+def linear_list_teams(cfg: ResolvedConfig, *, query: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    args: dict[str, Any] = {"limit": max(1, int(limit))}
+    if query:
+        args["query"] = query
+    result = _execute_linear_tool(cfg, ["list_teams", "teams"], args)
+    teams: list[dict[str, Any]] = []
+    for payload in _tool_result_payloads(result):
+        teams.extend(flatten_team_entries(payload))
+    return teams
+
+
+def linear_list_projects(
+    cfg: ResolvedConfig,
+    *,
+    team: str = "",
+    query: str = "",
+    include_archived: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    args: dict[str, Any] = {"limit": min(50, max(1, int(limit))), "includeArchived": include_archived}
+    if team:
+        args["team"] = team
+    if query:
+        args["query"] = query
+    result = _execute_linear_tool(cfg, ["list_projects", "projects"], args)
+    projects: list[dict[str, Any]] = []
+    for payload in _tool_result_payloads(result):
+        projects.extend(flatten_project_entries(payload))
+    return projects
 
 
 def linear_fetch_issue(cfg: ResolvedConfig, identifier: str) -> dict[str, Any]:
@@ -367,12 +541,15 @@ def linear_fetch_issue(cfg: ResolvedConfig, identifier: str) -> dict[str, Any]:
             result = _execute_linear_tool(cfg, ["get_issue", "fetch", "issue"], args)
         except Exception:
             continue
+        fallback: dict[str, Any] | None = None
         for payload in _tool_result_payloads(result):
             entries = flatten_issue_entries(payload)
             if entries:
                 return entries[0]
-            if isinstance(payload, dict):
-                return payload
+            if fallback is None and isinstance(payload, dict):
+                fallback = payload
+        if fallback is not None:
+            return fallback
     return {}
 
 
@@ -472,8 +649,9 @@ def linear_add_comment(cfg: ResolvedConfig, task: dict[str, Any], body: str) -> 
     if not body_text:
         return None
     attempts = (
-        {"issue_id": issue_id, "body": body_text},
         {"issueId": issue_id, "body": body_text},
+        {"issueId": issue_id, "comment": body_text},
+        {"issue_id": issue_id, "body": body_text},
         {"id": issue_id, "body": body_text},
         {"issue_id": issue_id, "comment": body_text},
     )
@@ -485,6 +663,43 @@ def linear_add_comment(cfg: ResolvedConfig, task: dict[str, Any], body: str) -> 
         except Exception as exc:
             last_error = exc
     raise RuntimeError(str(last_error) if last_error else "Linear comment creation failed.")
+
+
+def linear_list_comments(cfg: ResolvedConfig, task: dict[str, Any]) -> list[dict[str, Any]]:
+    source = dict(task.get("source") or {})
+    issue_id = str(source.get("issue_id") or source.get("id") or source.get("identifier") or source.get("item") or "").strip()
+    if not issue_id:
+        return []
+    attempts = (
+        {"issueId": issue_id},
+        {"issue_id": issue_id},
+        {"id": issue_id},
+    )
+    last_error: Exception | None = None
+    for args in attempts:
+        try:
+            result = _execute_linear_tool(cfg, ["list_comments"], args)
+        except Exception as exc:
+            last_error = exc
+            continue
+        comments: list[dict[str, Any]] = []
+        for payload in _tool_result_payloads(result):
+            comments.extend(_flatten_entries(payload, ("comments", "items", "nodes", "data", "results")))
+        if comments:
+            return comments
+        return []
+    raise RuntimeError(str(last_error) if last_error else "Linear comment listing failed.")
+
+
+def linear_comment_marker_present(cfg: ResolvedConfig, task: dict[str, Any], marker: str) -> bool:
+    marker_text = str(marker or "").strip()
+    if not marker_text:
+        return False
+    for comment in linear_list_comments(cfg, task):
+        body = str(comment.get("body") or comment.get("text") or comment.get("content") or "")
+        if marker_text in body:
+            return True
+    return False
 
 
 def build_linear_comment_body(

@@ -25,6 +25,7 @@ from src.tandem_agents.core.coordination.rows import (  # noqa: F401
     row_to_worker,
     row_to_lease,
     row_to_outbox,
+    row_to_external_action_approval,
     row_to_scheduler_event,
 )
 from src.tandem_agents.core.coordination.constants import (
@@ -40,5 +41,6 @@ from src.tandem_agents.core.coordination.runners import CoordinationRunnersMixin
 from src.tandem_agents.core.coordination.workers import CoordinationWorkersMixin
 from src.tandem_agents.core.coordination.leases import CoordinationLeasesMixin
 from src.tandem_agents.core.coordination.outbox import CoordinationOutboxMixin
+from src.tandem_agents.core.coordination.approvals import CoordinationApprovalsMixin
 from src.tandem_agents.core.coordination.scheduler import CoordinationSchedulerMixin
 from src.tandem_agents.core.coordination.snapshot import CoordinationSnapshotMixin

@@ -105,6 +105,32 @@ CREATE TABLE IF NOT EXISTS outbox (
     dedupe_key TEXT UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS external_action_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    source_type TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    target_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    verification_marker TEXT,
+    status TEXT NOT NULL,
+    requested_by TEXT,
+    decided_by TEXT,
+    decision_reason TEXT,
+    result_json TEXT NOT NULL,
+    error TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    decided_at_ms INTEGER,
+    executed_at_ms INTEGER,
+    expires_at_ms INTEGER,
+    dedupe_key TEXT UNIQUE
+);
+
 CREATE TABLE IF NOT EXISTS scheduler_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type TEXT NOT NULL,
@@ -120,6 +146,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_status
 
 CREATE INDEX IF NOT EXISTS idx_tasks_state_status
     ON tasks(state, status, updated_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_external_action_approvals_status
+    ON external_action_approvals(status, updated_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_external_action_approvals_run
+    ON external_action_approvals(run_id, status);
 """
 
 SQLITE_MIGRATIONS = [
@@ -218,6 +250,32 @@ CREATE TABLE IF NOT EXISTS outbox (
     dedupe_key TEXT UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS external_action_approvals (
+    id BIGSERIAL PRIMARY KEY,
+    approval_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    source_type TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    target_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    verification_marker TEXT,
+    status TEXT NOT NULL,
+    requested_by TEXT,
+    decided_by TEXT,
+    decision_reason TEXT,
+    result_json TEXT NOT NULL,
+    error TEXT,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    decided_at_ms BIGINT,
+    executed_at_ms BIGINT,
+    expires_at_ms BIGINT,
+    dedupe_key TEXT UNIQUE
+);
+
 CREATE TABLE IF NOT EXISTS scheduler_events (
     id BIGSERIAL PRIMARY KEY,
     event_type TEXT NOT NULL,
@@ -233,6 +291,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_status
 
 CREATE INDEX IF NOT EXISTS idx_tasks_state_status
     ON tasks(state, status, updated_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_external_action_approvals_status
+    ON external_action_approvals(status, updated_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_external_action_approvals_run
+    ON external_action_approvals(run_id, status);
 
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'queued';
 """

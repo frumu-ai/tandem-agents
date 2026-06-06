@@ -158,6 +158,37 @@ def row_to_outbox(row: Any | None) -> dict[str, Any]:
     }
 
 
+def row_to_external_action_approval(row: Any | None) -> dict[str, Any]:
+    """Convert an ``external_action_approvals`` row to an approval dict."""
+    if row is None:
+        return {}
+    return {
+        "id": row["id"],
+        "approval_id": row["approval_id"],
+        "run_id": row["run_id"],
+        "task_id": row["task_id"],
+        "source_type": row["source_type"],
+        "adapter": row["adapter"],
+        "action_type": row["action_type"],
+        "target": _json_loads(row["target_json"]),
+        "payload": _json_loads(row["payload_json"]),
+        "risk_level": row["risk_level"],
+        "verification_marker": row["verification_marker"],
+        "status": row["status"],
+        "requested_by": row["requested_by"],
+        "decided_by": row["decided_by"],
+        "decision_reason": row["decision_reason"],
+        "result": _json_loads(row["result_json"]),
+        "error": row["error"],
+        "created_at_ms": row["created_at_ms"],
+        "updated_at_ms": row["updated_at_ms"],
+        "decided_at_ms": row["decided_at_ms"],
+        "executed_at_ms": row["executed_at_ms"],
+        "expires_at_ms": row["expires_at_ms"],
+        "dedupe_key": row["dedupe_key"],
+    }
+
+
 def row_to_scheduler_event(row: Any | None) -> dict[str, Any]:
     """Convert a ``scheduler_events`` table row to an event dict."""
     if row is None:

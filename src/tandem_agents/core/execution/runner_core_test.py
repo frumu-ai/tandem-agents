@@ -13,6 +13,8 @@ from src.tandem_agents.core.engine.prompts import build_manager_prompt
 from src.tandem_agents.core.execution.runner_core import (
     _all_subtasks_verified_existing,
     _execute_local_worker_pool,
+    _has_unresolved_write_required_worker_failure,
+    _linear_comment_task_summary,
     _prepare_subtasks_with_discovery,
     _record_worker_result,
     _record_coding_run_contract,
@@ -149,6 +151,102 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 },
             )
         )
+
+    def test_write_required_worker_failure_is_unresolved_without_existing_proof(self) -> None:
+        self.assertTrue(
+            _has_unresolved_write_required_worker_failure(
+                [{"subtask_id": "subtask-1", "status": "failed", "write_required": True}]
+            )
+        )
+        self.assertFalse(
+            _has_unresolved_write_required_worker_failure(
+                [{"subtask_id": "subtask-1", "status": "failed", "write_required": False}]
+            )
+        )
+        self.assertFalse(
+            _has_unresolved_write_required_worker_failure(
+                [
+                    {
+                        "subtask_id": "subtask-1",
+                        "status": "failed",
+                        "write_required": True,
+                        "verified_existing": True,
+                    }
+                ]
+            )
+        )
+
+    def test_worker_pool_preserves_subtask_write_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def worker_runner(*_args):
+                return {
+                    "status": "failed",
+                    "returncode": 1,
+                    "write_required": False,
+                    "output_excerpt": "Worker reported success but produced no filesystem changes.",
+                }
+
+            results = _execute_local_worker_pool(
+                resolve_config(root),
+                "run-test",
+                root,
+                root,
+                {"title": "Needs edits"},
+                [
+                    {
+                        "id": "subtask-1",
+                        "title": "Write the change",
+                        "write_required": True,
+                    }
+                ],
+                1,
+                worker_runner=worker_runner,
+            )
+
+            self.assertEqual(results[0]["status"], "failed")
+            self.assertTrue(results[0]["write_required"])
+            self.assertTrue(_has_unresolved_write_required_worker_failure(results))
+
+    def test_linear_comment_summary_records_pr_decisions(self) -> None:
+        task = {
+            "title": "Inventory Bolt/Jules PRs and record close/merge decision per PR",
+            "raw_issue_body": "\n".join(
+                [
+                    "## Initial Inventory",
+                    "",
+                    "Green-ish / potentially cherry-pickable:",
+                    "",
+                    "* #1459 - 3+/3-, 3 files, green",
+                    "* #1357 - 40+/34-, 2 files, green",
+                    "",
+                    "Large or suspicious despite green:",
+                    "",
+                    "* #1454 - 1507+/2857-, 5 files, green but too large for casual merge",
+                    "",
+                    "Failing and likely close/supersede unless valuable:",
+                    "",
+                    "* #1457, #1456, #1455",
+                    "",
+                    "## Acceptance",
+                    "",
+                    "* Decision notes are posted in this Linear issue or linked follow-up comments.",
+                ]
+            ),
+            "acceptance_criteria": [
+                "Decision notes are posted in this Linear issue or linked follow-up comments.",
+            ],
+        }
+
+        summary = _linear_comment_task_summary(task)
+
+        self.assertIn("#1459: cherry-pick", summary)
+        self.assertIn("#1357: cherry-pick", summary)
+        self.assertIn("#1454: needs-manual-review", summary)
+        self.assertIn("#1457: close", summary)
+        self.assertIn("#1456: close", summary)
+        self.assertIn("No repository changes, commit, push, or PR were expected", summary)
 
     def test_worker_results_are_deduplicated_by_subtask(self) -> None:
         worker_results: list[dict[str, object]] = []

@@ -119,6 +119,78 @@ Provider stream failures masked a missing workspace artifact.
         self.assertIn("Bug Monitor triage run: automation-v2-run-123", task["notes_for_agent"])
         self.assertIn("Bug Monitor coder-ready signal: True", task["notes_for_agent"])
 
+    def test_linear_decision_note_task_is_not_code_edit(self) -> None:
+        body = """## Context
+
+There are 19 open Bolt/Jules-style PRs.
+
+## Acceptance
+
+* Each PR gets one of: close, cherry-pick, superseded-by-consolidated-PR, needs-manual-review.
+* Decision notes are posted in this Linear issue or linked follow-up comments.
+* No PR is merged directly without current-main validation.
+"""
+
+        task = apply_task_contract(
+            {
+                "title": "Inventory Bolt/Jules PRs and record close/merge decision per PR",
+                "description": body,
+                "source": {"type": "linear", "identifier": "TAN-109"},
+            }
+        )
+
+        self.assertEqual(task["execution_kind"], "linear_comment")
+        self.assertEqual(task["target_files"], [])
+
+    def test_linear_code_task_stays_code_edit(self) -> None:
+        body = """## Files likely touched
+
+- crates/tandem-server/src/http/linear.rs
+
+## Acceptance
+
+- Implement Linear routing for task intake.
+"""
+
+        task = apply_task_contract(
+            {
+                "title": "Implement Linear routing",
+                "description": body,
+                "source": {"type": "linear", "identifier": "TAN-130"},
+            }
+        )
+
+        self.assertEqual(task["execution_kind"], "code_edit")
+        self.assertEqual(task["target_files"], ["crates/tandem-server/src/http/linear.rs"])
+
+    def test_linear_github_pr_action_task_is_not_code_edit(self) -> None:
+        body = """## Context
+
+11 generated-style PRs currently have at least one failed check.
+
+Candidates:
+
+* #1457 — failing
+* #1400 — failing deep gate, 54 files
+
+## Acceptance
+
+* Re-check whether any candidate has become mergeable on current main.
+* Close clear duplicates/stale generated branches with a concise GitHub comment.
+* Do not close #1400 without explicit manual confirmation.
+"""
+
+        task = apply_task_contract(
+            {
+                "title": "Close duplicate or stale failing Bolt PRs",
+                "description": body,
+                "source": {"type": "linear", "identifier": "TAN-110"},
+            }
+        )
+
+        self.assertEqual(task["execution_kind"], "github_pr_action")
+        self.assertEqual(task["target_files"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
