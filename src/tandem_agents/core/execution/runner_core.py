@@ -1361,6 +1361,27 @@ def _role_provider_override_config(
     )
 
 
+def _permission_requests_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in ("permissions", "requests"):
+        raw_items = payload.get(key) or []
+        if not isinstance(raw_items, list):
+            continue
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            request_id = str(raw_item.get("request_id") or raw_item.get("id") or "")
+            dedupe_key = request_id or str(id(raw_item))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            items.append(raw_item)
+    return items
+
+
 def _auto_approve_loop(cfg: ResolvedConfig, stop_event: threading.Event) -> None:
     """Background thread to auto-approve Tandem permissions and agent spawn requests."""
     seen_approvals: set[str] = set()
@@ -1383,8 +1404,7 @@ def _auto_approve_loop(cfg: ResolvedConfig, stop_event: threading.Event) -> None
 
             # 2. Handle general permissions (bash, write, etc)
             permissions_payload = sdk_list_permissions(cfg)
-            perms = (permissions_payload.get("permissions") or []) if isinstance(permissions_payload, dict) else []
-            for perm in perms:
+            for perm in _permission_requests_from_payload(permissions_payload):
                 request_id = str(perm.get("request_id") or perm.get("id") or "")
                 status = str(perm.get("status") or "").strip().lower()
                 if request_id and status == "pending" and request_id not in seen_permissions:

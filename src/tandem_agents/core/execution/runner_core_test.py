@@ -15,6 +15,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _execute_local_worker_pool,
     _has_unresolved_write_required_worker_failure,
     _linear_comment_task_summary,
+    _permission_requests_from_payload,
     _prepare_subtasks_with_discovery,
     _record_worker_result,
     _record_coding_run_contract,
@@ -23,6 +24,35 @@ from src.tandem_agents.core.execution.runner_core import (
 
 
 class RunnerCoreDiscoveryTest(unittest.TestCase):
+    def test_permission_requests_from_payload_accepts_engine_requests_shape(self) -> None:
+        payload = {
+            "requests": [
+                {"id": "req-1", "status": "pending", "permission": "bash"},
+                {"id": "req-2", "status": "allow", "permission": "bash"},
+            ],
+            "rules": [],
+        }
+
+        self.assertEqual(
+            _permission_requests_from_payload(payload),
+            [
+                {"id": "req-1", "status": "pending", "permission": "bash"},
+                {"id": "req-2", "status": "allow", "permission": "bash"},
+            ],
+        )
+
+    def test_permission_requests_from_payload_accepts_sdk_permissions_shape(self) -> None:
+        payload = {
+            "permissions": [
+                {"request_id": "req-1", "status": "pending", "permission": "bash"},
+            ],
+        }
+
+        self.assertEqual(
+            _permission_requests_from_payload(payload),
+            [{"request_id": "req-1", "status": "pending", "permission": "bash"}],
+        )
+
     def test_empty_manager_plan_still_injects_discovered_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)
