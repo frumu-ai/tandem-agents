@@ -78,9 +78,12 @@ def mirror_run_file(run_id: str, source_path: Path, logical_path: str) -> dict[s
     data = source_path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     blob = _blob_path(digest)
-    blob.parent.mkdir(parents=True, exist_ok=True)
-    if not blob.exists():
-        blob.write_bytes(data)
+    try:
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        if not blob.exists():
+            blob.write_bytes(data)
+    except OSError:
+        return None
     entry = {
         "path": logical,
         "sha256": digest,
@@ -96,7 +99,10 @@ def mirror_run_file(run_id: str, source_path: Path, logical_path: str) -> dict[s
         entries.append(entry)
         manifest["entries"] = sorted(entries, key=lambda item: str(item.get("path") or ""))
         manifest["updated_at_ms"] = now_ms()
-        _save_manifest(run_id, manifest)
+        try:
+            _save_manifest(run_id, manifest)
+        except OSError:
+            return None
     return entry
 
 
@@ -131,4 +137,3 @@ def restore_run_tree(run_id: str, destination_root: Path) -> list[str]:
         target.write_bytes(object_path.read_bytes())
         restored.append(logical_path)
     return restored
-
