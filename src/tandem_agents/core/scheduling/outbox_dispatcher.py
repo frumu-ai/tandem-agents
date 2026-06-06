@@ -19,6 +19,7 @@ from src.tandem_agents.core.integrations.linear_mcp import (
     ensure_linear_mcp_disconnected,
     linear_update_issue,
     linear_add_comment,
+    linear_comment_marker_present,
 )
 
 DEFAULT_OUTBOX_BATCH_LIMIT = 25
@@ -230,6 +231,16 @@ def _dispatch_linear_comment(cfg: ResolvedConfig, outbox: dict[str, Any]) -> dic
             "status": "failed",
             "terminal": True,
             "error": warning,
+        }
+    marker = str(payload.get("run_id") or "").strip()
+    if marker and not linear_comment_marker_present(cfg, task, marker):
+        return {
+            "outbox_id": outbox.get("id"),
+            "kind": outbox.get("kind"),
+            "payload": payload,
+            "status": "failed",
+            "terminal": True,
+            "error": "Linear comment creation could not be verified by reading the run marker back from Linear.",
         }
     return {
         "outbox_id": outbox.get("id"),

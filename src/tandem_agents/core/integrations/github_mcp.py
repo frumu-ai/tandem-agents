@@ -292,7 +292,12 @@ def _tool_failed(result: dict[str, Any]) -> bool:
         if isinstance(inner, dict) and inner.get("isError") is True:
             return True
     output = str(result.get("output") or "").strip().lower()
-    return output.startswith("failed") or output.startswith("unknown method") or output.startswith("missing required")
+    return (
+        output.startswith("failed")
+        or output.startswith("unknown method")
+        or output.startswith("unknown tool")
+        or output.startswith("missing required")
+    )
 
 
 def _tool_error_message(result: dict[str, Any]) -> str:

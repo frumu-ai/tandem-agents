@@ -26,6 +26,7 @@ from src.tandem_agents.core.coordination.rows import (
     row_to_lease,
     row_to_outbox,
     row_to_scheduler_event,
+    row_to_external_action_approval,
 )
 
 from src.tandem_agents.core.coordination.tasks import CoordinationTasksMixin
@@ -33,6 +34,7 @@ from src.tandem_agents.core.coordination.runners import CoordinationRunnersMixin
 from src.tandem_agents.core.coordination.workers import CoordinationWorkersMixin
 from src.tandem_agents.core.coordination.leases import CoordinationLeasesMixin
 from src.tandem_agents.core.coordination.outbox import CoordinationOutboxMixin
+from src.tandem_agents.core.coordination.approvals import CoordinationApprovalsMixin
 from src.tandem_agents.core.coordination.scheduler import CoordinationSchedulerMixin
 from src.tandem_agents.core.coordination.snapshot import CoordinationSnapshotMixin
 
@@ -125,6 +127,7 @@ class CoordinationStore(
     CoordinationWorkersMixin,
     CoordinationLeasesMixin,
     CoordinationOutboxMixin,
+    CoordinationApprovalsMixin,
     CoordinationSchedulerMixin,
     CoordinationSnapshotMixin,
 ):
@@ -238,6 +241,8 @@ class CoordinationStore(
 
     def _row_to_outbox(self, row: sqlite3.Row | None) -> dict[str, Any]:
         return row_to_outbox(row)
+    def _row_to_external_action_approval(self, row: sqlite3.Row | None) -> dict[str, Any]:
+        return row_to_external_action_approval(row)
 
     def _row_to_scheduler_event(self, row: sqlite3.Row | None) -> dict[str, Any]:
         return row_to_scheduler_event(row)

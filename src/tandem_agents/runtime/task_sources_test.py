@@ -610,6 +610,39 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertFalse(by_identifier["ENG-1"]["actionable"])
             self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
 
+    def test_linear_board_snapshot_includes_active_items_outside_runnable_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            filtered_issues = [
+                {"id": "lin-2", "identifier": "ENG-2", "title": "First", "priority": 1, "state": {"name": "Backlog", "type": "backlog"}},
+            ]
+            all_issues = [
+                *filtered_issues,
+                {"id": "lin-3", "identifier": "ENG-3", "title": "Started", "priority": 2, "state": {"name": "In Progress", "type": "started"}},
+            ]
+            statuses = [
+                {"id": "st-1", "name": "Backlog", "type": "backlog"},
+                {"id": "st-2", "name": "In Progress", "type": "started"},
+            ]
+
+            def fake_list_issues(_cfg, **kwargs):
+                return filtered_issues if kwargs.get("statuses") else all_issues
+
+            with (
+                patch("src.tandem_agents.runtime.task_sources.ensure_linear_mcp_connected"),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issue_statuses", return_value=statuses),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issue_labels", return_value=[]),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issues", side_effect=fake_list_issues),
+            ):
+                snapshot = linear_board_snapshot(cfg, force_refresh=True)
+
+            by_identifier = {item["identifier"]: item for item in snapshot["items"]}
+            self.assertIn("ENG-3", by_identifier)
+            self.assertEqual(by_identifier["ENG-3"]["project_column"], "In Progress")
+            self.assertEqual(by_identifier["ENG-3"]["launch_state"], "in_progress")
+            self.assertFalse(by_identifier["ENG-3"]["actionable"])
+            self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
+
     def test_linear_task_carries_repo_and_issue_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))
@@ -644,6 +677,31 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertEqual(task["source"]["initial_status_key"], "todo")
             self.assertEqual(task["repo"]["slug"], "frumu-ai/tandem")
             self.assertIn("Add tests", task["acceptance_criteria"])
+
+    def test_linear_task_hydrates_selected_issue_before_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            listed_issue = {
+                "id": "ENG-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "short … (truncated, use `get_issue` for full description)",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+            full_issue = {
+                **listed_issue,
+                "description": "Full body\n\nAcceptance criteria:\n- Real criterion",
+            }
+
+            with (
+                patch("src.tandem_agents.runtime.task_sources._load_linear_live_data", return_value=([], [], [listed_issue])),
+                patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=full_issue),
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+
+            self.assertIn("Full body", task["description"])
+            self.assertNotIn("truncated", task["description"])
+            self.assertIn("Real criterion", task["acceptance_criteria"])
 
     def test_linear_task_source_reports_connector_failure_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

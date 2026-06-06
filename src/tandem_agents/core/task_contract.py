@@ -383,7 +383,73 @@ def apply_task_contract(task: Mapping[str, Any] | None) -> dict[str, Any]:
     result["task_contract"] = contract
     result["source"] = source
     result["repo"] = repo
+    result["execution_kind"] = classify_task_execution_kind(result)
     return result
+
+
+def classify_task_execution_kind(task: Mapping[str, Any] | None) -> str:
+    """Classify what ACA should actually do for a task.
+
+    Most tasks are repository code edits. Some Linear issues are operational
+    queue work where the requested artifact is a Linear note/comment rather
+    than a git diff. Those must not be forced through the repo worker path.
+    """
+    if not isinstance(task, Mapping):
+        return "code_edit"
+    contract = task_contract_payload(task)
+    source = dict(task.get("source") or {})
+    source_type = _normalize_text(source.get("type")).lower()
+    target_files = _coerce_text_list(contract.get("target_files") or task.get("target_files"))
+    verification_commands = _coerce_text_list(
+        contract.get("verification_commands") or task.get("verification_commands")
+    )
+    if target_files or verification_commands or contract.get("tandem_coder_handoff"):
+        return "code_edit"
+    text = "\n".join(
+        [
+            _normalize_text(task.get("title")),
+            _normalize_text(task.get("description")),
+            "\n".join(_coerce_text_list(contract.get("acceptance_criteria"))),
+            _normalize_text(contract.get("notes_for_agent")),
+        ]
+    ).lower()
+    if source_type == "linear":
+        github_pr_action_markers = (
+            "close duplicate",
+            "close clear duplicates",
+            "close stale",
+            "close/supersede",
+            "github comment",
+            "re-check whether any candidate has become mergeable",
+            "do not close #",
+        )
+        if any(marker in text for marker in github_pr_action_markers):
+            return "github_pr_action"
+        linear_note_markers = (
+            "posted in this linear issue",
+            "post decision notes",
+            "decision notes are posted",
+            "linked follow-up comments",
+            "record close/merge decision",
+            "record close merge decision",
+            "record decision per pr",
+            "inventory",
+        )
+        repo_edit_markers = (
+            "implement",
+            "fix bug",
+            "add ",
+            "build ",
+            "create ",
+            "update code",
+            "refactor",
+            "test ",
+        )
+        if any(marker in text for marker in linear_note_markers) and not any(
+            marker in text for marker in repo_edit_markers
+        ):
+            return "linear_comment"
+    return "code_edit"
 
 
 def _normalized_status(value: Any) -> str:

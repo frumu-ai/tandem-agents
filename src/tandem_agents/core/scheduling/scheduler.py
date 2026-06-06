@@ -7,6 +7,7 @@ from typing import Any
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
+from src.tandem_agents.core.task_contract import classify_task_execution_kind
 from src.tandem_agents.core.scheduling.coder_supervisor import task_has_active_coder_run
 
 
@@ -64,6 +65,11 @@ def task_repo_key(task: dict[str, Any]) -> str:
 
 
 def task_execution_backend(cfg: ResolvedConfig, task: dict[str, Any]) -> str:
+    execution_kind = classify_task_execution_kind(task)
+    if execution_kind == "linear_comment":
+        return "linear_comment"
+    if execution_kind == "github_pr_action":
+        return "github_pr_action"
     repo = dict(task.get("repo") or {})
     return coder_backend_mode(cfg, task, repo)
 

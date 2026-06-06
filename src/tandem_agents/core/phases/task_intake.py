@@ -57,7 +57,7 @@ def run_task_intake(
         write_board_snapshot,
     )
     from src.tandem_agents.runtime.task_sources import normalize_task
-    from src.tandem_agents.core.task_contract import task_contract_completeness
+    from src.tandem_agents.core.task_contract import classify_task_execution_kind, task_contract_completeness
     from src.tandem_agents.core.execution.run_lifecycle import build_provider_config_dict, build_swarm_config_dict
 
     # 1. Source MCP for intake
@@ -124,6 +124,7 @@ def run_task_intake(
         "target_files": list(task.get("target_files") or task_contract.get("target_files") or []),
         "acceptance_criteria": list(task.get("acceptance_criteria") or task_contract.get("acceptance_criteria") or []),
     }
+    ctx.blackboard["execution_kind"] = task.get("execution_kind") or classify_task_execution_kind(task)
     _rc._record_review_policy(ctx.blackboard, ctx.cfg)
     _rc._append_blackboard_note(
         ctx.blackboard,
@@ -279,6 +280,7 @@ def run_task_intake(
             ctx.task = card_to_task(card, board_path=board_path)
             ctx.task["source"]["type"] = ctx.task["source"].get("type") or ctx.cfg.task_source.type
             ctx.task["source"].setdefault("board_path", str(board_path))
+            ctx.task["execution_kind"] = task.get("execution_kind") or classify_task_execution_kind(task)
             append_event(
                 ctx.layout["events"], "task.claimed", ctx.run_id,
                 {"card_id": card["id"], "lane": card.get("lane")},
@@ -418,7 +420,14 @@ def run_task_intake(
     )
 
     # 12. Execution backend
-    ctx.execution_backend = coder_backend_mode(ctx.cfg, task, ctx.repo)
+    execution_kind = str(ctx.task.get("execution_kind") or classify_task_execution_kind(ctx.task)).strip()
+    if execution_kind == "linear_comment":
+        ctx.execution_backend = "linear_comment"
+    elif execution_kind == "github_pr_action":
+        ctx.execution_backend = "github_pr_action"
+    else:
+        ctx.execution_backend = coder_backend_mode(ctx.cfg, ctx.task, ctx.repo)
+    ctx.blackboard["execution_kind"] = execution_kind
     ctx.blackboard["execution_backend"] = ctx.execution_backend
     _rc._append_blackboard_note(ctx.blackboard, f"Execution backend: `{ctx.execution_backend}`.")
     save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
