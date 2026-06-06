@@ -76,7 +76,7 @@ class GithubPrExternalActionTest(unittest.TestCase):
         }
 
         def fake_execute(_cfg, tool, args):
-            if tool == "mcp.github.list_issue_comments":
+            if tool == "mcp.github.issue_read":
                 return {"output": '[{"body":"body <!-- marker -->"}]'}
             return {"output": "{}"}
 
