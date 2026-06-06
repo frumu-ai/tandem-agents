@@ -60,6 +60,7 @@ Project files live one level up in the repository tree:
 - `MONITORING.md` - how to watch runs and logs
 - `TANDEM_CONTROL_PANEL_INTEGRATION.md` - how to connect external control panels
 - `LOCAL_KANBAN_TEST_GUIDE.md` - practical Docker-based test flow using a local board and a small repo
+- `LINEAR_ACA_SMOKE_RUNBOOK.md` - mocked and live-readiness flow for Linear-to-PR ACA smoke testing
 - `kb_mcp.md` - KB MCP agent-guide upgrade plan and kanban board
 - `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md` - plain-language overview of the Tandem KB MCP and ACA autonomous coder
 
@@ -79,7 +80,8 @@ Project files live one level up in the repository tree:
 12. Read `DOCKER_COMPOSE.md`
 13. Read `MONITORING.md`
 14. Read `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md`
-15. Run `../scripts/setup.sh` to seed token files and the local control-panel config
+15. Read `LINEAR_ACA_SMOKE_RUNBOOK.md` before testing the Linear ACA coding loop
+16. Run `../scripts/setup.sh` to seed token files and the local control-panel config
 
 ## Typical Setup
 

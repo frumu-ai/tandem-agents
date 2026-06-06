@@ -500,8 +500,13 @@ def _maybe_auto_merge_pr(
 ) -> dict[str, Any] | None:
     if str(cfg.review.policy or "").strip().lower() != "auto_merge":
         return None
+    approvals = blackboard.get("finalization_approvals")
+    if not isinstance(approvals, dict):
+        approvals = status_payload.get("finalization_approvals")
+    if not isinstance(approvals, dict):
+        approvals = {}
     try:
-        merge = guarded_auto_merge(cfg, pull_request)
+        merge = guarded_auto_merge(cfg, pull_request, approvals=approvals)
     except Exception as exc:
         merge = {
             "status": "blocked",

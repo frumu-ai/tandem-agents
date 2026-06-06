@@ -11,6 +11,9 @@ class ReviewPolicyDecision:
     policy: str
     human_review_required: bool
     auto_merge_requested: bool
+    merge_requires_approval: bool
+    branch_delete_requires_approval: bool
+    delete_branch_after_merge: bool
     supported: bool
     blocker: str | None
     handoff_rules: list[str]
@@ -34,6 +37,17 @@ def evaluate_review_policy(cfg: ResolvedConfig) -> ReviewPolicyDecision:
                 "ACA must prove checks are clean and review state is approved before merge.",
             ]
         )
+        if cfg.review.merge_requires_approval:
+            handoff_rules.append("A human approval is required before ACA performs the merge.")
+        else:
+            handoff_rules.append("Merge approval gate is disabled by policy.")
+        if cfg.review.delete_branch_after_merge:
+            if cfg.review.branch_delete_requires_approval:
+                handoff_rules.append("A separate human approval is required before ACA deletes the remote branch.")
+            else:
+                handoff_rules.append("Remote branch deletion approval gate is disabled by policy.")
+        else:
+            handoff_rules.append("Remote branch deletion after merge is disabled by policy.")
     else:
         handoff_rules.extend(
             [
@@ -45,6 +59,9 @@ def evaluate_review_policy(cfg: ResolvedConfig) -> ReviewPolicyDecision:
         policy=policy,
         human_review_required=not auto_merge_requested,
         auto_merge_requested=auto_merge_requested,
+        merge_requires_approval=bool(cfg.review.merge_requires_approval),
+        branch_delete_requires_approval=bool(cfg.review.branch_delete_requires_approval),
+        delete_branch_after_merge=bool(cfg.review.delete_branch_after_merge),
         supported=supported,
         blocker=blocker,
         handoff_rules=handoff_rules,

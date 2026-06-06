@@ -372,6 +372,11 @@ def blackboard_markdown(blackboard: dict[str, Any]) -> str:
         lines.append(f"- Mode: `{review_policy.get('policy', '')}`")
         lines.append(f"- Human review required: `{review_policy.get('human_review_required', False)}`")
         lines.append(f"- Auto-merge requested: `{review_policy.get('auto_merge_requested', False)}`")
+        lines.append(f"- Merge approval required: `{review_policy.get('merge_requires_approval', False)}`")
+        lines.append(
+            f"- Branch deletion approval required: `{review_policy.get('branch_delete_requires_approval', False)}`"
+        )
+        lines.append(f"- Delete branch after merge: `{review_policy.get('delete_branch_after_merge', False)}`")
         blocker = str(review_policy.get("blocker") or "").strip()
         if blocker:
             lines.append(f"- Blocker: {blocker}")

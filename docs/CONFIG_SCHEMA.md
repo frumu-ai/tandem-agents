@@ -149,12 +149,16 @@ Optional fields:
 - `policy`: human handoff policy, one of `human_review` or `auto_merge`
 - `auto_merge_strategy`: merge method ACA may use when `policy` is `auto_merge`; one of `merge`, `squash`, or `rebase`
 - `auto_merge_allowed_strategies`: comma-separated allow-list of merge methods
+- `merge_requires_approval`: boolean, require explicit operator approval before ACA performs the merge; defaults to `true`
+- `branch_delete_requires_approval`: boolean, require separate operator approval before ACA deletes the remote branch; defaults to `true`
+- `delete_branch_after_merge`: boolean, allow ACA to delete the remote branch after merge when policy and approvals allow it; defaults to `true`
 
 Behavior:
 
 - `human_review` keeps merge approval with a human gate
-- `auto_merge` is opt-in and guarded: ACA only merges ACA-created branches for the configured repository when checks are successful, review is approved, the lifecycle is `ready-to-merge`, and the configured strategy is allowed
-- ACA refuses to merge when review or check state cannot be proven clean; successful auto-merges record merge metadata and then request deletion of the remote ACA branch
+- `auto_merge` is opt-in and guarded: ACA only finalizes ACA-created branches for the configured repository when checks are successful, review is approved, the lifecycle is `ready-to-merge`, and the configured strategy is allowed
+- Merge approval and branch deletion approval are separate decisions. Operators may approve the merge while leaving branch cleanup manual.
+- ACA refuses to merge when review or check state cannot be proven clean; successful guarded merges record merge metadata and only delete the remote ACA branch when deletion is enabled and approved or approval is disabled by policy.
 
 ### `scheduler`
 
@@ -311,6 +315,9 @@ Behavior:
 - `ACA_PROVIDER_KEY` -> primary generic provider secret for simple single-provider setups; ACA maps it onto the active provider's expected secret env var for Tandem subprocesses
 - `ACA_FALLBACK_PROVIDER` -> `provider.fallback_provider`
 - `ACA_REVIEW_POLICY` -> `review.policy`
+- `ACA_MERGE_REQUIRES_APPROVAL` -> `review.merge_requires_approval`
+- `ACA_BRANCH_DELETE_REQUIRES_APPROVAL` -> `review.branch_delete_requires_approval`
+- `ACA_DELETE_BRANCH_AFTER_MERGE` -> `review.delete_branch_after_merge`
 - `ACA_FALLBACK_MODEL` -> `provider.fallback_model`
 - `AUTOCODER_PROVIDER` and friends -> legacy aliases still accepted by the loader
 

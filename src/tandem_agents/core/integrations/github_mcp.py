@@ -1313,12 +1313,28 @@ def _allowed_merge_strategies(cfg: ResolvedConfig) -> set[str]:
     }
 
 
-def evaluate_auto_merge_gates(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
+def _approval_granted(approvals: dict[str, Any] | None, key: str) -> bool:
+    if not isinstance(approvals, dict):
+        return False
+    value = approvals.get(key)
+    if isinstance(value, dict):
+        value = value.get("approved") or value.get("status")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"approved", "approve", "granted", "true", "yes", "1"}
+
+
+def evaluate_auto_merge_gates(
+    cfg: ResolvedConfig,
+    pull_request: dict[str, Any],
+    approvals: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     strategy = str(cfg.review.auto_merge_strategy or "squash").strip().lower()
     allowed = _allowed_merge_strategies(cfg)
     base_repo = str(pull_request.get("base_repo") or "").strip()
     head_branch = str(pull_request.get("head_branch") or "").strip()
     denials: list[str] = []
+    pending_approvals: list[dict[str, Any]] = []
     if str(cfg.review.policy or "").strip().lower() != "auto_merge":
         denials.append("review.policy is not auto_merge")
     if strategy not in {"merge", "squash", "rebase"}:
@@ -1342,9 +1358,32 @@ def evaluate_auto_merge_gates(cfg: ResolvedConfig, pull_request: dict[str, Any])
         denials.append("PR number is missing")
     if not base_repo or "/" not in base_repo:
         denials.append("PR base repo is missing")
+    if not denials and bool(cfg.review.merge_requires_approval) and not _approval_granted(approvals, "merge"):
+        pending_approvals.append(
+            {
+                "action": "merge_pull_request",
+                "key": "merge",
+                "reason": "Policy requires explicit approval before ACA merges the pull request.",
+            }
+        )
+    if (
+        not denials
+        and bool(cfg.review.delete_branch_after_merge)
+        and bool(cfg.review.branch_delete_requires_approval)
+        and not _approval_granted(approvals, "branch_delete")
+    ):
+        pending_approvals.append(
+            {
+                "action": "delete_remote_branch",
+                "key": "branch_delete",
+                "reason": "Policy requires separate approval before ACA deletes the remote branch.",
+            }
+        )
     return {
-        "allowed": not denials,
+        "allowed": not denials
+        and not any(item.get("key") == "merge" for item in pending_approvals),
         "denials": denials,
+        "pending_approvals": pending_approvals,
         "strategy": strategy,
         "head_branch": head_branch,
         "base_repo": base_repo,
@@ -1394,24 +1433,52 @@ def delete_remote_branch(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> d
     return {"deleted": False, "error": "Could not delete remote branch through GitHub MCP."}
 
 
-def guarded_auto_merge(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
-    gates = evaluate_auto_merge_gates(cfg, pull_request)
-    if not gates["allowed"]:
+def guarded_auto_merge(
+    cfg: ResolvedConfig,
+    pull_request: dict[str, Any],
+    approvals: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    gates = evaluate_auto_merge_gates(cfg, pull_request, approvals=approvals)
+    if gates["denials"]:
         return {
             "status": "denied",
             "merged": False,
             "branch_deleted": False,
             "denials": gates["denials"],
+            "pending_approvals": [],
+            "strategy": gates["strategy"],
+            "pull_request": pull_request,
+        }
+    merge_pending = [item for item in gates["pending_approvals"] if item.get("key") == "merge"]
+    if merge_pending:
+        return {
+            "status": "pending_approval",
+            "merged": False,
+            "branch_deleted": False,
+            "denials": [],
+            "pending_approvals": merge_pending,
             "strategy": gates["strategy"],
             "pull_request": pull_request,
         }
     merge_result = merge_pull_request(cfg, pull_request, strategy=str(gates["strategy"]))
-    delete_result = delete_remote_branch(cfg, pull_request)
+    delete_pending = [item for item in gates["pending_approvals"] if item.get("key") == "branch_delete"]
+    if delete_pending:
+        delete_result = {
+            "deleted": False,
+            "skipped": True,
+            "pending_approvals": delete_pending,
+            "reason": "branch_delete_requires_approval is enabled and approval was not granted",
+        }
+    elif bool(cfg.review.delete_branch_after_merge):
+        delete_result = delete_remote_branch(cfg, pull_request)
+    else:
+        delete_result = {"deleted": False, "skipped": True, "reason": "delete_branch_after_merge is disabled"}
     return {
         "status": "merged",
         "merged": True,
-        "branch_deleted": bool(delete_result.get("deleted", True) or not delete_result.get("error")),
+        "branch_deleted": bool(delete_result.get("deleted")),
         "strategy": gates["strategy"],
+        "pending_approvals": delete_pending,
         "pull_request": pull_request,
         "merge_result": merge_result,
         "delete_result": delete_result,
