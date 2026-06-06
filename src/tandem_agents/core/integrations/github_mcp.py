@@ -792,6 +792,8 @@ def _fetch_issue_comments(cfg: ResolvedConfig, task: dict[str, Any]) -> list[dic
     if not owner or not repo_name or not issue_number:
         return []
     attempts = [
+        ("mcp.github.issue_read", {"owner": owner, "repo": repo_name, "issue_number": int(issue_number), "method": "get_comments"}),
+        ("mcp.github.issue_read", {"owner": owner, "repo": repo_name, "issueNumber": int(issue_number), "method": "get_comments"}),
         ("mcp.github.list_issue_comments", {"owner": owner, "repo": repo_name, "issue_number": int(issue_number)}),
         ("mcp.github.list_issue_comments", {"owner": owner, "repo": repo_name, "issueNumber": int(issue_number)}),
         ("mcp.github.get_issue_comments", {"owner": owner, "repo": repo_name, "issue_number": int(issue_number)}),
@@ -920,18 +922,23 @@ def fetch_project_item(
 
 
 def get_pull_request(cfg: ResolvedConfig, owner: str, repo: str, pr_number: int) -> dict[str, Any]:
-    result = execute_engine_tool(
-        cfg,
-        "mcp.github.get_pull_request",
-        {
-            "owner": owner,
-            "repo": repo,
-            "pull_number": pr_number,
-        },
-    )
-    if _tool_failed(result):
-        raise RuntimeError(_tool_error_message(result))
-    return _parse_json_output(result)
+    attempts = [
+        ("mcp.github.pull_request_read", {"owner": owner, "repo": repo, "pullNumber": pr_number, "method": "get"}),
+        ("mcp.github.pull_request_read", {"owner": owner, "repo": repo, "pull_number": pr_number, "method": "get"}),
+        ("mcp.github.get_pull_request", {"owner": owner, "repo": repo, "pull_number": pr_number}),
+        ("mcp.github.get_pull_request", {"owner": owner, "repo": repo, "pullNumber": pr_number}),
+    ]
+    for tool, args in attempts:
+        try:
+            result = execute_engine_tool(cfg, tool, args)
+        except RuntimeError:
+            continue
+        if _tool_failed(result):
+            continue
+        data = _parse_json_output(result)
+        if data:
+            return data
+    raise RuntimeError(f"Could not read GitHub pull request {owner}/{repo}#{pr_number} through GitHub MCP.")
 
 
 def list_pull_requests(cfg: ResolvedConfig, owner: str, repo: str, state: str = "open") -> list[dict[str, Any]]:
@@ -1406,7 +1413,7 @@ def merge_pull_request(cfg: ResolvedConfig, pull_request: dict[str, Any], *, str
         {
             "owner": owner,
             "repo": repo_name,
-            "pull_number": number,
+            "pullNumber": number,
             "merge_method": strategy,
         },
     )

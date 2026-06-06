@@ -287,8 +287,8 @@ def _verify_pr_comment(cfg: ResolvedConfig, base_repo: str, pr_number: int, mark
     owner, repo = _split_repo(base_repo)
     result = _execute_tool(
         cfg,
-        "mcp.github.list_issue_comments",
-        {"owner": owner, "repo": repo, "issue_number": int(pr_number)},
+        "mcp.github.issue_read",
+        {"owner": owner, "repo": repo, "issue_number": int(pr_number), "method": "get_comments"},
     )
     comments = result if isinstance(result, list) else result.get("comments") if isinstance(result, dict) else []
     for comment in comments or []:
@@ -319,7 +319,7 @@ def execute_approved_action(cfg: ResolvedConfig, approval: dict[str, Any]) -> di
 
     if action_type == "close_pr":
         owner, repo = _split_repo(base_repo)
-        _execute_tool(cfg, "mcp.github.update_pull_request", {"owner": owner, "repo": repo, "pull_number": pr_number, "state": "closed"})
+        _execute_tool(cfg, "mcp.github.update_pull_request", {"owner": owner, "repo": repo, "pullNumber": pr_number, "state": "closed"})
         refreshed = get_pull_request(cfg, owner, repo, pr_number)
         state = str(refreshed.get("state") or "").lower()
         if state != "closed":
@@ -328,12 +328,12 @@ def execute_approved_action(cfg: ResolvedConfig, approval: dict[str, Any]) -> di
 
     if action_type == "update_branch":
         owner, repo = _split_repo(base_repo)
-        result = _execute_tool(cfg, "mcp.github.update_pull_request_branch", {"owner": owner, "repo": repo, "pull_number": pr_number})
+        result = _execute_tool(cfg, "mcp.github.update_pull_request_branch", {"owner": owner, "repo": repo, "pullNumber": pr_number})
         return {"verified": True, "action_type": action_type, "result": result}
 
     if action_type == "request_review":
         owner, repo = _split_repo(base_repo)
-        result = _execute_tool(cfg, "mcp.github.request_copilot_review", {"owner": owner, "repo": repo, "pull_number": pr_number})
+        result = _execute_tool(cfg, "mcp.github.request_copilot_review", {"owner": owner, "repo": repo, "pullNumber": pr_number})
         return {"verified": True, "action_type": action_type, "result": result}
 
     if action_type == "merge_pr":
