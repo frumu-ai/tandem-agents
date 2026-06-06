@@ -45,6 +45,9 @@ DEFAULT_CODER_CANCEL_ON_SOURCE_TERMINAL = True
 DEFAULT_REVIEW_POLICY = "human_review"
 DEFAULT_AUTO_MERGE_STRATEGY = "squash"
 DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES = "squash"
+DEFAULT_MERGE_REQUIRES_APPROVAL = True
+DEFAULT_BRANCH_DELETE_REQUIRES_APPROVAL = True
+DEFAULT_DELETE_BRANCH_AFTER_MERGE = True
 TASK_SOURCE_TYPES = {
     "github_project",
     "linear",
@@ -251,6 +254,9 @@ class ReviewPolicyConfig:
     policy: str = DEFAULT_REVIEW_POLICY
     auto_merge_strategy: str = DEFAULT_AUTO_MERGE_STRATEGY
     auto_merge_allowed_strategies: str = DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES
+    merge_requires_approval: bool = DEFAULT_MERGE_REQUIRES_APPROVAL
+    branch_delete_requires_approval: bool = DEFAULT_BRANCH_DELETE_REQUIRES_APPROVAL
+    delete_branch_after_merge: bool = DEFAULT_DELETE_BRANCH_AFTER_MERGE
 
 
 @dataclass

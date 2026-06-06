@@ -25,6 +25,7 @@ from src.tandem_agents.config.config_types import (
     TandemConfig,
     TaskSourceConfig,
     DEFAULT_BASE_URL,
+    DEFAULT_BRANCH_DELETE_REQUIRES_APPROVAL,
     DEFAULT_BRANCH,
     DEFAULT_CODER_CANCEL_ON_SOURCE_TERMINAL,
     DEFAULT_CODER_POLL_INTERVAL_SECONDS,
@@ -32,6 +33,7 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_CODER_SUPERVISOR_ENABLED,
     DEFAULT_CODER_SUPERVISOR_INTERVAL_SECONDS,
     DEFAULT_CODER_WAIT_TIMEOUT_SECONDS,
+    DEFAULT_DELETE_BRANCH_AFTER_MERGE,
     DEFAULT_EXECUTION_BACKEND,
     DEFAULT_GITHUB_MCP_SCOPE,
     DEFAULT_GITHUB_MCP_TOOLSETS,
@@ -44,6 +46,7 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_LINEAR_MCP_SERVER,
     DEFAULT_LINEAR_REMOTE_SYNC,
     DEFAULT_MAX_WORKERS,
+    DEFAULT_MERGE_REQUIRES_APPROVAL,
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_COORDINATION_BACKEND,
@@ -367,6 +370,30 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
                 yaml_value=data.get("review", {}).get("auto_merge_allowed_strategies"),
                 default=DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES,
             )
+        ),
+        merge_requires_approval=_as_bool(
+            pick(
+                "ACA_MERGE_REQUIRES_APPROVAL",
+                yaml_value=data.get("review", {}).get("merge_requires_approval"),
+                default=DEFAULT_MERGE_REQUIRES_APPROVAL,
+            ),
+            default=DEFAULT_MERGE_REQUIRES_APPROVAL,
+        ),
+        branch_delete_requires_approval=_as_bool(
+            pick(
+                "ACA_BRANCH_DELETE_REQUIRES_APPROVAL",
+                yaml_value=data.get("review", {}).get("branch_delete_requires_approval"),
+                default=DEFAULT_BRANCH_DELETE_REQUIRES_APPROVAL,
+            ),
+            default=DEFAULT_BRANCH_DELETE_REQUIRES_APPROVAL,
+        ),
+        delete_branch_after_merge=_as_bool(
+            pick(
+                "ACA_DELETE_BRANCH_AFTER_MERGE",
+                yaml_value=data.get("review", {}).get("delete_branch_after_merge"),
+                default=DEFAULT_DELETE_BRANCH_AFTER_MERGE,
+            ),
+            default=DEFAULT_DELETE_BRANCH_AFTER_MERGE,
         ),
     )
     swarm = SwarmConfig(

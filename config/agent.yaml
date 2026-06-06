@@ -34,6 +34,14 @@ provider:
   fallback_provider: ""
   fallback_model: ""
 
+review:
+  policy: human_review
+  auto_merge_strategy: squash
+  auto_merge_allowed_strategies: squash
+  merge_requires_approval: true
+  branch_delete_requires_approval: true
+  delete_branch_after_merge: true
+
 storage:
   profile: local
 

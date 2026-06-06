@@ -229,12 +229,18 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
                     "ACA_REVIEW_POLICY": "auto_merge",
                     "ACA_AUTO_MERGE_STRATEGY": "squash",
                     "ACA_AUTO_MERGE_ALLOWED_STRATEGIES": "squash,rebase",
+                    "ACA_MERGE_REQUIRES_APPROVAL": "false",
+                    "ACA_BRANCH_DELETE_REQUIRES_APPROVAL": "true",
+                    "ACA_DELETE_BRANCH_AFTER_MERGE": "false",
                 },
             )
 
             self.assertEqual(cfg.review.policy, "auto_merge")
             self.assertEqual(cfg.review.auto_merge_strategy, "squash")
             self.assertEqual(cfg.review.auto_merge_allowed_strategies, "squash,rebase")
+            self.assertFalse(cfg.review.merge_requires_approval)
+            self.assertTrue(cfg.review.branch_delete_requires_approval)
+            self.assertFalse(cfg.review.delete_branch_after_merge)
             self.assertEqual(validate_config(cfg), [])
 
     def test_github_mcp_defaults_off_without_token_or_opt_in(self) -> None:

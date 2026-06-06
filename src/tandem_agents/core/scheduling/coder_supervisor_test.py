@@ -40,6 +40,8 @@ def _config(root: Path, *, review_policy: str = "human_review"):
               policy: {review_policy}
               auto_merge_strategy: squash
               auto_merge_allowed_strategies: squash
+              merge_requires_approval: false
+              branch_delete_requires_approval: false
             output:
               root: runs
             coordination:
@@ -405,7 +407,7 @@ class CoderSupervisorTest(unittest.TestCase):
             ):
                 result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
 
-            auto_merge.assert_called_once_with(cfg, refreshed)
+            auto_merge.assert_called_once_with(cfg, refreshed, approvals={})
             self.assertEqual(result["status"], "merged")
             self.assertTrue(result["terminal"])
             self.assertEqual(result["merge"]["status"], "merged")
@@ -468,6 +470,47 @@ class CoderSupervisorTest(unittest.TestCase):
             self.assertEqual(rows[0]["payload"]["merge"]["strategy"], "squash")
             self.assertIn("https://github.com/acme/demo/pull/7", rows[1]["payload"]["body"])
             self.assertIn("Remote branch deleted: `yes`", rows[1]["payload"]["body"])
+
+    def test_ready_to_merge_waits_for_merge_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp), review_policy="auto_merge")
+            cfg.review.merge_requires_approval = True
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(cfg, store)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "ready-to-merge",
+                "terminal": False,
+            }
+            merge = {
+                "status": "pending_approval",
+                "merged": False,
+                "branch_deleted": False,
+                "strategy": "squash",
+                "pull_request": refreshed,
+                "pending_approvals": [{"action": "merge_pull_request", "key": "merge"}],
+                "denials": [],
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "guarded_auto_merge", return_value=merge),
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            self.assertEqual(result["status"], "ready-to-merge")
+            self.assertEqual(result["merge"]["status"], "pending_approval")
+            status = load_status(cfg.output_root() / "run-pr" / "status.json")
+            self.assertEqual(status["pull_request_merge"]["pending_approvals"][0]["key"], "merge")
 
 
 if __name__ == "__main__":

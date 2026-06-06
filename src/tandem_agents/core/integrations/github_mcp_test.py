@@ -65,6 +65,8 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
                     f"  policy: {review_policy}",
                     "  auto_merge_strategy: squash",
                     "  auto_merge_allowed_strategies: squash",
+                    "  merge_requires_approval: false",
+                    "  branch_delete_requires_approval: false",
                     "output:",
                     "  root: runs",
                 ]
@@ -337,6 +339,54 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
 
             self.assertFalse(gates["allowed"])
             self.assertTrue(any("not auto_merge" in item for item in gates["denials"]))
+
+    def test_auto_merge_waits_for_merge_approval_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root, review_policy="auto_merge")
+            cfg.review.merge_requires_approval = True
+            pull_request = {
+                "number": 7,
+                "head_branch": "aca/task-123",
+                "base_repo": "frumu-ai/example",
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "ready-to-merge",
+                "terminal": False,
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                result = guarded_auto_merge(cfg, pull_request)
+
+            self.assertEqual(result["status"], "pending_approval")
+            self.assertFalse(result["merged"])
+            self.assertEqual(result["pending_approvals"][0]["key"], "merge")
+            tool_mock.assert_not_called()
+
+    def test_branch_delete_approval_is_separate_from_merge_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root, review_policy="auto_merge")
+            cfg.review.merge_requires_approval = True
+            cfg.review.branch_delete_requires_approval = True
+            pull_request = {
+                "number": 7,
+                "head_branch": "aca/task-123",
+                "base_repo": "frumu-ai/example",
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "ready-to-merge",
+                "terminal": False,
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                tool_mock.return_value = {"output": '{"merged": true, "sha": "abc123"}'}
+                result = guarded_auto_merge(cfg, pull_request, approvals={"merge": "approved"})
+
+            self.assertEqual(result["status"], "merged")
+            self.assertTrue(result["merged"])
+            self.assertFalse(result["branch_deleted"])
+            self.assertEqual(result["pending_approvals"][0]["key"], "branch_delete")
+            self.assertEqual(tool_mock.call_count, 1)
+            self.assertEqual(tool_mock.call_args.args[1], "mcp.github.merge_pull_request")
 
     def test_auto_merge_denies_non_aca_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
