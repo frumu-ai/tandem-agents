@@ -1312,7 +1312,12 @@ async def resume_approved_external_actions(run_id: str, token: str = Depends(get
                 run_dir / "summary.md",
                 "# Run completed\n\nExternal GitHub PR actions were approved, executed, and verified.\n",
             )
-            result["linear_finalize"] = _finalize_external_action_linear_status(cfg, run_id=run_id, run_dir=run_dir)
+            result["linear_finalize"] = await asyncio.to_thread(
+                _finalize_external_action_linear_status,
+                cfg,
+                run_id=run_id,
+                run_dir=run_dir,
+            )
             append_event(run_dir / "events.jsonl", "run.completed", run_id, {"kind": "external_actions"})
         elif result.get("failed_count"):
             status_payload.setdefault("run", {})["status"] = "blocked"
