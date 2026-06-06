@@ -49,6 +49,12 @@ from src.tandem_agents.runtime.runstate import load_status, load_blackboard, set
 from src.tandem_agents.runtime.runstate import append_event, write_status
 from src.tandem_agents.runtime.run_output import save_run_text
 from src.tandem_agents.core.external_actions.github_pr import execute_approved_actions
+from src.tandem_agents.core.integrations.linear_mcp import (
+    linear_mcp_scope,
+    linear_remote_sync_mode,
+    linear_status_name_for_task_state,
+    linear_update_issue,
+)
 from src.tandem_agents.cli.monitor import latest_run_dir
 
 # Setup logging
@@ -1118,6 +1124,47 @@ async def get_run(run_id: str, token: str = Depends(get_token)):
     }
 
 
+def _external_action_linear_fields(target_status: str, labels: list[str] | None = None) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "status": target_status,
+        "state": target_status,
+        "state_name": target_status,
+    }
+    clean_labels = [str(label).strip() for label in (labels or []) if str(label).strip()]
+    if clean_labels:
+        fields["labels"] = clean_labels
+        fields["label_names"] = clean_labels
+    return fields
+
+
+def _finalize_external_action_linear_status(cfg, *, run_id: str, run_dir: Path) -> dict[str, Any]:
+    blackboard = load_blackboard(run_dir / "blackboard.yaml")
+    task = blackboard.get("task") if isinstance(blackboard, dict) else None
+    if not isinstance(task, dict):
+        return {"skipped": True, "reason": "missing task"}
+    source_type = str((task.get("source") or {}).get("type") or "").strip()
+    if source_type != "linear":
+        return {"skipped": True, "reason": "source is not Linear"}
+    if linear_remote_sync_mode(cfg, source_type) == "off" or linear_mcp_scope(cfg, source_type) not in {"intake_finalize", "always"}:
+        return {"skipped": True, "reason": "Linear finalize sync disabled"}
+    target_status = str(cfg.linear_mcp.done_status or "").strip() or linear_status_name_for_task_state(cfg, "done")
+    labels = [cfg.linear_mcp.done_label] if str(cfg.linear_mcp.done_label or "").strip() else []
+    try:
+        warning = linear_update_issue(cfg, task, _external_action_linear_fields(target_status, labels))
+    except Exception as exc:
+        warning = str(exc)
+    if warning:
+        append_event(
+            run_dir / "events.jsonl",
+            "linear_issue.status_update_failed",
+            run_id,
+            {"status": target_status, "warning": warning},
+        )
+        return {"updated": False, "status": target_status, "warning": warning}
+    append_event(run_dir / "events.jsonl", "linear_issue.status_updated", run_id, {"status": target_status})
+    return {"updated": True, "status": target_status}
+
+
 @app.get("/approvals")
 async def list_external_action_approvals(
     run_id: Optional[str] = None,
@@ -1269,6 +1316,7 @@ async def resume_approved_external_actions(run_id: str, token: str = Depends(get
                 run_dir / "summary.md",
                 "# Run completed\n\nExternal GitHub PR actions were approved, executed, and verified.\n",
             )
+            result["linear_finalize"] = _finalize_external_action_linear_status(cfg, run_id=run_id, run_dir=run_dir)
             append_event(run_dir / "events.jsonl", "run.completed", run_id, {"kind": "external_actions"})
         elif result.get("failed_count"):
             status_payload.setdefault("run", {})["status"] = "blocked"
