@@ -50,8 +50,6 @@ from src.tandem_agents.runtime.runstate import append_event, write_status
 from src.tandem_agents.runtime.run_output import save_run_text
 from src.tandem_agents.core.external_actions.github_pr import execute_approved_actions
 from src.tandem_agents.core.integrations.linear_mcp import (
-    linear_mcp_scope,
-    linear_remote_sync_mode,
     linear_status_name_for_task_state,
     linear_update_issue,
 )
@@ -1145,8 +1143,6 @@ def _finalize_external_action_linear_status(cfg, *, run_id: str, run_dir: Path) 
     source_type = str((task.get("source") or {}).get("type") or "").strip()
     if source_type != "linear":
         return {"skipped": True, "reason": "source is not Linear"}
-    if linear_remote_sync_mode(cfg, source_type) == "off" or linear_mcp_scope(cfg, source_type) not in {"intake_finalize", "always"}:
-        return {"skipped": True, "reason": "Linear finalize sync disabled"}
     target_status = str(cfg.linear_mcp.done_status or "").strip() or linear_status_name_for_task_state(cfg, "done")
     labels = [cfg.linear_mcp.done_label] if str(cfg.linear_mcp.done_label or "").strip() else []
     try:
