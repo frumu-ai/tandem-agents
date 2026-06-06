@@ -52,6 +52,7 @@ from src.tandem_agents.core.external_actions.github_pr import execute_approved_a
 from src.tandem_agents.core.integrations.linear_mcp import (
     linear_status_name_for_task_state,
     linear_update_issue,
+    normalize_linear_key,
 )
 from src.tandem_agents.cli.monitor import latest_run_dir
 
@@ -928,6 +929,62 @@ async def get_project_tasks(slug: str, token: str = Depends(get_token)):
         return await asyncio.to_thread(preview_task, cfg)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _operator_linear_status_name(cfg, target_state: str) -> str:
+    key = normalize_linear_key(target_state)
+    explicit = {
+        "backlog": "Backlog",
+        "todo": "Todo",
+        "to_do": "Todo",
+        "ready": "Ready",
+        "triage": "Triage",
+    }
+    if key in explicit:
+        return explicit[key]
+    return linear_status_name_for_task_state(cfg, key)
+
+
+@app.post("/projects/{slug:path}/tasks/{item}/state")
+async def update_project_task_state(
+    slug: str,
+    item: str,
+    payload: Dict[str, Any] = Body(default={}),
+    token: str = Depends(get_token),
+):
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    _, cfg = _project_config(root, slug)
+    if cfg.task_source.type != "linear":
+        raise HTTPException(status_code=400, detail="Task state updates are currently supported for Linear task sources.")
+    target_state = str(payload.get("state") or payload.get("status") or "").strip()
+    if not target_state:
+        raise HTTPException(status_code=400, detail="state is required.")
+    target_status = _operator_linear_status_name(cfg, target_state)
+    task = {
+        "task_id": item,
+        "source": {
+            "type": "linear",
+            "item": item,
+            "identifier": item,
+            "issue_id": item,
+        },
+    }
+    try:
+        warning = await asyncio.to_thread(
+            linear_update_issue,
+            cfg,
+            task,
+            {
+                "status": target_status,
+                "state": target_status,
+                "state_name": target_status,
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not update Linear issue state: {exc}") from exc
+    if warning:
+        raise HTTPException(status_code=400, detail=warning)
+    return {"ok": True, "item": item, "state": target_state, "status": target_status}
 
 
 @app.post("/projects/{slug:path}/repo/sync")
