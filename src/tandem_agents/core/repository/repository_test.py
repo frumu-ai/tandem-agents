@@ -13,6 +13,7 @@ from src.tandem_agents.core.repository.repository import (
     _git_repo_args,
     _github_pat,
     git_diff_stat,
+    git_working_diff,
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
@@ -58,6 +59,49 @@ class RepositoryNamingTest(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"ACA_ROOT": str(root)}):
                 self.assertIn("README.md", git_diff_stat(worktree))
+
+    def test_git_working_diff_includes_modified_and_untracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "repo"
+            source.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+
+            # Modify a tracked file and add a brand-new untracked file.
+            (source / "README.md").write_text("after\n", encoding="utf-8")
+            (source / "new_module.py").write_text("print('hello')\n", encoding="utf-8")
+
+            diff = git_working_diff(source)
+
+            self.assertIn("README.md", diff)
+            self.assertIn("after", diff)
+            self.assertIn("new file: new_module.py", diff)
+            self.assertIn("print('hello')", diff)
+
+    def test_git_working_diff_truncates_to_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "repo"
+            source.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "big.txt").write_text("x" * 10000, encoding="utf-8")
+
+            diff = git_working_diff(source, max_chars=500, max_file_chars=200)
+
+            self.assertLessEqual(len(diff), 600)
+            self.assertIn("truncated", diff)
+
+    def test_git_working_diff_empty_when_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "repo"
+            source.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("hello\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+
+            self.assertEqual(git_working_diff(source), "")
 
     def test_task_run_branch_name_is_canonical(self) -> None:
         branch = task_run_branch_name(

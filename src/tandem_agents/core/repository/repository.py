@@ -509,6 +509,46 @@ def git_diff_stat(repo_path: Path) -> str:
     return result.stdout.strip()
 
 
+def git_working_diff(repo_path: Path, *, max_chars: int = 20000, max_file_chars: int = 4000) -> str:
+    """Return a best-effort unified diff of uncommitted working-tree changes.
+
+    Includes modified/deleted tracked files (via ``git diff HEAD``) and the
+    contents of new untracked files, so reviewers and testers can see what
+    actually changed instead of only a status summary.
+
+    This is read-only: it never mutates the index or working tree. The output is
+    truncated per file (``max_file_chars``) and overall (``max_chars``) so it
+    stays within prompt budgets.
+    """
+    sections: list[str] = []
+    tracked = run_command(_git_command_for_worktree(repo_path, "diff", "HEAD"))
+    tracked_text = tracked.stdout.strip()
+    if tracked_text:
+        sections.append(tracked_text)
+    try:
+        changes = list_worktree_changes(repo_path)
+    except Exception:
+        changes = []
+    for change in changes:
+        if not change["status"].strip().startswith("?"):
+            continue
+        rel_path = change["path"]
+        file_path = repo_path / rel_path
+        if not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(content) > max_file_chars:
+            content = content[:max_file_chars] + "\n... (file truncated)\n"
+        sections.append(f"new file: {rel_path}\n{content}")
+    diff_text = "\n\n".join(section for section in sections if section).strip()
+    if len(diff_text) > max_chars:
+        diff_text = diff_text[:max_chars] + "\n... (diff truncated)\n"
+    return diff_text
+
+
 def list_worktree_changes(worktree_path: Path) -> list[dict[str, str]]:
     result = run_command(
         _git_command_for_worktree(worktree_path, "status", "--porcelain", "--untracked-files=all")
