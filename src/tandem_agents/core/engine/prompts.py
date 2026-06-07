@@ -354,7 +354,30 @@ def build_integration_prompt(run_id: str, task: dict[str, Any], worker_notes: li
     )
 
 
-def build_review_prompt(run_id: str, task: dict[str, Any], worker_notes: list[dict[str, Any]]) -> str:
+def _diff_block(repo_diff: str | None) -> str:
+    """Render an uncommitted-changes diff block for review/test prompts."""
+    diff_text = (repo_diff or "").strip()
+    if not diff_text:
+        return (
+            "Uncommitted changes (git diff): none detected. "
+            "Verify directly against the repository before judging the work.\n"
+        )
+    return (
+        "Uncommitted changes produced by the workers (git diff against HEAD; "
+        "new files shown inline). Base your judgement on these actual changes, "
+        "not only the worker notes:\n"
+        "```diff\n"
+        f"{diff_text}\n"
+        "```\n"
+    )
+
+
+def build_review_prompt(
+    run_id: str,
+    task: dict[str, Any],
+    worker_notes: list[dict[str, Any]],
+    repo_diff: str | None = None,
+) -> str:
     contract_block = _task_contract_block(task)
     return (
         f"You are ACA reviewer for run {run_id}.\n"
@@ -367,11 +390,18 @@ def build_review_prompt(run_id: str, task: dict[str, Any], worker_notes: list[di
         "If the review cannot be completed confidently, use `human_review_needed`.\n\n"
         f"Task title: {task['title']}\n"
         f"Task contract:\n{contract_block}\n\n"
+        f"{_diff_block(repo_diff)}\n"
         f"Worker notes: {json.dumps(worker_notes, indent=2)}\n"
     )
 
 
-def build_test_prompt(run_id: str, task: dict[str, Any], repo: dict[str, Any], worker_notes: list[dict[str, Any]]) -> str:
+def build_test_prompt(
+    run_id: str,
+    task: dict[str, Any],
+    repo: dict[str, Any],
+    worker_notes: list[dict[str, Any]],
+    repo_diff: str | None = None,
+) -> str:
     contract_block = _task_contract_block(task)
     return (
         f"You are ACA tester for run {run_id}.\n"
@@ -386,6 +416,7 @@ def build_test_prompt(run_id: str, task: dict[str, Any], repo: dict[str, Any], w
         "Repository: (mounted as current directory)\n"
         f"Task title: {task['title']}\n"
         f"Task contract:\n{contract_block}\n\n"
+        f"{_diff_block(repo_diff)}\n"
         f"Worker notes: {json.dumps(worker_notes, indent=2)}\n"
     )
 

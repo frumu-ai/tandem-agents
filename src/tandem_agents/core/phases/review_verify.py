@@ -38,6 +38,7 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         effective_tandem_provider,
         engine_env,
         git_diff_stat,
+        git_working_diff,
     )
     from src.tandem_agents.core.execution.worker import stream_tandem_prompt
     from src.tandem_agents.core.engine.prompts import build_review_prompt, build_test_prompt
@@ -94,8 +95,16 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
             reason="review phase started",
         )
 
+    # Capture the actual uncommitted diff once so the reviewer and tester judge
+    # the real worker changes instead of relying only on self-reported notes.
+    try:
+        repo_diff = git_working_diff(ctx.repo_path)
+    except Exception:  # diff is advisory context; never fail the phase over it
+        logger.warning("Failed to capture working diff for review (run_id=%s)", ctx.run_id, exc_info=True)
+        repo_diff = ""
+
     # --- Reviewer ---
-    review_prompt = build_review_prompt(ctx.run_id, ctx.task, ctx.worker_results)
+    review_prompt = build_review_prompt(ctx.run_id, ctx.task, ctx.worker_results, repo_diff=repo_diff)
     review_provider, review_model = ctx.cfg.provider_for_role("reviewer")
     review_cli_provider = effective_tandem_provider(review_provider, ctx.cfg)
     _rc._role_provider_override_config(
@@ -143,7 +152,7 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
     _rc._wait_for_engine(ctx.cfg)
 
     # --- Tester ---
-    test_prompt = build_test_prompt(ctx.run_id, ctx.task, ctx.repo, ctx.worker_results)
+    test_prompt = build_test_prompt(ctx.run_id, ctx.task, ctx.repo, ctx.worker_results, repo_diff=repo_diff)
     test_provider, test_model = ctx.cfg.provider_for_role("tester")
     test_cli_provider = effective_tandem_provider(test_provider, ctx.cfg)
     _rc._role_provider_override_config(

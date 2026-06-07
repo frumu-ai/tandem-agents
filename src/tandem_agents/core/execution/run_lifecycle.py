@@ -41,28 +41,44 @@ def build_provider_config_dict(cfg: ResolvedConfig) -> dict[str, Any]:
 def build_swarm_config_dict(cfg: ResolvedConfig) -> dict[str, Any]:
     """Assemble the swarm metadata dict expected by initial_status.
 
-    Eliminates the repeated 10-line literal that appeared 6+ times in runner_core.
+    Records the resolved provider/model for each role together with the source
+    of each value (role override / global provider / fallback / built-in
+    default). Roles whose model resolved to the built-in ``default`` had no
+    operator selection (e.g. from the control panel); we surface those so a run
+    silently degrading to the generic fallback model is visible rather than
+    hidden.
     """
+    roles = ("manager", "worker", "reviewer", "tester")
+    role_entries: dict[str, dict[str, Any]] = {}
+    defaulted: list[str] = []
+    for role in roles:
+        resolved = cfg.provider_for_role_with_source(role)
+        role_entries[role] = {
+            "provider": resolved["provider"],
+            "model": resolved["model"],
+            "provider_source": resolved["provider_source"],
+            "model_source": resolved["model_source"],
+        }
+        if resolved["model_source"] == "default":
+            defaulted.append(role)
+
+    if defaulted:
+        logger.warning(
+            "No model configured for role(s) %s; falling back to the built-in "
+            "default %s/%s. Select a model in the control panel (or set "
+            "ACA_PROVIDER/ACA_MODEL) for better results.",
+            ", ".join(defaulted),
+            cfg.provider_for_role(defaulted[0])[0],
+            cfg.provider_for_role(defaulted[0])[1],
+        )
+
     return {
         "enabled": cfg.swarm.enabled,
         "shared_model": cfg.swarm.shared_model,
         "max_workers": cfg.swarm.max_workers,
-        "manager": {
-            "provider": cfg.provider_for_role("manager")[0],
-            "model": cfg.provider_for_role("manager")[1],
-        },
-        "worker": {
-            "provider": cfg.provider_for_role("worker")[0],
-            "model": cfg.provider_for_role("worker")[1],
-        },
-        "reviewer": {
-            "provider": cfg.provider_for_role("reviewer")[0],
-            "model": cfg.provider_for_role("reviewer")[1],
-        },
-        "tester": {
-            "provider": cfg.provider_for_role("tester")[0],
-            "model": cfg.provider_for_role("tester")[1],
-        },
+        "using_default_model_fallback": bool(defaulted),
+        "default_model_fallback_roles": defaulted,
+        **role_entries,
     }
 
 
