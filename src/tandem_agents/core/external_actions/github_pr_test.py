@@ -54,11 +54,19 @@ class GithubPrExternalActionTest(unittest.TestCase):
                 {"number": 1459, "title": "Small cleanup", "state": "open", "base": {"repo": {"full_name": "frumu-ai/tandem"}}},
                 {"number": 1449, "title": "Bolt tweak", "state": "closed", "base": {"repo": {"full_name": "frumu-ai/tandem"}}},
             ],
+        ), patch(
+            "src.tandem_agents.core.external_actions.github_pr.get_pull_request_files",
+            side_effect=[
+                [{"filename": "src/a.ts", "additions": 3, "deletions": 1, "patch": "@@ patch"}],
+                [{"filename": "src/b.ts", "additions": 1, "deletions": 0}],
+            ],
         ):
             contexts = fetch_pr_contexts(cfg, task)
 
         self.assertEqual([context["number"] for context in contexts], [1459, 1449])
         self.assertTrue(all(context["base_repo"] == "frumu-ai/tandem" for context in contexts))
+        self.assertEqual(contexts[0]["changed_files"], ["src/a.ts"])
+        self.assertEqual(contexts[0]["files"][0]["patch_excerpt"], "@@ patch")
 
     def test_approval_queue_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

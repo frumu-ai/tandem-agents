@@ -109,6 +109,23 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(subtasks[0]["files"], [])
             self.assertEqual(subtasks[0]["target_files"], [])
 
+    def test_manager_subtasks_are_capped_to_max_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            raw_subtasks = [
+                {"id": f"subtask-{index}", "title": f"Subtask {index}", "goal": f"Goal {index}"}
+                for index in range(1, 6)
+            ]
+
+            _, subtasks = _prepare_subtasks_with_discovery(
+                {"title": "cleanup", "description": "cleanup"},
+                {"subtasks": raw_subtasks},
+                repo_path,
+                3,
+            )
+
+            self.assertEqual([subtask["id"] for subtask in subtasks], ["subtask-1", "subtask-2", "subtask-3"])
+
     def test_worker_prompt_includes_pr_candidate_context_artifact(self) -> None:
         task = {
             "title": "Consolidate worthwhile small Bolt optimizations into one intentional PR",

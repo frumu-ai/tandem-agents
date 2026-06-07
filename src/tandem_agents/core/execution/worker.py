@@ -286,6 +286,37 @@ def _prepare_worktree_targets(worktree: Path, subtask: dict[str, Any]) -> None:
         parent.mkdir(parents=True, exist_ok=True)
 
 
+def _materialize_worker_context(worktree: Path, subtask: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(subtask)
+    pr_context = prepared.get("pr_candidate_context")
+    source_artifact = str(prepared.get("pr_candidate_context_artifact") or "").strip()
+    if not pr_context and not source_artifact:
+        return prepared
+
+    context_dir = worktree / ".aca"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    destination = context_dir / "pr_candidate_context.json"
+    try:
+        if source_artifact and Path(source_artifact).exists():
+            shutil.copyfile(source_artifact, destination)
+        else:
+            destination.write_text(
+                json.dumps(
+                    {"pull_requests": pr_context or [], "source_artifact": source_artifact},
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        prepared["pr_candidate_context_artifact"] = ".aca/pr_candidate_context.json"
+        prepared["pr_candidate_context_artifact_source"] = source_artifact
+    except Exception as exc:
+        prepared["pr_candidate_context_artifact_error"] = str(exc)
+    return prepared
+
+
 def _target_files_exist(worktree: Path, subtask: dict[str, Any]) -> bool:
     targets = _subtask_targets(subtask)
     if not targets:
@@ -767,6 +798,7 @@ def run_worker_subtask(
     # Create an isolated worktree for this worker/subtask ownership pair.
     worktree_path = layout["worktrees"] / worker_worktree_name(worker_id, subtask.get("id"))
     worktree = create_worktree(repo_path, worktree_path)
+    subtask = _materialize_worker_context(worktree, subtask)
     
     _prepare_worktree_targets(worktree, subtask)
     preflight_ok, preflight_detail = _worktree_preflight(cfg, worktree)

@@ -719,7 +719,7 @@ def _prepare_subtasks_with_discovery(
             subtasks[0]["target_files"] = list(task_target_files)
         elif discovered_files and not _task_mentions_external_pr_candidates(task):
             subtasks[0]["files"] = list(discovered_files)
-    return discovered_files, subtasks
+    return discovered_files, subtasks[: max(1, max_workers)]
 
 
 def _normalized_text(value: Any) -> str:

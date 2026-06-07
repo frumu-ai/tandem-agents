@@ -390,6 +390,20 @@ def _flatten_pull_request_entries(payload: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def _flatten_pull_request_file_entries(payload: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    if isinstance(payload, dict):
+        for key in ("files", "pullRequestFiles", "pull_request_files", "items", "nodes", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                entries.extend(entry for entry in value if isinstance(entry, dict))
+            elif isinstance(value, dict) and isinstance(value.get("nodes"), list):
+                entries.extend(entry for entry in value["nodes"] if isinstance(entry, dict))
+    return entries
+
+
 def _flatten_review_entries(payload: Any) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     if isinstance(payload, list):
@@ -939,6 +953,20 @@ def get_pull_request(cfg: ResolvedConfig, owner: str, repo: str, pr_number: int)
         if data:
             return data
     raise RuntimeError(f"Could not read GitHub pull request {owner}/{repo}#{pr_number} through GitHub MCP.")
+
+
+def get_pull_request_files(cfg: ResolvedConfig, owner: str, repo: str, pr_number: int) -> list[dict[str, Any]]:
+    attempts = [
+        ("mcp.github.pull_request_read", {"owner": owner, "repo": repo, "pullNumber": pr_number, "method": "get_files"}),
+        ("mcp.github.pull_request_read", {"owner": owner, "repo": repo, "pull_number": pr_number, "method": "get_files"}),
+        ("mcp.github.pull_request_read", {"owner": owner, "repo": repo, "pullNumber": pr_number, "method": "files"}),
+        ("mcp.github.get_pull_request_files", {"owner": owner, "repo": repo, "pull_number": pr_number}),
+        ("mcp.github.list_pull_request_files", {"owner": owner, "repo": repo, "pull_number": pr_number}),
+    ]
+    entries: list[dict[str, Any]] = []
+    for payload in _execute_github_tool_attempts(cfg, attempts):
+        entries.extend(_flatten_pull_request_file_entries(payload))
+    return entries
 
 
 def list_pull_requests(cfg: ResolvedConfig, owner: str, repo: str, state: str = "open") -> list[dict[str, Any]]:
