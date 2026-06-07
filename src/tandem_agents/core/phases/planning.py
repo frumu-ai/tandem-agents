@@ -141,8 +141,12 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     ctx.blackboard["task_plan_validation"] = plan_validation
     task_source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
     force_worker_execution = (
-        isinstance(task_source, dict)
-        and str(task_source.get("type") or "").strip() == "github_project"
+        (
+            isinstance(task_source, dict)
+            and str(task_source.get("type") or "").strip() == "github_project"
+        )
+        or bool(getattr(ctx, "_manager_fallback_required", False))
+        or _rc._task_mentions_external_pr_candidates(ctx.task)
     )
     if not plan_validation.get("ok", True):
         blocker_kind = str(plan_validation.get("blocker_kind") or "contract_incomplete")

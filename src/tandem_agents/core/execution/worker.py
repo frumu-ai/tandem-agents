@@ -351,7 +351,8 @@ def stream_tandem_prompt(
                         log.flush()
                         _print_line(role, line)
                 stream_result = sdk_stream_run_text(cfg, session_id, run_id, _writer, timeout_seconds=600.0) if run_id else {"text": "", "completed": False}
-                stdout_text = str(stream_result.get("text") or "")
+                streamed_text = str(stream_result.get("text") or "")
+                stdout_text = streamed_text
                 completed = bool(stream_result.get("completed"))
                 if completed and not stdout_text.strip() and run_id:
                     try:
@@ -363,6 +364,10 @@ def stream_tandem_prompt(
                     completed = False
                 if stdout_text and not stdout_text.endswith("\n"):
                     stdout_text += "\n"
+                if stdout_text and stdout_text != streamed_text:
+                    log.write(stdout_text)
+                    log.flush()
+                    _print_line(role, stdout_text)
                 return {
                     "role": role,
                     "returncode": 0 if completed else 1,

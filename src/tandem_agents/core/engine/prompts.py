@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from src.tandem_agents.config.config_types import ResolvedConfig
@@ -104,6 +105,27 @@ def _task_scope_block(task: dict[str, Any]) -> str:
     if verification_commands:
         lines.append(f"Verification commands: {json.dumps(verification_commands)}")
     return "\n".join(lines).strip()
+
+
+def _referenced_pr_numbers(task: dict[str, Any], subtask: dict[str, Any] | None = None) -> list[str]:
+    text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or task.get("raw_issue_body") or ""),
+            "\n".join(str(entry or "") for entry in _as_list(task.get("acceptance_criteria"))),
+            str((subtask or {}).get("goal") or ""),
+            "\n".join(str(entry or "") for entry in _as_list((subtask or {}).get("acceptance_criteria"))),
+        ]
+    )
+    seen: set[str] = set()
+    numbers: list[str] = []
+    for match in re.finditer(r"(?:^|[\s(])#(\d+)\b", text):
+        number = match.group(1)
+        if number in seen:
+            continue
+        seen.add(number)
+        numbers.append(number)
+    return numbers
 
 
 def derive_subtasks(task: dict[str, Any], max_workers: int) -> list[dict[str, Any]]:
@@ -255,11 +277,22 @@ def build_manager_prompt(
 
 def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], task: dict[str, Any], worktree: str) -> str:
     deliverables = json.dumps(subtask.get("deliverables") or [])
-    files = json.dumps(subtask.get("files") or subtask.get("target_files") or [])
+    target_files = subtask.get("files") or subtask.get("target_files") or []
+    files = json.dumps(target_files)
     existing_files = json.dumps(subtask.get("existing_files") or [])
     write_required = bool(subtask.get("write_required", True))
     parent_scope = _task_scope_block(task)
     subtask_contract = _task_contract_block(subtask)
+    no_target_guidance = ""
+    if not target_files:
+        pr_numbers = _referenced_pr_numbers(task, subtask)
+        pr_line = f" Referenced PR candidates: {', '.join('#' + number for number in pr_numbers)}." if pr_numbers else ""
+        no_target_guidance = (
+            "\nNo target files were declared for this task, so you must discover them from the task context and repository state."
+            f"{pr_line}\n"
+            "If the task references PRs or branches, inspect those PRs with available GitHub tools or `gh`/`git`, compare them to latest main, "
+            "apply only still-relevant changes in this worktree, and leave a clear blocker if no safe repository diff can be produced.\n"
+        )
     return (
         f"You are ACA worker {worker_id} in run {run_id}.\n"
         "Your isolated worktree is mounted as the current directory.\n"
@@ -286,6 +319,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Target files: {files}\n"
         f"Existing readable target files in the base repo before this worker: {existing_files}\n"
         f"Write required for this worker: {json.dumps(write_required)}\n"
+        f"{no_target_guidance}"
     )
 
 

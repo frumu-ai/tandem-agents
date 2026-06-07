@@ -17,6 +17,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _linear_comment_task_summary,
     _permission_requests_from_payload,
     _prepare_subtasks_with_discovery,
+    _task_mentions_external_pr_candidates,
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
@@ -73,6 +74,38 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertIn("styles.css", discovered_files)
             self.assertTrue(subtasks)
             self.assertTrue(subtasks[0]["files"])
+
+    def test_pr_candidate_task_does_not_use_discovered_files_as_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            (repo_path / "crates").mkdir()
+            (repo_path / "crates" / "optimizations.rs").write_text("fn existing() {}\n", encoding="utf-8")
+            task = {
+                "title": "Consolidate worthwhile small Bolt optimizations into one intentional PR",
+                "description": "\n".join(
+                    [
+                        "Initial candidates to inspect/cherry-pick if still relevant:",
+                        "* #1459 - 3+/3-, 3 files",
+                        "* #1449 - 9+/3-, 2 files",
+                        "",
+                        "Acceptance:",
+                        "* Apply only improvements that still make sense in the current file layout.",
+                    ]
+                ),
+                "acceptance_criteria": [
+                    "#1459 - 3+/3-, 3 files",
+                    "Apply only improvements that still make sense in the current file layout.",
+                ],
+                "source": {"type": "linear", "item": "TAN-111"},
+            }
+
+            discovered_files, subtasks = _prepare_subtasks_with_discovery(task, {"subtasks": []}, repo_path, 1)
+
+            self.assertTrue(_task_mentions_external_pr_candidates(task))
+            self.assertIn("crates/optimizations.rs", discovered_files)
+            self.assertTrue(subtasks)
+            self.assertEqual(subtasks[0]["files"], [])
+            self.assertEqual(subtasks[0]["target_files"], [])
 
     def test_github_project_contract_target_files_override_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
