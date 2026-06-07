@@ -20,7 +20,8 @@ from src.tandem_agents.core.engine.coder_backend import (
     coder_workflow_supported,
     execute_coder_run,
 )
-from src.tandem_agents.core.engine.engine import checkout_run_branch, commit_repository_changes, effective_tandem_provider, engine_env, engine_health, ensure_engine, git_diff_stat, push_repository_changes, resolve_repository, task_run_branch_name, write_provider_override_config
+from src.tandem_agents.core.engine.engine import checkout_run_branch, commit_repository_changes, effective_tandem_provider, engine_env, engine_health, engine_visible_path, ensure_engine, git_diff_stat, push_repository_changes, resolve_repository, task_run_branch_name, write_provider_override_config
+from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.integrations.github_mcp import (
     add_issue_comment,
     build_issue_comment_body,
@@ -48,7 +49,7 @@ from src.tandem_agents.core.integrations.linear_mcp import (
     linear_status_name_for_task_state,
     linear_update_issue,
 )
-from src.tandem_agents.core.repository.repository import repository_binding_issues
+from src.tandem_agents.core.repository.repository import _git_repo_args, repository_binding_issues
 from src.tandem_agents.core.task_contract import task_contract_payload
 from src.tandem_agents.core.scheduling.outbox_dispatcher import dispatch_outbox_tick
 from src.tandem_agents.core.scheduling.coder_supervisor import apply_coder_result
@@ -186,6 +187,201 @@ def _task_mentions_external_pr_candidates(task: dict[str, Any] | None) -> bool:
     )
 
 
+def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, Any]:
+    failed = [
+        result
+        for result in worker_results
+        if str(result.get("status") or "").strip() == "failed"
+        or int(result.get("returncode") or 0) != 0
+    ]
+    first = failed[0] if failed else {}
+    kind = str(first.get("blocker_kind") or "").strip() or "worker_failed"
+    failure_reason = str(first.get("failure_reason") or "").strip()
+    engine = dict(first.get("engine") or {})
+    worker_id = str(first.get("worker_id") or "").strip() or "worker"
+    if kind == "engine_empty_response":
+        message = "Tandem engine returned no assistant transcript after async retry and prompt_sync fallback."
+        phase_detail = f"{worker_id} blocked on empty Tandem engine transcript"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Check Tandem engine provider/model routing and persisted engine snapshots, then reset the task to Backlog."
+        )
+    elif kind == "worker_no_diff":
+        message = "Worker inspected the task but produced no repository diff."
+        phase_detail = f"{worker_id} produced no filesystem changes"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Inspect the worker log and PR candidate context, then reset the task to Backlog if another attempt is needed."
+        )
+    elif kind == "engine_exception":
+        message = failure_reason or "Tandem engine prompt failed with an exception."
+        phase_detail = f"{worker_id} hit an engine prompt exception"
+        recovery_action = first.get("recovery_action") or "Inspect the worker log and Tandem engine health, then retry."
+    elif kind == "engine_provider_auth":
+        message = failure_reason or "Tandem engine provider authentication failed."
+        phase_detail = f"{worker_id} blocked on Tandem provider authentication"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Repair the Tandem Control Panel provider credentials/model route, then reset the task to Backlog."
+        )
+    elif kind == "engine_dispatch_failed":
+        message = failure_reason or "Tandem engine could not dispatch the provider request."
+        phase_detail = f"{worker_id} blocked on Tandem engine dispatch"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Inspect Tandem engine dispatch logs and provider routing, then reset the task to Backlog."
+        )
+    else:
+        message = failure_reason or "One or more workers failed."
+        phase_detail = f"{worker_id} failed during worker execution"
+        recovery_action = "Inspect the failed worker log, then reset the task to Backlog if another attempt is needed."
+    detail_bits = [
+        f"worker={worker_id}",
+        f"reason={failure_reason or kind}",
+    ]
+    session_id = str(engine.get("session_id") or "").strip()
+    run_id = str(engine.get("run_id") or first.get("engine_run_id") or "").strip()
+    fallback_mode = str(engine.get("fallback_mode") or "").strip()
+    retry_count = engine.get("retry_count")
+    if session_id:
+        detail_bits.append(f"session_id={session_id}")
+    if run_id:
+        detail_bits.append(f"engine_run_id={run_id}")
+    if retry_count not in (None, ""):
+        detail_bits.append(f"retry_count={retry_count}")
+    if fallback_mode:
+        detail_bits.append(f"fallback={fallback_mode}")
+    return {
+        "kind": kind,
+        "message": message,
+        "detail": "; ".join(detail_bits),
+        "phase_detail": phase_detail,
+        "recovery_action": str(recovery_action or "").strip(),
+        "engine": engine,
+        "worker": first,
+    }
+
+
+def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | None:
+    if not _task_mentions_external_pr_candidates(ctx.task):
+        return None
+    from src.tandem_agents.runtime.run_output import (
+        build_blocked_summary, save_run_text, set_status, write_board_snapshot, write_blackboard_snapshot
+    )
+    from src.tandem_agents.core.repository.board import save_board
+
+    contexts = fetch_pr_contexts(ctx.cfg, ctx.task)
+    artifact = {
+        "task_id": ctx.task.get("task_id"),
+        "title": ctx.task.get("title"),
+        "source": ctx.task.get("source") or {},
+        "repo": ctx.task.get("repo") or ctx.repo,
+        "pull_requests": contexts,
+    }
+    ctx.layout["artifacts"].mkdir(parents=True, exist_ok=True)
+    artifact_path = ctx.layout["artifacts"] / "pr_candidate_context.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    ctx.status.setdefault("artifacts", {})["pr_candidate_context"] = str(artifact_path)
+    ctx.blackboard["pr_candidate_context"] = {
+        "artifact": str(artifact_path),
+        "pull_request_count": len(contexts),
+        "pull_requests": contexts,
+    }
+    for subtask in ctx.planned_subtasks or []:
+        subtask["pr_candidate_context_artifact"] = str(artifact_path)
+        subtask["pr_candidate_context"] = contexts
+    for subtask in ctx.pending_subtasks or []:
+        subtask["pr_candidate_context_artifact"] = str(artifact_path)
+        subtask["pr_candidate_context"] = contexts
+    errors = [context for context in contexts if context.get("error")]
+    if contexts and not errors:
+        save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+        write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+        write_status(ctx.layout["status"], ctx.status)
+        append_event(
+            ctx.layout["events"],
+            "github.pr_candidate_context.ready",
+            ctx.run_id,
+            {"artifact": str(artifact_path), "pr_count": len(contexts)},
+            task_id=ctx.task.get("task_id"),
+            role="manager",
+            repo={"path": ctx.repo.get("path")},
+        )
+        return None
+
+    detail = (
+        "No referenced GitHub pull requests could be fetched."
+        if not contexts
+        else "; ".join(
+            f"#{context.get('number')}: {context.get('error')}"
+            for context in errors
+            if context.get("error")
+        )
+    )
+    msg = "GitHub PR candidate context is unavailable; ACA will not start workers without it."
+    recovery = "Reconnect/refresh the GitHub MCP, verify repository access, then reset the task to Backlog."
+    ctx.status = set_status(
+        ctx.status,
+        ctx.layout,
+        phase="planning",
+        phase_detail=detail,
+        run_status="blocked",
+        blocker=(True, "github_context_unavailable", msg, "manager"),
+        run_completed=True,
+    )
+    ctx.status.setdefault("blocker", {})["detail"] = detail
+    ctx.status.setdefault("blocker", {})["recovery_action"] = recovery
+    ctx.blackboard.setdefault("blockers", []).append(
+        {
+            "kind": "github_context_unavailable",
+            "message": msg,
+            "detail": detail,
+            "recovery_action": recovery,
+            "phase": "planning",
+        }
+    )
+    _touch_coordination(
+        ctx.coordination,
+        run_id=ctx.run_id,
+        lease_id=ctx.lease_id,
+        lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+        status="blocked",
+        phase="planning",
+        error=msg,
+        completed=True,
+    )
+    _move_task_card_if_present(ctx.board, ctx.task, "blocked", "manager", "github context unavailable")
+    save_board(ctx.board_path, ctx.board)
+    write_board_snapshot(ctx.run_dir, ctx.board)
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    save_run_text(
+        ctx.layout["summary"],
+        build_blocked_summary(
+            task_title=ctx.task["title"],
+            message=f"{msg}\n\nDetail: {detail}\nRecovery: {recovery}",
+        ),
+    )
+    _finalize_github_sync(
+        cfg=ctx.cfg,
+        task=ctx.task,
+        run_id=ctx.run_id,
+        layout=ctx.layout,
+        status=ctx.status,
+        blackboard=ctx.blackboard,
+        outcome="blocked",
+        summary=msg,
+        coordination=ctx.coordination,
+    )
+    append_event(
+        ctx.layout["events"],
+        "run.blocked",
+        ctx.run_id,
+        {"kind": "github_context_unavailable", "detail": detail, "recovery_action": recovery},
+    )
+    return ctx.make_result()
+
+
 def _record_coding_run_contract(blackboard: dict[str, Any], contract: Any) -> None:
     blackboard["coding_run_contract"] = contract.as_dict()
     if getattr(contract, "code_editing", False):
@@ -229,6 +425,62 @@ def _task_claim_identity(cfg: ResolvedConfig, task: dict[str, Any]) -> dict[str,
     if str(cfg.env.get("ACA_COORDINATION_ROLE") or "").strip():
         role = str(cfg.env.get("ACA_COORDINATION_ROLE") or "").strip()
     return {"worker_id": worker_id, "host_id": host_id, "role": role, "source_type": str(source.get("type") or cfg.task_source.type or "")}
+
+
+def _run_start_preflight(
+    cfg: ResolvedConfig,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    repo: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str] | None]:
+    repo_path = Path(repo.get("path") or ".")
+    engine_repo_path = engine_visible_path(repo_path)
+    engine_run_dir = engine_visible_path(layout["run_dir"])
+    result = run_command(_git_repo_args(repo_path, "status", "--short", "--branch"), env=cfg.env)
+    detail = result.stderr.strip() or result.stdout.strip()
+    preflight = {
+        "run_id": run_id,
+        "repo_path": str(repo_path),
+        "repo_exists": repo_path.exists(),
+        "git_metadata_exists": (repo_path / ".git").exists(),
+        "engine_visible_repo_path": str(engine_repo_path),
+        "engine_visible_run_dir": str(engine_run_dir),
+        "logs_dir": str(layout["logs"]),
+        "artifacts_dir": str(layout["artifacts"]),
+        "git_status": {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        },
+    }
+    layout["artifacts"].mkdir(parents=True, exist_ok=True)
+    artifact_path = layout["artifacts"] / "run_start_preflight.json"
+    artifact_path.write_text(json.dumps(preflight, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    preflight["artifact"] = str(artifact_path)
+    append_event(
+        layout["events"],
+        "run.preflight",
+        run_id,
+        {
+            "artifact": str(artifact_path),
+            "repo_path": str(repo_path),
+            "engine_visible_repo_path": str(engine_repo_path),
+            "git_status_ok": result.returncode == 0,
+        },
+    )
+    if result.returncode == 0:
+        return preflight, None
+    kind = "repo_safe_directory" if "dubious ownership" in detail.lower() else "engine_workspace_unreachable"
+    return preflight, {
+        "kind": kind,
+        "message": detail or "Run-start repository preflight failed.",
+        "recovery_action": (
+            "Ensure all ACA-managed git commands use the safe.directory helper and retry."
+            if kind == "repo_safe_directory"
+            else "Verify the resolved repo path and ACA_ENGINE_HOST_ROOT mapping, then retry."
+        ),
+    }
 
 
 COORDINATION_LOST_THRESHOLD = 3
@@ -1687,6 +1939,23 @@ def _run_once_internal_impl(
     # and returns the repo — retrieve it via a lightweight re-ping (no disk I/O).
     repo = resolve_repository(cfg)
     append_event(layout["events"], "repo.resolved", run_id, {"path": repo["path"], "branch": repo.get("branch")})
+    preflight, preflight_blocker = _run_start_preflight(cfg, run_id=run_id, layout=layout, repo=repo)
+    repo["run_start_preflight"] = preflight
+    if preflight_blocker is not None:
+        return block_run(
+            run_id=run_id,
+            run_dir=run_dir,
+            layout=layout,
+            cfg=cfg,
+            task=None,
+            repo=repo,
+            engine=engine,
+            phase="repo_resolution",
+            kind=preflight_blocker["kind"],
+            message=preflight_blocker["message"],
+            phase_detail=preflight_blocker["recovery_action"],
+            coordination=coordination,
+        )
 
     # ------------------------------------------------------------------
     # Phase 2: Task intake + coordination claim
@@ -1846,6 +2115,10 @@ def _run_once_internal_impl(
         # 4c. Early-exit if everything already satisfied
         if all_pre_satisfied:
             return _complete_pre_satisfied(ctx)
+
+        pr_context_blocked = _prepare_pr_candidate_context(ctx)
+        if pr_context_blocked is not None:
+            return pr_context_blocked
 
         # 4d. Worker dispatch
         ctx.status["metrics"]["planned_workers"] = len(ctx.planned_subtasks)
@@ -2452,29 +2725,67 @@ def _block_worker_failure(ctx: "_PhaseRunContext") -> dict[str, Any]:
     from src.tandem_agents.core.repository.board import save_board
     from src.tandem_agents.runtime.runstate import save_blackboard
 
+    blocker = _worker_failure_blocker(ctx.worker_results)
     ctx.status = set_status(
         ctx.status, ctx.layout, phase="worker_execution",
-        phase_detail="one or more workers failed", run_status="blocked",
-        blocker=(True, "worker", "One or more workers failed", "worker"),
+        phase_detail=blocker["phase_detail"], run_status="blocked",
+        blocker=(True, blocker["kind"], blocker["message"], "worker"),
         run_completed=True,
+    )
+    ctx.status.setdefault("blocker", {})["detail"] = blocker["detail"]
+    ctx.status.setdefault("blocker", {})["recovery_action"] = blocker["recovery_action"]
+    if blocker.get("engine"):
+        ctx.status.setdefault("engine", {}).update(blocker["engine"])
+    ctx.status.setdefault("artifacts", {})
+    for key in ("events_path", "messages_path", "sync_snapshot_path"):
+        value = (blocker.get("engine") or {}).get(key)
+        if value:
+            ctx.status["artifacts"][f"engine_{key.replace('_path', '')}"] = value
+    ctx.blackboard.setdefault("blockers", []).append(
+        {
+            "kind": blocker["kind"],
+            "message": blocker["message"],
+            "detail": blocker["detail"],
+            "recovery_action": blocker["recovery_action"],
+            "phase": "worker_execution",
+        }
     )
     _touch_coordination(ctx.coordination, run_id=ctx.run_id, lease_id=ctx.lease_id,
                         lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
                         status="blocked", phase="worker_execution",
-                        error="One or more workers failed", completed=True)
-    _move_task_card_if_present(ctx.board, ctx.task, "blocked", "manager", "worker failure")
+                        error=blocker["message"], completed=True)
+    _move_task_card_if_present(ctx.board, ctx.task, "blocked", "manager", blocker["kind"])
     save_board(ctx.board_path, ctx.board)
     write_board_snapshot(ctx.run_dir, ctx.board)
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
     write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
     save_run_text(ctx.layout["summary"], build_blocked_summary(
-        task_title=ctx.task["title"], message="One or more workers failed.",
+        task_title=ctx.task["title"],
+        message="\n".join(
+            line
+            for line in (
+                blocker["message"],
+                f"Detail: {blocker['detail']}" if blocker.get("detail") else "",
+                f"Recovery: {blocker['recovery_action']}" if blocker.get("recovery_action") else "",
+            )
+            if line
+        ),
         worker_results=ctx.worker_results,
     ))
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,
-                          outcome="blocked", summary="One or more worker executions failed.",
+                          outcome="blocked", summary=blocker["message"],
                           coordination=ctx.coordination)
-    append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "worker"})
+    append_event(
+        ctx.layout["events"],
+        "run.blocked",
+        ctx.run_id,
+        {
+            "kind": blocker["kind"],
+            "detail": blocker["detail"],
+            "recovery_action": blocker["recovery_action"],
+        },
+    )
     return ctx.make_result()
 
 

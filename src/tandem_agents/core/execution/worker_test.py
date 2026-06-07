@@ -4,12 +4,198 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from src.tandem_agents.core.execution.worker import _coerce_worker_failure
+from src.tandem_agents.core.execution.worker import (
+    _coerce_worker_failure,
+    _extract_prompt_sync_text,
+    _extract_session_reply,
+    stream_tandem_prompt,
+)
 from src.tandem_agents.core.phases.worker_dispatch import _apply_tolerated_failures
 
 
 class WorkerFailureCoercionTest(unittest.TestCase):
+    def test_session_reply_extracts_assistant_text_from_engine_messages(self) -> None:
+        messages = [
+            {"info": {"role": "user"}, "parts": [{"text": "prompt"}]},
+            {"info": {"role": "assistant"}, "parts": [{"content": [{"text": "answer"}]}]},
+        ]
+
+        self.assertEqual(_extract_session_reply(messages), "answer")
+
+    def test_prompt_sync_text_extracts_messages_payload(self) -> None:
+        response = {
+            "messages": [
+                {"info": {"role": "assistant"}, "parts": [{"text": "sync answer"}]},
+            ]
+        }
+
+        self.assertEqual(_extract_prompt_sync_text(response), "sync answer")
+
+    def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            log_path = worktree / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 1,
+                    "stdout": "ENGINE_EMPTY_RESPONSE: empty\n",
+                    "failure_reason": "ENGINE_EMPTY_RESPONSE",
+                },
+                log_path,
+                worktree,
+                {"files": []},
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["blocker_kind"], "engine_empty_response")
+
+    def test_engine_provider_auth_error_gets_actionable_blocker_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            log_path = worktree / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 1,
+                    "stdout": "ENGINE_ERROR: ENGINE_DISPATCH_FAILED: You didn't provide an API key.\n",
+                },
+                log_path,
+                worktree,
+                {"files": []},
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["blocker_kind"], "engine_provider_auth")
+            self.assertIn("API key", result["failure_reason"])
+
+    def test_empty_async_stream_recovers_text_from_run_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async", return_value={"run_id": "run-1"}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_stream_run_text", return_value={"text": "", "completed": True}), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_run_events",
+                    return_value=[{"type": "message.part.updated", "properties": {"delta": {"text": "event text"}}}],
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_session_messages", return_value=[]):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=False,
+                    write_required=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("event text", result["stdout"])
+            self.assertTrue((Path(tmp) / "worker.engine-events-run-1.json").exists())
+
+    def test_empty_async_stream_recovers_text_from_session_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async", return_value={"run_id": "run-1"}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_stream_run_text", return_value={"text": "", "completed": True}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_session_messages",
+                    return_value=[{"info": {"role": "assistant"}, "parts": [{"text": "message text"}]}],
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=False,
+                    write_required=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("message text", result["stdout"])
+            self.assertTrue((Path(tmp) / "worker.engine-messages-session-1.json").exists())
+
+    def test_empty_async_stream_retries_then_uses_prompt_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ) as prompt_async, \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_stream_run_text", return_value={"text": "", "completed": True}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_session_messages", return_value=[]), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    return_value={"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync fallback"}]}]},
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=False,
+                    write_required=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("sync fallback", result["stdout"])
+            self.assertEqual(result["engine"]["retry_count"], 1)
+            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync")
+            self.assertEqual(prompt_async.call_count, 2)
+
+    def test_double_empty_engine_response_blocks_with_specific_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_stream_run_text", return_value={"text": "", "completed": True}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_session_messages", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.prompt_tandem_session_sync", return_value={"messages": []}):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=False,
+                    write_required=False,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_EMPTY_RESPONSE")
+            self.assertEqual(result["blocker_kind"], "engine_empty_response")
+
     def test_github_tasks_do_not_treat_readable_targets_as_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)

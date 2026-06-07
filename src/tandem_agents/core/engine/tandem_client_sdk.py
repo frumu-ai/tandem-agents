@@ -144,6 +144,16 @@ def sdk_delete_session(cfg: ResolvedConfig, session_id: str) -> Any:
     return with_sync_tandem_client(cfg, lambda client: client.sessions.delete(session_id))
 
 
+def sdk_session_messages(cfg: ResolvedConfig, session_id: str) -> Any:
+    return with_sync_tandem_client(
+        cfg,
+        lambda client: [
+            (message.model_dump(exclude_none=True) if hasattr(message, "model_dump") else message)
+            for message in client.sessions.messages(session_id)
+        ],
+    )
+
+
 def sdk_list_mcp_servers(cfg: ResolvedConfig) -> Any:
     return with_sync_tandem_client(cfg, lambda client: client.mcp.list())
 
