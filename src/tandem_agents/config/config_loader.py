@@ -258,12 +258,16 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         remote_name=str(repo_remote_name or DEFAULT_REMOTE_NAME),
         credential_file=str(repo_credential_file or ""),
     )
+    provider_id_raw = str(pick("ACA_PROVIDER", "AUTOCODER_PROVIDER", yaml_value=provider_data.get("id"), default="")).strip()
+    provider_model_raw = str(pick("ACA_MODEL", "AUTOCODER_MODEL", yaml_value=provider_data.get("model"), default="")).strip()
     provider = ProviderConfig(
-        id=str(pick("ACA_PROVIDER", "AUTOCODER_PROVIDER", yaml_value=provider_data.get("id"), default=DEFAULT_PROVIDER)),
-        model=str(pick("ACA_MODEL", "AUTOCODER_MODEL", yaml_value=provider_data.get("model"), default=DEFAULT_MODEL)),
+        id=provider_id_raw or DEFAULT_PROVIDER,
+        model=provider_model_raw or DEFAULT_MODEL,
         base_url=str(pick("ACA_PROVIDER_BASE_URL", "AUTOCODER_PROVIDER_BASE_URL", yaml_value=provider_data.get("base_url"), default="")),
         fallback_provider=str(pick("ACA_FALLBACK_PROVIDER", "AUTOCODER_FALLBACK_PROVIDER", yaml_value=provider_data.get("fallback_provider"), default="")),
         fallback_model=str(pick("ACA_FALLBACK_MODEL", "AUTOCODER_FALLBACK_MODEL", yaml_value=provider_data.get("fallback_model"), default="")),
+        provider_configured=bool(provider_id_raw),
+        model_configured=bool(provider_model_raw),
     )
     storage = StorageConfig(
         profile=str(

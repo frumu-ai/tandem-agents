@@ -230,6 +230,11 @@ class ProviderConfig:
     base_url: str = ""
     fallback_provider: str = ""
     fallback_model: str = ""
+    # Whether id/model were explicitly configured (env/yaml/control panel) vs.
+    # left as the built-in default. The loader sets these; manually built
+    # configs default to True so they are never flagged as silent fallbacks.
+    provider_configured: bool = True
+    model_configured: bool = True
 
 
 @dataclass
@@ -395,13 +400,48 @@ class ResolvedConfig:
         return host, port
 
     def provider_for_role(self, role: str) -> tuple[str, str]:
+        resolved = self.provider_for_role_with_source(role)
+        return resolved["provider"], resolved["model"]
+
+    def provider_for_role_with_source(self, role: str) -> dict[str, str]:
+        """Resolve a role's provider/model and report where each value came from.
+
+        ``*_source`` is one of ``role`` (per-role swarm override), ``provider``
+        (global provider config, typically set in the control panel), ``fallback``
+        (configured fallback), or ``default`` (the built-in last-resort default).
+        A ``default`` source means nothing was configured for that role, so the
+        run is about to use ACA's generic fallback model rather than an operator
+        selection -- callers can surface that as a warning.
+        """
         role_cfg = getattr(self.swarm, role, RoleSelection())
-        provider = _nonempty(role_cfg.provider) or _nonempty(self.provider.id) or _nonempty(self.provider.fallback_provider) or DEFAULT_PROVIDER
-        model = _nonempty(role_cfg.model) or _nonempty(self.provider.model) or _nonempty(self.provider.fallback_model) or DEFAULT_MODEL
-        if self.swarm.shared_model:
-            provider = _nonempty(self.provider.id) or _nonempty(self.provider.fallback_provider) or DEFAULT_PROVIDER
-            model = _nonempty(self.provider.model) or _nonempty(self.provider.fallback_model) or DEFAULT_MODEL
-        return str(provider), str(model)
+        use_role = not self.swarm.shared_model
+
+        def _pick(role_value: str, global_value: str, global_configured: bool, fallback_value: str) -> tuple[str, str]:
+            if use_role and _nonempty(role_value):
+                return str(role_value), "role"
+            if global_configured and _nonempty(global_value):
+                return str(global_value), "provider"
+            if _nonempty(fallback_value):
+                return str(fallback_value), "fallback"
+            return "", "default"
+
+        provider, provider_source = _pick(
+            role_cfg.provider, self.provider.id, self.provider.provider_configured, self.provider.fallback_provider
+        )
+        model, model_source = _pick(
+            role_cfg.model, self.provider.model, self.provider.model_configured, self.provider.fallback_model
+        )
+        if provider_source == "default":
+            provider = DEFAULT_PROVIDER
+        if model_source == "default":
+            model = DEFAULT_MODEL
+        return {
+            "role": role,
+            "provider": provider,
+            "provider_source": provider_source,
+            "model": model,
+            "model_source": model_source,
+        }
 
     def as_dict(self) -> dict[str, Any]:
         payload = _jsonable(self)
