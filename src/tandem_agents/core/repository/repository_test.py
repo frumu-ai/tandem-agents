@@ -10,6 +10,7 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.repository.repository import (
     _git_clone_args_and_env,
+    _git_repo_args,
     _github_pat,
     git_diff_stat,
     repository_binding_issues,
@@ -20,6 +21,24 @@ from src.tandem_agents.core.repository.repository import (
 
 
 class RepositoryNamingTest(unittest.TestCase):
+    def test_git_repo_args_marks_managed_checkout_safe(self) -> None:
+        repo_path = Path("/workspace/tandem-agents/workspace/repos/tandem")
+
+        args = _git_repo_args(repo_path, "status", "--porcelain")
+
+        self.assertEqual(
+            args,
+            [
+                "git",
+                "-c",
+                "safe.directory=/workspace/tandem-agents/workspace/repos/tandem",
+                "-C",
+                "/workspace/tandem-agents/workspace/repos/tandem",
+                "status",
+                "--porcelain",
+            ],
+        )
+
     def test_git_diff_stat_maps_container_worktree_gitdir_to_host_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

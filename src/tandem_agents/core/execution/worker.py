@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 import shutil
 import subprocess
 import threading
@@ -33,6 +35,7 @@ from src.tandem_agents.runtime.artifact_store import mirror_run_tree
 from src.tandem_agents.runtime.runstate import append_event, ensure_layout
 from src.tandem_agents.utils.utils import now_ms
 from src.tandem_agents.core.engine.tandem_client_sdk import (
+    sdk_session_messages,
     sdk_sessions_prompt_async,
     sdk_run_events,
     sdk_stream_run_text,
@@ -66,24 +69,88 @@ def _print_line(prefix: str, line: str) -> None:
         print(f"[{prefix}] {line}", end="", flush=True)
 
 
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return _jsonable(value.model_dump(exclude_none=True))
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _message_dict(message: Any) -> dict[str, Any] | None:
+    if hasattr(message, "model_dump"):
+        message = message.model_dump(exclude_none=True)
+    if isinstance(message, dict):
+        return message
+    return None
+
+
+def _message_role(message: dict[str, Any]) -> str:
+    info = message.get("info") if isinstance(message.get("info"), dict) else {}
+    for value in (
+        info.get("role") if isinstance(info, dict) else None,
+        message.get("role"),
+        message.get("author"),
+    ):
+        role = str(value or "").strip().lower()
+        if role:
+            return role
+    return ""
+
+
+def _extract_text_from_message_part(part: Any) -> str:
+    if hasattr(part, "model_dump"):
+        part = part.model_dump(exclude_none=True)
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        chunks: list[str] = []
+        for key in ("text", "content", "value", "delta", "message"):
+            value = part.get(key)
+            if isinstance(value, str):
+                chunks.append(value)
+            elif isinstance(value, (dict, list)):
+                chunks.append(_extract_text_from_message_part(value))
+        return "".join(chunk for chunk in chunks if chunk)
+    if isinstance(part, list):
+        return "".join(_extract_text_from_message_part(item) for item in part)
+    return ""
+
+
 def _extract_session_reply(messages: Any) -> str:
     if not isinstance(messages, list):
         return ""
-    assistant_parts: list[dict[str, Any]] = []
+    assistant_parts: list[Any] = []
     for message in reversed(messages):
-        if not isinstance(message, dict):
+        message_dict = _message_dict(message)
+        if not message_dict:
             continue
-        info = message.get("info") or {}
-        if str(info.get("role") or "").strip().lower() != "assistant":
+        if _message_role(message_dict) != "assistant":
             continue
-        parts = message.get("parts") or []
+        parts = message_dict.get("parts") or message_dict.get("content") or []
         if isinstance(parts, list):
-            assistant_parts = [part for part in parts if isinstance(part, dict)]
+            assistant_parts = list(parts)
+            break
+        text = _extract_text_from_message_part(parts)
+        if text:
+            return text.strip()
+    if not assistant_parts:
+        for message in reversed(messages):
+            message_dict = _message_dict(message)
+            if not message_dict:
+                continue
+            text = _extract_text_from_message_part(message_dict)
+            if text:
+                return text.strip()
             break
     text_chunks: list[str] = []
     for part in assistant_parts:
-        text = part.get("text")
-        if isinstance(text, str) and text:
+        text = _extract_text_from_message_part(part)
+        if text:
             text_chunks.append(text)
     return "\n".join(chunk.rstrip("\n") for chunk in text_chunks if chunk).strip()
 
@@ -119,6 +186,73 @@ def _extract_run_event_text(events: Any) -> str:
         if text:
             chunks.append(text)
     return "".join(chunks).strip()
+
+
+def _write_engine_snapshot(log_path: Path, label: str, payload: Any) -> str:
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "snapshot"
+    snapshot_path = log_path.with_name(f"{log_path.stem}.{safe_label}.json")
+    snapshot_path.write_text(
+        json.dumps(_jsonable(payload), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return str(snapshot_path)
+
+
+def _recover_engine_text_from_state(
+    cfg: ResolvedConfig,
+    *,
+    session_id: str | None,
+    run_id: str | None,
+    log_path: Path,
+) -> tuple[str, dict[str, Any]]:
+    recovery: dict[str, Any] = {"errors": []}
+    text = ""
+    if run_id:
+        try:
+            events = sdk_run_events(cfg, run_id, tail=500)
+            recovery["events_path"] = _write_engine_snapshot(log_path, f"engine-events-{run_id}", events)
+            text = _extract_run_event_text(events)
+        except Exception as exc:
+            recovery.setdefault("errors", []).append(f"run_events: {exc}")
+            logger.debug("Failed to recover text from run events", exc_info=True)
+    if session_id:
+        try:
+            messages = sdk_session_messages(cfg, session_id)
+            recovery["messages_path"] = _write_engine_snapshot(log_path, f"engine-messages-{session_id}", messages)
+            if not text.strip():
+                text = _extract_session_reply(messages)
+        except Exception as exc:
+            recovery.setdefault("errors", []).append(f"session_messages: {exc}")
+            logger.debug("Failed to recover text from session messages", exc_info=True)
+    return text.strip(), recovery
+
+
+def _extract_prompt_sync_text(response: Any) -> str:
+    if hasattr(response, "model_dump"):
+        response = response.model_dump(exclude_none=True)
+    if isinstance(response, dict):
+        for key in ("messages", "message", "response", "output", "stdout", "text", "content"):
+            value = response.get(key)
+            if key == "messages":
+                text = _extract_session_reply(value)
+            else:
+                text = _extract_text_from_message_part(value)
+            if text.strip():
+                return text.strip()
+        return _extract_text_from_message_part(response).strip()
+    if isinstance(response, list):
+        text = _extract_session_reply(response) or _extract_text_from_message_part(response)
+        return text.strip()
+    return _extract_text_from_message_part(response).strip()
+
+
+def _empty_transcript_retry_prompt() -> str:
+    return (
+        "The previous async engine run completed without a visible assistant transcript. "
+        "Retry the same task now using the context already in this session. "
+        "Use tools if they are required. Finish with a concise textual summary. "
+        "If blocked, state the exact blocker and the next operator action."
+    )
 
 
 def _subtask_targets(subtask: dict[str, Any]) -> list[str]:
@@ -262,10 +396,16 @@ def _coerce_worker_failure(
         result["returncode"] = 0
         result["verified_existing"] = True
         return result
-    failure_reason = ""
+    failure_reason = str(result.get("failure_reason") or "").strip()
     for marker in WORKER_FAILURE_MARKERS:
-        if marker in stdout_text:
-            failure_reason = marker
+        if not failure_reason and marker in stdout_text:
+            if marker == "ENGINE_ERROR:":
+                failure_reason = next(
+                    (line.strip() for line in stdout_text.splitlines() if marker in line),
+                    marker,
+                )
+            else:
+                failure_reason = marker
             break
     if result.get("returncode", 0) == 0 and not diff_text:
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
@@ -281,6 +421,34 @@ def _coerce_worker_failure(
         result["stdout"] = f"{stdout_text}{message}"
     result["returncode"] = 1
     result["failure_reason"] = failure_reason
+    if failure_reason == "ENGINE_EMPTY_RESPONSE":
+        result["blocker_kind"] = "engine_empty_response"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Check Tandem engine provider/model routing and persisted engine snapshots, then retry the task."
+            )
+    elif failure_reason == "NO_FILESYSTEM_CHANGES":
+        result["blocker_kind"] = "worker_no_diff"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Inspect the worker log and PR candidate context; reset the task to Backlog if another attempt is needed."
+            )
+    elif failure_reason == "ENGINE_EXCEPTION":
+        result["blocker_kind"] = "engine_exception"
+    elif failure_reason.startswith("ENGINE_ERROR:"):
+        lower_reason = failure_reason.lower()
+        if "api key" in lower_reason or "authorization" in lower_reason:
+            result["blocker_kind"] = "engine_provider_auth"
+            if not result.get("recovery_action"):
+                result["recovery_action"] = (
+                    "Repair the Tandem Control Panel provider credentials/model route, then reset the task to Backlog."
+                )
+        else:
+            result["blocker_kind"] = "engine_dispatch_failed"
+            if not result.get("recovery_action"):
+                result["recovery_action"] = (
+                    "Inspect Tandem engine dispatch logs and provider routing, then reset the task to Backlog."
+                )
     return result
 
 
@@ -300,6 +468,7 @@ def stream_tandem_prompt(
 ) -> dict[str, Any]:
     if config_path is None:
         session_id: str | None = None
+        last_run_id = ""
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\n=== {role} @ {now_ms()} ===\n")
@@ -324,51 +493,136 @@ def stream_tandem_prompt(
                         time.sleep(0.5 * (attempt + 1))
                 if session_id is None and create_exc is not None:
                     raise create_exc
-                
-                async_result = sdk_sessions_prompt_async(
-                    cfg,
-                    session_id=session_id,
-                    prompt=prompt,
-                    tool_mode="required" if require_tool_use else "auto",
-                    tool_allowlist=SESSION_TOOL_ALLOWLIST,
-                    context_mode=None,
-                    write_required=write_required,
-                )
-                run_id = ""
-                try:
-                    run_id = str((async_result or {}).get("run_id"))  # type: ignore[attr-defined]
-                except Exception:
-                    logger.debug("Failed to extract run_id from dict", exc_info=True)
-                if not run_id:
-                    for attr in ("runID", "runId", "id", "run_id"):
-                        try:
-                            val = getattr(async_result, attr)
-                            if val:
-                                run_id = str(val)
-                                break
-                        except Exception:
-                            logger.debug(f"Failed to extract run_id from object attr {attr}", exc_info=True)
-                            continue
+
+                engine_meta: dict[str, Any] = {
+                    "session_id": session_id,
+                    "run_id": "",
+                    "retry_count": 0,
+                    "fallback_mode": None,
+                    "recovery": [],
+                }
+
                 def _writer(delta: str) -> None:
                     for line in delta.splitlines(keepends=True):
                         log.write(line)
                         log.flush()
                         _print_line(role, line)
-                stream_result = sdk_stream_run_text(cfg, session_id, run_id, _writer, timeout_seconds=600.0) if run_id else {"text": "", "completed": False}
-                streamed_text = str(stream_result.get("text") or "")
-                stdout_text = streamed_text
-                completed = bool(stream_result.get("completed"))
-                if completed and not stdout_text.strip() and run_id:
+
+                def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str]:
+                    async_result = sdk_sessions_prompt_async(
+                        cfg,
+                        session_id=session_id,
+                        prompt=prompt_text,
+                        tool_mode="required" if require_tool_use else "auto",
+                        tool_allowlist=SESSION_TOOL_ALLOWLIST,
+                        context_mode=None,
+                        write_required=write_required,
+                    )
+                    run_id = ""
                     try:
-                        stdout_text = _extract_run_event_text(sdk_run_events(cfg, run_id, tail=300))
+                        run_id = str((async_result or {}).get("run_id"))  # type: ignore[attr-defined]
                     except Exception:
-                        logger.debug("Failed to recover text from run events", exc_info=True)
-                if completed and not stdout_text.strip():
-                    stdout_text = f"ENGINE_EMPTY_RESPONSE: engine run {run_id or 'unknown'} completed without transcript text.\n"
-                    completed = False
-                if stdout_text and not stdout_text.endswith("\n"):
-                    stdout_text += "\n"
-                if stdout_text and stdout_text != streamed_text:
+                        logger.debug("Failed to extract run_id from dict", exc_info=True)
+                    if not run_id:
+                        for attr in ("runID", "runId", "id", "run_id"):
+                            try:
+                                val = getattr(async_result, attr)
+                                if val:
+                                    run_id = str(val)
+                                    break
+                            except Exception:
+                                logger.debug("Failed to extract run_id from object attr %s", attr, exc_info=True)
+                                continue
+                    engine_meta["run_id"] = run_id
+                    engine_meta["retry_count"] = attempt
+                    nonlocal last_run_id
+                    last_run_id = run_id
+                    stream_result = (
+                        sdk_stream_run_text(cfg, session_id, run_id, _writer, timeout_seconds=600.0)
+                        if run_id
+                        else {"text": "", "completed": False}
+                    )
+                    streamed_text = str(stream_result.get("text") or "")
+                    completed = bool(stream_result.get("completed"))
+                    if completed and streamed_text.strip():
+                        return streamed_text, True, run_id
+                    recovered_text = ""
+                    if completed:
+                        recovered_text, recovery = _recover_engine_text_from_state(
+                            cfg,
+                            session_id=session_id,
+                            run_id=run_id,
+                            log_path=log_path,
+                        )
+                        recovery["run_id"] = run_id
+                        recovery["attempt"] = attempt
+                        engine_meta.setdefault("recovery", []).append(recovery)
+                        for key in ("events_path", "messages_path"):
+                            if recovery.get(key):
+                                engine_meta[key] = recovery[key]
+                    if completed and recovered_text.strip():
+                        return recovered_text, True, run_id
+                    return streamed_text, completed and bool(streamed_text.strip()), run_id
+
+                stdout_text, completed, run_id = _run_async_once(prompt, 0)
+                if not completed:
+                    retry_notice = (
+                        f"ENGINE_EMPTY_RESPONSE_RETRY: engine run {run_id or 'unknown'} completed "
+                        "without transcript text; retrying once in the same session.\n"
+                    )
+                    log.write(retry_notice)
+                    log.flush()
+                    _print_line(role, retry_notice)
+                    retry_text, retry_completed, retry_run_id = _run_async_once(_empty_transcript_retry_prompt(), 1)
+                    if retry_completed:
+                        stdout_text = retry_text
+                        completed = True
+                        run_id = retry_run_id
+                    else:
+                        stdout_text = retry_text or stdout_text
+                        run_id = retry_run_id or run_id
+
+                if not completed:
+                    engine_meta["fallback_mode"] = "prompt_sync"
+                    fallback_notice = (
+                        f"ENGINE_EMPTY_RESPONSE_FALLBACK: engine run {run_id or 'unknown'} still had "
+                        "no transcript text; using prompt_sync fallback.\n"
+                    )
+                    log.write(fallback_notice)
+                    log.flush()
+                    _print_line(role, fallback_notice)
+                    sync_response = prompt_tandem_session_sync(
+                        cfg,
+                        session_id=session_id,
+                        prompt=_empty_transcript_retry_prompt(),
+                        tool_allowlist=SESSION_TOOL_ALLOWLIST,
+                        require_tool_use=require_tool_use,
+                        write_required=write_required,
+                    )
+                    engine_meta["sync_snapshot_path"] = _write_engine_snapshot(
+                        log_path,
+                        f"engine-sync-{session_id}",
+                        sync_response,
+                    )
+                    sync_text = _extract_prompt_sync_text(sync_response)
+                    if sync_text.strip():
+                        stdout_text = sync_text
+                        completed = True
+
+                failure_reason = ""
+                blocker_kind = ""
+                if completed:
+                    if stdout_text and not stdout_text.endswith("\n"):
+                        stdout_text += "\n"
+                else:
+                    failure_reason = "ENGINE_EMPTY_RESPONSE"
+                    blocker_kind = "engine_empty_response"
+                    stdout_text = (
+                        "ENGINE_EMPTY_RESPONSE: Tandem engine completed async prompt, same-session "
+                        "retry, and prompt_sync fallback without transcript text. "
+                        f"Last engine run: {run_id or last_run_id or 'unknown'}.\n"
+                    )
+                if stdout_text:
                     log.write(stdout_text)
                     log.flush()
                     _print_line(role, stdout_text)
@@ -379,7 +633,16 @@ def stream_tandem_prompt(
                     "log_path": str(log_path),
                     "cwd": str(cwd),
                     "session_id": session_id,
-                    "engine_run_id": run_id,
+                    "engine_run_id": run_id or last_run_id,
+                    "engine": engine_meta,
+                    "failure_reason": failure_reason,
+                    "blocker_kind": blocker_kind,
+                    "recovery_action": (
+                        "Check Tandem engine provider/model routing and persisted engine snapshots, "
+                        "then retry the task after the engine returns assistant text."
+                    )
+                    if blocker_kind
+                    else "",
                 }
             except Exception as exc:
                 message = f"Error: {exc}\n"
@@ -393,6 +656,16 @@ def stream_tandem_prompt(
                     "log_path": str(log_path),
                     "cwd": str(cwd),
                     "session_id": session_id,
+                    "engine_run_id": last_run_id,
+                    "engine": {
+                        "session_id": session_id,
+                        "run_id": last_run_id,
+                        "retry_count": 0,
+                        "fallback_mode": None,
+                    },
+                    "failure_reason": "ENGINE_EXCEPTION",
+                    "blocker_kind": "engine_exception",
+                    "recovery_action": "Inspect the worker log and Tandem engine health, then retry the task.",
                 }
             finally:
                 if session_id:
@@ -430,6 +703,10 @@ def summarize_worker_notes(
         "worktree": str(worktree),
         "log_path": result["log_path"],
         "output_excerpt": result["stdout"][:2000],
+        "failure_reason": str(result.get("failure_reason") or ""),
+        "blocker_kind": str(result.get("blocker_kind") or ""),
+        "recovery_action": str(result.get("recovery_action") or ""),
+        "engine": dict(result.get("engine") or {}),
         "write_required": bool(result.get("write_required", True)),
         "verified_existing": bool(result.get("verified_existing")),
         "changed_files": [path for path in changed_files if path],
@@ -541,7 +818,7 @@ def run_worker_subtask(
         require_filesystem_changes=require_filesystem_changes,
     )
     
-    if result["returncode"] != 0:
+    if result["returncode"] != 0 and result.get("blocker_kind") != "engine_empty_response":
         retry_prompt = prompt + _worker_prompt_retry_suffix(subtask)
         retry_result = stream_tandem_prompt(
             cfg,
@@ -575,7 +852,15 @@ def run_worker_subtask(
         layout["events"],
         "worker.completed" if result["returncode"] == 0 else "worker.failed",
         run_id,
-        {"worker_id": worker_id, "subtask_id": subtask["id"], "returncode": result["returncode"]},
+        {
+            "worker_id": worker_id,
+            "subtask_id": subtask["id"],
+            "returncode": result["returncode"],
+            "failure_reason": result.get("failure_reason"),
+            "blocker_kind": result.get("blocker_kind"),
+            "recovery_action": result.get("recovery_action"),
+            "engine": result.get("engine"),
+        },
         task_id=task.get("task_id"),
         role="worker",
         repo={"path": str(repo_path)},

@@ -83,6 +83,18 @@ def _git_identity_args(cfg: ResolvedConfig) -> list[str]:
     return ["-c", f"user.name={name}", "-c", f"user.email={email}"]
 
 
+def _git_repo_args(repo_path: Path, *args: str, prefix: list[str] | None = None) -> list[str]:
+    base = list(prefix or ["git"])
+    return [
+        *base,
+        "-c",
+        f"safe.directory={repo_path}",
+        "-C",
+        str(repo_path),
+        *args,
+    ]
+
+
 def _remote_is_empty(cfg: ResolvedConfig, clone_url: str) -> bool:
     args, env = _git_auth_args(cfg, clone_url)
     result = run_command(args + ["ls-remote", clone_url], env=env)
@@ -94,7 +106,7 @@ def _remote_url_for_existing_repo(cfg: ResolvedConfig, repo_path: Path) -> str:
     if configured:
         return configured
     remote_name = cfg.repository.remote_name or "origin"
-    result = run_command(["git", "-C", str(repo_path), "remote", "get-url", remote_name], env=cfg.env)
+    result = run_command(_git_repo_args(repo_path, "remote", "get-url", remote_name), env=cfg.env)
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -109,7 +121,7 @@ def _configured_clone_url(cfg: ResolvedConfig) -> str:
 
 
 def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
-    status = run_command(["git", "-C", str(repo_path), "status", "--porcelain"], env=cfg.env)
+    status = run_command(_git_repo_args(repo_path, "status", "--porcelain"), env=cfg.env)
     if status.returncode != 0:
         raise RuntimeError(status.stderr.strip() or status.stdout.strip())
     if status.stdout.strip():
@@ -125,18 +137,18 @@ def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
     args, env = _git_auth_args(cfg, remote_url)
 
     fetch_result = run_command(
-        args + ["-C", str(repo_path), "fetch", "--prune", remote_name, default_branch],
+        _git_repo_args(repo_path, "fetch", "--prune", remote_name, default_branch, prefix=args),
         env=env,
     )
     if fetch_result.returncode != 0:
         raise RuntimeError(fetch_result.stderr.strip() or fetch_result.stdout.strip())
 
-    checkout_result = run_command(["git", "-C", str(repo_path), "checkout", default_branch], env=env)
+    checkout_result = run_command(_git_repo_args(repo_path, "checkout", default_branch), env=env)
     if checkout_result.returncode != 0:
         raise RuntimeError(checkout_result.stderr.strip() or checkout_result.stdout.strip())
 
     pull_result = run_command(
-        args + ["-C", str(repo_path), "pull", "--ff-only", remote_name, default_branch],
+        _git_repo_args(repo_path, "pull", "--ff-only", remote_name, default_branch, prefix=args),
         env=env,
     )
     if pull_result.returncode != 0:
@@ -160,13 +172,15 @@ def _bootstrap_local_repository(cfg: ResolvedConfig, target: Path) -> Path:
     if init_result.returncode != 0:
         raise RuntimeError(init_result.stderr.strip() or init_result.stdout.strip())
 
-    add_result = run_command(["git", "-C", str(target), "add", "-A"], env=cfg.env)
+    add_result = run_command(_git_repo_args(target, "add", "-A"), env=cfg.env)
     if add_result.returncode != 0:
         raise RuntimeError(add_result.stderr.strip() or add_result.stdout.strip())
 
     commit_result = run_command(
         [
             "git",
+            "-c",
+            f"safe.directory={target}",
             "-C",
             str(target),
             *identity_args,
@@ -192,12 +206,14 @@ def _bootstrap_empty_repository(cfg: ResolvedConfig, clone_url: str, target: Pat
     if init_result.returncode != 0:
         raise RuntimeError(init_result.stderr.strip() or init_result.stdout.strip())
     remote_name = cfg.repository.remote_name or "origin"
-    remote_result = run_command(["git", "-C", str(target), "remote", "add", remote_name, clone_url], env=cfg.env)
+    remote_result = run_command(_git_repo_args(target, "remote", "add", remote_name, clone_url), env=cfg.env)
     if remote_result.returncode != 0 and "already exists" not in (remote_result.stderr or ""):
         raise RuntimeError(remote_result.stderr.strip() or remote_result.stdout.strip())
     commit_result = run_command(
         [
             "git",
+            "-c",
+            f"safe.directory={target}",
             "-C",
             str(target),
             *identity_args,
@@ -269,7 +285,7 @@ def repository_binding_issues(cfg: ResolvedConfig) -> list[str]:
                         )
                 elif slug:
                     remote_name = cfg.repository.remote_name or "origin"
-                    remote_result = run_command(["git", "-C", str(repo_path), "remote", "get-url", remote_name], env=cfg.env)
+                    remote_result = run_command(_git_repo_args(repo_path, "remote", "get-url", remote_name), env=cfg.env)
                     remote_slug = _clone_url_to_slug(remote_result.stdout.strip()) if remote_result.returncode == 0 else ""
                     if remote_slug and remote_slug != slug:
                         issues.append(
@@ -385,13 +401,13 @@ def resolve_repository(cfg: ResolvedConfig) -> dict[str, Any]:
 def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> str:
     """Creates and checkouts a new branch for the run."""
     # Ensure we are on the default branch and it's clean
-    run_command(["git", "-C", str(repo_path), "checkout", cfg.repository.default_branch], env=cfg.env)
+    run_command(_git_repo_args(repo_path, "checkout", cfg.repository.default_branch), env=cfg.env)
     
     # Create and checkout new branch
-    result = run_command(["git", "-C", str(repo_path), "checkout", "-b", branch_name], env=cfg.env)
+    result = run_command(_git_repo_args(repo_path, "checkout", "-b", branch_name), env=cfg.env)
     if result.returncode != 0:
         # If branch exists, just checkout
-        run_command(["git", "-C", str(repo_path), "checkout", branch_name], env=cfg.env)
+        run_command(_git_repo_args(repo_path, "checkout", branch_name), env=cfg.env)
     
     return branch_name
 
@@ -399,15 +415,15 @@ def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) 
 def push_repository_changes(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> bool:
     """Pushes the current branch to the remote."""
     remote_name = cfg.repository.remote_name or "origin"
-    result = run_command(["git", "-C", str(repo_path), "push", "-u", remote_name, branch_name], env=cfg.env)
+    result = run_command(_git_repo_args(repo_path, "push", "-u", remote_name, branch_name), env=cfg.env)
     return result.returncode == 0
 
 
 def repository_status(repo_path: Path, remote_name: str = "origin", default_branch: str = "main") -> dict[str, Any]:
-    branch = run_command(["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"])
-    commit = run_command(["git", "-C", str(repo_path), "rev-parse", "HEAD"])
-    status = run_command(["git", "-C", str(repo_path), "status", "--porcelain"])
-    remote = run_command(["git", "-C", str(repo_path), "remote", "-v"])
+    branch = run_command(_git_repo_args(repo_path, "rev-parse", "--abbrev-ref", "HEAD"))
+    commit = run_command(_git_repo_args(repo_path, "rev-parse", "HEAD"))
+    status = run_command(_git_repo_args(repo_path, "status", "--porcelain"))
+    remote = run_command(_git_repo_args(repo_path, "remote", "-v"))
     return {
         "path": str(repo_path.resolve()),
         "remote_name": remote_name,
@@ -422,26 +438,24 @@ def repository_status(repo_path: Path, remote_name: str = "origin", default_bran
 
 def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
     with WORKTREE_LOCK:
-        run_command(["git", "-C", str(repo_path), "worktree", "prune"])
+        run_command(_git_repo_args(repo_path, "worktree", "prune"))
         if worktree_path.exists():
             remove_result = run_command(
-                ["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree_path)]
+                _git_repo_args(repo_path, "worktree", "remove", "--force", str(worktree_path))
             )
             if remove_result.returncode != 0 and worktree_path.exists():
                 shutil.rmtree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         result = run_command(
-            [
-                "git",
-                "-C",
-                str(repo_path),
+            _git_repo_args(
+                repo_path,
                 "worktree",
                 "add",
                 "--detach",
                 "--force",
                 str(worktree_path),
                 "HEAD",
-            ]
+            )
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
@@ -486,8 +500,8 @@ def _git_dir_for_worktree(repo_path: Path) -> Path | None:
 def _git_command_for_worktree(repo_path: Path, *args: str) -> list[str]:
     git_dir = _git_dir_for_worktree(repo_path)
     if git_dir is None or not git_dir.exists():
-        return ["git", "-C", str(repo_path), *args]
-    return ["git", f"--git-dir={git_dir}", f"--work-tree={repo_path}", *args]
+        return _git_repo_args(repo_path, *args)
+    return ["git", "-c", f"safe.directory={repo_path}", f"--git-dir={git_dir}", f"--work-tree={repo_path}", *args]
 
 
 def git_diff_stat(repo_path: Path) -> str:
@@ -545,11 +559,11 @@ def commit_repository_changes(cfg: ResolvedConfig, repo_path: Path, message: str
     if not git_diff_stat(repo_path).strip():
         return None
     env = {"GIT_TERMINAL_PROMPT": "0", **cfg.env}
-    add_result = run_command(["git", "-C", str(repo_path), "add", "-A"], env=env)
+    add_result = run_command(_git_repo_args(repo_path, "add", "-A"), env=env)
     if add_result.returncode != 0:
         raise RuntimeError(add_result.stderr.strip() or add_result.stdout.strip())
     commit_result = run_command(
-        ["git", "-C", str(repo_path), *_git_identity_args(cfg), "commit", "-m", message],
+        _git_repo_args(repo_path, *_git_identity_args(cfg), "commit", "-m", message),
         env=env,
     )
     if commit_result.returncode != 0:
@@ -559,7 +573,7 @@ def commit_repository_changes(cfg: ResolvedConfig, repo_path: Path, message: str
         if "nothing to commit" in combined.lower():
             return None
         raise RuntimeError(stderr or stdout)
-    head_result = run_command(["git", "-C", str(repo_path), "rev-parse", "HEAD"], env=env)
+    head_result = run_command(_git_repo_args(repo_path, "rev-parse", "HEAD"), env=env)
     if head_result.returncode != 0:
         raise RuntimeError(head_result.stderr.strip() or head_result.stdout.strip())
     return {

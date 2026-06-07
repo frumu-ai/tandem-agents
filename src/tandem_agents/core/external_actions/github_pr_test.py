@@ -12,6 +12,7 @@ from src.tandem_agents.core.external_actions.github_pr import (
     enqueue_approvals_for_plan,
     execute_approved_action,
     extract_pr_numbers,
+    fetch_pr_contexts,
 )
 
 
@@ -37,6 +38,27 @@ class GithubPrExternalActionTest(unittest.TestCase):
         self.assertIn("leave_open", action_types)
         self.assertIn("post_linear_summary", action_types)
         self.assertTrue(all(action["action_type"] != "close_pr" or action["target"]["pr_number"] != 1400 for action in actions))
+
+    def test_fetch_pr_contexts_records_tan_111_candidates(self) -> None:
+        cfg = SimpleNamespace(repository=SimpleNamespace(slug="frumu-ai/tandem"))
+        task = {
+            "task_id": "TAN-111",
+            "title": "Consolidate worthwhile small Bolt optimizations into one intentional PR",
+            "description": "Inspect #1459 and #1449, then apply only safe changes.",
+            "source": {"type": "linear", "identifier": "TAN-111"},
+        }
+
+        with patch(
+            "src.tandem_agents.core.external_actions.github_pr.get_pull_request",
+            side_effect=[
+                {"number": 1459, "title": "Small cleanup", "state": "open", "base": {"repo": {"full_name": "frumu-ai/tandem"}}},
+                {"number": 1449, "title": "Bolt tweak", "state": "closed", "base": {"repo": {"full_name": "frumu-ai/tandem"}}},
+            ],
+        ):
+            contexts = fetch_pr_contexts(cfg, task)
+
+        self.assertEqual([context["number"] for context in contexts], [1459, 1449])
+        self.assertTrue(all(context["base_repo"] == "frumu-ai/tandem" for context in contexts))
 
     def test_approval_queue_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

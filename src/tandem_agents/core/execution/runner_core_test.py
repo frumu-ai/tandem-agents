@@ -18,10 +18,12 @@ from src.tandem_agents.core.execution.runner_core import (
     _permission_requests_from_payload,
     _prepare_subtasks_with_discovery,
     _task_mentions_external_pr_candidates,
+    _worker_failure_blocker,
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
 )
+from src.tandem_agents.core.engine.prompts import build_worker_prompt
 
 
 class RunnerCoreDiscoveryTest(unittest.TestCase):
@@ -106,6 +108,50 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertTrue(subtasks)
             self.assertEqual(subtasks[0]["files"], [])
             self.assertEqual(subtasks[0]["target_files"], [])
+
+    def test_worker_prompt_includes_pr_candidate_context_artifact(self) -> None:
+        task = {
+            "title": "Consolidate worthwhile small Bolt optimizations into one intentional PR",
+            "description": "Inspect #1459 before editing.",
+        }
+        subtask = {
+            "id": "subtask-1",
+            "title": "Inspect PRs",
+            "goal": "Inspect candidates and apply safe changes.",
+            "files": [],
+            "target_files": [],
+            "pr_candidate_context_artifact": "artifacts/pr_candidate_context.json",
+            "pr_candidate_context": [{"number": 1459, "title": "Small cleanup", "state": "open"}],
+        }
+
+        prompt = build_worker_prompt("run-1", "worker-1", subtask, task, "/tmp/worktree")
+
+        self.assertIn("ACA already fetched GitHub PR candidate context", prompt)
+        self.assertIn("artifacts/pr_candidate_context.json", prompt)
+        self.assertIn('"number": 1459', prompt)
+
+    def test_worker_failure_blocker_preserves_engine_empty_response_details(self) -> None:
+        blocker = _worker_failure_blocker(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "ENGINE_EMPTY_RESPONSE",
+                    "blocker_kind": "engine_empty_response",
+                    "engine": {
+                        "session_id": "session-1",
+                        "run_id": "run-engine-1",
+                        "retry_count": 1,
+                        "fallback_mode": "prompt_sync",
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(blocker["kind"], "engine_empty_response")
+        self.assertIn("session_id=session-1", blocker["detail"])
+        self.assertIn("fallback=prompt_sync", blocker["detail"])
 
     def test_github_project_contract_target_files_override_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

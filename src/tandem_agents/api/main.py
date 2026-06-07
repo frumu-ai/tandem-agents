@@ -1221,6 +1221,7 @@ def _finalize_external_action_linear_status(cfg, *, run_id: str, run_dir: Path) 
 @app.get("/approvals")
 async def list_external_action_approvals(
     run_id: Optional[str] = None,
+    status: Optional[str] = None,
     status_filter: Optional[str] = None,
     limit: int = 100,
     token: str = Depends(get_token),
@@ -1231,7 +1232,7 @@ async def list_external_action_approvals(
     store.ensure_schema()
     approvals = store.list_external_action_approvals(
         run_id=run_id,
-        status=status_filter,
+        status=status_filter or status,
         limit=max(1, min(limit, 500)),
     )
     return {"approvals": approvals, "count": len(approvals)}
@@ -1248,12 +1249,17 @@ async def list_pending_external_action_approvals(limit: int = 100, token: str = 
 
 
 @app.get("/runs/{run_id}/approvals")
-async def list_run_external_action_approvals(run_id: str, token: str = Depends(get_token)):
+async def list_run_external_action_approvals(
+    run_id: str,
+    status: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    token: str = Depends(get_token),
+):
     root = Path(os.environ.get("ACA_ROOT", "."))
     cfg = resolve_config(root)
     store = CoordinationStore.from_config(cfg)
     store.ensure_schema()
-    approvals = store.list_external_action_approvals(run_id=run_id, limit=500)
+    approvals = store.list_external_action_approvals(run_id=run_id, status=status_filter or status, limit=500)
     return {"run_id": run_id, "approvals": approvals, "count": len(approvals)}
 
 

@@ -7,15 +7,107 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.api.main import _project_runtime_env, app
+from src.tandem_agents.core.coordination.coordination import CoordinationStore
 
 
 class AcaApiWorkspaceGuideTest(unittest.TestCase):
+    def _write_minimal_config(self, root: Path) -> None:
+        (root / "tandem-data").mkdir(parents=True, exist_ok=True)
+        (root / ".env").write_text(
+            "\n".join(
+                [
+                    "ACA_COORDINATION_SQLITE_PATH=tandem-data/coordination.sqlite3",
+                    "ACA_TASK_SOURCE_TYPE=manual",
+                    "ACA_TASK_SOURCE_PROMPT=Do the thing",
+                    "ACA_REPO_SLUG=frumu-ai/example",
+                    "ACA_PROVIDER=openai",
+                    "ACA_MODEL=gpt-5.5",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / "agent.yaml").write_text(
+            "\n".join(
+                [
+                    "agent:",
+                    "  name: ACA",
+                    "tandem:",
+                    "  base_url: http://127.0.0.1:39733",
+                    "task_source:",
+                    "  type: manual",
+                    "  prompt: Do the thing",
+                    "repository:",
+                    "  slug: frumu-ai/example",
+                    "provider:",
+                    "  id: openai",
+                    "  model: gpt-5.5",
+                    "output:",
+                    "  root: runs",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def test_mcp_routes_are_registered_on_the_main_api(self) -> None:
         paths = {getattr(route, "path", "") for route in app.routes}
         self.assertIn("/server.json", paths)
         self.assertIn("/.well-known/mcp/server.json", paths)
         self.assertIn("/mcp", paths)
+
+    def test_approvals_status_query_filters_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+                "ACA_COORDINATION_SQLITE_PATH": str(root / "tandem-data" / "coordination.sqlite3"),
+            }
+            with patch.dict("os.environ", env, clear=False):
+                cfg = resolve_config(root)
+                store = CoordinationStore.from_config(cfg)
+                store.ensure_schema()
+                pending = store.enqueue_external_action_approval(
+                    run_id="run-1",
+                    task_id="TAN-110",
+                    source_type="linear",
+                    adapter="github_pr",
+                    action_type="comment_pr",
+                    target={"pr_number": 1},
+                    payload={"body": "pending"},
+                    risk_level="medium",
+                )
+                approved = store.enqueue_external_action_approval(
+                    run_id="run-1",
+                    task_id="TAN-110",
+                    source_type="linear",
+                    adapter="github_pr",
+                    action_type="close_pr",
+                    target={"pr_number": 2},
+                    payload={},
+                    risk_level="high",
+                )
+                store.decide_external_action_approval(
+                    approved["approval_id"],
+                    decision="approve",
+                    actor="tester",
+                    reason="ok",
+                )
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/approvals",
+                        params={"status": "pending"},
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    payload = response.json()
+
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["approvals"][0]["approval_id"], pending["approval_id"])
 
     def test_workspace_projects_and_guide_include_repo_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

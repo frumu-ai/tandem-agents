@@ -99,6 +99,13 @@ def run_manager_prompt(ctx: RunContext) -> None:
         "tests": [],
     }
     ctx.blackboard["manager_plan"] = ctx.manager_plan
+    if manager_result.get("engine") or manager_result.get("blocker_kind"):
+        ctx.blackboard["manager_engine"] = {
+            "engine": manager_result.get("engine") or {},
+            "failure_reason": manager_result.get("failure_reason") or "",
+            "blocker_kind": manager_result.get("blocker_kind") or "",
+            "recovery_action": manager_result.get("recovery_action") or "",
+        }
     save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
     write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
     return manager_result

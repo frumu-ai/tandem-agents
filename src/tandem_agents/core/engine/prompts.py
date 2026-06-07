@@ -293,6 +293,17 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "If the task references PRs or branches, inspect those PRs with available GitHub tools or `gh`/`git`, compare them to latest main, "
             "apply only still-relevant changes in this worktree, and leave a clear blocker if no safe repository diff can be produced.\n"
         )
+    pr_context_guidance = ""
+    pr_context = subtask.get("pr_candidate_context")
+    pr_context_artifact = str(subtask.get("pr_candidate_context_artifact") or "").strip()
+    if pr_context:
+        pr_context_guidance = (
+            "\nACA already fetched GitHub PR candidate context for this task. "
+            f"Artifact: {pr_context_artifact or 'pr_candidate_context.json'}\n"
+            "Use this context first, then verify anything important against the repository before editing. "
+            "If no safe changes remain, return a structured blocker that lists the inspected PR numbers.\n"
+            f"PR candidate context:\n{json.dumps(pr_context, indent=2, sort_keys=True, default=str)[:6000]}\n"
+        )
     return (
         f"You are ACA worker {worker_id} in run {run_id}.\n"
         "Your isolated worktree is mounted as the current directory.\n"
@@ -320,6 +331,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Existing readable target files in the base repo before this worker: {existing_files}\n"
         f"Write required for this worker: {json.dumps(write_required)}\n"
         f"{no_target_guidance}"
+        f"{pr_context_guidance}"
     )
 
 
