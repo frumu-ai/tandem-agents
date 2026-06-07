@@ -11,6 +11,7 @@ from src.tandem_agents.core.execution.worker import (
     _extract_prompt_sync_text,
     _extract_session_reply,
     _materialize_worker_context,
+    run_worker_subtask,
     stream_tandem_prompt,
 )
 from src.tandem_agents.core.phases.worker_dispatch import _apply_tolerated_failures
@@ -53,6 +54,44 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(prepared["pr_candidate_context_artifact"], ".aca/pr_candidate_context.json")
             self.assertTrue((worktree / ".aca" / "pr_candidate_context.json").exists())
+
+    def test_run_worker_subtask_syncs_successful_worktree_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            repo_path.mkdir()
+            worktree.mkdir()
+            cfg = SimpleNamespace(provider_for_role=lambda role: ("openai-codex", "gpt-5.5"))
+            result = {
+                "returncode": 0,
+                "stdout": "changed files",
+                "log_path": str(run_dir / "logs" / "worker-1.log"),
+            }
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch("src.tandem_agents.core.execution.worker.effective_tandem_provider", return_value="openai-codex"), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt", return_value=result), \
+                mock.patch("src.tandem_agents.core.execution.worker._coerce_worker_failure", return_value=result), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes") as sync_changes, \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", return_value={"returncode": 0}):
+                output = run_worker_subtask(
+                    cfg,
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-111", "source": {"type": "linear"}, "title": "Task"},
+                    {"id": "subtask-1", "title": "Subtask", "goal": "Change files", "files": []},
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 0)
+            sync_changes.assert_called_once_with(worktree, repo_path)
 
     def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

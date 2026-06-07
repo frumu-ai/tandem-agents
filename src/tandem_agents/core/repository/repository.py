@@ -504,9 +504,26 @@ def _git_command_for_worktree(repo_path: Path, *args: str) -> list[str]:
     return ["git", "-c", f"safe.directory={repo_path}", f"--git-dir={git_dir}", f"--work-tree={repo_path}", *args]
 
 
+def _is_internal_worktree_artifact(path_text: str) -> bool:
+    normalized = path_text.replace("\\", "/").strip("/")
+    return normalized == ".aca" or normalized.startswith(".aca/")
+
+
+def _status_path(raw_line: str) -> str:
+    path_text = raw_line[3:].strip()
+    if "->" in path_text:
+        path_text = path_text.split("->", 1)[1].strip()
+    return path_text
+
+
 def git_diff_stat(repo_path: Path) -> str:
-    result = run_command(_git_command_for_worktree(repo_path, "status", "--short"))
-    return result.stdout.strip()
+    result = run_command(_git_command_for_worktree(repo_path, "status", "--short", "--untracked-files=all"))
+    lines = [
+        raw_line
+        for raw_line in result.stdout.splitlines()
+        if raw_line.strip() and not _is_internal_worktree_artifact(_status_path(raw_line))
+    ]
+    return "\n".join(lines).strip()
 
 
 def git_working_diff(repo_path: Path, *, max_chars: int = 20000, max_file_chars: int = 4000) -> str:
@@ -560,11 +577,11 @@ def list_worktree_changes(worktree_path: Path) -> list[dict[str, str]]:
         if not raw_line.strip():
             continue
         status = raw_line[:2]
-        path_text = raw_line[3:].strip()
+        path_text = _status_path(raw_line)
         if not path_text:
             continue
-        if "->" in path_text:
-            path_text = path_text.split("->", 1)[1].strip()
+        if _is_internal_worktree_artifact(path_text):
+            continue
         changes.append({"status": status, "path": path_text})
     return changes
 

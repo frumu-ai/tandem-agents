@@ -14,6 +14,7 @@ from src.tandem_agents.core.repository.repository import (
     _github_pat,
     git_diff_stat,
     git_working_diff,
+    list_worktree_changes,
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
@@ -59,6 +60,21 @@ class RepositoryNamingTest(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"ACA_ROOT": str(root)}):
                 self.assertIn("README.md", git_diff_stat(worktree))
+
+    def test_git_diff_stat_ignores_aca_internal_context_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            (repo / ".aca").mkdir()
+            (repo / ".aca" / "pr_candidate_context.json").write_text("{}\n", encoding="utf-8")
+
+            self.assertEqual(git_diff_stat(repo), "")
+            self.assertEqual(list_worktree_changes(repo), [])
 
     def test_git_working_diff_includes_modified_and_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

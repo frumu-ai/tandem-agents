@@ -25,6 +25,7 @@ from src.tandem_agents.core.engine.engine import (
     list_engine_permissions,
     prompt_tandem_session_sync,
     reply_engine_permission,
+    sync_worktree_changes,
     worker_worktree_name,
     write_provider_override_config,
 )
