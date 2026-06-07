@@ -295,6 +295,34 @@ def reply_engine_permission(cfg: ResolvedConfig, request_id: str, reply: str) ->
     return payload
 
 
+def engine_visible_path(path: Path) -> Path:
+    """Map ACA container paths to the filesystem path visible to Tandem engine.
+
+    In hosted deployments ACA can run in Docker while the reused Tandem engine
+    runs on the host. ACA sees `/workspace/tandem-agents`, but the host engine
+    needs the bind-mount source path. Keep the mapping explicit so local
+    non-container runs are unchanged.
+    """
+    host_root = (os.environ.get("ACA_ENGINE_HOST_ROOT") or "").strip()
+    if not host_root:
+        return path
+    container_root = (
+        os.environ.get("ACA_ENGINE_CONTAINER_ROOT")
+        or os.environ.get("ACA_ROOT")
+        or "/workspace/tandem-agents"
+    ).strip()
+    if not container_root:
+        return path
+    resolved = path.expanduser()
+    text = str(resolved)
+    prefix = container_root.rstrip("/") + "/"
+    if text == container_root.rstrip("/"):
+        return Path(host_root).expanduser()
+    if text.startswith(prefix):
+        return Path(host_root).expanduser() / text[len(prefix):]
+    return path
+
+
 def create_tandem_session(
     cfg: ResolvedConfig,
     *,
@@ -308,7 +336,7 @@ def create_tandem_session(
             sdk_create_session(
                 cfg,
                 title=title,
-                directory=str(directory),
+                directory=str(engine_visible_path(directory)),
                 provider=provider,
                 model=model,
             )
@@ -317,7 +345,7 @@ def create_tandem_session(
     else:
         payload = {
             "title": title,
-            "directory": str(directory),
+            "directory": str(engine_visible_path(directory)),
             "provider": provider,
             "model": {
                 "providerID": provider,

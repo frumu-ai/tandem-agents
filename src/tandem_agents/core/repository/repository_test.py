@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -10,6 +11,7 @@ from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.repository.repository import (
     _git_clone_args_and_env,
     _github_pat,
+    git_diff_stat,
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
@@ -18,6 +20,26 @@ from src.tandem_agents.core.repository.repository import (
 
 
 class RepositoryNamingTest(unittest.TestCase):
+    def test_git_diff_stat_maps_container_worktree_gitdir_to_host_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "workspace" / "repos" / "demo"
+            source.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            worktree = root / "runs" / "run-1" / "worktrees" / "worker-1"
+            run_command(["git", "-C", str(source), "worktree", "add", "--detach", str(worktree), "HEAD"])
+            git_file = worktree / ".git"
+            host_gitdir = git_file.read_text(encoding="utf-8").split(":", 1)[1].strip()
+            container_gitdir = str(Path(host_gitdir)).replace(str(root), "/workspace/tandem-agents")
+            git_file.write_text(f"gitdir: {container_gitdir}\n", encoding="utf-8")
+            (worktree / "README.md").write_text("after\n", encoding="utf-8")
+
+            with mock.patch.dict("os.environ", {"ACA_ROOT": str(root)}):
+                self.assertIn("README.md", git_diff_stat(worktree))
+
     def test_task_run_branch_name_is_canonical(self) -> None:
         branch = task_run_branch_name(
             {"title": "Fix README", "task_id": "1234abcd"},

@@ -159,6 +159,33 @@ def _append_blackboard_note(blackboard: dict[str, Any], message: str) -> None:
     blackboard.setdefault("notes", []).append(message)
 
 
+def _task_mentions_external_pr_candidates(task: dict[str, Any] | None) -> bool:
+    if not isinstance(task, dict):
+        return False
+    text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or task.get("raw_issue_body") or ""),
+            "\n".join(str(entry or "") for entry in _as_list(task.get("acceptance_criteria"))),
+        ]
+    ).lower()
+    if not re.search(r"(?:^|[\s(])#\d+\b", text):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            " pr",
+            "prs",
+            "pull request",
+            "pull requests",
+            "cherry-pick",
+            "merge",
+            "close",
+            "branch",
+        )
+    )
+
+
 def _record_coding_run_contract(blackboard: dict[str, Any], contract: Any) -> None:
     blackboard["coding_run_contract"] = contract.as_dict()
     if getattr(contract, "code_editing", False):
@@ -310,6 +337,7 @@ def _normalize_manager_subtasks(
         if str(entry).strip()
     ]
     contract_constrained = bool(task_target_files)
+    suppress_discovered_targets = _task_mentions_external_pr_candidates(task) and not contract_constrained
 
     def _normalize_repo_file(entry: str) -> str:
         if entry.startswith(repo_prefix):
@@ -396,7 +424,7 @@ def _normalize_manager_subtasks(
             }
         )
     if normalized:
-        if discovered_files:
+        if discovered_files and not suppress_discovered_targets:
             chunks = [discovered_files[i::len(normalized)] for i in range(len(normalized))]
             for index, item in enumerate(normalized):
                 if item.get("files"):
@@ -404,7 +432,7 @@ def _normalize_manager_subtasks(
                 item["files"] = chunks[index] or list(discovered_files)
         return normalized
     fallback = derive_subtasks(task, 1)
-    if discovered_files and fallback:
+    if discovered_files and fallback and not suppress_discovered_targets:
         if contract_constrained:
             fallback[0]["files"] = list(normalized_task_target_files)
             fallback[0]["target_files"] = list(normalized_task_target_files)
@@ -437,7 +465,7 @@ def _prepare_subtasks_with_discovery(
         if task_target_files:
             subtasks[0]["files"] = list(task_target_files)
             subtasks[0]["target_files"] = list(task_target_files)
-        elif discovered_files:
+        elif discovered_files and not _task_mentions_external_pr_candidates(task):
             subtasks[0]["files"] = list(discovered_files)
     return discovered_files, subtasks
 
@@ -1361,6 +1389,27 @@ def _role_provider_override_config(
     )
 
 
+def _permission_requests_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in ("permissions", "requests"):
+        raw_items = payload.get(key) or []
+        if not isinstance(raw_items, list):
+            continue
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            request_id = str(raw_item.get("request_id") or raw_item.get("id") or "")
+            dedupe_key = request_id or str(id(raw_item))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            items.append(raw_item)
+    return items
+
+
 def _auto_approve_loop(cfg: ResolvedConfig, stop_event: threading.Event) -> None:
     """Background thread to auto-approve Tandem permissions and agent spawn requests."""
     seen_approvals: set[str] = set()
@@ -1383,8 +1432,7 @@ def _auto_approve_loop(cfg: ResolvedConfig, stop_event: threading.Event) -> None
 
             # 2. Handle general permissions (bash, write, etc)
             permissions_payload = sdk_list_permissions(cfg)
-            perms = (permissions_payload.get("permissions") or []) if isinstance(permissions_payload, dict) else []
-            for perm in perms:
+            for perm in _permission_requests_from_payload(permissions_payload):
                 request_id = str(perm.get("request_id") or perm.get("id") or "")
                 status = str(perm.get("status") or "").strip().lower()
                 if request_id and status == "pending" and request_id not in seen_permissions:
@@ -1718,28 +1766,76 @@ def _run_once_internal_impl(
 
         # 4a. Manager prompt
         setattr(ctx, "_previous_feedback", previous_feedback)
+        setattr(ctx, "_manager_fallback_required", False)
         manager_result = run_manager_prompt(ctx)
-        if manager_result["returncode"] != 0:
+        manager_failed = manager_result["returncode"] != 0
+        manager_failure_excerpt = str(manager_result.get("stdout") or "").strip()[:1000]
+        if manager_failed:
             append_event(
                 layout["events"], "manager.failed", run_id,
-                {"returncode": manager_result["returncode"]},
+                {
+                    "returncode": manager_result["returncode"],
+                    "stdout_excerpt": manager_failure_excerpt,
+                },
                 task_id=ctx.task.get("task_id"), role="manager", repo={"path": ctx.repo.get("path")},
             )
-            ctx.status = set_status(
-                ctx.status, layout, phase="planning",
-                phase_detail="manager planning failed", run_status="blocked",
-                blocker=(True, "manager", "Manager planning failed", "manager"),
+            setattr(ctx, "_manager_fallback_required", True)
+            ctx.blackboard["manager_fallback"] = {
+                "required": True,
+                "reason": manager_failure_excerpt or "manager planning returned nonzero status",
+                "used": False,
+            }
+            _append_blackboard_note(
+                ctx.blackboard,
+                "Manager planning returned no usable plan; ACA will try contract-based fallback planning.",
             )
-            _touch_coordination(
-                coordination, run_id=run_id, lease_id=ctx.lease_id,
-                lease_ttl_seconds=cfg.coordination.lease_ttl_seconds,
-                status="blocked", phase="planning", error="Manager planning failed",
-            )
+            save_blackboard(layout["blackboard"], ctx.blackboard)
+            write_blackboard_snapshot(run_dir, ctx.blackboard)
 
         # 4b. Pre-screen subtasks
         ctx.worker_results = []
         all_pre_satisfied = pre_screen_subtasks(ctx)
         write_status(layout["status"], ctx.status)
+
+        if manager_failed and ctx.status["run"]["status"] != "blocked":
+            pending_count = len(ctx.pending_subtasks or [])
+            planned_count = len(ctx.planned_subtasks or [])
+            if pending_count > 0:
+                ctx.blackboard["manager_fallback"] = {
+                    "required": True,
+                    "reason": manager_failure_excerpt or "manager planning returned nonzero status",
+                    "used": True,
+                    "planned_workers": planned_count,
+                    "pending_workers": pending_count,
+                }
+                append_event(
+                    layout["events"],
+                    "manager.fallback",
+                    run_id,
+                    {
+                        "reason": manager_failure_excerpt,
+                        "planned_workers": planned_count,
+                        "pending_workers": pending_count,
+                    },
+                    task_id=ctx.task.get("task_id"),
+                    role="manager",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                save_blackboard(layout["blackboard"], ctx.blackboard)
+                write_blackboard_snapshot(run_dir, ctx.blackboard)
+            else:
+                detail = manager_failure_excerpt or "Manager planning failed"
+                ctx.status = set_status(
+                    ctx.status, layout, phase="planning",
+                    phase_detail="manager planning failed", run_status="blocked",
+                    blocker=(True, "manager", detail, "manager"),
+                )
+                _touch_coordination(
+                    coordination, run_id=run_id, lease_id=ctx.lease_id,
+                    lease_ttl_seconds=cfg.coordination.lease_ttl_seconds,
+                    status="blocked", phase="planning", error=detail,
+                )
+                write_status(layout["status"], ctx.status)
 
         if not ctx.planned_subtasks and not any(s.get("files") for s in (ctx.planned_subtasks or [])):
             return _block_no_targets(ctx)

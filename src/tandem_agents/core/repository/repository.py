@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 import shutil
 import threading
@@ -447,14 +448,56 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
         return worktree_path.resolve()
 
 
+def _host_path_for_git_metadata(path: Path) -> Path:
+    """Map container absolute git metadata paths back to the ACA host checkout.
+
+    ACA runs inside a container at /workspace/tandem-agents, while the host-side
+    API process may inspect the same run tree at cfg.root_dir. Git worktree
+    .git files created in the container can therefore contain gitdir paths that
+    are invalid from the host process.
+    """
+    root_dir = Path(os.environ.get("ACA_ROOT") or ".").resolve()
+    text = str(path)
+    prefix = "/workspace/tandem-agents/"
+    if text.startswith(prefix):
+        return root_dir / text[len(prefix):]
+    if text == "/workspace/tandem-agents":
+        return root_dir
+    return path
+
+
+def _git_dir_for_worktree(repo_path: Path) -> Path | None:
+    git_file = repo_path / ".git"
+    try:
+        text = git_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    raw_git_dir = text.split(":", 1)[1].strip()
+    if not raw_git_dir:
+        return None
+    git_dir = Path(raw_git_dir)
+    if not git_dir.is_absolute():
+        git_dir = (repo_path / git_dir).resolve()
+    return _host_path_for_git_metadata(git_dir)
+
+
+def _git_command_for_worktree(repo_path: Path, *args: str) -> list[str]:
+    git_dir = _git_dir_for_worktree(repo_path)
+    if git_dir is None or not git_dir.exists():
+        return ["git", "-C", str(repo_path), *args]
+    return ["git", f"--git-dir={git_dir}", f"--work-tree={repo_path}", *args]
+
+
 def git_diff_stat(repo_path: Path) -> str:
-    result = run_command(["git", "-C", str(repo_path), "status", "--short"])
+    result = run_command(_git_command_for_worktree(repo_path, "status", "--short"))
     return result.stdout.strip()
 
 
 def list_worktree_changes(worktree_path: Path) -> list[dict[str, str]]:
     result = run_command(
-        ["git", "-C", str(worktree_path), "status", "--porcelain", "--untracked-files=all"]
+        _git_command_for_worktree(worktree_path, "status", "--porcelain", "--untracked-files=all")
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
