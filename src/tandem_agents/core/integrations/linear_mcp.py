@@ -119,6 +119,14 @@ def ensure_linear_mcp_connected(cfg: ResolvedConfig) -> dict[str, Any]:
         if any(tool_id.startswith(f"mcp.{server_name}.") for tool_id in list_engine_tool_ids(cfg)):
             return server
         time.sleep(0.25)
+    last_error = str(server.get("last_error") or "").strip()
+    pending_auth = server.get("last_auth_challenge") or server.get("pending_auth_by_tool")
+    if not server.get("connected"):
+        detail = last_error or "authorization is required"
+        raise RuntimeError(f"Linear MCP server '{server_name}' is not connected: {detail}")
+    if pending_auth:
+        raise RuntimeError(f"Linear MCP server '{server_name}' is awaiting authorization.")
+    raise RuntimeError(f"Linear MCP server '{server_name}' is connected but exposed no tools.")
     return server
 
 
@@ -236,6 +244,8 @@ def _resolve_linear_tool_id(cfg: ResolvedConfig, aliases: list[str]) -> str:
     candidates: list[str] = []
     for alias in aliases:
         for variant in _alias_variants(alias):
+            if variant.startswith("_"):
+                continue
             candidates.append(f"mcp.{server_name}.{variant}")
     candidates = list(dict.fromkeys(candidates))
     for candidate in candidates:
@@ -246,9 +256,16 @@ def _resolve_linear_tool_id(cfg: ResolvedConfig, aliases: list[str]) -> str:
         for tool_id in ids:
             if tool_id.startswith(f"mcp.{server_name}.") and tool_id.rsplit(".", 1)[-1] == suffix:
                 return tool_id
-    if candidates:
-        return candidates[0]
-    raise RuntimeError("No Linear MCP tool aliases provided.")
+    if not candidates:
+        raise RuntimeError("No Linear MCP tool aliases provided.")
+    server = get_mcp_server(cfg, server_name) or {}
+    last_error = str(server.get("last_error") or "").strip()
+    if not server.get("connected"):
+        detail = last_error or "authorization is required"
+        raise RuntimeError(f"Linear MCP server '{server_name}' is not connected: {detail}")
+    raise RuntimeError(
+        f"Linear MCP server '{server_name}' did not expose a tool matching any of: {', '.join(candidates)}"
+    )
 
 
 def _execute_linear_tool(cfg: ResolvedConfig, aliases: list[str], args: dict[str, Any]) -> dict[str, Any]:

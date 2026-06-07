@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.integrations.linear_mcp import (
+    _resolve_linear_tool_id,
     _tool_failed,
+    ensure_linear_mcp_connected,
     linear_count_issues,
     linear_fetch_issue,
     linear_list_comments,
@@ -129,6 +131,35 @@ class LinearMcpIntegrationTest(unittest.TestCase):
 
     def test_tool_failed_recognizes_unknown_tool_output(self) -> None:
         self.assertTrue(_tool_failed({"output": "Unknown tool: mcp.linear.listComments"}))
+
+    def test_resolve_linear_tool_does_not_guess_private_underscore_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch("src.tandem_agents.core.integrations.linear_mcp.list_engine_tool_ids", return_value=[]), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.get_mcp_server",
+                    return_value={"connected": True, "last_error": ""},
+                ):
+                with self.assertRaisesRegex(RuntimeError, "did not expose a tool") as raised:
+                    _resolve_linear_tool_id(cfg, ["issues"])
+                self.assertIn("mcp.linear.issues", str(raised.exception))
+                self.assertNotIn("mcp.linear._issues", str(raised.exception))
+
+    def test_ensure_linear_mcp_connected_fails_fast_when_auth_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            server = {
+                "connected": False,
+                "enabled": True,
+                "last_error": "Authorization required.",
+                "last_auth_challenge": {"status": "pending"},
+            }
+            with patch("src.tandem_agents.core.integrations.linear_mcp.get_mcp_server", return_value=server), \
+                patch("src.tandem_agents.core.integrations.linear_mcp._connect_mcp_server"), \
+                patch("src.tandem_agents.core.integrations.linear_mcp.list_engine_tool_ids", return_value=[]), \
+                patch("src.tandem_agents.core.integrations.linear_mcp.time.time", side_effect=[0.0, 11.0]):
+                with self.assertRaisesRegex(RuntimeError, "not connected: Authorization required"):
+                    ensure_linear_mcp_connected(cfg)
 
     def test_linear_list_comments_uses_issue_id_and_parses_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
