@@ -198,6 +198,12 @@ def _write_engine_snapshot(log_path: Path, label: str, payload: Any) -> str:
     return str(snapshot_path)
 
 
+def _exception_status_code(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
 def _recover_engine_text_from_state(
     cfg: ResolvedConfig,
     *,
@@ -213,7 +219,10 @@ def _recover_engine_text_from_state(
             recovery["events_path"] = _write_engine_snapshot(log_path, f"engine-events-{run_id}", events)
             text = _extract_run_event_text(events)
         except Exception as exc:
-            recovery.setdefault("errors", []).append(f"run_events: {exc}")
+            if _exception_status_code(exc) == 404:
+                recovery.setdefault("notes", []).append("run_events: engine run events were unavailable for this completed run")
+            else:
+                recovery.setdefault("errors", []).append(f"run_events: {exc}")
             logger.debug("Failed to recover text from run events", exc_info=True)
     if session_id:
         try:
