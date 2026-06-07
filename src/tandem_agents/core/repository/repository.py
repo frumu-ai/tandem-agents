@@ -566,6 +566,58 @@ def git_working_diff(repo_path: Path, *, max_chars: int = 20000, max_file_chars:
     return diff_text
 
 
+def pr_head_ref(number: int) -> str:
+    """Local ref name ACA uses for a fetched candidate PR head."""
+    return f"refs/aca/pr-{int(number)}"
+
+
+def fetch_pr_refs(
+    cfg: ResolvedConfig,
+    repo_path: Path,
+    pr_numbers: list[int],
+    *,
+    remote_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch each candidate PR's head into a local ``refs/aca/pr-<n>`` ref.
+
+    A git worktree shares the base repository's object store and refs, so
+    fetching here makes the PR commits available to every worker worktree. This
+    gives workers real git objects to inspect and apply (``git show`` /
+    ``git diff`` / ``git cherry-pick``) for PR-consolidation tasks, instead of
+    only truncated patch text. Failures are reported per PR and never raise, so
+    a missing/forbidden PR degrades gracefully rather than blocking the run.
+    """
+    remote = str(remote_name or cfg.repository.remote_name or "origin").strip() or "origin"
+    clone_url = _remote_url_for_existing_repo(cfg, repo_path) or _configured_clone_url(cfg)
+    auth_args, env = _git_auth_args(cfg, clone_url)
+    results: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw_number in pr_numbers:
+        try:
+            number = int(raw_number)
+        except (TypeError, ValueError):
+            continue
+        if number in seen:
+            continue
+        seen.add(number)
+        ref = pr_head_ref(number)
+        refspec = f"pull/{number}/head:{ref}"
+        entry: dict[str, Any] = {"number": number, "ref": ref}
+        try:
+            result = run_command(
+                _git_repo_args(repo_path, "fetch", "--force", remote, refspec, prefix=auth_args),
+                env=env,
+            )
+            entry["ok"] = result.returncode == 0
+            if result.returncode != 0:
+                entry["error"] = result.stderr.strip() or result.stdout.strip() or "git fetch failed"
+        except Exception as exc:  # never let a single PR fetch break the run
+            entry["ok"] = False
+            entry["error"] = str(exc)
+        results.append(entry)
+    return results
+
+
 def list_worktree_changes(worktree_path: Path) -> list[dict[str, str]]:
     result = run_command(
         _git_command_for_worktree(worktree_path, "status", "--porcelain", "--untracked-files=all")

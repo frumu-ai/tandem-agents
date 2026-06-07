@@ -81,6 +81,7 @@ def _normalize_pr_file(entry: dict[str, Any]) -> dict[str, Any]:
         "changes": safe_int(entry.get("changes") or entry.get("changed")),
     }
     if patch:
+        normalized["patch"] = patch
         normalized["patch_excerpt"] = patch[:2500]
     return normalized
 
