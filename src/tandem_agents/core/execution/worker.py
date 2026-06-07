@@ -56,6 +56,7 @@ WORKER_FAILURE_MARKERS = (
     "ENGINE_ERROR:",
     "TOOL_MODE_REQUIRED_NOT_SATISFIED",
     "WRITE_REQUIRED_NOT_SATISFIED",
+    "ENGINE_EMPTY_RESPONSE",
 )
 
 
@@ -84,6 +85,39 @@ def _extract_session_reply(messages: Any) -> str:
         if isinstance(text, str) and text:
             text_chunks.append(text)
     return "\n".join(chunk.rstrip("\n") for chunk in text_chunks if chunk).strip()
+
+
+def _event_value_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        chunks: list[str] = []
+        for key in ("delta", "text", "content", "message"):
+            if key in value:
+                chunks.append(_event_value_text(value.get(key)))
+        return "".join(chunk for chunk in chunks if chunk)
+    if isinstance(value, list):
+        return "".join(_event_value_text(item) for item in value)
+    return ""
+
+
+def _extract_run_event_text(events: Any) -> str:
+    if not isinstance(events, list):
+        return ""
+    chunks: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        properties = event.get("properties") or event.get("payload") or {}
+        if not isinstance(properties, dict):
+            properties = {}
+        event_type = str(event.get("type") or properties.get("type") or "").strip()
+        if event_type in {"run.complete", "run.completed", "session.run.finished"}:
+            continue
+        text = _event_value_text(properties)
+        if text:
+            chunks.append(text)
+    return "".join(chunks).strip()
 
 
 def _subtask_targets(subtask: dict[str, Any]) -> list[str]:
@@ -319,6 +353,14 @@ def stream_tandem_prompt(
                 stream_result = sdk_stream_run_text(cfg, session_id, run_id, _writer, timeout_seconds=600.0) if run_id else {"text": "", "completed": False}
                 stdout_text = str(stream_result.get("text") or "")
                 completed = bool(stream_result.get("completed"))
+                if completed and not stdout_text.strip() and run_id:
+                    try:
+                        stdout_text = _extract_run_event_text(sdk_run_events(cfg, run_id, tail=300))
+                    except Exception:
+                        logger.debug("Failed to recover text from run events", exc_info=True)
+                if completed and not stdout_text.strip():
+                    stdout_text = f"ENGINE_EMPTY_RESPONSE: engine run {run_id or 'unknown'} completed without transcript text.\n"
+                    completed = False
                 if stdout_text and not stdout_text.endswith("\n"):
                     stdout_text += "\n"
                 return {
@@ -328,6 +370,7 @@ def stream_tandem_prompt(
                     "log_path": str(log_path),
                     "cwd": str(cwd),
                     "session_id": session_id,
+                    "engine_run_id": run_id,
                 }
             except Exception as exc:
                 message = f"Error: {exc}\n"
