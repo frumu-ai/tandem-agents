@@ -8,18 +8,49 @@ from pathlib import Path
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.engine.process_utils import run_command
+import os
+
+from src.tandem_agents.config.config_loader import resolve_config as _resolve_config
 from src.tandem_agents.core.repository.repository import (
     _git_clone_args_and_env,
     _git_repo_args,
     _github_pat,
+    fetch_pr_refs,
     git_diff_stat,
     git_working_diff,
     list_worktree_changes,
+    pr_head_ref,
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
     worker_worktree_name,
 )
+
+
+def _config_for_repo(root: Path, repo_path: Path):
+    (root / "agent.yaml").write_text(
+        "\n".join(
+            [
+                "agent:",
+                "  name: ACA",
+                "tandem:",
+                "  base_url: http://127.0.0.1:39733",
+                "task_source:",
+                "  type: manual",
+                "  prompt: x",
+                "repository:",
+                f"  path: {repo_path}",
+                "provider:",
+                "  id: openai",
+                "  model: gpt-4.1-mini",
+                "output:",
+                "  root: runs",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return _resolve_config(root, env=dict(os.environ))
 
 
 class RepositoryNamingTest(unittest.TestCase):
@@ -118,6 +149,62 @@ class RepositoryNamingTest(unittest.TestCase):
             run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
 
             self.assertEqual(git_working_diff(source), "")
+
+    def test_pr_head_ref_is_namespaced(self) -> None:
+        self.assertEqual(pr_head_ref(7), "refs/aca/pr-7")
+
+    def test_fetch_pr_refs_fetches_pull_head_into_local_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ident = ["-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid"]
+            bare = root / "remote.git"
+            run_command(["git", "init", "--bare", "--initial-branch=main", str(bare)])
+            work = root / "work"
+            run_command(["git", "clone", str(bare), str(work)])
+            (work / "README.md").write_text("base\n", encoding="utf-8")
+            run_command(["git", "-C", str(work), *ident, "add", "README.md"])
+            run_command(["git", "-C", str(work), *ident, "commit", "-m", "base"])
+            run_command(["git", "-C", str(work), "push", "origin", "main"])
+            # Publish a PR-like commit as refs/pull/1/head on the remote.
+            run_command(["git", "-C", str(work), "checkout", "-b", "feature"])
+            (work / "feature.txt").write_text("from pr\n", encoding="utf-8")
+            run_command(["git", "-C", str(work), *ident, "add", "feature.txt"])
+            run_command(["git", "-C", str(work), *ident, "commit", "-m", "pr work"])
+            run_command(["git", "-C", str(work), "push", "origin", "feature:refs/pull/1/head"])
+            # Fresh consumer checkout (as ACA's repo); refs/pull/* are not cloned by default.
+            checkout = root / "checkout"
+            run_command(["git", "clone", str(bare), str(checkout)])
+
+            cfg = _config_for_repo(root, checkout)
+            results = fetch_pr_refs(cfg, checkout, [1])
+
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0]["ok"], results[0])
+            self.assertEqual(results[0]["ref"], "refs/aca/pr-1")
+            show = run_command(["git", "-C", str(checkout), "show", "--stat", "refs/aca/pr-1"])
+            self.assertIn("feature.txt", show.stdout)
+
+    def test_fetch_pr_refs_reports_missing_pr_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ident = ["-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid"]
+            bare = root / "remote.git"
+            run_command(["git", "init", "--bare", "--initial-branch=main", str(bare)])
+            work = root / "work"
+            run_command(["git", "clone", str(bare), str(work)])
+            (work / "README.md").write_text("base\n", encoding="utf-8")
+            run_command(["git", "-C", str(work), *ident, "add", "README.md"])
+            run_command(["git", "-C", str(work), *ident, "commit", "-m", "base"])
+            run_command(["git", "-C", str(work), "push", "origin", "main"])
+            checkout = root / "checkout"
+            run_command(["git", "clone", str(bare), str(checkout)])
+
+            cfg = _config_for_repo(root, checkout)
+            results = fetch_pr_refs(cfg, checkout, [999])
+
+            self.assertEqual(len(results), 1)
+            self.assertFalse(results[0]["ok"])
+            self.assertTrue(results[0]["error"])
 
     def test_task_run_branch_name_is_canonical(self) -> None:
         branch = task_run_branch_name(

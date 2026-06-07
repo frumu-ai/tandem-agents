@@ -49,7 +49,7 @@ from src.tandem_agents.core.integrations.linear_mcp import (
     linear_status_name_for_task_state,
     linear_update_issue,
 )
-from src.tandem_agents.core.repository.repository import _git_repo_args, repository_binding_issues
+from src.tandem_agents.core.repository.repository import _git_repo_args, fetch_pr_refs, repository_binding_issues
 from src.tandem_agents.core.task_contract import task_contract_payload
 from src.tandem_agents.core.scheduling.outbox_dispatcher import dispatch_outbox_tick
 from src.tandem_agents.core.scheduling.coder_supervisor import apply_coder_result
@@ -271,12 +271,27 @@ def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | N
     from src.tandem_agents.core.repository.board import save_board
 
     contexts = fetch_pr_contexts(ctx.cfg, ctx.task)
+    # Fetch each candidate PR head into a local ref so workers have real git
+    # objects to inspect and apply (cherry-pick / checkout), not just patch text.
+    pr_numbers = [
+        int(context["number"])
+        for context in contexts
+        if not context.get("error") and str(context.get("number") or "").strip().isdigit()
+    ]
+    pr_refs: list[dict[str, Any]] = []
+    if pr_numbers:
+        try:
+            pr_refs = fetch_pr_refs(ctx.cfg, ctx.repo_path, pr_numbers)
+        except Exception as exc:  # ref fetch is best-effort; never block on it here
+            logger.warning("Failed to fetch PR candidate refs for run %s: %s", ctx.run_id, exc)
+            pr_refs = []
     artifact = {
         "task_id": ctx.task.get("task_id"),
         "title": ctx.task.get("title"),
         "source": ctx.task.get("source") or {},
         "repo": ctx.task.get("repo") or ctx.repo,
         "pull_requests": contexts,
+        "fetched_refs": pr_refs,
     }
     ctx.layout["artifacts"].mkdir(parents=True, exist_ok=True)
     artifact_path = ctx.layout["artifacts"] / "pr_candidate_context.json"
@@ -286,13 +301,16 @@ def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | N
         "artifact": str(artifact_path),
         "pull_request_count": len(contexts),
         "pull_requests": contexts,
+        "fetched_refs": pr_refs,
     }
     for subtask in ctx.planned_subtasks or []:
         subtask["pr_candidate_context_artifact"] = str(artifact_path)
         subtask["pr_candidate_context"] = contexts
+        subtask["pr_candidate_refs"] = pr_refs
     for subtask in ctx.pending_subtasks or []:
         subtask["pr_candidate_context_artifact"] = str(artifact_path)
         subtask["pr_candidate_context"] = contexts
+        subtask["pr_candidate_refs"] = pr_refs
     errors = [context for context in contexts if context.get("error")]
     if contexts and not errors:
         save_blackboard(ctx.layout["blackboard"], ctx.blackboard)

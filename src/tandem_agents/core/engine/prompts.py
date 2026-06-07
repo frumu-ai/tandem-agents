@@ -275,6 +275,34 @@ def build_manager_prompt(
     )
 
 
+def _compact_pr_context(pr_context: Any) -> Any:
+    """Drop heavy full ``patch`` bodies from inline PR context.
+
+    The full per-file patches live in the on-disk artifact (which the worker is
+    told to read); the inline prompt copy keeps only metadata and short patch
+    excerpts so it stays within the prompt budget and shows all PRs rather than
+    being truncated inside the first one.
+    """
+    if not isinstance(pr_context, list):
+        return pr_context
+    compact: list[Any] = []
+    for entry in pr_context:
+        if not isinstance(entry, dict):
+            compact.append(entry)
+            continue
+        slim = {key: value for key, value in entry.items() if key != "files"}
+        files = entry.get("files")
+        if isinstance(files, list):
+            slim["files"] = [
+                {key: value for key, value in file_entry.items() if key != "patch"}
+                if isinstance(file_entry, dict)
+                else file_entry
+                for file_entry in files
+            ]
+        compact.append(slim)
+    return compact
+
+
 def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], task: dict[str, Any], worktree: str) -> str:
     deliverables = json.dumps(subtask.get("deliverables") or [])
     target_files = subtask.get("files") or subtask.get("target_files") or []
@@ -290,19 +318,35 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         no_target_guidance = (
             "\nNo target files were declared for this task, so you must discover them from the task context and repository state."
             f"{pr_line}\n"
-            "If the task references PRs or branches, inspect those PRs with available GitHub tools or `gh`/`git`, compare them to latest main, "
-            "apply only still-relevant changes in this worktree, and leave a clear blocker if no safe repository diff can be produced.\n"
+            "If the task references PRs or branches, inspect them (see the fetched local refs below if present), compare them to latest main, "
+            "apply the still-relevant changes into this worktree so a real diff is produced, and leave a clear blocker only if no safe repository diff can be produced.\n"
         )
     pr_context_guidance = ""
     pr_context = subtask.get("pr_candidate_context")
     pr_context_artifact = str(subtask.get("pr_candidate_context_artifact") or "").strip()
+    pr_refs = [
+        ref
+        for ref in (subtask.get("pr_candidate_refs") or [])
+        if isinstance(ref, dict) and ref.get("ok") and ref.get("ref")
+    ]
     if pr_context:
+        ref_block = ""
+        if pr_refs:
+            ref_lines = "\n".join(f"- PR #{ref.get('number')}: `{ref.get('ref')}`" for ref in pr_refs)
+            ref_block = (
+                "\nACA fetched these candidate PR heads into THIS repository as local git refs, so the real commits are available here:\n"
+                f"{ref_lines}\n"
+                "Apply them with real git in the worktree: review each with `git show <ref>` or `git diff main...<ref>`, then bring the worthwhile, "
+                "still-relevant changes into the working tree (e.g. `git cherry-pick -n <ref>`, `git checkout <ref> -- <path>`, or manual edits). "
+                "Resolve conflicts, drop anything already on main or no longer relevant, and leave the working tree with a real, reviewable diff.\n"
+            )
         pr_context_guidance = (
             "\nACA already fetched GitHub PR candidate context for this task. "
-            f"Artifact: {pr_context_artifact or 'pr_candidate_context.json'}\n"
-            "Use this context first, then verify anything important against the repository before editing. "
-            "If no safe changes remain, return a structured blocker that lists the inspected PR numbers.\n"
-            f"PR candidate context:\n{json.dumps(pr_context, indent=2, sort_keys=True, default=str)[:6000]}\n"
+            f"Full per-file patches are in the artifact `{pr_context_artifact or 'pr_candidate_context.json'}` -- read it for complete diffs.\n"
+            f"{ref_block}"
+            "Use this context first, then verify against the repository before editing. "
+            "If after applying you genuinely have no safe changes, return a structured blocker that lists the inspected PR numbers.\n"
+            f"PR candidate summary:\n{json.dumps(_compact_pr_context(pr_context), indent=2, sort_keys=True, default=str)[:6000]}\n"
         )
     return (
         f"You are ACA worker {worker_id} in run {run_id}.\n"
