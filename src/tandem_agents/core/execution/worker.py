@@ -18,6 +18,7 @@ from src.tandem_agents.core.engine.engine import (
     delete_tandem_session,
     effective_tandem_provider,
     engine_env,
+    engine_visible_path,
     git_diff_stat,
     list_engine_permissions,
     prompt_tandem_session_sync,
@@ -180,6 +181,9 @@ def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]
     git_result = run_command(["git", "-C", str(worktree), "rev-parse", "--git-dir"])
     if git_result.returncode != 0:
         return False, git_result.stderr.strip() or git_result.stdout.strip() or "worktree git preflight failed"
+    engine_worktree = engine_visible_path(worktree)
+    if engine_worktree != worktree:
+        return True, "ok"
     try:
         result = execute_engine_tool(
             cfg,
