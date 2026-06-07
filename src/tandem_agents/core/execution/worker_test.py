@@ -10,6 +10,7 @@ from src.tandem_agents.core.execution.worker import (
     _coerce_worker_failure,
     _extract_prompt_sync_text,
     _extract_session_reply,
+    _materialize_worker_context,
     stream_tandem_prompt,
 )
 from src.tandem_agents.core.phases.worker_dispatch import _apply_tolerated_failures
@@ -32,6 +33,26 @@ class WorkerFailureCoercionTest(unittest.TestCase):
         }
 
         self.assertEqual(_extract_prompt_sync_text(response), "sync answer")
+
+    def test_materialize_worker_context_copies_pr_artifact_inside_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "pr_candidate_context.json"
+            artifact.write_text('{"pull_requests":[{"number":1459}]}\n', encoding="utf-8")
+            worktree = root / "worktree"
+            worktree.mkdir()
+
+            prepared = _materialize_worker_context(
+                worktree,
+                {
+                    "id": "subtask-1",
+                    "pr_candidate_context_artifact": str(artifact),
+                    "pr_candidate_context": [{"number": 1459}],
+                },
+            )
+
+            self.assertEqual(prepared["pr_candidate_context_artifact"], ".aca/pr_candidate_context.json")
+            self.assertTrue((worktree / ".aca" / "pr_candidate_context.json").exists())
 
     def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,6 +12,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     delete_remote_branch,
     ensure_github_mcp_connected,
     get_pull_request,
+    get_pull_request_files,
     guarded_auto_merge,
     normalize_pull_request_metadata,
 )
@@ -63,6 +64,27 @@ def _repo_owner_name(cfg: ResolvedConfig, task: dict[str, Any]) -> tuple[str, st
     return owner, name
 
 
+def _normalize_pr_file(entry: dict[str, Any]) -> dict[str, Any]:
+    def safe_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    filename = str(entry.get("filename") or entry.get("path") or entry.get("name") or "").strip()
+    patch = str(entry.get("patch") or entry.get("diff") or "").strip()
+    normalized = {
+        "filename": filename,
+        "status": str(entry.get("status") or entry.get("changeType") or "").strip(),
+        "additions": safe_int(entry.get("additions")),
+        "deletions": safe_int(entry.get("deletions")),
+        "changes": safe_int(entry.get("changes") or entry.get("changed")),
+    }
+    if patch:
+        normalized["patch_excerpt"] = patch[:2500]
+    return normalized
+
+
 def fetch_pr_contexts(cfg: ResolvedConfig, task: dict[str, Any]) -> list[dict[str, Any]]:
     owner, repo = _repo_owner_name(cfg, task)
     contexts: list[dict[str, Any]] = []
@@ -70,6 +92,17 @@ def fetch_pr_contexts(cfg: ResolvedConfig, task: dict[str, Any]) -> list[dict[st
         try:
             raw = get_pull_request(cfg, owner, repo, number)
             normalized = normalize_pull_request_metadata(raw, base_repo=f"{owner}/{repo}")
+            try:
+                files = [
+                    _normalize_pr_file(entry)
+                    for entry in get_pull_request_files(cfg, owner, repo, number)
+                    if isinstance(entry, dict)
+                ]
+                normalized["changed_files"] = [entry["filename"] for entry in files if entry.get("filename")]
+                normalized["files"] = files
+                normalized["file_count"] = len(files)
+            except Exception as file_exc:
+                normalized["files_error"] = str(file_exc)
         except Exception as exc:
             normalized = {
                 "number": number,
