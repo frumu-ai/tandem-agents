@@ -131,6 +131,42 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertIn("message text", result["stdout"])
             self.assertTrue((Path(tmp) / "worker.engine-messages-session-1.json").exists())
 
+    def test_run_event_404_is_recorded_as_recovery_note(self) -> None:
+        class Response:
+            status_code = 404
+
+        class NotFound(Exception):
+            response = Response()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async", return_value={"run_id": "run-1"}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_stream_run_text", return_value={"text": "", "completed": True}), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", side_effect=NotFound()), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_session_messages",
+                    return_value=[{"info": {"role": "assistant"}, "parts": [{"text": "message text"}]}],
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=False,
+                    write_required=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("message text", result["stdout"])
+            self.assertEqual(result["engine"]["recovery"][0]["errors"], [])
+            self.assertIn("engine run events were unavailable", result["engine"]["recovery"][0]["notes"][0])
+
     def test_empty_async_stream_retries_then_uses_prompt_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
