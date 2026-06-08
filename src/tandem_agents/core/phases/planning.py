@@ -50,15 +50,17 @@ def run_manager_prompt(ctx: RunContext) -> None:
         ctx.manager_plan   -- parsed plan dict (summary, subtasks, risks, tests)
         ctx.blackboard     -- updated with manager_plan key
     """
-    from src.tandem_agents.core.engine.engine import effective_tandem_provider, engine_env
+    from src.tandem_agents.core.engine.engine import engine_env, engine_session_provider_model
     from src.tandem_agents.core.execution.worker import stream_tandem_prompt
     from src.tandem_agents.core.repository.repo_truth import repo_context_summary
     from src.tandem_agents.core.engine.prompts import build_manager_prompt
+    from src.tandem_agents.core.execution import runner_core as _rc
     from src.tandem_agents.runtime.runstate import append_event, save_blackboard
     from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
 
-    manager_provider, manager_model = ctx.cfg.provider_for_role("manager")
-    manager_cli_provider = effective_tandem_provider(manager_provider, ctx.cfg)
+    manager_model_selection = engine_session_provider_model(ctx.cfg, "manager")
+    manager_provider = manager_model_selection["provider"]
+    manager_model = manager_model_selection["model"]
 
     manager_prompt = build_manager_prompt(
         ctx.run_id,
@@ -80,17 +82,18 @@ def run_manager_prompt(ctx: RunContext) -> None:
     )
 
     logger.info("Running manager prompt (run_id=%s)", ctx.run_id)
-    manager_result = stream_tandem_prompt(
-        ctx.cfg,
-        role="manager",
-        prompt=manager_prompt,
-        cwd=ctx.repo_path,
-        provider=manager_provider,
-        model=manager_model,
-        env=engine_env(ctx.cfg),
-        log_path=ctx.layout["logs"] / "manager.log",
-        config_path=None,
-    )
+    with _rc._coordination_heartbeat(ctx, phase="planning"):
+        manager_result = stream_tandem_prompt(
+            ctx.cfg,
+            role="manager",
+            prompt=manager_prompt,
+            cwd=ctx.repo_path,
+            provider=manager_provider,
+            model=manager_model,
+            env=engine_env(ctx.cfg),
+            log_path=ctx.layout["logs"] / "manager.log",
+            config_path=None,
+        )
 
     ctx.manager_plan = _extract_json(manager_result["stdout"]) or {
         "summary": manager_result["stdout"][:1200],

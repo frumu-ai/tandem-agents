@@ -441,6 +441,47 @@ class CoordinationStoreTest(unittest.TestCase):
             )
             self.assertEqual(store.get_task(task_key)["state"], "done")
 
+    def test_transition_task_state_can_clear_stale_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "task-reset",
+                "title": "Task Reset",
+                "source": {"type": "manual", "prompt": "Reset the thing"},
+                "repo": {"slug": "frumu-ai/example", "path": str(root / "repo")},
+            }
+            registered = store.register_task(task, repo=task["repo"])
+            task_key = registered["task_key"]
+            claim = store.claim_task(
+                task,
+                run_id="run-1",
+                worker_id="worker-1",
+                host_id="host-a",
+                lease_ttl_seconds=60,
+                repo=task["repo"],
+            )
+            lease = claim["lease"]
+            store.mark_task_active(
+                task_key,
+                run_id="run-1",
+                lease_id=lease["lease_id"],
+                worker_id="worker-1",
+                host_id="host-a",
+                lease_expires_at_ms=lease["expires_at_ms"],
+            )
+
+            reset = store.transition_task_state(task_key, "queued", status="queued", clear_claim=True)
+
+            self.assertEqual(reset["state"], "queued")
+            self.assertIsNone(reset["claimed_run_id"])
+            self.assertIsNone(reset["claimed_lease_id"])
+            self.assertIsNone(reset["lease_expires_at_ms"])
+            released_lease = store.get_lease(lease["lease_id"])
+            self.assertEqual((released_lease or {}).get("status"), "stale")
+            self.assertEqual((released_lease or {}).get("release_reason"), "operator cleared task claim")
+
     def test_postgres_backend_uses_postgres_connection_and_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

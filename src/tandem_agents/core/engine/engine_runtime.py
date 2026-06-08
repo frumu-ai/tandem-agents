@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
-from src.tandem_agents.config.config import ResolvedConfig
+from src.tandem_agents.config.config import DEFAULT_MODEL, DEFAULT_PROVIDER, ResolvedConfig
 from src.tandem_agents.core.engine.process_utils import command_exists
 from src.tandem_agents.core.engine.tandem_client_sdk import (
     sdk_available,
@@ -42,6 +42,19 @@ PROVIDER_SECRET_ENV_BY_ID = {
     "openai": "OPENAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "together": "TOGETHER_API_KEY",
+}
+
+ROLE_PROVIDER_ENV_NAMES = {
+    "manager": ("ACA_MANAGER_PROVIDER", "AUTOCODER_MANAGER_PROVIDER"),
+    "worker": ("ACA_WORKER_PROVIDER", "AUTOCODER_WORKER_PROVIDER"),
+    "reviewer": ("ACA_REVIEWER_PROVIDER", "AUTOCODER_REVIEWER_PROVIDER"),
+    "tester": ("ACA_TESTER_PROVIDER", "AUTOCODER_TESTER_PROVIDER"),
+}
+ROLE_MODEL_ENV_NAMES = {
+    "manager": ("ACA_MANAGER_MODEL", "AUTOCODER_MANAGER_MODEL"),
+    "worker": ("ACA_WORKER_MODEL", "AUTOCODER_WORKER_MODEL"),
+    "reviewer": ("ACA_REVIEWER_MODEL", "AUTOCODER_REVIEWER_MODEL"),
+    "tester": ("ACA_TESTER_MODEL", "AUTOCODER_TESTER_MODEL"),
 }
 
 
@@ -112,6 +125,83 @@ def engine_health(cfg: ResolvedConfig, timeout: float = 5.0) -> dict[str, Any]:
             last_error = exc
     detail = "; ".join(attempts) if attempts else "no health endpoint available"
     raise RuntimeError(f"Unable to reach Tandem health endpoint: {detail}") from last_error
+
+
+def _config_env_is_set(cfg: ResolvedConfig, names: tuple[str, ...]) -> bool:
+    for name in names:
+        if str(cfg.env.get(name) or "").strip():
+            return True
+    return False
+
+
+def _operator_provider_override_present(cfg: ResolvedConfig, role: str) -> bool:
+    if _config_env_is_set(cfg, ROLE_PROVIDER_ENV_NAMES.get(role, ()) + ("ACA_PROVIDER", "AUTOCODER_PROVIDER")):
+        return True
+    if _config_env_is_set(cfg, ROLE_MODEL_ENV_NAMES.get(role, ()) + ("ACA_MODEL", "AUTOCODER_MODEL")):
+        return True
+    resolved = cfg.provider_for_role_with_source(role)
+    if resolved["provider_source"] in {"role", "fallback"} or resolved["model_source"] in {"role", "fallback"}:
+        return True
+    return (resolved["provider"], resolved["model"]) != (DEFAULT_PROVIDER, DEFAULT_MODEL)
+
+
+def engine_default_provider_model(cfg: ResolvedConfig) -> tuple[str, str] | None:
+    """Read Tandem's current default provider/model without exposing secrets."""
+    try:
+        payload = _engine_request_json(cfg, "/config/providers", timeout=3.0)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    selected = payload.get("selected_model") or payload.get("selectedModel") or {}
+    if isinstance(selected, dict):
+        selected_provider = str(
+            selected.get("provider_id") or selected.get("providerId") or selected.get("provider") or ""
+        ).strip()
+        selected_model = str(
+            selected.get("model_id") or selected.get("modelId") or selected.get("model") or ""
+        ).strip()
+        if selected_provider and selected_model:
+            return selected_provider, selected_model
+
+    provider = str(payload.get("default") or payload.get("default_provider") or payload.get("defaultProvider") or "").strip()
+    providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+    provider_entry = providers.get(provider) if provider else None
+    if not isinstance(provider_entry, dict):
+        provider_entry = {}
+    model = str(
+        provider_entry.get("default_model")
+        or provider_entry.get("defaultModel")
+        or payload.get("default_model")
+        or payload.get("defaultModel")
+        or ""
+    ).strip()
+    if provider and model:
+        return provider, model
+    return None
+
+
+def engine_session_provider_model(cfg: ResolvedConfig, role: str) -> dict[str, str]:
+    """Resolve the provider/model ACA should pass when creating an engine session.
+
+    ACA's bundled ``config/agent.yaml`` still carries an OpenAI fallback for
+    local demos, but Tandem engine/control-panel defaults are the authority for
+    hosted/reuse deployments. If the operator did not explicitly override the
+    run model, read Tandem's current default and pass that to the session API.
+    """
+    configured_provider, configured_model = cfg.provider_for_role(role)
+    if _operator_provider_override_present(cfg, role):
+        provider = effective_tandem_provider(configured_provider, cfg)
+        return {"provider": provider, "model": configured_model, "source": "aca_config"}
+
+    engine_default = engine_default_provider_model(cfg)
+    if engine_default:
+        provider, model = engine_default
+        return {"provider": provider, "model": model, "source": "engine_default"}
+
+    provider = effective_tandem_provider(configured_provider, cfg)
+    return {"provider": provider, "model": configured_model, "source": "aca_fallback"}
 
 
 def cli_version() -> str | None:
@@ -331,13 +421,29 @@ def create_tandem_session(
     provider: str,
     model: str,
     temperature: float | None = None,
+    permission_rules: list[dict[str, str]] | None = None,
 ) -> str:
-    if sdk_available():
+    visible_directory = str(engine_visible_path(directory))
+    if permission_rules:
+        payload = {
+            "title": title,
+            "directory": visible_directory,
+            "workspace_root": visible_directory,
+            "provider": provider,
+            "model": {
+                "providerID": provider,
+                "modelID": model,
+            },
+            "permission": permission_rules,
+        }
+        response = _engine_request_json(cfg, "/session", method="POST", payload=payload)
+        session_id = str((response or {}).get("id") or "").strip()
+    elif sdk_available():
         session_id = str(
             sdk_create_session(
                 cfg,
                 title=title,
-                directory=str(engine_visible_path(directory)),
+                directory=visible_directory,
                 provider=provider,
                 model=model,
                 temperature=temperature,
@@ -347,7 +453,7 @@ def create_tandem_session(
     else:
         payload = {
             "title": title,
-            "directory": str(engine_visible_path(directory)),
+            "directory": visible_directory,
             "provider": provider,
             "model": {
                 "providerID": provider,
@@ -367,15 +473,16 @@ def prompt_tandem_session_sync(
     session_id: str,
     prompt: str,
     tool_allowlist: list[str] | None = None,
+    tool_mode: str | None = None,
     require_tool_use: bool = False,
     write_required: bool = False,
     prewrite_requirements: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "parts": [{"type": "text", "text": prompt}],
-        "toolMode": "required" if require_tool_use else "auto",
+        "toolMode": tool_mode or ("required" if require_tool_use else "auto"),
     }
-    if tool_allowlist:
+    if tool_allowlist is not None:
         payload["toolAllowlist"] = tool_allowlist
     if write_required:
         payload["writeRequired"] = True

@@ -945,6 +945,19 @@ def _operator_linear_status_name(cfg, target_state: str) -> str:
     return linear_status_name_for_task_state(cfg, key)
 
 
+def _operator_coordination_state(target_state: str) -> str:
+    key = normalize_linear_key(target_state)
+    if key in {"done", "completed", "complete"}:
+        return "done"
+    if key in {"review", "in_review"}:
+        return "review"
+    if key in {"blocked", "failed", "stale"}:
+        return "blocked"
+    if key in {"in_progress", "active", "running"}:
+        return "active"
+    return "queued"
+
+
 @app.post("/projects/{slug:path}/tasks/{item}/state")
 async def update_project_task_state(
     slug: str,
@@ -984,7 +997,47 @@ async def update_project_task_state(
         raise HTTPException(status_code=502, detail=f"Could not update Linear issue state: {exc}") from exc
     if warning:
         raise HTTPException(status_code=400, detail=warning)
-    return {"ok": True, "item": item, "state": target_state, "status": target_status}
+    coordination_task = None
+    try:
+        store = CoordinationStore.from_config(cfg)
+        coord_state = _operator_coordination_state(target_state)
+        task_for_key = {
+            "task_id": item,
+            "title": item,
+            "source": {
+                "type": "linear",
+                "team": cfg.task_source.team,
+                "project": cfg.task_source.project,
+                "item": item,
+                "identifier": item,
+                "issue_id": item,
+            },
+        }
+        repo = {
+            "slug": cfg.repository.slug,
+            "path": cfg.repository.path,
+            "default_branch": cfg.repository.default_branch,
+            "remote_name": cfg.repository.remote_name,
+        }
+        registered = store.register_task(task_for_key, repo=repo, status=coord_state)
+        task_key = str((registered or {}).get("task_key") or "").strip()
+        if task_key:
+            coordination_task = store.transition_task_state(
+                task_key,
+                coord_state,
+                status=coord_state,
+                reason=f"operator moved Linear issue to {target_status}",
+                clear_claim=coord_state != "active",
+            )
+    except Exception as exc:
+        logger.warning("Could not update ACA coordination task state for %s: %s", item, exc)
+    return {
+        "ok": True,
+        "item": item,
+        "state": target_state,
+        "status": target_status,
+        "coordination_state": (coordination_task or {}).get("state"),
+    }
 
 
 @app.post("/projects/{slug:path}/repo/sync")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import subprocess
 import re
@@ -324,7 +325,11 @@ def collect_expected_repo_files(subtasks: list[dict[str, Any]]) -> list[str]:
     files: list[str] = []
     for subtask in subtasks:
         for raw_path in list(subtask.get("files") or []) + list(subtask.get("target_files") or []):
-            rel_path = str(raw_path or "").strip().lstrip("./")
+            rel_path = str(raw_path or "").strip().replace("\\", "/")
+            while rel_path.startswith("./"):
+                rel_path = rel_path[2:]
+            if rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
+                continue
             if not rel_path or rel_path in seen:
                 continue
             seen.add(rel_path)
@@ -470,13 +475,136 @@ def extract_command_checks(manager_plan: dict[str, Any]) -> list[str]:
     return commands
 
 
-def run_command_checks(repo_path: Path, commands: list[str], timeout_seconds: int = 20) -> list[dict[str, Any]]:
+def _safe_rel_path(raw_path: Any) -> str:
+    rel_path = str(raw_path or "").strip().replace("\\", "/")
+    while rel_path.startswith("./"):
+        rel_path = rel_path[2:]
+    if not rel_path or rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
+        return ""
+    return rel_path
+
+
+def _load_package_scripts(package_json: Path) -> dict[str, str]:
+    try:
+        payload = json.loads(package_json.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    scripts = payload.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    return {str(name): str(command) for name, command in scripts.items() if str(name).strip() and str(command).strip()}
+
+
+def _nearest_package_dir(repo_path: Path, rel_path: str) -> Path | None:
+    target_parent = (repo_path / rel_path).parent
+    try:
+        target_parent.relative_to(repo_path)
+    except ValueError:
+        return None
+    for candidate in [target_parent, *target_parent.parents]:
+        if candidate == repo_path.parent:
+            break
+        if (candidate / "package.json").is_file():
+            return candidate
+        if candidate == repo_path:
+            break
+    return None
+
+
+def _package_runner(repo_path: Path, package_dir: Path) -> str:
+    rel = package_dir.relative_to(repo_path)
+    rel_arg = "." if str(rel) == "." else rel.as_posix()
+    quoted = shlex.quote(rel_arg)
+    if (package_dir / "pnpm-lock.yaml").is_file() or (repo_path / "pnpm-lock.yaml").is_file():
+        return f"pnpm -C {quoted} run"
+    if (package_dir / "yarn.lock").is_file() or (repo_path / "yarn.lock").is_file():
+        return f"yarn --cwd {quoted} run"
+    if (package_dir / "bun.lockb").is_file() or (repo_path / "bun.lockb").is_file():
+        return f"bun --cwd {quoted} run"
+    return f"npm --prefix {quoted} run"
+
+
+def infer_command_checks(
+    repo_path: Path,
+    changed_files: list[str],
+    task: dict[str, Any] | None = None,
+) -> list[str]:
+    """Infer deterministic verification commands from changed package files.
+
+    This is intentionally conservative: it only uses scripts already declared
+    by the nearest package.json for a changed file. That gives coding runs a
+    real verification gate without letting the model invent shell commands.
+    """
+    normalized_files = [_safe_rel_path(path) for path in changed_files]
+    normalized_files = [path for path in normalized_files if path and not _is_ignored_path(Path(path))]
+    if not normalized_files:
+        return []
+
+    package_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for rel_path in normalized_files:
+        package_dir = _nearest_package_dir(repo_path, rel_path)
+        if package_dir is None or package_dir in seen_dirs:
+            continue
+        seen_dirs.add(package_dir)
+        package_dirs.append(package_dir)
+
+    commands: list[str] = []
+    raw_acceptance = (task or {}).get("acceptance_criteria")
+    acceptance = raw_acceptance if isinstance(raw_acceptance, (list, tuple, set)) else [raw_acceptance]
+    task_text = " ".join(
+        [
+            str((task or {}).get("title") or ""),
+            str((task or {}).get("description") or ""),
+            " ".join(str(item or "") for item in acceptance if str(item or "").strip()),
+        ]
+    ).lower()
+    prefer_tests = any(token in task_text for token in ("test", "smoke", "verify", "verification", "lint", "typecheck"))
+    test_script_priority = ("test:smoke", "test:ci", "test:unit", "test")
+
+    for package_dir in sorted(package_dirs, key=lambda path: path.relative_to(repo_path).as_posix()):
+        scripts = _load_package_scripts(package_dir / "package.json")
+        if not scripts:
+            continue
+        runner = _package_runner(repo_path, package_dir)
+        package_commands: list[str] = []
+        if "build" in scripts:
+            package_commands.append(f"{runner} build")
+        if prefer_tests or "build" not in scripts:
+            for script_name in test_script_priority:
+                if script_name in scripts:
+                    package_commands.append(f"{runner} {script_name}")
+                    break
+        for command in package_commands:
+            if command not in commands:
+                commands.append(command)
+    return commands
+
+
+def _command_check_env() -> dict[str, str]:
+    env = dict(os.environ)
+    existing_path = [part for part in str(env.get("PATH") or "").split(os.pathsep) if part]
+    path_parts = [
+        "/home/node/npm/bin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/bin",
+        "/sbin",
+    ]
+    env["PATH"] = os.pathsep.join(dict.fromkeys(path_parts + existing_path))
+    return env
+
+
+def run_command_checks(repo_path: Path, commands: list[str], timeout_seconds: int = 60) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for command in commands:
         try:
             proc = subprocess.run(
-                ["/bin/bash", "-lc", command],
+                ["/bin/bash", "-c", command],
                 cwd=str(repo_path),
+                env=_command_check_env(),
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
@@ -540,9 +668,12 @@ def deterministic_repo_validation(
 def repo_validation_blocker_message(repo_validation: dict[str, Any]) -> str | None:
     if repo_validation.get("verification_missing"):
         return "Verification commands are missing."
+    unexpected = list(repo_validation.get("unexpected_files") or [])
     missing = list(repo_validation.get("missing_files") or [])
     unreadable = list(repo_validation.get("unreadable_files") or [])
     command_failures = list(repo_validation.get("command_failures") or [])
+    if unexpected:
+        return "Unexpected repository files changed: " + ", ".join(unexpected)
     if missing:
         return "Expected repository files are missing: " + ", ".join(missing)
     if unreadable:
@@ -550,6 +681,20 @@ def repo_validation_blocker_message(repo_validation: dict[str, Any]) -> str | No
     if command_failures:
         first = command_failures[0]
         return "Repository validation command failed: " + str(first.get("command") or "").strip()
+    return None
+
+
+def repo_validation_blocker_kind(repo_validation: dict[str, Any]) -> str | None:
+    if repo_validation.get("verification_missing"):
+        return "verification_missing"
+    if repo_validation.get("unexpected_files"):
+        return "unexpected_repo_changes"
+    if repo_validation.get("missing_files"):
+        return "expected_files_missing"
+    if repo_validation.get("unreadable_files"):
+        return "expected_files_unreadable"
+    if repo_validation.get("command_failures"):
+        return "verification_failed"
     return None
 
 

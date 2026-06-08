@@ -16,6 +16,7 @@ from src.tandem_agents.core.repository.repository import (
     _git_repo_args,
     _github_pat,
     checkout_run_branch,
+    create_worktree,
     current_repository_branch,
     fetch_pr_refs,
     git_diff_stat,
@@ -94,6 +95,39 @@ class RepositoryNamingTest(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"ACA_ROOT": str(root)}):
                 self.assertIn("README.md", git_diff_stat(worktree))
+
+    def test_create_worktree_gitdir_is_visible_to_engine_and_aca(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aca_root = root / "aca"
+            host_root = root / "host"
+            aca_root.mkdir()
+            host_root.symlink_to(aca_root, target_is_directory=True)
+            source = aca_root / "workspace" / "repos" / "demo"
+            source.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            worktree = aca_root / "runs" / "run-1" / "worktrees" / "worker-1"
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "ACA_ROOT": str(aca_root),
+                    "ACA_ENGINE_HOST_ROOT": str(host_root),
+                },
+            ):
+                create_worktree(source, worktree)
+                git_file_text = (worktree / ".git").read_text(encoding="utf-8")
+                self.assertIn(str(host_root), git_file_text)
+                (worktree / "README.md").write_text("after\n", encoding="utf-8")
+                self.assertIn("README.md", git_diff_stat(worktree))
+
+            host_worktree = host_root / "runs" / "run-1" / "worktrees" / "worker-1"
+            host_status = run_command(["git", "-C", str(host_worktree), "status", "--short"])
+            self.assertEqual(host_status.returncode, 0, host_status.stderr)
+            self.assertIn("README.md", host_status.stdout)
 
     def test_git_diff_stat_ignores_aca_internal_context_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

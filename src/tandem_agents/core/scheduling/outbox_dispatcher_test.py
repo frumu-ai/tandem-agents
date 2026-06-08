@@ -218,14 +218,13 @@ class OutboxDispatcherTest(unittest.TestCase):
             )
 
             with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_connected", return_value=None):
-                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_disconnected", return_value=None):
-                    with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_update_issue", return_value=None) as status_mock:
-                        with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_add_comment", return_value=None) as comment_mock:
-                            with patch(
-                                "src.tandem_agents.core.scheduling.outbox_dispatcher.linear_comment_marker_present",
-                                return_value=True,
-                            ) as marker_mock:
-                                summary = dispatch_outbox_tick(cfg, coordination=store)
+                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_update_issue", return_value=None) as status_mock:
+                    with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_add_comment", return_value=None) as comment_mock:
+                        with patch(
+                            "src.tandem_agents.core.scheduling.outbox_dispatcher.linear_comment_marker_present",
+                            return_value=True,
+                        ) as marker_mock:
+                            summary = dispatch_outbox_tick(cfg, coordination=store)
 
             self.assertEqual(summary["dispatched"], 2)
             self.assertEqual(summary["failed"], 0)
@@ -260,13 +259,12 @@ class OutboxDispatcherTest(unittest.TestCase):
             )
 
             with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_connected", return_value=None):
-                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_disconnected", return_value=None):
-                    with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_add_comment", return_value=None):
-                        with patch(
-                            "src.tandem_agents.core.scheduling.outbox_dispatcher.linear_comment_marker_present",
-                            return_value=False,
-                        ):
-                            summary = dispatch_outbox_tick(cfg, coordination=store)
+                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.linear_add_comment", return_value=None):
+                    with patch(
+                        "src.tandem_agents.core.scheduling.outbox_dispatcher.linear_comment_marker_present",
+                        return_value=False,
+                    ):
+                        summary = dispatch_outbox_tick(cfg, coordination=store)
 
             self.assertEqual(summary["dispatched"], 0)
             self.assertEqual(summary["failed"], 1)

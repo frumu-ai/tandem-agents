@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from src.tandem_agents.core.repository.repo_truth import repo_validation_blocker_message
+from src.tandem_agents.core.repository.repo_truth import (
+    repo_validation_blocker_kind,
+    repo_validation_blocker_message,
+)
 
 REPAIR_ACTIONS = {
     "repair_needed",
@@ -250,7 +253,8 @@ def evaluate_verification_policy(
     else:
         outcome = "pass"
     validation_blocker = repo_blocker or review_blocker or test_blocker
-    failure_category = "verification_missing" if repo_blocker or (repo_validation or {}).get("verification_missing") else None
+    repo_blocker_kind = repo_validation_blocker_kind(repo_validation or {})
+    failure_category = repo_blocker_kind if repo_blocker or (repo_validation or {}).get("verification_missing") else None
     should_retry = bool(
         outcome == "repair_needed"
         and (

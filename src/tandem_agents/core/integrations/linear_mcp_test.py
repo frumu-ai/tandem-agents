@@ -211,6 +211,23 @@ class LinearMcpIntegrationTest(unittest.TestCase):
             self.assertIsNone(warning)
             self.assertEqual(calls[0], {"id": "TAN-111", "state": "Todo"})
 
+    def test_linear_update_issue_includes_camel_case_write_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            aliases_seen: list[list[str]] = []
+
+            def fake_execute(_cfg, aliases, args):
+                aliases_seen.append(list(aliases))
+                return {"metadata": {"result": {"ok": True}}}
+
+            task = {"source": {"type": "linear", "issue_id": "TAN-111", "identifier": "TAN-111"}}
+            with patch("src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool", side_effect=fake_execute):
+                warning = linear_update_issue(cfg, task, {"status": "Todo"})
+
+            self.assertIsNone(warning)
+            self.assertIn("saveIssue", aliases_seen[0])
+            self.assertIn("updateIssue", aliases_seen[0])
+
     def test_linear_list_comments_uses_issue_id_and_parses_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))

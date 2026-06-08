@@ -8,7 +8,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from src.tandem_agents.config.config_loader import resolve_config
-from src.tandem_agents.api.main import _project_runtime_env, app
+from src.tandem_agents.api.main import _operator_coordination_state, _project_runtime_env, app
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 
 
@@ -57,6 +57,14 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertIn("/server.json", paths)
         self.assertIn("/.well-known/mcp/server.json", paths)
         self.assertIn("/mcp", paths)
+
+    def test_operator_state_translation_matches_coordination_states(self) -> None:
+        self.assertEqual(_operator_coordination_state("Todo"), "queued")
+        self.assertEqual(_operator_coordination_state("Backlog"), "queued")
+        self.assertEqual(_operator_coordination_state("In Progress"), "active")
+        self.assertEqual(_operator_coordination_state("In Review"), "review")
+        self.assertEqual(_operator_coordination_state("Done"), "done")
+        self.assertEqual(_operator_coordination_state("Blocked"), "blocked")
 
     def test_approvals_status_query_filters_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

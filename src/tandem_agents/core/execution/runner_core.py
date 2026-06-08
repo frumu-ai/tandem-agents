@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import re
@@ -23,8 +24,8 @@ from src.tandem_agents.core.engine.coder_backend import (
 from src.tandem_agents.core.engine.engine import (
     checkout_run_branch,
     commit_repository_changes,
-    effective_tandem_provider,
     engine_env,
+    engine_session_provider_model,
     engine_health,
     engine_visible_path,
     ensure_engine,
@@ -54,8 +55,6 @@ from src.tandem_agents.core.integrations.github_mcp import (
 from src.tandem_agents.core.integrations.linear_mcp import (
     build_linear_comment_body,
     ensure_linear_mcp_connected,
-    ensure_linear_mcp_disconnected,
-    get_mcp_server as get_linear_mcp_server,
     linear_add_comment,
     linear_mcp_scope,
     linear_mcp_server_name,
@@ -283,7 +282,7 @@ def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | N
     )
     from src.tandem_agents.core.repository.board import save_board
 
-    contexts = fetch_pr_contexts(ctx.cfg, ctx.task)
+    contexts = _annotate_pr_candidate_current_layout(fetch_pr_contexts(ctx.cfg, ctx.task), ctx.repo_path)
     # Fetch each candidate PR head into a local ref so workers have real git
     # objects to inspect and apply (cherry-pick / checkout), not just patch text.
     pr_numbers = [
@@ -424,6 +423,39 @@ def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | N
     return ctx.make_result()
 
 
+def _annotate_pr_candidate_current_layout(
+    contexts: list[dict[str, Any]],
+    repo_path: Path,
+) -> list[dict[str, Any]]:
+    for context in contexts:
+        if not isinstance(context, dict) or context.get("error"):
+            continue
+        current_files: list[str] = []
+        stale_files: list[str] = []
+        raw_files = context.get("files") or []
+        if not isinstance(raw_files, list):
+            continue
+        for file_entry in raw_files:
+            if not isinstance(file_entry, dict):
+                continue
+            path = str(file_entry.get("filename") or "").strip().lstrip("/")
+            if not path:
+                continue
+            status = _normalized_text(file_entry.get("status"))
+            base_path_exists = (repo_path / path).is_file()
+            file_entry["base_path_exists"] = base_path_exists
+            is_new_file = status in {"added", "created"}
+            if not base_path_exists and not is_new_file:
+                file_entry["current_layout_stale"] = True
+                stale_files.append(path)
+                continue
+            current_files.append(path)
+        context["current_layout_files"] = current_files
+        if stale_files:
+            context["stale_files"] = stale_files
+    return contexts
+
+
 def _pr_candidate_target_files(contexts: list[dict[str, Any]]) -> list[str]:
     excluded = {".jules/bolt.md", "jules/bolt.md"}
     files: list[str] = []
@@ -431,13 +463,17 @@ def _pr_candidate_target_files(contexts: list[dict[str, Any]]) -> list[str]:
     for context in contexts:
         if not isinstance(context, dict) or context.get("error"):
             continue
-        raw_files = context.get("changed_files")
-        if not isinstance(raw_files, list):
+        file_entries = context.get("files") if isinstance(context.get("files"), list) else []
+        if file_entries:
             raw_files = [
                 file_entry.get("filename")
-                for file_entry in (context.get("files") or [])
-                if isinstance(file_entry, dict)
+                for file_entry in file_entries
+                if isinstance(file_entry, dict) and not file_entry.get("current_layout_stale")
             ]
+        else:
+            raw_files = context.get("changed_files")
+            if not isinstance(raw_files, list):
+                raw_files = []
         for raw_file in raw_files:
             path = str(raw_file or "").strip().lstrip("/")
             if not path or path in excluded or path.startswith(".jules/"):
@@ -446,6 +482,29 @@ def _pr_candidate_target_files(contexts: list[dict[str, Any]]) -> list[str]:
                 seen.add(path)
                 files.append(path)
     return files
+
+
+def _pr_candidate_contexts_from_subtasks(subtasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for subtask in subtasks or []:
+        contexts = subtask.get("pr_candidate_context")
+        if isinstance(contexts, list):
+            return [context for context in contexts if isinstance(context, dict)]
+    return []
+
+
+def _pr_candidate_unexpected_changed_files(
+    subtasks: list[dict[str, Any]],
+    changed_files: list[str],
+) -> list[str]:
+    contexts = _pr_candidate_contexts_from_subtasks(subtasks)
+    allowed = set(_pr_candidate_target_files(contexts))
+    if not allowed:
+        return []
+    unexpected: list[str] = []
+    for path in changed_files:
+        if path and path not in allowed and path not in unexpected:
+            unexpected.append(path)
+    return unexpected
 
 
 def _pr_candidate_edit_goal(existing_goal: Any) -> str:
@@ -625,6 +684,47 @@ def _touch_coordination(
         completed=completed,
     )
     return heartbeat_ok
+
+
+@contextmanager
+def _coordination_heartbeat(
+    ctx: "_PhaseRunContext",
+    *,
+    phase: str,
+    status: str = "running",
+):
+    """Keep the run lease alive while a blocking engine call is in flight."""
+    stop_event = threading.Event()
+    sleep_s = max(1.0, float(ctx.cfg.coordination.heartbeat_interval_seconds or 1) / 2.0)
+
+    def _loop() -> None:
+        while not stop_event.wait(sleep_s):
+            _touch_coordination(
+                ctx.coordination,
+                run_id=ctx.run_id,
+                lease_id=ctx.lease_id,
+                lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+                status=status,
+                phase=phase,
+                ctx=ctx,
+            )
+
+    _touch_coordination(
+        ctx.coordination,
+        run_id=ctx.run_id,
+        lease_id=ctx.lease_id,
+        lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+        status=status,
+        phase=phase,
+        ctx=ctx,
+    )
+    thread = threading.Thread(target=_loop, name=f"aca-heartbeat-{phase}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=2.0)
 
 
 def _coordination_task_context(status: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, int | None]:
@@ -821,6 +921,23 @@ def _as_list(value: Any) -> list[Any]:
 
 def _collect_expected_repo_files(subtasks: list[dict[str, Any]]) -> list[str]:
     return collect_expected_repo_files(subtasks)
+
+
+def _collect_worker_changed_files(worker_results: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    files: list[str] = []
+    for result in worker_results:
+        for raw_path in result.get("changed_files") or []:
+            rel_path = str(raw_path or "").strip().replace("\\", "/")
+            while rel_path.startswith("./"):
+                rel_path = rel_path[2:]
+            if not rel_path or rel_path in seen:
+                continue
+            if rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
+                continue
+            seen.add(rel_path)
+            files.append(rel_path)
+    return files
 
 
 def _upsert_worker_result(collection: list[dict[str, Any]], result: dict[str, Any]) -> None:
@@ -1152,29 +1269,10 @@ def _disconnect_linear_for_coding(
     blackboard: dict[str, Any] | None,
     event_type: str,
 ) -> None:
-    server_name = linear_mcp_server_name(cfg)
-    server = get_linear_mcp_server(cfg, server_name)
-    if not server or not server.get("connected"):
-        return
-    try:
-        ensure_linear_mcp_disconnected(cfg)
-    except Exception as exc:
-        if status is not None:
-            _record_linear_warning(
-                run_id=run_id,
-                layout=layout,
-                status=status,
-                blackboard=blackboard,
-                message=str(exc),
-            )
-        return
-    append_event(layout["events"], event_type, run_id, {"connected": False, "server": server_name})
-    if status is not None:
-        _update_linear_mcp_status(status, layout, connected=False, last_action=event_type, server=server_name)
-    if blackboard is not None:
-        _append_blackboard_note(blackboard, f"Linear MCP disconnected for phase `{event_type}`.")
-        save_blackboard(layout["blackboard"], blackboard)
-        write_blackboard_snapshot(layout["run_dir"], blackboard)
+    # Linear is ACA's task source and status/comment sink. Keep the
+    # operator-authenticated MCP connection durable across runs instead of
+    # disconnecting it after finalize or GitHub sync cleanup.
+    return
 
 
 def _connect_github_for_phase(
@@ -1819,8 +1917,9 @@ def run_qa(cfg: ResolvedConfig, pr_number: int) -> dict[str, Any]:
         diff=diff_text
     )
     
-    qa_provider, qa_model = cfg.provider_for_role("reviewer")
-    qa_cli_provider = effective_tandem_provider(qa_provider, cfg)
+    qa_model_selection = engine_session_provider_model(cfg, "reviewer")
+    qa_cli_provider = qa_model_selection["provider"]
+    qa_model = qa_model_selection["model"]
     
     result = stream_tandem_prompt(
         cfg,
@@ -1950,24 +2049,12 @@ def _run_once_internal(
         ctx_final = refs.get("ctx")
         if ctx_final is not None and getattr(ctx_final, "lease_id", None):
             try:
-                if crashed_exc is not None:
-                    release_status = "failed"
-                    release_reason = f"crashed: {crashed_exc}"
-                else:
-                    run_status_str = ""
-                    try:
-                        run_status_str = (ctx_final.status or {}).get("run_status") or ""
-                    except Exception:
-                        pass
-                    if run_status_str == "blocked":
-                        release_status = "blocked"
-                        release_reason = "run blocked"
-                    elif run_status_str == "completed":
-                        release_status = "completed"
-                        release_reason = "run completed"
-                    else:
-                        release_status = "completed"
-                        release_reason = f"run finished (status={run_status_str or 'unknown'})"
+                release_status, release_reason = _final_lease_release_decision(
+                    ctx_final,
+                    layout=layout,
+                    crashed_exc=crashed_exc,
+                    result=result,
+                )
                 ctx_final.coordination.release_lease(
                     str(ctx_final.lease_id),
                     status=release_status,
@@ -1979,6 +2066,92 @@ def _run_once_internal(
                     ctx_final.lease_id,
                     run_id,
                 )
+
+
+def _status_run_value(status: Any) -> str:
+    if not isinstance(status, dict):
+        return ""
+    direct = str(status.get("run_status") or "").strip().lower()
+    if direct:
+        return direct
+    run = status.get("run")
+    if isinstance(run, dict):
+        return str(run.get("status") or "").strip().lower()
+    return ""
+
+
+def _status_blocker_reason(status: Any) -> str:
+    if not isinstance(status, dict):
+        return ""
+    blocker = status.get("blocker")
+    if isinstance(blocker, dict) and blocker.get("active") is True:
+        for key in ("detail", "message"):
+            value = str(blocker.get(key) or "").strip()
+            if value:
+                return value
+    phase = status.get("phase")
+    if isinstance(phase, dict):
+        value = str(phase.get("detail") or "").strip()
+        if value:
+            return value
+    if isinstance(blocker, dict) and blocker.get("active") is True:
+        return str(blocker.get("kind") or "").strip()
+    return ""
+
+
+def _status_has_active_blocker(status: Any) -> bool:
+    return isinstance(status, dict) and isinstance(status.get("blocker"), dict) and status["blocker"].get("active") is True
+
+
+def _status_payloads_for_final_release(ctx_final: Any, layout: dict[str, Path], result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    if isinstance(result, dict) and isinstance(result.get("status"), dict):
+        payloads.append(result["status"])
+    status_path = None
+    ctx_layout = getattr(ctx_final, "layout", None)
+    if isinstance(ctx_layout, dict):
+        status_path = ctx_layout.get("status")
+    status_path = status_path or layout.get("status")
+    if status_path:
+        try:
+            persisted = load_status(Path(status_path))
+            if isinstance(persisted, dict) and persisted:
+                payloads.append(persisted)
+        except Exception:
+            logger.debug("Failed to load persisted run status for final lease release", exc_info=True)
+    ctx_status = getattr(ctx_final, "status", None)
+    if isinstance(ctx_status, dict):
+        payloads.append(ctx_status)
+    return payloads
+
+
+def _final_lease_release_decision(
+    ctx_final: Any,
+    *,
+    layout: dict[str, Path],
+    crashed_exc: Exception | None,
+    result: dict[str, Any] | None,
+) -> tuple[str, str]:
+    if crashed_exc is not None:
+        return "failed", f"crashed: {crashed_exc}"
+
+    payloads = _status_payloads_for_final_release(ctx_final, layout, result)
+    for payload in payloads:
+        if _status_has_active_blocker(payload):
+            return "blocked", _status_blocker_reason(payload) or "run blocked"
+
+    for payload in payloads:
+        run_status = _status_run_value(payload)
+        if run_status == "completed":
+            return "completed", "run completed"
+        if run_status == "blocked":
+            return "blocked", _status_blocker_reason(payload) or "run blocked"
+        if run_status == "failed":
+            return "failed", _status_blocker_reason(payload) or "run failed"
+        if run_status == "cancelled":
+            return "blocked", _status_blocker_reason(payload) or "run cancelled"
+
+    return "blocked", "run finished without terminal status"
 
 
 def _run_once_internal_impl(
@@ -2089,6 +2262,7 @@ def _run_once_internal_impl(
         # operator sees a clear blocker and the reaper / reclaim logic can
         # take over cleanly.
         if ctx.coordination_lost:
+            _preserve_and_reset_blocked_worktree(ctx, reason="coordination_lost")
             return block_run(
                 run_id=run_id,
                 run_dir=run_dir,
@@ -2209,6 +2383,27 @@ def _run_once_internal_impl(
 
         dispatch_workers(ctx)
 
+        if ctx.coordination_lost:
+            _preserve_and_reset_blocked_worktree(ctx, reason="coordination_lost")
+            return block_run(
+                run_id=run_id,
+                run_dir=run_dir,
+                layout=layout,
+                cfg=cfg,
+                task=ctx.task,
+                repo=ctx.repo,
+                engine=ctx.engine,
+                phase="coordination",
+                kind="coordination_lost",
+                message=(
+                    f"Lost coordination lease during worker execution after "
+                    f"{ctx.consecutive_heartbeat_misses} consecutive heartbeat misses."
+                ),
+                phase_detail="lease heartbeat repeatedly missed during worker execution",
+                coordination=coordination,
+                existing_status=ctx.status,
+            )
+
         if ctx.status["metrics"]["failed_workers"]:
             source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
             if _has_unresolved_write_required_worker_failure(ctx.worker_results):
@@ -2235,13 +2430,47 @@ def _run_once_internal_impl(
         )
 
         if integration_result["returncode"] != 0:
-            return _block_integration_failed(ctx)
-        integration_blocker = _integration_blocker_message(integration_result)
-        if integration_blocker:
-            if attempt < max_loops - 1:
-                previous_feedback = _integration_retry_feedback(ctx, attempt, integration_blocker, integration_result)
-                continue
-            return _block_integration_failed(ctx, integration_blocker)
+            if _integration_failure_can_defer_to_review(integration_result):
+                _append_blackboard_note(
+                    ctx.blackboard,
+                    "Integration prompt hit an engine watchdog after worker sync; deferring to review and deterministic verification.",
+                )
+                append_event(
+                    layout["events"],
+                    "integration.deferred",
+                    run_id,
+                    {"reason": str(integration_result.get("stdout") or "").strip()[:500]},
+                    task_id=ctx.task.get("task_id"),
+                    role="manager",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                save_blackboard(layout["blackboard"], ctx.blackboard)
+                write_blackboard_snapshot(run_dir, ctx.blackboard)
+            else:
+                return _block_integration_failed(ctx)
+        else:
+            integration_blocker = _integration_blocker_message(integration_result)
+            if integration_blocker:
+                if _integration_semantic_blocker_can_defer_to_review(integration_result, integration_blocker):
+                    _append_blackboard_note(
+                        ctx.blackboard,
+                        "Integration review could not inspect repository state because its tool environment was limited; deferring to review and deterministic verification.",
+                    )
+                    append_event(
+                        layout["events"],
+                        "integration.deferred",
+                        run_id,
+                        {"reason": integration_blocker[:500]},
+                        task_id=ctx.task.get("task_id"),
+                        role="manager",
+                        repo={"path": ctx.repo.get("path")},
+                    )
+                    save_blackboard(layout["blackboard"], ctx.blackboard)
+                    write_blackboard_snapshot(run_dir, ctx.blackboard)
+                elif attempt < max_loops - 1:
+                    previous_feedback = _integration_retry_feedback(ctx, attempt, integration_blocker, integration_result)
+                    continue
+                return _block_integration_failed(ctx, integration_blocker)
 
         # 4f. No-diff / no-proof repair check
         ctx.pending_diff_snapshot = git_diff_stat(ctx.repo_path)
@@ -2298,8 +2527,9 @@ def _run_once_internal_impl(
 def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
     """Run the integration prompt and return the raw stream result."""
     integration_prompt = build_integration_prompt(ctx.run_id, ctx.task, ctx.worker_results)
-    integration_provider, integration_model = ctx.cfg.provider_for_role("manager")
-    integration_cli_provider = effective_tandem_provider(integration_provider, ctx.cfg)
+    integration_model_selection = engine_session_provider_model(ctx.cfg, "manager")
+    integration_cli_provider = integration_model_selection["provider"]
+    integration_model = integration_model_selection["model"]
     _role_provider_override_config(
         cfg=ctx.cfg,
         layout=ctx.layout,
@@ -2307,17 +2537,18 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
         provider=integration_cli_provider,
         model=integration_model,
     )
-    return stream_tandem_prompt(
-        ctx.cfg,
-        role="integration",
-        prompt=integration_prompt,
-        cwd=ctx.repo_path,
-        provider=integration_cli_provider,
-        model=integration_model,
-        env=engine_env(ctx.cfg),
-        log_path=ctx.layout["logs"] / "manager-integration.log",
-        config_path=None,
-    )
+    with _coordination_heartbeat(ctx, phase="integration"):
+        return stream_tandem_prompt(
+            ctx.cfg,
+            role="integration",
+            prompt=integration_prompt,
+            cwd=ctx.repo_path,
+            provider=integration_cli_provider,
+            model=integration_model,
+            env=engine_env(ctx.cfg),
+            log_path=ctx.layout["logs"] / "manager-integration.log",
+            config_path=None,
+        )
 
 
 def _integration_blocker_message(integration_result: dict[str, Any]) -> str | None:
@@ -2341,6 +2572,60 @@ def _integration_blocker_message(integration_result: dict[str, Any]) -> str | No
     if required_fixes:
         return "Integration review reported required fixes." + details
     return None
+
+
+def _integration_failure_can_defer_to_review(integration_result: dict[str, Any]) -> bool:
+    if int(integration_result.get("returncode") or 0) == 0:
+        return False
+    engine = integration_result.get("engine") if isinstance(integration_result.get("engine"), dict) else {}
+    combined = " ".join(
+        str(value or "")
+        for value in (
+            integration_result.get("stdout"),
+            integration_result.get("failure_reason"),
+            integration_result.get("blocker_kind"),
+            engine.get("stream_reason"),
+        )
+    )
+    markers = (
+        "ENGINE_TOOL_LOOP_STALLED",
+        "ENGINE_PROMPT_TIMEOUT",
+        "ENGINE_EMPTY_RESPONSE",
+        "engine_tool_loop_stalled",
+        "engine_prompt_timeout",
+        "engine_empty_response",
+        "no_text_timeout",
+    )
+    return any(marker in combined for marker in markers)
+
+
+def _integration_semantic_blocker_can_defer_to_review(
+    integration_result: dict[str, Any],
+    blocker_message: str,
+) -> bool:
+    payload = _extract_json(str(integration_result.get("stdout") or "")) or {}
+    combined = " ".join(
+        str(value or "")
+        for value in (
+            integration_result.get("stdout"),
+            blocker_message,
+            payload.get("summary") if isinstance(payload, dict) else "",
+            payload.get("risks") if isinstance(payload, dict) else "",
+            payload.get("tests") if isinstance(payload, dict) else "",
+        )
+    ).lower()
+    inspection_markers = (
+        "bubblewrap_not_available",
+        "sandbox",
+        "git/status",
+        "status/diff inspection",
+        "could not inspect",
+        "cannot verify",
+        "not run:",
+        "tool environment",
+        "commands were blocked",
+    )
+    return any(marker in combined for marker in inspection_markers)
 
 
 def _integration_payload_details(payload: dict[str, Any]) -> str:

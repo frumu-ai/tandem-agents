@@ -657,7 +657,11 @@ def linear_update_issue(cfg: ResolvedConfig, task: dict[str, Any], fields: dict[
     last_error: Exception | None = None
     for args in attempts:
         try:
-            _execute_linear_tool(cfg, ["update_issue", "save_issue"], args)
+            _execute_linear_tool(
+                cfg,
+                ["update_issue", "updateIssue", "save_issue", "saveIssue"],
+                args,
+            )
             return None
         except Exception as exc:
             last_error = exc

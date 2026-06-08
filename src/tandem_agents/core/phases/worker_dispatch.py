@@ -69,6 +69,7 @@ def dispatch_workers(ctx: RunContext) -> None:
         lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
         status="running",
         phase="worker_execution",
+        ctx=ctx,
     )
     append_event(
         ctx.layout["events"],
@@ -100,6 +101,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                 lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
                 status="running",
                 phase="worker_execution",
+                ctx=ctx,
             )
             with active_workers_lock:
                 ids = list(active_workers)
@@ -219,6 +221,8 @@ def _apply_tolerated_failures(ctx: RunContext) -> None:
     task_source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
     if isinstance(task_source, dict) and str(task_source.get("type") or "").strip() == "github_project":
         return
+    if _rc._task_mentions_external_pr_candidates(ctx.task):
+        return
 
     for result in ctx.worker_results:
         if result.get("status") != "failed":
@@ -227,6 +231,15 @@ def _apply_tolerated_failures(ctx: RunContext) -> None:
             (s for s in ctx.planned_subtasks if s["id"] == result.get("subtask_id")),
             None,
         )
+        failure_reason = str(result.get("failure_reason") or "").upper()
+        blocker_kind = str(result.get("blocker_kind") or "").lower()
+        if (
+            failure_reason.startswith("ENGINE_")
+            or failure_reason.startswith("ENGINE_ERROR:")
+            or blocker_kind.startswith("engine_")
+            or (matching and (matching.get("pr_candidate_context") or matching.get("pr_candidate_refs")))
+        ):
+            continue
         if matching and subtask_satisfied(ctx.repo_path, matching):
             result["status"] = "tolerated_failure"
             result["verified_existing"] = True
@@ -248,7 +261,18 @@ def _post_dispatch_validation(ctx: RunContext) -> None:
     from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
 
     ctx.expected_repo_files = _rc._collect_expected_repo_files(ctx.planned_subtasks)
+    changed_files: list[str] = []
+    if _rc._task_mentions_external_pr_candidates(ctx.task):
+        changed_files = _rc._collect_worker_changed_files(ctx.worker_results)
+        if changed_files:
+            ctx.expected_repo_files = changed_files
     ctx.repo_validation = _rc._deterministic_repo_validation(ctx.repo_path, ctx.expected_repo_files)
+    if changed_files:
+        unexpected_files = _rc._pr_candidate_unexpected_changed_files(ctx.planned_subtasks, changed_files)
+        if unexpected_files:
+            ctx.repo_validation = dict(ctx.repo_validation)
+            ctx.repo_validation["unexpected_files"] = unexpected_files
+            ctx.repo_validation["ok"] = False
     coding_run_contract = build_coding_run_contract(
         run_id=ctx.run_id,
         task=ctx.task,

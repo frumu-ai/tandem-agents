@@ -25,8 +25,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     openssh-client \
   && rm -rf /var/lib/apt/lists/*
 
+RUN groupadd --gid "${HOST_GID}" tandem \
+  && useradd --uid "${HOST_UID}" --gid "${HOST_GID}" --create-home --home-dir /home/node tandem \
+  && mkdir -p /home/node/npm \
+  && chown -R "${HOST_UID}:${HOST_GID}" /home/node
+
 RUN --mount=type=cache,target=/root/.npm \
-    npm install -g "${TANDEM_ENGINE_PACKAGE}@${TANDEM_ENGINE_RELEASE_VERSION}"
+    npm install -g "${TANDEM_ENGINE_PACKAGE}@${TANDEM_ENGINE_RELEASE_VERSION}" pnpm@10.23.0
 
 RUN mkdir -p /workspace/tandem-agents/runs /workspace/repos /workspace/tandem-data
 
@@ -51,6 +56,7 @@ RUN chmod +x /workspace/tandem-agents/scripts/run.sh /workspace/tandem-agents/sc
 
 COPY LICENSE /LICENSE
 COPY NOTICE /NOTICE
+RUN chown -R "${HOST_UID}:${HOST_GID}" /home/node /workspace/tandem-agents /workspace/repos /workspace/tandem-data
 
 ARG VERSION=dev
 ARG VCS_REF=unknown
@@ -63,5 +69,7 @@ LABEL org.opencontainers.image.title="Tandem Agents" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
 EXPOSE 39735
+
+USER ${HOST_UID}:${HOST_GID}
 
 CMD ["/workspace/tandem-agents/scripts/entrypoint.sh"]
