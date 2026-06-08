@@ -2238,6 +2238,9 @@ def _run_once_internal_impl(
             return _block_integration_failed(ctx)
         integration_blocker = _integration_blocker_message(integration_result)
         if integration_blocker:
+            if attempt < max_loops - 1:
+                previous_feedback = _integration_retry_feedback(ctx, attempt, integration_blocker, integration_result)
+                continue
             return _block_integration_failed(ctx, integration_blocker)
 
         # 4f. No-diff / no-proof repair check
@@ -2326,17 +2329,103 @@ def _integration_blocker_message(integration_result: dict[str, Any]) -> str | No
     approved = payload.get("approved")
     blockers = payload.get("blockers")
     required_fixes = payload.get("required_fixes")
+    details = _integration_payload_details(payload)
     if approved is False:
-        return "Integration review did not approve the worker result."
+        return "Integration review did not approve the worker result." + details
     if status in {"blocked", "failed", "fail", "repair_needed", "needs_changes", "incomplete"}:
-        return f"Integration review reported `{status}`."
+        return f"Integration review reported `{status}`." + details
     if next_action in {"blocked", "repair_needed", "needs_changes", "retry", "fix_required"}:
-        return f"Integration review requested `{next_action}`."
+        return f"Integration review requested `{next_action}`." + details
     if blockers:
-        return "Integration review reported blockers."
+        return "Integration review reported blockers." + details
     if required_fixes:
-        return "Integration review reported required fixes."
+        return "Integration review reported required fixes." + details
     return None
+
+
+def _integration_payload_details(payload: dict[str, Any]) -> str:
+    lines: list[str] = []
+    summary = str(payload.get("summary") or "").strip()
+    if summary:
+        lines.append(f"Summary: {summary}")
+    for label, key in (("Blockers", "blockers"), ("Required fixes", "required_fixes"), ("Risks", "risks"), ("Tests", "tests")):
+        value = payload.get(key)
+        entries: list[str] = []
+        if isinstance(value, list):
+            entries = [str(entry).strip() for entry in value if str(entry).strip()]
+        elif isinstance(value, dict):
+            entries = [f"{k}: {v}" for k, v in value.items() if str(v).strip()]
+        elif str(value or "").strip():
+            entries = [str(value).strip()]
+        if entries:
+            lines.append(f"{label}: " + "; ".join(entries[:5]))
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+def _integration_retry_feedback(
+    ctx: "_PhaseRunContext",
+    attempt: int,
+    blocker_message: str,
+    integration_result: dict[str, Any],
+) -> str:
+    from src.tandem_agents.runtime.runstate import save_blackboard
+    from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
+
+    stdout = str(integration_result.get("stdout") or "").strip()
+    feedback = "\n\n".join(
+        part
+        for part in (
+            "Integration review rejected the previous worker result. Repair these issues before continuing.",
+            blocker_message,
+            f"Raw integration output:\n{stdout}" if stdout else "",
+        )
+        if part
+    )
+    _append_blackboard_note(
+        ctx.blackboard,
+        f"Attempt {attempt + 1} failed integration review. Retrying with integration feedback.",
+    )
+    ctx.blackboard.setdefault("integration_reviews", []).append(
+        {
+            "attempt": attempt + 1,
+            "returncode": integration_result.get("returncode"),
+            "blocker": blocker_message,
+            "stdout": stdout,
+        }
+    )
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    return feedback
+
+
+def _preserve_and_reset_blocked_worktree(ctx: "_PhaseRunContext", *, reason: str) -> None:
+    status = run_command(_git_repo_args(ctx.repo_path, "status", "--short", "--untracked-files=all"), env=ctx.cfg.env)
+    if status.returncode != 0 or not status.stdout.strip():
+        return
+    diff = run_command(_git_repo_args(ctx.repo_path, "diff", "--binary", "HEAD"), env=ctx.cfg.env)
+    patch_path = ctx.layout["artifacts"] / "blocked-working-diff.patch"
+    patch_text = diff.stdout if diff.returncode == 0 and diff.stdout.strip() else status.stdout
+    patch_path.write_text(patch_text, encoding="utf-8")
+    ctx.blackboard.setdefault("artifacts", []).append(str(patch_path))
+    ctx.blackboard.setdefault("blocked_worktree_cleanup", []).append(
+        {
+            "reason": reason,
+            "patch_path": str(patch_path),
+            "status": status.stdout.strip(),
+        }
+    )
+    reset = run_command(_git_repo_args(ctx.repo_path, "reset", "--hard", "HEAD"), env=ctx.cfg.env)
+    clean = run_command(_git_repo_args(ctx.repo_path, "clean", "-fd"), env=ctx.cfg.env)
+    if reset.returncode != 0 or clean.returncode != 0:
+        _append_blackboard_note(
+            ctx.blackboard,
+            "Warning: failed to fully clean blocked run worktree after preserving diff artifact.",
+        )
+    else:
+        _append_blackboard_note(
+            ctx.blackboard,
+            f"Preserved blocked worktree diff at `{patch_path}` and reset shared checkout.",
+        )
 
 
 def _linear_comment_task_summary(task: dict[str, Any]) -> str:
@@ -2906,6 +2995,7 @@ def _block_integration_failed(ctx: "_PhaseRunContext", message: str | None = Non
     from src.tandem_agents.runtime.runstate import save_blackboard
 
     blocker_message = message or "Integration prompt failed after worker completion."
+    _preserve_and_reset_blocked_worktree(ctx, reason="integration_failed")
     ctx.status = set_status(
         ctx.status, ctx.layout, phase="handoff",
         phase_detail=blocker_message, run_status="blocked",
@@ -2941,6 +3031,7 @@ def _block_verification_failed(ctx: "_PhaseRunContext", verification: Any) -> di
     failure_category = str(getattr(verification, "failure_category", None) or verification.outcome).strip() or verification.outcome
     label = failure_category.replace("_", "-")
     blocker_msg = verification.validation_blocker or "Review or test failed"
+    _preserve_and_reset_blocked_worktree(ctx, reason=f"verification_{failure_category}")
     ctx.status = set_status(
         ctx.status, ctx.layout, phase="handoff",
         phase_detail=f"{label}: {blocker_msg}",
