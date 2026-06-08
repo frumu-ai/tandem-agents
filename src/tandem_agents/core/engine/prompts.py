@@ -344,6 +344,8 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "\nACA already fetched GitHub PR candidate context for this task. "
             f"Full per-file patches are in the artifact `{pr_context_artifact or 'pr_candidate_context.json'}` -- read it for complete diffs.\n"
             f"{ref_block}"
+            "This is an edit task, not a report-only task. Do not stop after producing an applicability matrix. "
+            "A successful worker turn must either leave a filesystem diff or return a structured blocker that names every inspected PR and explains why no safe code change should be applied.\n"
             "Use this context first, then verify against the repository before editing. "
             "If after applying you genuinely have no safe changes, return a structured blocker that lists the inspected PR numbers.\n"
             f"PR candidate summary:\n{json.dumps(_compact_pr_context(pr_context), indent=2, sort_keys=True, default=str)[:6000]}\n"

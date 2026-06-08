@@ -20,6 +20,8 @@ from src.tandem_agents.core.execution.runner_core import (
     _linear_comment_task_summary,
     _permission_requests_from_payload,
     _prepare_subtasks_with_discovery,
+    _pr_candidate_edit_goal,
+    _pr_candidate_target_files,
     _task_mentions_external_pr_candidates,
     _worker_failure_blocker,
     _record_worker_result,
@@ -205,6 +207,43 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("ACA already fetched GitHub PR candidate context", prompt)
         self.assertIn("artifacts/pr_candidate_context.json", prompt)
         self.assertIn('"number": 1459', prompt)
+        self.assertIn("This is an edit task, not a report-only task", prompt)
+        self.assertIn("Do not stop after producing an applicability matrix", prompt)
+
+    def test_pr_candidate_target_files_are_derived_from_context_without_noise_docs(self) -> None:
+        contexts = [
+            {
+                "number": 1459,
+                "changed_files": [
+                    ".jules/bolt.md",
+                    "packages/tandem-control-panel/src/pages/DashboardPage.tsx",
+                    "packages/tandem-control-panel/src/pages/DashboardPage.tsx",
+                ],
+            },
+            {
+                "number": 1446,
+                "files": [
+                    {"filename": "src/components/logs/LogsDrawer.tsx"},
+                    {"filename": "/src/lib/utils.ts"},
+                ],
+            },
+            {"number": 1, "error": "not found", "changed_files": ["ignored.ts"]},
+        ]
+
+        self.assertEqual(
+            _pr_candidate_target_files(contexts),
+            [
+                "packages/tandem-control-panel/src/pages/DashboardPage.tsx",
+                "src/components/logs/LogsDrawer.tsx",
+                "src/lib/utils.ts",
+            ],
+        )
+
+    def test_pr_candidate_edit_goal_replaces_matrix_only_goal(self) -> None:
+        goal = _pr_candidate_edit_goal("Produce a concise applicability matrix for each PR.")
+
+        self.assertIn("Apply the still-relevant code changes", goal)
+        self.assertIn("An applicability matrix alone is not sufficient", goal)
 
     def test_worker_failure_blocker_preserves_engine_empty_response_details(self) -> None:
         blocker = _worker_failure_blocker(

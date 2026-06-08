@@ -11,6 +11,7 @@ from src.tandem_agents.core.execution.worker import (
     _extract_prompt_sync_text,
     _extract_session_reply,
     _materialize_worker_context,
+    _worker_prompt_retry_suffix,
     run_worker_subtask,
     stream_tandem_prompt,
 )
@@ -54,6 +55,22 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(prepared["pr_candidate_context_artifact"], ".aca/pr_candidate_context.json")
             self.assertTrue((worktree / ".aca" / "pr_candidate_context.json").exists())
+
+    def test_retry_suffix_for_pr_context_requires_diff_or_structured_blocker(self) -> None:
+        suffix = _worker_prompt_retry_suffix(
+            {
+                "id": "subtask-1",
+                "files": ["src/lib/utils.ts"],
+                "pr_candidate_context": [{"number": 1459}],
+                "pr_candidate_refs": [{"number": 1459, "ok": True, "ref": "refs/aca/pr-1459"}],
+            }
+        )
+
+        self.assertIn("Read `.aca/pr_candidate_context.json`", suffix)
+        self.assertIn("Do not produce only an applicability matrix", suffix)
+        self.assertIn("filesystem diff", suffix)
+        self.assertIn("no-safe-changes blocker", suffix)
+        self.assertNotIn("Start with `pwd`", suffix)
 
     def test_run_worker_subtask_syncs_successful_worktree_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
