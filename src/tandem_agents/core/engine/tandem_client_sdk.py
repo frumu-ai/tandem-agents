@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -121,6 +122,22 @@ def sdk_reply_permission(cfg: ResolvedConfig, request_id: str, reply: str) -> An
     return with_sync_tandem_client(cfg, lambda client: client.permissions.reply(request_id, reply))
 
 
+def _sessions_create_supports_temperature(create_fn: Any) -> bool:
+    """Whether the installed tandem-client ``sessions.create`` accepts temperature.
+
+    Lets ACA forward a sampling temperature only when the SDK supports it, so the
+    same code is a no-op on older clients and activates automatically once the
+    SDK ships sampling support (TAN-177) -- without raising TypeError today.
+    """
+    try:
+        params = inspect.signature(create_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "temperature" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def sdk_create_session(
     cfg: ResolvedConfig,
     *,
@@ -128,16 +145,20 @@ def sdk_create_session(
     directory: str,
     provider: str,
     model: str,
+    temperature: float | None = None,
 ) -> Any:
-    return with_sync_tandem_client(
-        cfg,
-        lambda client: client.sessions.create(
-            title=title,
-            directory=directory,
-            provider=provider,
-            model=model,
-        ),
-    )
+    def _create(client: Any) -> Any:
+        kwargs: dict[str, Any] = {
+            "title": title,
+            "directory": directory,
+            "provider": provider,
+            "model": model,
+        }
+        if temperature is not None and _sessions_create_supports_temperature(client.sessions.create):
+            kwargs["temperature"] = temperature
+        return client.sessions.create(**kwargs)
+
+    return with_sync_tandem_client(cfg, _create)
 
 
 def sdk_delete_session(cfg: ResolvedConfig, session_id: str) -> Any:

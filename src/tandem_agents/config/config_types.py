@@ -9,6 +9,16 @@ from urllib.parse import urlparse
 DEFAULT_BASE_URL = "http://127.0.0.1:39733"
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-4.1-mini"
+# Default sampling temperature for the JSON-emitting roles. Low temperature
+# improves the reliability of the strict-JSON plans/verdicts those roles must
+# produce. Roles not listed here (e.g. worker) use the engine/provider default
+# unless a temperature is explicitly configured. Only takes effect once the
+# engine + SDK accept sampling params; until then it is recorded but not sent.
+DEFAULT_ROLE_TEMPERATURES: dict[str, float] = {
+    "manager": 0.0,
+    "reviewer": 0.0,
+    "tester": 0.0,
+}
 DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE_NAME = "origin"
 DEFAULT_STARTUP_MODE = "reuse_or_start"
@@ -102,6 +112,17 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _as_float_or_none(value: Any) -> float | None:
+    """Parse an optional float. Empty/unset/invalid yields None (engine default)."""
+    value = _nonempty(value)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _env_or_file(env: Mapping[str, str], file_env: Mapping[str, str], name: str) -> Any:
     value = _nonempty(env.get(name))
     if value is not None:
@@ -168,6 +189,7 @@ def _jsonable(value: Any) -> Any:
 class RoleSelection:
     provider: str = ""
     model: str = ""
+    temperature: float | None = None
 
 
 @dataclass
@@ -235,6 +257,10 @@ class ProviderConfig:
     # configs default to True so they are never flagged as silent fallbacks.
     provider_configured: bool = True
     model_configured: bool = True
+    # Global default sampling temperature; None means "unset" (use the engine
+    # default or the per-role JSON default). Per-role overrides live on
+    # SwarmConfig role selections.
+    temperature: float | None = None
 
 
 @dataclass
@@ -441,6 +467,33 @@ class ResolvedConfig:
             "provider_source": provider_source,
             "model": model,
             "model_source": model_source,
+        }
+
+    def sampling_for_role(self, role: str) -> dict[str, Any]:
+        """Resolve the sampling temperature for a role and report its source.
+
+        Precedence:
+          1. ``role``     -- per-role temperature override (swarm.<role>.temperature)
+          2. ``provider`` -- global provider.temperature
+          3. ``default``  -- built-in low default for JSON-emitting roles
+                             (manager/reviewer/tester); ``None`` otherwise, meaning
+                             the engine/provider default is used.
+
+        A ``None`` temperature means ACA sends no sampling override. These values
+        are recorded for observability now and only transmitted to the engine
+        once the engine + SDK accept sampling params.
+        """
+        role_cfg = getattr(self.swarm, role, RoleSelection())
+        use_role = not self.swarm.shared_model
+        if use_role and role_cfg.temperature is not None:
+            return {"role": role, "temperature": float(role_cfg.temperature), "temperature_source": "role"}
+        if self.provider.temperature is not None:
+            return {"role": role, "temperature": float(self.provider.temperature), "temperature_source": "provider"}
+        default_temp = DEFAULT_ROLE_TEMPERATURES.get(role)
+        return {
+            "role": role,
+            "temperature": None if default_temp is None else float(default_temp),
+            "temperature_source": "default",
         }
 
     def as_dict(self) -> dict[str, Any]:

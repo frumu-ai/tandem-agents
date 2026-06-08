@@ -78,6 +78,7 @@ from src.tandem_agents.config.config_types import (
     VALID_REVIEW_POLICIES,
     VALID_MERGE_STRATEGIES,
     _as_bool,
+    _as_float_or_none,
     _as_int,
     _env_or_file,
     _load_env_file,
@@ -268,6 +269,9 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         fallback_model=str(pick("ACA_FALLBACK_MODEL", "AUTOCODER_FALLBACK_MODEL", yaml_value=provider_data.get("fallback_model"), default="")),
         provider_configured=bool(provider_id_raw),
         model_configured=bool(provider_model_raw),
+        temperature=_as_float_or_none(
+            pick("ACA_TEMPERATURE", "AUTOCODER_TEMPERATURE", yaml_value=provider_data.get("temperature"), default="")
+        ),
     )
     storage = StorageConfig(
         profile=str(
@@ -407,18 +411,22 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         manager=RoleSelection(
             provider=str(pick("ACA_MANAGER_PROVIDER", "AUTOCODER_MANAGER_PROVIDER", yaml_value=(swarm_data.get("manager") or {}).get("provider"), default="")),
             model=str(pick("ACA_MANAGER_MODEL", "AUTOCODER_MANAGER_MODEL", yaml_value=(swarm_data.get("manager") or {}).get("model"), default="")),
+            temperature=_as_float_or_none(pick("ACA_MANAGER_TEMPERATURE", "AUTOCODER_MANAGER_TEMPERATURE", yaml_value=(swarm_data.get("manager") or {}).get("temperature"), default="")),
         ),
         worker=RoleSelection(
             provider=str(pick("ACA_WORKER_PROVIDER", "AUTOCODER_WORKER_PROVIDER", yaml_value=(swarm_data.get("worker") or {}).get("provider"), default="")),
             model=str(pick("ACA_WORKER_MODEL", "AUTOCODER_WORKER_MODEL", yaml_value=(swarm_data.get("worker") or {}).get("model"), default="")),
+            temperature=_as_float_or_none(pick("ACA_WORKER_TEMPERATURE", "AUTOCODER_WORKER_TEMPERATURE", yaml_value=(swarm_data.get("worker") or {}).get("temperature"), default="")),
         ),
         reviewer=RoleSelection(
             provider=str(pick("ACA_REVIEWER_PROVIDER", "AUTOCODER_REVIEWER_PROVIDER", yaml_value=(swarm_data.get("reviewer") or {}).get("provider"), default="")),
             model=str(pick("ACA_REVIEWER_MODEL", "AUTOCODER_REVIEWER_MODEL", yaml_value=(swarm_data.get("reviewer") or {}).get("model"), default="")),
+            temperature=_as_float_or_none(pick("ACA_REVIEWER_TEMPERATURE", "AUTOCODER_REVIEWER_TEMPERATURE", yaml_value=(swarm_data.get("reviewer") or {}).get("temperature"), default="")),
         ),
         tester=RoleSelection(
             provider=str(pick("ACA_TESTER_PROVIDER", "AUTOCODER_TESTER_PROVIDER", yaml_value=(swarm_data.get("tester") or {}).get("provider"), default="")),
             model=str(pick("ACA_TESTER_MODEL", "AUTOCODER_TESTER_MODEL", yaml_value=(swarm_data.get("tester") or {}).get("model"), default="")),
+            temperature=_as_float_or_none(pick("ACA_TESTER_TEMPERATURE", "AUTOCODER_TESTER_TEMPERATURE", yaml_value=(swarm_data.get("tester") or {}).get("temperature"), default="")),
         ),
     )
     output_root = pick("ACA_OUTPUT_ROOT", "AUTOCODER_OUTPUT_ROOT", yaml_value=output_data.get("root"), default=DEFAULT_OUTPUT_ROOT)

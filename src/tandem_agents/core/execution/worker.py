@@ -518,12 +518,16 @@ def stream_tandem_prompt(
                 create_exc: Exception | None = None
                 for attempt in range(3):
                     try:
+                        session_temperature = None
+                        if hasattr(cfg, "sampling_for_role"):
+                            session_temperature = cfg.sampling_for_role(role).get("temperature")
                         session_id = create_tandem_session(
                             cfg,
                             title=f"ACA {role}",
                             directory=cwd,
                             provider=provider,
                             model=model,
+                            temperature=session_temperature,
                         )
                         create_exc = None
                         break
