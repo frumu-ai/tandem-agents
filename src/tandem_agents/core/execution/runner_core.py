@@ -316,14 +316,25 @@ def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | N
         "pull_requests": contexts,
         "fetched_refs": pr_refs,
     }
+    candidate_target_files = _pr_candidate_target_files(contexts)
     for subtask in ctx.planned_subtasks or []:
         subtask["pr_candidate_context_artifact"] = str(artifact_path)
         subtask["pr_candidate_context"] = contexts
         subtask["pr_candidate_refs"] = pr_refs
+        if candidate_target_files:
+            subtask["files"] = list(candidate_target_files)
+            subtask["target_files"] = list(candidate_target_files)
+            subtask["write_required"] = True
+            subtask["goal"] = _pr_candidate_edit_goal(subtask.get("goal"))
     for subtask in ctx.pending_subtasks or []:
         subtask["pr_candidate_context_artifact"] = str(artifact_path)
         subtask["pr_candidate_context"] = contexts
         subtask["pr_candidate_refs"] = pr_refs
+        if candidate_target_files:
+            subtask["files"] = list(candidate_target_files)
+            subtask["target_files"] = list(candidate_target_files)
+            subtask["write_required"] = True
+            subtask["goal"] = _pr_candidate_edit_goal(subtask.get("goal"))
     errors = [context for context in contexts if context.get("error")]
     if contexts and not errors:
         save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
@@ -411,6 +422,45 @@ def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | N
         {"kind": "github_context_unavailable", "detail": detail, "recovery_action": recovery},
     )
     return ctx.make_result()
+
+
+def _pr_candidate_target_files(contexts: list[dict[str, Any]]) -> list[str]:
+    excluded = {".jules/bolt.md", "jules/bolt.md"}
+    files: list[str] = []
+    seen: set[str] = set()
+    for context in contexts:
+        if not isinstance(context, dict) or context.get("error"):
+            continue
+        raw_files = context.get("changed_files")
+        if not isinstance(raw_files, list):
+            raw_files = [
+                file_entry.get("filename")
+                for file_entry in (context.get("files") or [])
+                if isinstance(file_entry, dict)
+            ]
+        for raw_file in raw_files:
+            path = str(raw_file or "").strip().lstrip("/")
+            if not path or path in excluded or path.startswith(".jules/"):
+                continue
+            if path not in seen:
+                seen.add(path)
+                files.append(path)
+    return files
+
+
+def _pr_candidate_edit_goal(existing_goal: Any) -> str:
+    goal = str(existing_goal or "").strip()
+    required = (
+        "Apply the still-relevant code changes from the fetched PR candidate refs into this worktree. "
+        "An applicability matrix alone is not sufficient; leave a repository diff or a structured no-safe-changes blocker."
+    )
+    if not goal:
+        return required
+    if "applicability matrix" in goal.lower() and "apply" not in goal.lower():
+        return required
+    if "An applicability matrix alone is not sufficient" in goal:
+        return goal
+    return f"{goal}\n\n{required}"
 
 
 def _record_coding_run_contract(blackboard: dict[str, Any], contract: Any) -> None:

@@ -381,20 +381,43 @@ def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]
 
 def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
     targets = _subtask_targets(subtask)
+    has_pr_context = bool(subtask.get("pr_candidate_context") or subtask.get("pr_candidate_refs"))
     steps = [
         "Retry this subtask and use tools immediately.",
-        "Start with `pwd` and `ls -la` in the current directory.",
+        "Use lightweight repository tools first; if shell sandboxing is unavailable, use read/glob/apply_patch instead of stopping.",
     ]
-    if targets:
-        steps.append(
-            "Create any missing parent directories for the target files with `bash` before writing them: "
-            + ", ".join(f"`{path}`" for path in targets)
+    if has_pr_context:
+        refs = [
+            f"refs/aca/pr-{ref.get('number')}"
+            for ref in (subtask.get("pr_candidate_refs") or [])
+            if isinstance(ref, dict) and ref.get("ok") and ref.get("number")
+        ]
+        steps.extend(
+            [
+                "Read `.aca/pr_candidate_context.json` and inspect the fetched PR candidate refs.",
+                "Do not produce only an applicability matrix; apply still-relevant code changes into the worktree.",
+            ]
         )
+        if refs:
+            steps.append(
+                "Available candidate refs: " + ", ".join(f"`{ref}`" for ref in refs) + "."
+            )
+    if targets:
+        if has_pr_context:
+            steps.append(
+                "Restrict edits to existing relevant candidate files unless a candidate patch requires a nearby supporting change: "
+                + ", ".join(f"`{path}`" for path in targets)
+            )
+        else:
+            steps.append(
+                "Create any missing parent directories for the target files before writing them: "
+                + ", ".join(f"`{path}`" for path in targets)
+            )
     steps.extend(
         [
             "Then create or edit the target files using `write`, `edit`, or `apply_patch`.",
             "Finish by verifying the changed files with `ls -la`, `read`, or `grep`.",
-            "Do not reply with a summary until you have completed at least one productive tool call.",
+            "Do not reply with a summary until you have either produced a filesystem diff or produced a structured no-safe-changes blocker naming every inspected PR.",
         ]
     )
     return "\n\nRetry instructions:\n- " + "\n- ".join(steps) + "\n"
