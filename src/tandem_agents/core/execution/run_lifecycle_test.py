@@ -84,5 +84,47 @@ class SwarmConfigDictTest(unittest.TestCase):
         self.assertEqual(payload["manager"]["provider"], "openai")
 
 
+class SamplingResolutionTest(unittest.TestCase):
+    def test_json_roles_default_to_zero_worker_to_none(self) -> None:
+        cfg = _config({})
+        for role in ("manager", "reviewer", "tester"):
+            resolved = cfg.sampling_for_role(role)
+            self.assertEqual(resolved["temperature"], 0.0, role)
+            self.assertEqual(resolved["temperature_source"], "default", role)
+        worker = cfg.sampling_for_role("worker")
+        self.assertIsNone(worker["temperature"])
+        self.assertEqual(worker["temperature_source"], "default")
+
+    def test_global_temperature_applies_to_all_roles(self) -> None:
+        cfg = _config({"ACA_TEMPERATURE": "0.5"})
+        worker = cfg.sampling_for_role("worker")
+        self.assertEqual(worker["temperature"], 0.5)
+        self.assertEqual(worker["temperature_source"], "provider")
+        self.assertEqual(cfg.sampling_for_role("manager")["temperature"], 0.5)
+
+    def test_role_override_wins(self) -> None:
+        cfg = _config({"ACA_TEMPERATURE": "0.5", "ACA_REVIEWER_TEMPERATURE": "0.1"})
+        reviewer = cfg.sampling_for_role("reviewer")
+        self.assertEqual(reviewer["temperature"], 0.1)
+        self.assertEqual(reviewer["temperature_source"], "role")
+        # Other roles still use the global value.
+        self.assertEqual(cfg.sampling_for_role("tester")["temperature"], 0.5)
+
+    def test_shared_model_ignores_role_temperature(self) -> None:
+        cfg = _config({"ACA_REVIEWER_TEMPERATURE": "0.1", "ACA_SHARED_MODEL": "true"})
+        reviewer = cfg.sampling_for_role("reviewer")
+        # role override ignored; falls to default (json role -> 0.0)
+        self.assertEqual(reviewer["temperature"], 0.0)
+        self.assertEqual(reviewer["temperature_source"], "default")
+
+    def test_swarm_config_dict_records_temperature(self) -> None:
+        cfg = _config({"ACA_REVIEWER_TEMPERATURE": "0.1"})
+        payload = build_swarm_config_dict(cfg)
+        self.assertEqual(payload["reviewer"]["temperature"], 0.1)
+        self.assertEqual(payload["reviewer"]["temperature_source"], "role")
+        self.assertEqual(payload["manager"]["temperature"], 0.0)
+        self.assertIsNone(payload["worker"]["temperature"])
+
+
 if __name__ == "__main__":
     unittest.main()

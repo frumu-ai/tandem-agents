@@ -330,6 +330,7 @@ def create_tandem_session(
     directory: Path,
     provider: str,
     model: str,
+    temperature: float | None = None,
 ) -> str:
     if sdk_available():
         session_id = str(
@@ -339,6 +340,7 @@ def create_tandem_session(
                 directory=str(engine_visible_path(directory)),
                 provider=provider,
                 model=model,
+                temperature=temperature,
             )
             or ""
         ).strip()

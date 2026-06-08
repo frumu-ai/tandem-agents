@@ -53,11 +53,14 @@ def build_swarm_config_dict(cfg: ResolvedConfig) -> dict[str, Any]:
     defaulted: list[str] = []
     for role in roles:
         resolved = cfg.provider_for_role_with_source(role)
+        sampling = cfg.sampling_for_role(role)
         role_entries[role] = {
             "provider": resolved["provider"],
             "model": resolved["model"],
             "provider_source": resolved["provider_source"],
             "model_source": resolved["model_source"],
+            "temperature": sampling["temperature"],
+            "temperature_source": sampling["temperature_source"],
         }
         if resolved["model_source"] == "default":
             defaulted.append(role)
