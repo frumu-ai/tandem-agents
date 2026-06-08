@@ -32,6 +32,7 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
     """
     from src.tandem_agents.core.engine.engine import (
         commit_repository_changes,
+        current_repository_branch,
         git_diff_stat,
         push_repository_changes,
     )
@@ -45,7 +46,20 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
         write_diff_snapshot,
     )
 
-    # Step 1: Commit
+    # Step 1: Commit, but only from the run branch. If anything has left the
+    # checkout on main/default, block before polluting the shared checkout.
+    current_branch = current_repository_branch(ctx.repo_path, cfg=ctx.cfg)
+    if current_branch != ctx.branch_name:
+        return _block_finalization_failure(
+            ctx,
+            kind="run_branch_mismatch",
+            message=(
+                f"ACA expected to finalize on branch `{ctx.branch_name}` but the "
+                f"repository is on `{current_branch or 'unknown'}`. No commit was "
+                "created; reset the checkout to the default branch and rerun."
+            ),
+        )
+
     commit_info = commit_repository_changes(
         ctx.cfg, ctx.repo_path, f"aca: {ctx.task['title']}"
     )
