@@ -5,6 +5,7 @@ import threading
 import unittest
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from textwrap import dedent
@@ -20,6 +21,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _integration_blocker_message,
     _linear_comment_task_summary,
     _permission_requests_from_payload,
+    _preserve_and_reset_blocked_worktree,
     _prepare_subtasks_with_discovery,
     _pr_candidate_edit_goal,
     _pr_candidate_target_files,
@@ -29,6 +31,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _record_coding_run_contract,
     _record_review_policy,
 )
+from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.engine.prompts import build_worker_prompt
 
 
@@ -500,13 +503,48 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
     def test_integration_blocker_detects_semantic_failure_with_zero_exit(self) -> None:
         result = {
             "returncode": 0,
-            "stdout": '{"status":"blocked","approved":false,"blockers":["missing PR"]}',
+            "stdout": (
+                '{"status":"blocked","approved":false,'
+                '"summary":"Duplicate findLast import remains.",'
+                '"blockers":["missing PR"]}'
+            ),
         }
 
-        self.assertEqual(
-            _integration_blocker_message(result),
-            "Integration review did not approve the worker result.",
-        )
+        message = _integration_blocker_message(result)
+
+        self.assertIsNotNone(message)
+        self.assertIn("Integration review did not approve", message or "")
+        self.assertIn("Duplicate findLast import remains", message or "")
+        self.assertIn("missing PR", message or "")
+
+    def test_preserve_and_reset_blocked_worktree_cleans_synced_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem.invalid", "commit", "-m", "init"])
+            (repo / "README.md").write_text("after\n", encoding="utf-8")
+            (repo / "scratch.txt").write_text("temp\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                repo_path=repo,
+                cfg=SimpleNamespace(env={}),
+                layout={"artifacts": artifacts},
+                blackboard={},
+            )
+
+            _preserve_and_reset_blocked_worktree(ctx, reason="test")
+
+            self.assertEqual((repo / "README.md").read_text(encoding="utf-8"), "before\n")
+            self.assertFalse((repo / "scratch.txt").exists())
+            patch_text = (artifacts / "blocked-working-diff.patch").read_text(encoding="utf-8")
+            self.assertIn("-before", patch_text)
+            self.assertIn("+after", patch_text)
+            self.assertIn("blocked_worktree_cleanup", ctx.blackboard)
 
     def test_manager_prompt_includes_previous_feedback_for_repairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

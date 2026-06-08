@@ -156,7 +156,13 @@ def sdk_create_session(
         }
         if temperature is not None and _sessions_create_supports_temperature(client.sessions.create):
             kwargs["temperature"] = temperature
-        return client.sessions.create(**kwargs)
+        try:
+            return client.sessions.create(**kwargs)
+        except TypeError as exc:
+            if "temperature" not in kwargs or "temperature" not in str(exc):
+                raise
+            kwargs.pop("temperature", None)
+            return client.sessions.create(**kwargs)
 
     return with_sync_tandem_client(cfg, _create)
 

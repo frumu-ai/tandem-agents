@@ -79,6 +79,21 @@ class SdkCreateSessionPassthroughTest(unittest.TestCase):
         self._call(client, None)
         self.assertIsNone(captured.get("temperature"))
 
+    def test_retries_without_temperature_when_sdk_rejects_kwargs(self) -> None:
+        captured: list[dict] = []
+
+        def create(**kwargs):
+            captured.append(dict(kwargs))
+            if "temperature" in kwargs:
+                raise TypeError("_Sessions.create() got an unexpected keyword argument 'temperature'")
+            return "session-1"
+
+        client = SimpleNamespace(sessions=SimpleNamespace(create=create))
+
+        self.assertEqual(self._call(client, 0.0), "session-1")
+        self.assertIn("temperature", captured[0])
+        self.assertNotIn("temperature", captured[1])
+
 
 class TandemClientSdkEventTextTest(unittest.TestCase):
     def test_extracts_message_part_updated_text(self) -> None:
