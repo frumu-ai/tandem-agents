@@ -57,7 +57,67 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
         ctx.run_id,
     )
 
-    # Step 2: Final status
+    # Step 2: Update blackboard
+    ctx.blackboard["artifacts"].extend([
+        str(ctx.layout["summary"]),
+        str(ctx.layout["status"]),
+        str(ctx.layout["events"]),
+    ])
+    ctx.blackboard["workers"] = ctx.worker_results
+    ctx.blackboard["review"] = ctx.review_result
+    ctx.blackboard["test"] = ctx.test_result
+
+    # Step 3: Push + PR creation. A code-edit run is not complete until the
+    # branch is pushed and the PR creation outbox produces a PR URL.
+    if commit_info:
+        ctx.blackboard["commit"] = commit_info
+        _rc._append_blackboard_note(
+            ctx.blackboard,
+            f"Committed validated changes as `{commit_info['commit'][:7]}`.",
+        )
+        if push_repository_changes(ctx.cfg, ctx.repo_path, ctx.branch_name):
+            _rc._append_blackboard_note(
+                ctx.blackboard,
+                f"Pushed branch `{ctx.branch_name}` to remote.",
+            )
+            if not _enqueue_and_dispatch_pr(ctx, final_diff_snapshot):
+                _rc._append_blackboard_note(
+                    ctx.blackboard,
+                    "Blocked: GitHub PR creation did not return a pull request URL.",
+                )
+                save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+                write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+                return _block_finalization_failure(
+                    ctx,
+                    kind="pull_request_missing",
+                    message=(
+                        "ACA committed and pushed the branch, but GitHub PR creation "
+                        "did not return a pull request URL. The task cannot be marked "
+                        "complete without a reviewable PR."
+                    ),
+                )
+        else:
+            _rc._append_blackboard_note(
+                ctx.blackboard,
+                f"Warning: Failed to push branch `{ctx.branch_name}`.",
+            )
+            logger.warning("Failed to push branch %s (run_id=%s)", ctx.branch_name, ctx.run_id)
+            save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+            write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+            return _block_finalization_failure(
+                ctx,
+                kind="push_failed",
+                message=(
+                    f"ACA committed local changes as `{commit_info['commit'][:7]}`, "
+                    f"but failed to push branch `{ctx.branch_name}`. No pull request "
+                    "was created, so the task remains blocked."
+                ),
+            )
+
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+
+    # Step 4: Final completed status
     ctx.status = set_status(
         ctx.status,
         ctx.layout,
@@ -100,39 +160,6 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
     from src.tandem_agents.runtime.run_output import write_board_snapshot
     save_board(ctx.board_path, ctx.board)
     write_board_snapshot(ctx.run_dir, ctx.board)
-
-    # Step 3: Update blackboard
-    ctx.blackboard["artifacts"].extend([
-        str(ctx.layout["summary"]),
-        str(ctx.layout["status"]),
-        str(ctx.layout["events"]),
-    ])
-    ctx.blackboard["workers"] = ctx.worker_results
-    ctx.blackboard["review"] = ctx.review_result
-    ctx.blackboard["test"] = ctx.test_result
-
-    # Step 4: Push + PR creation
-    if commit_info:
-        ctx.blackboard["commit"] = commit_info
-        _rc._append_blackboard_note(
-            ctx.blackboard,
-            f"Committed validated changes as `{commit_info['commit'][:7]}`.",
-        )
-        if push_repository_changes(ctx.cfg, ctx.repo_path, ctx.branch_name):
-            _rc._append_blackboard_note(
-                ctx.blackboard,
-                f"Pushed branch `{ctx.branch_name}` to remote.",
-            )
-            _enqueue_and_dispatch_pr(ctx, final_diff_snapshot)
-        else:
-            _rc._append_blackboard_note(
-                ctx.blackboard,
-                f"Warning: Failed to push branch `{ctx.branch_name}`.",
-            )
-            logger.warning("Failed to push branch %s (run_id=%s)", ctx.branch_name, ctx.run_id)
-
-    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
-    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
 
     # Step 5: Final summary
     save_run_text(
@@ -213,7 +240,7 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _enqueue_and_dispatch_pr(ctx: RunContext, final_diff_snapshot: str) -> None:
+def _enqueue_and_dispatch_pr(ctx: RunContext, final_diff_snapshot: str) -> bool:
     """Enqueue a github_pull_request.create outbox event and dispatch it now."""
     from src.tandem_agents.core.execution import runner_core as _rc
     from src.tandem_agents.runtime.runstate import append_event, write_status
@@ -281,3 +308,37 @@ def _enqueue_and_dispatch_pr(ctx: RunContext, final_diff_snapshot: str) -> None:
                 {"url": pr_url, "pull_request": pull_request},
             )
             logger.info("Pull request created: %s (run_id=%s)", pr_url, ctx.run_id)
+            return True
+    return False
+
+
+def _block_finalization_failure(
+    ctx: RunContext,
+    *,
+    kind: str,
+    message: str,
+) -> dict[str, Any]:
+    from src.tandem_agents.core.execution import runner_core as _rc
+    from src.tandem_agents.core.execution.run_lifecycle import block_run
+    from src.tandem_agents.core.repository.board import save_board
+    from src.tandem_agents.runtime.run_output import write_board_snapshot
+
+    _rc._move_task_card_if_present(ctx.board, ctx.task, "blocked", "manager", kind)
+    save_board(ctx.board_path, ctx.board)
+    write_board_snapshot(ctx.run_dir, ctx.board)
+    return block_run(
+        run_id=ctx.run_id,
+        run_dir=ctx.run_dir,
+        layout=ctx.layout,
+        cfg=ctx.cfg,
+        task=ctx.task,
+        repo=ctx.repo,
+        engine=ctx.engine,
+        phase="handoff",
+        kind=kind,
+        message=message,
+        phase_detail=message,
+        coordination=ctx.coordination,
+        worker_results=ctx.worker_results,
+        existing_status=ctx.status,
+    )

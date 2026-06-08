@@ -17,6 +17,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _auto_approve_loop,
     _execute_local_worker_pool,
     _has_unresolved_write_required_worker_failure,
+    _integration_blocker_message,
     _linear_comment_task_summary,
     _permission_requests_from_payload,
     _prepare_subtasks_with_discovery,
@@ -495,6 +496,17 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(blackboard["workers"]), 1)
         self.assertEqual(worker_results[0]["status"], "completed")
         self.assertEqual(blackboard["workers"][0]["status"], "completed")
+
+    def test_integration_blocker_detects_semantic_failure_with_zero_exit(self) -> None:
+        result = {
+            "returncode": 0,
+            "stdout": '{"status":"blocked","approved":false,"blockers":["missing PR"]}',
+        }
+
+        self.assertEqual(
+            _integration_blocker_message(result),
+            "Integration review did not approve the worker result.",
+        )
 
     def test_manager_prompt_includes_previous_feedback_for_repairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
