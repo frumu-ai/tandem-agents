@@ -273,7 +273,11 @@ def _execute_linear_tool(cfg: ResolvedConfig, aliases: list[str], args: dict[str
     tried: set[str] = set()
     for alias in aliases:
         for variant in _alias_variants(alias):
-            tool_id = _resolve_linear_tool_id(cfg, [variant])
+            try:
+                tool_id = _resolve_linear_tool_id(cfg, [variant])
+            except RuntimeError as exc:
+                last_error = exc
+                continue
             if tool_id in tried:
                 continue
             tried.add(tool_id)
@@ -603,20 +607,22 @@ def linear_update_issue(cfg: ResolvedConfig, task: dict[str, Any], fields: dict[
         or clean_fields.get("stateName")
     )
     labels_value = clean_fields.get("labels") or clean_fields.get("label_names") or clean_fields.get("labelNames")
-    field_variants: list[dict[str, Any]] = [clean_fields]
+    field_variants: list[dict[str, Any]] = []
+    if status_value:
+        field_variants.append({"state": status_value})
     if status_value and labels_value:
         field_variants.extend(
             [
-                {"status": status_value, "labels": labels_value},
                 {"state": status_value, "labels": labels_value},
+                {"status": status_value, "labels": labels_value},
                 {"stateName": status_value, "labelNames": labels_value},
             ]
         )
     if status_value:
         field_variants.extend(
             [
-                {"status": status_value},
                 {"state": status_value},
+                {"status": status_value},
                 {"state_name": status_value},
                 {"stateName": status_value},
             ]
@@ -629,6 +635,7 @@ def linear_update_issue(cfg: ResolvedConfig, task: dict[str, Any], fields: dict[
                 {"labelNames": labels_value},
             ]
         )
+    field_variants.append(clean_fields)
     deduped_variants: list[dict[str, Any]] = []
     seen_variants: set[str] = set()
     for variant in field_variants:

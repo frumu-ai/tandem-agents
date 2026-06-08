@@ -8,12 +8,14 @@ from unittest.mock import patch
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.integrations.linear_mcp import (
     _resolve_linear_tool_id,
+    _execute_linear_tool,
     _tool_failed,
     ensure_linear_mcp_connected,
     linear_count_issues,
     linear_fetch_issue,
     linear_list_comments,
     linear_list_issues,
+    linear_update_issue,
 )
 
 
@@ -160,6 +162,54 @@ class LinearMcpIntegrationTest(unittest.TestCase):
                 patch("src.tandem_agents.core.integrations.linear_mcp.time.time", side_effect=[0.0, 11.0]):
                 with self.assertRaisesRegex(RuntimeError, "not connected: Authorization required"):
                     ensure_linear_mcp_connected(cfg)
+
+    def test_execute_linear_tool_skips_missing_alias_and_tries_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            calls: list[str] = []
+
+            def fake_execute(_cfg, tool_id, args):
+                calls.append(tool_id)
+                return {"metadata": {"result": {"ok": True}}}
+
+            with patch(
+                "src.tandem_agents.core.integrations.linear_mcp.list_engine_tool_ids",
+                return_value=["mcp.linear.save_issue"],
+            ), patch(
+                "src.tandem_agents.core.integrations.linear_mcp.get_mcp_server",
+                return_value={"connected": True, "last_error": ""},
+            ), patch(
+                "src.tandem_agents.core.integrations.linear_mcp.execute_engine_tool",
+                side_effect=fake_execute,
+            ):
+                result = _execute_linear_tool(
+                    cfg,
+                    ["update_issue", "save_issue"],
+                    {"id": "TAN-111", "state": "Todo"},
+                )
+
+            self.assertEqual(calls, ["mcp.linear.save_issue"])
+            self.assertEqual(result["metadata"]["result"]["ok"], True)
+
+    def test_linear_update_issue_tries_state_only_payload_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            calls: list[dict[str, object]] = []
+
+            def fake_execute(_cfg, aliases, args):
+                calls.append(args)
+                return {"metadata": {"result": {"ok": True}}}
+
+            task = {"source": {"type": "linear", "issue_id": "TAN-111", "identifier": "TAN-111"}}
+            with patch("src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool", side_effect=fake_execute):
+                warning = linear_update_issue(
+                    cfg,
+                    task,
+                    {"status": "Todo", "state": "Todo", "state_name": "Todo"},
+                )
+
+            self.assertIsNone(warning)
+            self.assertEqual(calls[0], {"id": "TAN-111", "state": "Todo"})
 
     def test_linear_list_comments_uses_issue_id_and_parses_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
