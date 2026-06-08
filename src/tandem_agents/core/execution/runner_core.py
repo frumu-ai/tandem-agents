@@ -2236,6 +2236,9 @@ def _run_once_internal_impl(
 
         if integration_result["returncode"] != 0:
             return _block_integration_failed(ctx)
+        integration_blocker = _integration_blocker_message(integration_result)
+        if integration_blocker:
+            return _block_integration_failed(ctx, integration_blocker)
 
         # 4f. No-diff / no-proof repair check
         ctx.pending_diff_snapshot = git_diff_stat(ctx.repo_path)
@@ -2262,6 +2265,8 @@ def _run_once_internal_impl(
             if attempt < max_loops - 1:
                 previous_feedback = build_retry_feedback(ctx, attempt, verification)
                 continue
+            return _block_verification_failed(ctx, verification)
+        if getattr(verification, "outcome", "pass") != "pass":
             return _block_verification_failed(ctx, verification)
 
         # 4h. Finalize (happy path)
@@ -2310,6 +2315,28 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
         log_path=ctx.layout["logs"] / "manager-integration.log",
         config_path=None,
     )
+
+
+def _integration_blocker_message(integration_result: dict[str, Any]) -> str | None:
+    payload = _extract_json(str(integration_result.get("stdout") or "")) or {}
+    if not payload:
+        return None
+    status = _normalized_text(payload.get("status") or payload.get("outcome") or payload.get("result"))
+    next_action = _normalized_text(payload.get("next_action") or payload.get("action"))
+    approved = payload.get("approved")
+    blockers = payload.get("blockers")
+    required_fixes = payload.get("required_fixes")
+    if approved is False:
+        return "Integration review did not approve the worker result."
+    if status in {"blocked", "failed", "fail", "repair_needed", "needs_changes", "incomplete"}:
+        return f"Integration review reported `{status}`."
+    if next_action in {"blocked", "repair_needed", "needs_changes", "retry", "fix_required"}:
+        return f"Integration review requested `{next_action}`."
+    if blockers:
+        return "Integration review reported blockers."
+    if required_fixes:
+        return "Integration review reported required fixes."
+    return None
 
 
 def _linear_comment_task_summary(task: dict[str, Any]) -> str:
@@ -2870,7 +2897,7 @@ def _block_worker_failure(ctx: "_PhaseRunContext") -> dict[str, Any]:
     return ctx.make_result()
 
 
-def _block_integration_failed(ctx: "_PhaseRunContext") -> dict[str, Any]:
+def _block_integration_failed(ctx: "_PhaseRunContext", message: str | None = None) -> dict[str, Any]:
     """Return a blocked-run result when the integration prompt failed."""
     from src.tandem_agents.runtime.run_output import (
         build_blocked_summary, save_run_text, set_status, write_board_snapshot, write_blackboard_snapshot
@@ -2878,27 +2905,28 @@ def _block_integration_failed(ctx: "_PhaseRunContext") -> dict[str, Any]:
     from src.tandem_agents.core.repository.board import save_board
     from src.tandem_agents.runtime.runstate import save_blackboard
 
+    blocker_message = message or "Integration prompt failed after worker completion."
     ctx.status = set_status(
         ctx.status, ctx.layout, phase="handoff",
-        phase_detail="integration failed", run_status="blocked",
-        blocker=(True, "manager", "Integration prompt failed", "manager"),
+        phase_detail=blocker_message, run_status="blocked",
+        blocker=(True, "integration", blocker_message, "manager"),
     )
     _touch_coordination(ctx.coordination, run_id=ctx.run_id, lease_id=ctx.lease_id,
                         lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
-                        status="blocked", phase="handoff", error="Integration prompt failed")
+                        status="blocked", phase="handoff", error=blocker_message)
     _move_task_card_if_present(ctx.board, ctx.task, "blocked", "manager", "integration failure")
     save_board(ctx.board_path, ctx.board)
     write_board_snapshot(ctx.run_dir, ctx.board)
     write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
     save_run_text(ctx.layout["summary"], build_blocked_summary(
-        task_title=ctx.task["title"], message="Integration prompt failed after worker completion.",
+        task_title=ctx.task["title"], message=blocker_message,
     ))
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,
-                          outcome="blocked", summary="Integration prompt failed after worker completion.",
+                          outcome="blocked", summary=blocker_message,
                           review_returncode=None, test_returncode=None,
                           coordination=ctx.coordination)
-    append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "integration"})
+    append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "integration", "detail": blocker_message})
     return ctx.make_result()
 
 
