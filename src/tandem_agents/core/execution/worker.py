@@ -359,6 +359,51 @@ def _diff_touches_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
     return bool(changed.intersection(targets))
 
 
+def _worktree_changed_files(worktree: Path) -> list[str]:
+    result = run_command(["git", "-C", str(worktree), "status", "--short", "--untracked-files=all"])
+    if result.returncode != 0:
+        return []
+    changed: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        path = raw_line[3:].strip() if len(raw_line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path and not path.startswith(".aca/"):
+            changed.append(path)
+    return changed
+
+
+def _recover_nonzero_result_with_diff(
+    result: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    changed_files = _worktree_changed_files(worktree)
+    diff_text = git_diff_stat(worktree).strip()
+    if result.get("returncode", 0) == 0 or not diff_text or not changed_files:
+        return result
+    stdout_text = str(result.get("stdout") or "")
+    message = (
+        f"Worker returned a nonzero status ({reason}), but filesystem changes were detected. "
+        "Treating as success.\n"
+    )
+    log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
+    result["stdout"] = f"{stdout_text}{message}"
+    result["returncode"] = 0
+    result["recovered_success"] = True
+    result["recovered_failure_reason"] = result.get("failure_reason") or reason
+    result.pop("failure_reason", None)
+    result.pop("blocker_kind", None)
+    result.pop("recovery_action", None)
+    result["changed_files"] = changed_files
+    result["diff_stat"] = diff_text
+    return result
+
+
 def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]:
     if not worktree.exists():
         return False, f"worktree path does not exist: {worktree}"
@@ -455,15 +500,12 @@ def _coerce_worker_failure(
             readable_targets = _readable_target_files(worktree, subtask)
             diff_touches_targets = _diff_touches_target_files(worktree, subtask)
     if result.get("returncode", 0) != 0 and diff_text and (targets_exist or diff_touches_targets):
-        message = (
-            "Worker returned a nonzero status, but filesystem changes were detected in declared target files. "
-            "Treating as success.\n"
+        return _recover_nonzero_result_with_diff(
+            result,
+            log_path,
+            worktree,
+            reason="target file diff",
         )
-        log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
-        result["stdout"] = f"{stdout_text}{message}"
-        result["returncode"] = 0
-        result["recovered_success"] = True
-        return result
     if (
         result.get("returncode", 0) != 0
         and readable_targets
@@ -768,11 +810,7 @@ def summarize_worker_notes(
     index: int,
 ) -> dict[str, Any]:
     diff_stat = git_diff_stat(worktree).strip()
-    changed_files = [
-        line.split("|", 1)[0].strip()
-        for line in diff_stat.splitlines()
-        if "|" in line and " file changed" not in line and " files changed" not in line
-    ]
+    changed_files = list(result.get("changed_files") or _worktree_changed_files(worktree))
     return {
         "worker_id": worker_id,
         "subtask_index": index,
@@ -930,6 +968,13 @@ def run_worker_subtask(
             subtask,
             require_filesystem_changes=require_filesystem_changes,
         )
+        if retry_result["returncode"] != 0:
+            retry_result = _recover_nonzero_result_with_diff(
+                retry_result,
+                log_path,
+                worktree,
+                reason=str(retry_result.get("failure_reason") or "retry produced diff"),
+            )
         if retry_result["returncode"] == 0:
             result = retry_result
             

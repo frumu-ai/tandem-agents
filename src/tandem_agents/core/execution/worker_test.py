@@ -11,6 +11,7 @@ from src.tandem_agents.core.execution.worker import (
     _extract_prompt_sync_text,
     _extract_session_reply,
     _materialize_worker_context,
+    _recover_nonzero_result_with_diff,
     _worker_prompt_retry_suffix,
     run_worker_subtask,
     stream_tandem_prompt,
@@ -179,6 +180,43 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(result["returncode"], 0)
             self.assertTrue(result["recovered_success"])
+
+    def test_recover_nonzero_result_with_diff_clears_blocker_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            log_path = worktree / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+            subprocess_result = mock.Mock(
+                returncode=0,
+                stdout=" M src/existing.ts\n?? .aca/pr_candidate_context.json\n",
+                stderr="",
+            )
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.git_diff_stat",
+                return_value=" M src/existing.ts",
+            ), mock.patch(
+                "src.tandem_agents.core.execution.worker.run_command",
+                return_value=subprocess_result,
+            ):
+                result = _recover_nonzero_result_with_diff(
+                    {
+                        "returncode": 1,
+                        "stdout": "ENGINE_ERROR: ENGINE_DISPATCH_FAILED: iteration budget\n",
+                        "failure_reason": "ENGINE_ERROR: ENGINE_DISPATCH_FAILED: iteration budget",
+                        "blocker_kind": "engine_dispatch_failed",
+                        "recovery_action": "retry",
+                    },
+                    log_path,
+                    worktree,
+                    reason="retry produced diff",
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertTrue(result["recovered_success"])
+            self.assertEqual(result["changed_files"], ["src/existing.ts"])
+            self.assertNotIn("failure_reason", result)
+            self.assertNotIn("blocker_kind", result)
 
     def test_empty_async_stream_recovers_text_from_run_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
