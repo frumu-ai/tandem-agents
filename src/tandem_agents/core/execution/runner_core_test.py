@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from textwrap import dedent
 
@@ -12,6 +14,7 @@ from src.tandem_agents.core.verification.coding_run_contract import build_coding
 from src.tandem_agents.core.engine.prompts import build_manager_prompt
 from src.tandem_agents.core.execution.runner_core import (
     _all_subtasks_verified_existing,
+    _auto_approve_loop,
     _execute_local_worker_pool,
     _has_unresolved_write_required_worker_failure,
     _linear_comment_task_summary,
@@ -27,6 +30,31 @@ from src.tandem_agents.core.engine.prompts import build_worker_prompt
 
 
 class RunnerCoreDiscoveryTest(unittest.TestCase):
+    def _config(self, root: Path):
+        (root / "agent.yaml").write_text(
+            dedent(
+                """
+                agent:
+                  name: ACA
+                tandem:
+                  base_url: http://127.0.0.1:39733
+                task_source:
+                  type: manual
+                  prompt: Permission test
+                repository:
+                  slug: frumu-ai/example
+                provider:
+                  id: openai
+                  model: gpt-4.1-mini
+                output:
+                  root: runs
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        return resolve_config(root)
+
     def test_permission_requests_from_payload_accepts_engine_requests_shape(self) -> None:
         payload = {
             "requests": [
@@ -55,6 +83,37 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             _permission_requests_from_payload(payload),
             [{"request_id": "req-1", "status": "pending", "permission": "bash"}],
         )
+
+    def test_auto_approve_loop_replies_to_pending_engine_permissions(self) -> None:
+        stop_event = threading.Event()
+        replied: list[tuple[str, str]] = []
+
+        def fake_sleep(_seconds: float) -> None:
+            stop_event.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch(
+                "src.tandem_agents.core.execution.runner_core.sdk_agent_teams_list_approvals",
+                return_value={"approvals": []},
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core.list_engine_permissions",
+                return_value={
+                    "requests": [
+                        {
+                            "id": "perm-1",
+                            "status": "pending",
+                            "permission": "apply_patch",
+                        }
+                    ]
+                },
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core.reply_engine_permission",
+                side_effect=lambda _cfg, request_id, reply: replied.append((request_id, reply)) or {"ok": True},
+            ), patch("src.tandem_agents.core.execution.runner_core.time.sleep", side_effect=fake_sleep):
+                _auto_approve_loop(cfg, stop_event)
+
+        self.assertEqual(replied, [("perm-1", "allow")])
 
     def test_empty_manager_plan_still_injects_discovered_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

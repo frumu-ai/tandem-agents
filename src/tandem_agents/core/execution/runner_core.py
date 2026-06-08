@@ -20,7 +20,22 @@ from src.tandem_agents.core.engine.coder_backend import (
     coder_workflow_supported,
     execute_coder_run,
 )
-from src.tandem_agents.core.engine.engine import checkout_run_branch, commit_repository_changes, effective_tandem_provider, engine_env, engine_health, engine_visible_path, ensure_engine, git_diff_stat, push_repository_changes, resolve_repository, task_run_branch_name, write_provider_override_config
+from src.tandem_agents.core.engine.engine import (
+    checkout_run_branch,
+    commit_repository_changes,
+    effective_tandem_provider,
+    engine_env,
+    engine_health,
+    engine_visible_path,
+    ensure_engine,
+    git_diff_stat,
+    list_engine_permissions,
+    push_repository_changes,
+    reply_engine_permission,
+    resolve_repository,
+    task_run_branch_name,
+    write_provider_override_config,
+)
 from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.integrations.github_mcp import (
     add_issue_comment,
@@ -112,8 +127,6 @@ from src.tandem_agents.core.execution.worker import run_worker_subtask, stream_t
 from src.tandem_agents.core.engine.tandem_client_sdk import (
     sdk_agent_teams_list_approvals,
     sdk_agent_teams_approve_spawn,
-    sdk_list_permissions,
-    sdk_reply_permission,
 )
 
 logger = logging.getLogger("aca.runner_core")
@@ -1701,13 +1714,13 @@ def _auto_approve_loop(cfg: ResolvedConfig, stop_event: threading.Event) -> None
                         logger.warning("Failed to auto-approve spawn %s", ap_id, exc_info=True)
 
             # 2. Handle general permissions (bash, write, etc)
-            permissions_payload = sdk_list_permissions(cfg)
+            permissions_payload = list_engine_permissions(cfg)
             for perm in _permission_requests_from_payload(permissions_payload):
                 request_id = str(perm.get("request_id") or perm.get("id") or "")
                 status = str(perm.get("status") or "").strip().lower()
                 if request_id and status == "pending" and request_id not in seen_permissions:
                     try:
-                        sdk_reply_permission(cfg, request_id, "allow")
+                        reply_engine_permission(cfg, request_id, "allow")
                         seen_permissions.add(request_id)
                     except Exception:
                         logger.warning("Failed to auto-approve permission %s", request_id, exc_info=True)
