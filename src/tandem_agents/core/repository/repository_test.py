@@ -15,11 +15,14 @@ from src.tandem_agents.core.repository.repository import (
     _git_clone_args_and_env,
     _git_repo_args,
     _github_pat,
+    checkout_run_branch,
+    current_repository_branch,
     fetch_pr_refs,
     git_diff_stat,
     git_working_diff,
     list_worktree_changes,
     pr_head_ref,
+    push_repository_changes,
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
@@ -538,6 +541,36 @@ class RepositoryNamingTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "uncommitted changes"):
                 resolve_repository(cfg)
+
+    def test_checkout_run_branch_fails_when_default_checkout_is_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "checkout"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("one\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "one"])
+            (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+            cfg = _config_for_repo(root, repo)
+
+            with self.assertRaisesRegex(RuntimeError, "uncommitted changes"):
+                checkout_run_branch(cfg, repo, "aca/test-run")
+
+            self.assertEqual(current_repository_branch(repo, cfg=cfg), "main")
+
+    def test_push_repository_changes_refuses_wrong_current_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "checkout"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("one\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "one"])
+            cfg = _config_for_repo(root, repo)
+
+            self.assertFalse(push_repository_changes(cfg, repo, "aca/test-run"))
 
 
 if __name__ == "__main__":
