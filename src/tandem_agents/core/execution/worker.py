@@ -348,6 +348,17 @@ def _wait_for_target_files(worktree: Path, subtask: dict[str, Any], timeout_seco
         time.sleep(0.25)
 
 
+def _diff_touches_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
+    targets = set(_subtask_targets(subtask))
+    if not targets:
+        return False
+    result = run_command(["git", "-C", str(worktree), "diff", "--name-only"])
+    if result.returncode != 0:
+        return False
+    changed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return bool(changed.intersection(targets))
+
+
 def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]:
     if not worktree.exists():
         return False, f"worktree path does not exist: {worktree}"
@@ -435,14 +446,19 @@ def _coerce_worker_failure(
     targets_exist = _target_files_exist(worktree, subtask)
     readable_targets = _readable_target_files(worktree, subtask)
     diff_text = git_diff_stat(worktree).strip()
+    diff_touches_targets = _diff_touches_target_files(worktree, subtask)
     if result.get("returncode", 0) != 0 and (not targets_exist or not diff_text):
         recovered, recovered_diff = _wait_for_target_files(worktree, subtask)
         if recovered:
             targets_exist = True
             diff_text = recovered_diff
             readable_targets = _readable_target_files(worktree, subtask)
-    if result.get("returncode", 0) != 0 and diff_text and targets_exist:
-        message = "Worker returned a nonzero status, but target files exist and filesystem changes were detected. Treating as success.\n"
+            diff_touches_targets = _diff_touches_target_files(worktree, subtask)
+    if result.get("returncode", 0) != 0 and diff_text and (targets_exist or diff_touches_targets):
+        message = (
+            "Worker returned a nonzero status, but filesystem changes were detected in declared target files. "
+            "Treating as success.\n"
+        )
         log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
         result["stdout"] = f"{stdout_text}{message}"
         result["returncode"] = 0
