@@ -400,20 +400,45 @@ def resolve_repository(cfg: ResolvedConfig) -> dict[str, Any]:
 
 def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> str:
     """Creates and checkouts a new branch for the run."""
-    # Ensure we are on the default branch and it's clean
-    run_command(_git_repo_args(repo_path, "checkout", cfg.repository.default_branch), env=cfg.env)
-    
-    # Create and checkout new branch
-    result = run_command(_git_repo_args(repo_path, "checkout", "-b", branch_name), env=cfg.env)
-    if result.returncode != 0:
-        # If branch exists, just checkout
-        run_command(_git_repo_args(repo_path, "checkout", branch_name), env=cfg.env)
-    
+    default_branch = cfg.repository.default_branch or "main"
+    checkout_default = run_command(_git_repo_args(repo_path, "checkout", default_branch), env=cfg.env)
+    if checkout_default.returncode != 0:
+        raise RuntimeError(checkout_default.stderr.strip() or checkout_default.stdout.strip())
+
+    status = run_command(_git_repo_args(repo_path, "status", "--porcelain"), env=cfg.env)
+    if status.returncode != 0:
+        raise RuntimeError(status.stderr.strip() or status.stdout.strip())
+    if status.stdout.strip():
+        raise RuntimeError(f"Repository has uncommitted changes before run branch checkout: {repo_path}")
+
+    create_result = run_command(_git_repo_args(repo_path, "checkout", "-b", branch_name), env=cfg.env)
+    if create_result.returncode != 0:
+        checkout_existing = run_command(_git_repo_args(repo_path, "checkout", branch_name), env=cfg.env)
+        if checkout_existing.returncode != 0:
+            detail = checkout_existing.stderr.strip() or checkout_existing.stdout.strip()
+            create_detail = create_result.stderr.strip() or create_result.stdout.strip()
+            raise RuntimeError(
+                f"Could not checkout ACA run branch `{branch_name}`: {detail or create_detail}"
+            )
+
+    current = current_repository_branch(repo_path, cfg=cfg)
+    if current != branch_name:
+        raise RuntimeError(
+            f"ACA expected to run on branch `{branch_name}` but repository is on `{current or 'unknown'}`."
+        )
     return branch_name
+
+
+def current_repository_branch(repo_path: Path, *, cfg: ResolvedConfig | None = None) -> str:
+    env = cfg.env if cfg is not None else None
+    result = run_command(_git_repo_args(repo_path, "rev-parse", "--abbrev-ref", "HEAD"), env=env)
+    return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def push_repository_changes(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> bool:
     """Pushes the current branch to the remote."""
+    if current_repository_branch(repo_path, cfg=cfg) != branch_name:
+        return False
     remote_name = cfg.repository.remote_name or "origin"
     result = run_command(_git_repo_args(repo_path, "push", "-u", remote_name, branch_name), env=cfg.env)
     return result.returncode == 0
