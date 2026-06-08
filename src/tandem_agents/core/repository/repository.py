@@ -484,7 +484,62 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        _rewrite_worktree_gitdir_for_engine(worktree_path)
         return worktree_path.resolve()
+
+
+def _aca_root() -> Path:
+    return Path(os.environ.get("ACA_ROOT") or "/workspace/tandem-agents").resolve()
+
+
+def _engine_host_root() -> Path | None:
+    raw = str(os.environ.get("ACA_ENGINE_HOST_ROOT") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _map_path_prefix(path: Path, source: Path, target: Path) -> Path:
+    text = str(path)
+    source_text = str(source).rstrip("/")
+    if text == source_text:
+        return target
+    prefix = f"{source_text}/"
+    if text.startswith(prefix):
+        return target / text[len(prefix):]
+    return path
+
+
+def _engine_visible_git_metadata_path(path: Path) -> Path:
+    """Map container git metadata paths to host-visible paths for engine tools."""
+    host_root = _engine_host_root()
+    if host_root is None:
+        return path
+    return _map_path_prefix(path, _aca_root(), host_root)
+
+
+def _rewrite_worktree_gitdir_for_engine(worktree_path: Path) -> None:
+    """Make worker worktree git metadata usable by the host-side Tandem engine."""
+    host_root = _engine_host_root()
+    if host_root is None:
+        return
+    git_file = worktree_path / ".git"
+    try:
+        text = git_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if not text.startswith("gitdir:"):
+        return
+    raw_git_dir = text.split(":", 1)[1].strip()
+    if not raw_git_dir:
+        return
+    git_dir = Path(raw_git_dir)
+    if not git_dir.is_absolute():
+        git_dir = (worktree_path / git_dir).resolve()
+    visible_git_dir = _engine_visible_git_metadata_path(git_dir)
+    if visible_git_dir == git_dir:
+        return
+    git_file.write_text(f"gitdir: {visible_git_dir}\n", encoding="utf-8")
 
 
 def _host_path_for_git_metadata(path: Path) -> Path:
@@ -495,8 +550,13 @@ def _host_path_for_git_metadata(path: Path) -> Path:
     .git files created in the container can therefore contain gitdir paths that
     are invalid from the host process.
     """
-    root_dir = Path(os.environ.get("ACA_ROOT") or ".").resolve()
+    root_dir = _aca_root()
     text = str(path)
+    host_root = _engine_host_root()
+    if host_root is not None:
+        mapped = _map_path_prefix(path, host_root, root_dir)
+        if mapped != path:
+            return mapped
     prefix = "/workspace/tandem-agents/"
     if text.startswith(prefix):
         return root_dir / text[len(prefix):]
@@ -527,6 +587,19 @@ def _git_command_for_worktree(repo_path: Path, *args: str) -> list[str]:
     if git_dir is None or not git_dir.exists():
         return _git_repo_args(repo_path, *args)
     return ["git", "-c", f"safe.directory={repo_path}", f"--git-dir={git_dir}", f"--work-tree={repo_path}", *args]
+
+
+def git_command_for_worktree(repo_path: Path, *args: str) -> list[str]:
+    """Build a git command that works for ACA and host-visible worktree metadata."""
+
+    return _git_command_for_worktree(repo_path, *args)
+
+
+def git_worktree_preflight(repo_path: Path) -> tuple[bool, str]:
+    result = run_command(_git_command_for_worktree(repo_path, "rev-parse", "--git-dir"))
+    if result.returncode != 0:
+        return False, result.stderr.strip() or result.stdout.strip() or "worktree git preflight failed"
+    return True, result.stdout.strip()
 
 
 def _is_internal_worktree_artifact(path_text: str) -> bool:

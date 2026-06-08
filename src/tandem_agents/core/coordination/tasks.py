@@ -103,6 +103,7 @@ class CoordinationTasksMixin:
         host_id: str | None = None,
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
+        clear_claim: bool = False,
     ) -> None:
         row = conn.execute("SELECT * FROM tasks WHERE task_key = ?", (task_key,)).fetchone()
         if row is None:
@@ -147,6 +148,47 @@ class CoordinationTasksMixin:
                 "UPDATE tasks SET updated_at_ms = ? WHERE task_key = ?",
                 (now, task_key),
             )
+        if clear_claim:
+            active_lease_rows = conn.execute(
+                "SELECT lease_id, worker_id FROM leases WHERE task_key = ? AND status = 'active'",
+                (task_key,),
+            ).fetchall()
+            if active_lease_rows:
+                conn.execute(
+                    """
+                    UPDATE leases
+                    SET status = 'stale',
+                        released_at_ms = ?,
+                        release_reason = ?
+                    WHERE task_key = ? AND status = 'active'
+                    """,
+                    (now, reason or "operator cleared task claim", task_key),
+                )
+                for lease_row in active_lease_rows:
+                    conn.execute(
+                        """
+                        UPDATE workers
+                        SET status = 'idle',
+                            current_lease_id = NULL,
+                            current_run_id = NULL,
+                            updated_at_ms = ?
+                        WHERE worker_id = ? AND current_lease_id = ?
+                        """,
+                        (now, lease_row["worker_id"], lease_row["lease_id"]),
+                    )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET claimed_run_id = NULL,
+                    claimed_lease_id = NULL,
+                    claimed_by = NULL,
+                    claimed_host_id = NULL,
+                    lease_expires_at_ms = NULL,
+                    updated_at_ms = ?
+                WHERE task_key = ?
+                """,
+                (now, task_key),
+            )
     def transition_task_state(
         self,
         task_key: str,
@@ -160,6 +202,7 @@ class CoordinationTasksMixin:
         host_id: str | None = None,
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
+        clear_claim: bool = False,
     ) -> dict[str, Any] | None:
         now = now_ms()
         with self.connection() as conn:
@@ -177,6 +220,7 @@ class CoordinationTasksMixin:
                 host_id=host_id,
                 reason=reason,
                 metadata=metadata,
+                clear_claim=clear_claim,
             )
         return self.get_task(task_key)
     def mark_task_claimed(

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.tandem_agents.core.repository.repo_truth import discover_repo_files, repo_context_summary, subtask_satisfied
+from src.tandem_agents.core.repository.repo_truth import (
+    discover_repo_files,
+    infer_command_checks,
+    repo_context_summary,
+    run_command_checks,
+    subtask_satisfied,
+)
 
 
 class RepoTruthDiscoveryTest(unittest.TestCase):
@@ -113,6 +121,67 @@ class RepoTruthDiscoveryTest(unittest.TestCase):
 
             self.assertIn("index.html", discovered)
             self.assertIn("styles.css", discovered)
+
+    def test_infers_package_build_and_smoke_verification_for_changed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            package_dir = repo_path / "packages" / "tandem-control-panel"
+            (package_dir / "src").mkdir(parents=True)
+            (package_dir / "package.json").write_text(
+                """
+                {
+                  "scripts": {
+                    "build": "vite build",
+                    "test:smoke": "node --test tests/smoke.test.mjs"
+                  }
+                }
+                """.strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (package_dir / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+
+            commands = infer_command_checks(
+                repo_path,
+                ["packages/tandem-control-panel/src/App.tsx"],
+                task={"acceptance_criteria": ["Run frontend lint/typecheck and relevant tests."]},
+            )
+
+            self.assertEqual(
+                commands,
+                [
+                    "pnpm -C packages/tandem-control-panel run build",
+                    "pnpm -C packages/tandem-control-panel run test:smoke",
+                ],
+            )
+
+    def test_infer_command_checks_ignores_files_without_package_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            (repo_path / "src").mkdir()
+            (repo_path / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+
+            self.assertEqual(infer_command_checks(repo_path, ["src/app.py"], task={}), [])
+
+    def test_run_command_checks_preserves_npm_global_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            completed = subprocess.CompletedProcess(
+                args=["/bin/bash", "-c", "pnpm --version"],
+                returncode=0,
+                stdout="10.23.0\n",
+                stderr="",
+            )
+
+            with patch("src.tandem_agents.core.repository.repo_truth.subprocess.run", return_value=completed) as run_mock:
+                results = run_command_checks(repo_path, ["pnpm --version"])
+
+            self.assertEqual(results[0]["status"], "pass")
+            args, kwargs = run_mock.call_args
+            self.assertEqual(args[0], ["/bin/bash", "-c", "pnpm --version"])
+            path_parts = kwargs["env"]["PATH"].split(os.pathsep)
+            self.assertIn("/home/node/npm/bin", path_parts)
+            self.assertNotIn("-lc", args[0])
 
 
 if __name__ == "__main__":

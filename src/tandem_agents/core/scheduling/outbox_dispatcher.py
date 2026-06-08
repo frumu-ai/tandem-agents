@@ -16,7 +16,6 @@ from src.tandem_agents.core.integrations.github_mcp import (
 from src.tandem_agents.core.integrations.linear_mcp import (
     build_linear_comment_body,
     ensure_linear_mcp_connected,
-    ensure_linear_mcp_disconnected,
     linear_update_issue,
     linear_add_comment,
     linear_comment_marker_present,
@@ -314,14 +313,12 @@ def dispatch_outbox_tick(
     github_needed = any(str(outbox.get("kind") or "").startswith("github_") for outbox in claimed)
     linear_needed = any(str(outbox.get("kind") or "").startswith("linear_") for outbox in claimed)
     github_connected = False
-    linear_connected = False
     try:
         if github_needed:
             ensure_github_mcp_connected(cfg)
             github_connected = True
         if linear_needed:
             ensure_linear_mcp_connected(cfg)
-            linear_connected = True
     except Exception as exc:
         error = str(exc).strip() or "Failed to connect MCP server"
         for outbox in claimed:
@@ -374,11 +371,6 @@ def dispatch_outbox_tick(
         if github_connected:
             try:
                 ensure_github_mcp_disconnected(cfg)
-            except Exception:
-                pass
-        if linear_connected:
-            try:
-                ensure_linear_mcp_disconnected(cfg)
             except Exception:
                 pass
 

@@ -35,14 +35,18 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         repo_blocker, validation_blocker.
     """
     from src.tandem_agents.core.engine.engine import (
-        effective_tandem_provider,
         engine_env,
+        engine_session_provider_model,
         git_diff_stat,
         git_working_diff,
     )
     from src.tandem_agents.core.execution.worker import stream_tandem_prompt
     from src.tandem_agents.core.engine.prompts import build_review_prompt, build_test_prompt
-    from src.tandem_agents.core.repository.repo_truth import deterministic_repo_validation, extract_command_checks
+    from src.tandem_agents.core.repository.repo_truth import (
+        deterministic_repo_validation,
+        extract_command_checks,
+        infer_command_checks,
+    )
     from src.tandem_agents.core.verification.coding_run_contract import build_coding_run_contract
     from src.tandem_agents.core.execution import runner_core as _rc
     from src.tandem_agents.runtime.runstate import append_event, save_blackboard
@@ -65,8 +69,15 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         if str(entry).strip()
     ]
     manager_command_checks = extract_command_checks(ctx.manager_plan)
+    worker_changed_files: list[str] = []
+    for result in ctx.worker_results:
+        for raw_path in _as_list(result.get("changed_files")):
+            rel_path = str(raw_path or "").strip()
+            if rel_path and rel_path not in worker_changed_files:
+                worker_changed_files.append(rel_path)
+    inferred_command_checks = infer_command_checks(ctx.repo_path, worker_changed_files, task=ctx.task)
     combined_command_checks: list[str] = []
-    for command in task_verification_commands + manager_command_checks:
+    for command in task_verification_commands + manager_command_checks + inferred_command_checks:
         if command not in combined_command_checks:
             combined_command_checks.append(command)
 
@@ -105,8 +116,9 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
 
     # --- Reviewer ---
     review_prompt = build_review_prompt(ctx.run_id, ctx.task, ctx.worker_results, repo_diff=repo_diff)
-    review_provider, review_model = ctx.cfg.provider_for_role("reviewer")
-    review_cli_provider = effective_tandem_provider(review_provider, ctx.cfg)
+    review_model_selection = engine_session_provider_model(ctx.cfg, "reviewer")
+    review_cli_provider = review_model_selection["provider"]
+    review_model = review_model_selection["model"]
     _rc._role_provider_override_config(
         cfg=ctx.cfg,
         layout=ctx.layout,
@@ -115,17 +127,18 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         model=review_model,
     )
     logger.info("Running reviewer prompt (run_id=%s)", ctx.run_id)
-    ctx.review_result = stream_tandem_prompt(
-        ctx.cfg,
-        role="reviewer",
-        prompt=review_prompt,
-        cwd=ctx.repo_path,
-        provider=review_cli_provider,
-        model=review_model,
-        env=engine_env(ctx.cfg),
-        log_path=ctx.layout["logs"] / "reviewer.log",
-        config_path=None,
-    )
+    with _rc._coordination_heartbeat(ctx, phase="review"):
+        ctx.review_result = stream_tandem_prompt(
+            ctx.cfg,
+            role="reviewer",
+            prompt=review_prompt,
+            cwd=ctx.repo_path,
+            provider=review_cli_provider,
+            model=review_model,
+            env=engine_env(ctx.cfg),
+            log_path=ctx.layout["logs"] / "reviewer.log",
+            config_path=None,
+        )
     append_event(
         ctx.layout["events"],
         "review.completed" if ctx.review_result["returncode"] == 0 else "review.failed",
@@ -153,8 +166,9 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
 
     # --- Tester ---
     test_prompt = build_test_prompt(ctx.run_id, ctx.task, ctx.repo, ctx.worker_results, repo_diff=repo_diff)
-    test_provider, test_model = ctx.cfg.provider_for_role("tester")
-    test_cli_provider = effective_tandem_provider(test_provider, ctx.cfg)
+    test_model_selection = engine_session_provider_model(ctx.cfg, "tester")
+    test_cli_provider = test_model_selection["provider"]
+    test_model = test_model_selection["model"]
     _rc._role_provider_override_config(
         cfg=ctx.cfg,
         layout=ctx.layout,
@@ -163,17 +177,18 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         model=test_model,
     )
     logger.info("Running tester prompt (run_id=%s)", ctx.run_id)
-    ctx.test_result = stream_tandem_prompt(
-        ctx.cfg,
-        role="tester",
-        prompt=test_prompt,
-        cwd=ctx.repo_path,
-        provider=test_cli_provider,
-        model=test_model,
-        env=engine_env(ctx.cfg),
-        log_path=ctx.layout["logs"] / "tester.log",
-        config_path=None,
-    )
+    with _rc._coordination_heartbeat(ctx, phase="test"):
+        ctx.test_result = stream_tandem_prompt(
+            ctx.cfg,
+            role="tester",
+            prompt=test_prompt,
+            cwd=ctx.repo_path,
+            provider=test_cli_provider,
+            model=test_model,
+            env=engine_env(ctx.cfg),
+            log_path=ctx.layout["logs"] / "tester.log",
+            config_path=None,
+        )
     append_event(
         ctx.layout["events"],
         "test.completed" if ctx.test_result["returncode"] == 0 else "test.failed",
@@ -192,6 +207,12 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
             ctx.expected_repo_files,
             command_checks=combined_command_checks,
         )
+    if worker_changed_files and _rc._task_mentions_external_pr_candidates(ctx.task):
+        unexpected_files = _rc._pr_candidate_unexpected_changed_files(ctx.planned_subtasks, worker_changed_files)
+        if unexpected_files:
+            ctx.repo_validation = dict(ctx.repo_validation)
+            ctx.repo_validation["unexpected_files"] = unexpected_files
+            ctx.repo_validation["ok"] = False
     coding_run_contract = build_coding_run_contract(
         run_id=ctx.run_id,
         task=ctx.task,
@@ -212,6 +233,8 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         "commands": combined_command_checks,
         "task_commands": task_verification_commands,
         "manager_commands": manager_command_checks,
+        "inferred_commands": inferred_command_checks,
+        "changed_files": worker_changed_files,
         "expected_files": list(ctx.expected_repo_files or []),
     }
     ctx.blackboard["expected_deliverables"] = {

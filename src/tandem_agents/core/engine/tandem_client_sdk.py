@@ -4,7 +4,7 @@ import inspect
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import asyncio
 import time
 from urllib.parse import quote
@@ -351,7 +351,7 @@ def sdk_sessions_prompt_async(
         payload: dict[str, Any] = {"parts": [{"type": "text", "text": prompt}]}
         if tool_mode is not None:
             payload["toolMode"] = tool_mode
-        if tool_allowlist:
+        if tool_allowlist is not None:
             payload["toolAllowlist"] = tool_allowlist
         if context_mode is not None:
             payload["contextMode"] = context_mode
@@ -554,6 +554,9 @@ def sdk_stream_run_text(
     run_id: str,
     log_writer: Any | None = None,
     timeout_seconds: float = 600.0,
+    no_text_timeout_seconds: float | None = None,
+    max_events_without_text: int | None = None,
+    stop_when_text: Callable[[str], bool] | None = None,
 ) -> Any:
     TandemClient = _import_async_client()
     token = cfg.tandem_token()
@@ -564,23 +567,58 @@ def sdk_stream_run_text(
         async with TandemClient(base_url=cfg.tandem.base_url, token=token) as client:
             parts: list[str] = []
             completed = False
-            deadline = time.time() + timeout_seconds
-            async for evt in client.stream(session_id, run_id):
-                t = str(getattr(evt, "type", "") or "").strip()
-                delta = _extract_event_text_delta(evt)
-                if delta:
-                    parts.append(delta)
-                    if log_writer is not None:
-                        try:
-                            log_writer(delta)
-                        except Exception:
-                            pass
-                if t in {"run.complete", "run.completed", "run.failed", "session.run.finished"}:
-                    completed = True
-                    break
-                if time.time() >= deadline:
-                    break
+            reason = ""
+            event_count = 0
+            events_without_text = 0
+            last_text_at = time.monotonic()
+            no_text_timeout = (
+                float(no_text_timeout_seconds)
+                if no_text_timeout_seconds is not None and no_text_timeout_seconds > 0
+                else None
+            )
+            max_empty_events = (
+                int(max_events_without_text)
+                if max_events_without_text is not None and max_events_without_text > 0
+                else None
+            )
+
+            async def _consume() -> None:
+                nonlocal completed, event_count, events_without_text, last_text_at, reason
+                async for evt in client.stream(session_id, run_id):
+                    event_count += 1
+                    t = str(getattr(evt, "type", "") or "").strip()
+                    delta = _extract_event_text_delta(evt)
+                    if delta:
+                        parts.append(delta)
+                        events_without_text = 0
+                        last_text_at = time.monotonic()
+                        if log_writer is not None:
+                            try:
+                                log_writer(delta)
+                            except Exception:
+                                pass
+                        if stop_when_text is not None and stop_when_text("".join(parts)):
+                            completed = True
+                            reason = "stop_condition"
+                            return
+                    else:
+                        events_without_text += 1
+                    if t in {"run.complete", "run.completed", "run.failed", "session.run.finished"}:
+                        completed = True
+                        return
+                    now = time.monotonic()
+                    if no_text_timeout is not None and event_count >= 5 and now - last_text_at >= no_text_timeout:
+                        reason = "no_text_timeout"
+                        return
+                    if max_empty_events is not None and events_without_text >= max_empty_events:
+                        reason = "max_events_without_text"
+                        return
+
+            try:
+                await asyncio.wait_for(_consume(), timeout=max(1.0, float(timeout_seconds or 1.0)))
+            except asyncio.TimeoutError:
+                reason = "timeout"
             text = "".join(parts)
-            return {"text": text, "completed": completed}
+            return {"text": text, "completed": completed, "reason": reason, "event_count": event_count}
 
     return asyncio.run(_runner())

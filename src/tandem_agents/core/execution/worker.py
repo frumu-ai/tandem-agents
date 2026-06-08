@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
 import shutil
 import subprocess
@@ -18,10 +19,14 @@ from src.tandem_agents.core.engine.engine import (
     create_tandem_session,
     create_worktree,
     delete_tandem_session,
-    effective_tandem_provider,
     engine_env,
+    engine_session_provider_model,
     engine_visible_path,
+    git_command_for_worktree,
     git_diff_stat,
+    git_working_diff,
+    git_worktree_preflight,
+    list_worktree_changes,
     list_engine_permissions,
     prompt_tandem_session_sync,
     reply_engine_permission,
@@ -57,12 +62,30 @@ SESSION_TOOL_ALLOWLIST = [
     "browser_screenshot",
     "browser_content",
 ]
+SESSION_PERMISSION_RULES = [
+    {"permission": tool, "pattern": "*", "action": "allow"}
+    for tool in SESSION_TOOL_ALLOWLIST
+]
 WORKER_FAILURE_MARKERS = (
     "ENGINE_ERROR:",
     "TOOL_MODE_REQUIRED_NOT_SATISFIED",
     "WRITE_REQUIRED_NOT_SATISFIED",
     "ENGINE_EMPTY_RESPONSE",
+    "ENGINE_PROMPT_TIMEOUT",
+    "ENGINE_TOOL_LOOP_STALLED",
 )
+
+TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "max_events_without_text"}
+NON_RETRYABLE_WORKER_BLOCKERS = {
+    "coordination_lost",
+    "engine_empty_response",
+    "engine_prompt_timeout",
+    "engine_provider_auth",
+    "engine_tool_loop_stalled",
+}
+PR_CANDIDATE_SEED_CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".py")
+PR_CANDIDATE_SEED_EXCLUDED_PREFIXES = (".jules/", "jules/")
+PR_CANDIDATE_SEED_EXCLUDED_FILES = {".jules/bolt.md", "jules/bolt.md"}
 
 
 def _print_line(prefix: str, line: str) -> None:
@@ -205,6 +228,36 @@ def _exception_status_code(exc: Exception) -> int | None:
     return status_code if isinstance(status_code, int) else None
 
 
+def _call_with_timeout(fn: Any, *, timeout_seconds: float) -> Any:
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            result_queue.put(("ok", fn()))
+        except Exception as exc:
+            result_queue.put(("err", exc))
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(max(0.1, timeout_seconds))
+    if thread.is_alive():
+        raise TimeoutError(f"operation did not finish within {timeout_seconds:.1f}s")
+    status, value = result_queue.get_nowait()
+    if status == "err":
+        raise value
+    return value
+
+
+def _engine_snapshot_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_SNAPSHOT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_SNAPSHOT_TIMEOUT_SECONDS=%s", raw)
+    return 8.0
+
+
 def _recover_engine_text_from_state(
     cfg: ResolvedConfig,
     *,
@@ -214,9 +267,10 @@ def _recover_engine_text_from_state(
 ) -> tuple[str, dict[str, Any]]:
     recovery: dict[str, Any] = {"errors": []}
     text = ""
+    snapshot_timeout = _engine_snapshot_timeout_seconds(cfg)
     if run_id:
         try:
-            events = sdk_run_events(cfg, run_id, tail=500)
+            events = _call_with_timeout(lambda: sdk_run_events(cfg, run_id, tail=500), timeout_seconds=snapshot_timeout)
             recovery["events_path"] = _write_engine_snapshot(log_path, f"engine-events-{run_id}", events)
             text = _extract_run_event_text(events)
         except Exception as exc:
@@ -227,7 +281,7 @@ def _recover_engine_text_from_state(
             logger.debug("Failed to recover text from run events", exc_info=True)
     if session_id:
         try:
-            messages = sdk_session_messages(cfg, session_id)
+            messages = _call_with_timeout(lambda: sdk_session_messages(cfg, session_id), timeout_seconds=snapshot_timeout)
             recovery["messages_path"] = _write_engine_snapshot(log_path, f"engine-messages-{session_id}", messages)
             if not text.strip():
                 text = _extract_session_reply(messages)
@@ -254,6 +308,47 @@ def _extract_prompt_sync_text(response: Any) -> str:
         text = _extract_session_reply(response) or _extract_text_from_message_part(response)
         return text.strip()
     return _extract_text_from_message_part(response).strip()
+
+
+def _first_balanced_json_object(text: str) -> dict[str, Any] | None:
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if start < 0:
+            if char == "{":
+                start = index
+                depth = 1
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start:index + 1])
+                except Exception:
+                    return None
+                return value if isinstance(value, dict) else None
+    return None
+
+
+def _manager_plan_stream_complete(text: str) -> bool:
+    plan = _first_balanced_json_object(text)
+    if not isinstance(plan, dict):
+        return False
+    return {"summary", "subtasks", "risks", "tests"}.issubset(set(plan))
 
 
 def _empty_transcript_retry_prompt() -> str:
@@ -352,27 +447,351 @@ def _diff_touches_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
     targets = set(_subtask_targets(subtask))
     if not targets:
         return False
-    result = run_command(["git", "-C", str(worktree), "diff", "--name-only"])
-    if result.returncode != 0:
+    try:
+        changes = list_worktree_changes(worktree)
+    except Exception:
         return False
-    changed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    changed = {str(change.get("path") or "").strip() for change in changes}
     return bool(changed.intersection(targets))
 
 
+def _is_aca_repo_artifact_path(path: str) -> bool:
+    rel_path = str(path or "").strip().replace("\\", "/")
+    name = Path(rel_path).name
+    if not rel_path:
+        return True
+    if rel_path.startswith(".aca/"):
+        return True
+    if name.startswith("aca-") and name.endswith(".md"):
+        return True
+    if name.startswith("ACA_") and name.endswith(".md"):
+        return True
+    return False
+
+
 def _worktree_changed_files(worktree: Path) -> list[str]:
-    result = run_command(["git", "-C", str(worktree), "status", "--short", "--untracked-files=all"])
-    if result.returncode != 0:
-        return []
+    try:
+        changes = list_worktree_changes(worktree)
+    except Exception:
+        changes = []
     changed: list[str] = []
-    for raw_line in result.stdout.splitlines():
+    for change in changes:
+        path = str(change.get("path") or "").strip()
+        if path and not _is_aca_repo_artifact_path(path):
+            changed.append(path)
+    if changed:
+        return changed
+    try:
+        status_text = git_diff_stat(worktree)
+    except Exception:
+        return []
+    for raw_line in status_text.splitlines():
         if not raw_line.strip():
             continue
         path = raw_line[3:].strip() if len(raw_line) > 3 else ""
         if " -> " in path:
             path = path.split(" -> ", 1)[1].strip()
-        if path and not path.startswith(".aca/"):
+        if path and not _is_aca_repo_artifact_path(path):
             changed.append(path)
     return changed
+
+
+def _engine_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_PROMPT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(30.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_PROMPT_TIMEOUT_SECONDS=%s", raw)
+    coordination = getattr(cfg, "coordination", None)
+    lease_ttl = float(getattr(coordination, "lease_ttl_seconds", 300) or 300)
+    heartbeat = float(getattr(coordination, "heartbeat_interval_seconds", 30) or 30)
+    return max(60.0, min(240.0, lease_ttl - heartbeat))
+
+
+def _engine_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_NO_TEXT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(15.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_NO_TEXT_TIMEOUT_SECONDS=%s", raw)
+    return 210.0
+
+
+def _engine_max_events_without_text(cfg: ResolvedConfig, role: str) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT", "") or "").strip()
+    if raw:
+        try:
+            return max(10, int(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT=%s", raw)
+    if role.startswith("worker-"):
+        return 50
+    return 150
+
+
+def _preserve_partial_worker_diff(
+    result: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    stdout_text = str(result.get("stdout") or "")
+    normalized_reason = str(result.get("failure_reason") or reason or "").strip()
+    if "ENGINE_ERROR:" in stdout_text:
+        normalized_reason = next(
+            (line.strip() for line in stdout_text.splitlines() if "ENGINE_ERROR:" in line),
+            "ENGINE_ERROR:",
+        )
+    elif "ENGINE_PROMPT_TIMEOUT" in stdout_text:
+        normalized_reason = "ENGINE_PROMPT_TIMEOUT"
+    elif "ENGINE_TOOL_LOOP_STALLED" in stdout_text:
+        normalized_reason = "ENGINE_TOOL_LOOP_STALLED"
+    if normalized_reason:
+        result["failure_reason"] = normalized_reason
+    if not result.get("blocker_kind"):
+        if normalized_reason == "ENGINE_PROMPT_TIMEOUT":
+            result["blocker_kind"] = "engine_prompt_timeout"
+        elif normalized_reason == "ENGINE_TOOL_LOOP_STALLED":
+            result["blocker_kind"] = "engine_tool_loop_stalled"
+        elif normalized_reason.startswith("ENGINE_ERROR:"):
+            result["blocker_kind"] = "engine_dispatch_failed"
+    if not result.get("recovery_action"):
+        result["recovery_action"] = (
+            "Inspect the preserved partial diff and engine/session logs, then retry from a clean checkout."
+        )
+    diff_text = ""
+    status_text = ""
+    try:
+        diff_text = git_working_diff(worktree)
+    except Exception:
+        logger.debug("Failed to capture partial worker diff", exc_info=True)
+    try:
+        status_text = git_diff_stat(worktree)
+    except Exception:
+        logger.debug("Failed to capture partial worker status", exc_info=True)
+    artifacts_dir = log_path.parent.parent / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifacts_dir / f"{log_path.stem}.partial-worker-diff.patch"
+    artifact_path.write_text(
+        f"# Partial worker diff preserved after nonterminal engine result\n"
+        f"# Reason: {reason}\n\n"
+        f"## git status --short --untracked-files=all\n\n{status_text}\n"
+        f"## git diff --binary\n\n{diff_text}\n",
+        encoding="utf-8",
+    )
+    result.setdefault("artifacts", {})["partial_diff"] = str(artifact_path)
+    result["partial_diff_artifact"] = str(artifact_path)
+    return result
+
+
+def _recover_tool_stall_with_diff(
+    result: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    changed_files = _worktree_changed_files(worktree)
+    if not changed_files:
+        return _preserve_partial_worker_diff(result, log_path, worktree, reason=reason)
+    recovered = _preserve_partial_worker_diff(result, log_path, worktree, reason=reason)
+    changed_summary = "\n".join(f"- {path}" for path in changed_files)
+    message = (
+        "\nACA recovered this worker because the Tandem engine stalled after producing a real diff.\n"
+        "The partial diff was preserved and will be sent through normal review/verification gates.\n"
+        f"Changed files:\n{changed_summary}\n"
+    )
+    log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
+    recovered["stdout"] = f"{recovered.get('stdout') or ''}{message}"
+    recovered["returncode"] = 0
+    recovered["recovered_from_engine_stall"] = True
+    recovered["changed_files"] = changed_files
+    recovered.setdefault("warnings", []).append("engine_tool_loop_stalled_after_diff")
+    recovered.pop("failure_reason", None)
+    recovered.pop("blocker_kind", None)
+    recovered.pop("recovery_action", None)
+    return recovered
+
+
+def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str) -> bool:
+    reason = str(result.get("failure_reason") or "").upper()
+    blocker = str(result.get("blocker_kind") or "").lower()
+    text = stdout_text.upper()
+    return (
+        "ENGINE_PROMPT_TIMEOUT" in reason
+        or "ENGINE_TOOL_LOOP_STALLED" in reason
+        or "ENGINE_ERROR:" in text
+        or "ENGINE_DISPATCH_FAILED" in text
+        or "ITERATION BUDGET" in text
+        or blocker in {"engine_prompt_timeout", "engine_tool_loop_stalled"}
+        or "ENGINE_PROMPT_TIMEOUT" in text
+        or "ENGINE_TOOL_LOOP_STALLED" in text
+    )
+
+
+def _worker_result_should_retry(result: dict[str, Any]) -> bool:
+    if result.get("returncode") == 0:
+        return False
+    blocker_kind = str(result.get("blocker_kind") or "").strip()
+    return blocker_kind not in NON_RETRYABLE_WORKER_BLOCKERS
+
+
+def _subtask_requires_real_diff(subtask: dict[str, Any]) -> bool:
+    return bool(subtask.get("pr_candidate_context") or subtask.get("pr_candidate_refs"))
+
+
+def _pr_candidate_ref_map(subtask: dict[str, Any]) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    for ref_entry in subtask.get("pr_candidate_refs") or []:
+        if not isinstance(ref_entry, dict) or not ref_entry.get("ok"):
+            continue
+        number = str(ref_entry.get("number") or "").strip()
+        ref = str(ref_entry.get("ref") or f"refs/aca/pr-{number}").strip()
+        if number and ref:
+            refs[number] = ref
+    return refs
+
+
+def _seedable_pr_candidate_specs(subtask: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return conservative PR candidates ACA can seed before retrying a no-diff worker.
+
+    The seed path is intentionally narrow: it only applies candidates whose changed
+    files all exist in the current layout, are code files, and have fetched refs.
+    This keeps the runtime from blindly resurrecting stale docs, generated churn,
+    lockfiles, or policy scripts when the model stalls before editing.
+    """
+
+    ref_by_number = _pr_candidate_ref_map(subtask)
+    if not ref_by_number:
+        return []
+    target_files = set(_subtask_targets(subtask))
+    specs: list[dict[str, Any]] = []
+    for context in subtask.get("pr_candidate_context") or []:
+        if not isinstance(context, dict) or context.get("error"):
+            continue
+        number = str(context.get("number") or "").strip()
+        ref = ref_by_number.get(number)
+        if not number or not ref:
+            continue
+        file_entries = context.get("files")
+        if not isinstance(file_entries, list) or not file_entries:
+            continue
+        files: list[str] = []
+        rejected = False
+        for entry in file_entries:
+            if not isinstance(entry, dict):
+                rejected = True
+                break
+            path = str(entry.get("filename") or "").strip().lstrip("/")
+            if not path:
+                rejected = True
+                break
+            if path in PR_CANDIDATE_SEED_EXCLUDED_FILES or path.startswith(PR_CANDIDATE_SEED_EXCLUDED_PREFIXES):
+                rejected = True
+                break
+            if entry.get("current_layout_stale") or not entry.get("base_path_exists"):
+                rejected = True
+                break
+            if target_files and path not in target_files:
+                rejected = True
+                break
+            if not path.endswith(PR_CANDIDATE_SEED_CODE_EXTENSIONS):
+                rejected = True
+                break
+            files.append(path)
+        if rejected or not files:
+            continue
+        specs.append({"number": number, "ref": ref, "files": files})
+    return specs
+
+
+def _seed_pr_candidate_diff(
+    worktree: Path,
+    subtask: dict[str, Any],
+    log_path: Path,
+) -> dict[str, Any] | None:
+    def append_log(message: str) -> None:
+        previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        log_path.write_text(previous + message, encoding="utf-8")
+
+    for spec in _seedable_pr_candidate_specs(subtask):
+        files = [str(path) for path in spec.get("files") or [] if str(path).strip()]
+        ref = str(spec.get("ref") or "").strip()
+        number = str(spec.get("number") or "").strip()
+        if not files or not ref:
+            continue
+        diff_result = run_command(
+            git_command_for_worktree(worktree, "diff", "--binary", f"HEAD..{ref}", "--", *files)
+        )
+        if diff_result.returncode != 0 or not diff_result.stdout.strip():
+            append_log(
+                f"ACA PR candidate seed skipped for PR #{number}: {diff_result.stderr or 'empty diff'}\n"
+            )
+            continue
+        apply_cmd = [
+            "--work-tree=." if arg.startswith("--work-tree=") else arg
+            for arg in git_command_for_worktree(worktree, "apply", "--3way", "--whitespace=nowarn")
+        ]
+        apply_proc = subprocess.run(
+            apply_cmd,
+            cwd=str(worktree),
+            input=diff_result.stdout,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if apply_proc.returncode != 0:
+            append_log(f"ACA PR candidate seed failed for PR #{number}: {apply_proc.stderr or apply_proc.stdout}\n")
+            continue
+        changed_files = _worktree_changed_files(worktree)
+        diff_stat = git_diff_stat(worktree).strip()
+        if not changed_files or not diff_stat:
+            continue
+        message = (
+            f"ACA seeded PR candidate #{number} into the worker worktree before retry "
+            f"because the first worker attempt produced no diff. Files: {', '.join(files)}\n"
+        )
+        append_log(message)
+        return {
+            "number": number,
+            "ref": ref,
+            "files": files,
+            "changed_files": changed_files,
+            "diff_stat": diff_stat,
+        }
+    return None
+
+
+def _recover_seeded_pr_candidate_diff(
+    result: dict[str, Any],
+    seeded_diff: dict[str, Any],
+    log_path: Path,
+) -> dict[str, Any]:
+    message = (
+        "\nACA recovered this worker by applying a conservative pre-fetched PR candidate diff "
+        "after the engine did not produce a usable worker result. The seeded diff will continue "
+        "through normal review and verification gates.\n"
+        f"Seeded PR: #{seeded_diff.get('number')} ({seeded_diff.get('ref')})\n"
+        "Changed files:\n"
+        + "\n".join(f"- {path}" for path in seeded_diff.get("changed_files") or [])
+        + "\n"
+    )
+    previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    log_path.write_text(previous + message, encoding="utf-8")
+    result["stdout"] = f"{result.get('stdout') or ''}{message}"
+    result["returncode"] = 0
+    result["changed_files"] = list(seeded_diff.get("changed_files") or [])
+    result["diff_stat"] = str(seeded_diff.get("diff_stat") or "")
+    result["recovered_from_pr_candidate_seed"] = True
+    result["seeded_pr_candidate"] = dict(seeded_diff)
+    result.setdefault("warnings", []).append("pr_candidate_seeded_after_engine_failure")
+    result.pop("failure_reason", None)
+    result.pop("blocker_kind", None)
+    result.pop("recovery_action", None)
+    return result
 
 
 def _recover_nonzero_result_with_diff(
@@ -387,6 +806,16 @@ def _recover_nonzero_result_with_diff(
     if result.get("returncode", 0) == 0 or not diff_text or not changed_files:
         return result
     stdout_text = str(result.get("stdout") or "")
+    reason_text = str(result.get("failure_reason") or reason or "").upper()
+    blocker_kind = str(result.get("blocker_kind") or "").lower()
+    if (
+        "ENGINE_TOOL_LOOP_STALLED" in reason_text
+        or blocker_kind == "engine_tool_loop_stalled"
+        or "ENGINE_TOOL_LOOP_STALLED" in stdout_text.upper()
+    ):
+        return _recover_tool_stall_with_diff(result, log_path, worktree, reason=reason)
+    if _engine_failure_should_not_recover(result, str(result.get("stdout") or "")):
+        return _preserve_partial_worker_diff(result, log_path, worktree, reason=reason)
     message = (
         f"Worker returned a nonzero status ({reason}), but filesystem changes were detected. "
         "Treating as success.\n"
@@ -409,9 +838,9 @@ def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]
         return False, f"worktree path does not exist: {worktree}"
     if not (worktree / ".git").exists():
         return False, f"worktree git metadata missing: {worktree / '.git'}"
-    git_result = run_command(["git", "-C", str(worktree), "rev-parse", "--git-dir"])
-    if git_result.returncode != 0:
-        return False, git_result.stderr.strip() or git_result.stdout.strip() or "worktree git preflight failed"
+    ok, detail = git_worktree_preflight(worktree)
+    if not ok:
+        return False, detail
     engine_worktree = engine_visible_path(worktree)
     if engine_worktree != worktree:
         return True, "ok"
@@ -488,10 +917,13 @@ def _coerce_worker_failure(
     require_filesystem_changes: bool = False,
 ) -> dict[str, Any]:
     stdout_text = str(result.get("stdout") or "")
+    engine_failure = _engine_failure_should_not_recover(result, stdout_text)
+    requires_real_diff = require_filesystem_changes or _subtask_requires_real_diff(subtask)
     targets_exist = _target_files_exist(worktree, subtask)
     readable_targets = _readable_target_files(worktree, subtask)
     diff_text = git_diff_stat(worktree).strip()
     diff_touches_targets = _diff_touches_target_files(worktree, subtask)
+    changed_files = _worktree_changed_files(worktree)
     if result.get("returncode", 0) != 0 and (not targets_exist or not diff_text):
         recovered, recovered_diff = _wait_for_target_files(worktree, subtask)
         if recovered:
@@ -510,7 +942,8 @@ def _coerce_worker_failure(
         result.get("returncode", 0) != 0
         and readable_targets
         and not diff_text
-        and not require_filesystem_changes
+        and not requires_real_diff
+        and not engine_failure
     ):
         message = "Worker returned a nonzero status, but all target files were readable in the worktree. Treating as verification success.\n"
         log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
@@ -529,7 +962,9 @@ def _coerce_worker_failure(
             else:
                 failure_reason = marker
             break
-    if result.get("returncode", 0) == 0 and not diff_text:
+    if result.get("returncode", 0) == 0 and requires_real_diff and not changed_files:
+        failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
+    elif result.get("returncode", 0) == 0 and not diff_text:
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
     if not failure_reason:
         return result
@@ -548,6 +983,18 @@ def _coerce_worker_failure(
         if not result.get("recovery_action"):
             result["recovery_action"] = (
                 "Check Tandem engine provider/model routing and persisted engine snapshots, then retry the task."
+            )
+    elif failure_reason == "ENGINE_PROMPT_TIMEOUT":
+        result["blocker_kind"] = "engine_prompt_timeout"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Inspect the preserved engine/session snapshots and reduce prompt/tool scope before retrying."
+            )
+    elif failure_reason == "ENGINE_TOOL_LOOP_STALLED":
+        result["blocker_kind"] = "engine_tool_loop_stalled"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Inspect the preserved partial diff and engine messages, reset the task to Backlog, and retry from a clean checkout."
             )
     elif failure_reason == "NO_FILESYSTEM_CHANGES":
         result["blocker_kind"] = "worker_no_diff"
@@ -571,6 +1018,10 @@ def _coerce_worker_failure(
                 result["recovery_action"] = (
                     "Inspect Tandem engine dispatch logs and provider routing, then reset the task to Backlog."
                 )
+    if diff_text and failure_reason == "ENGINE_TOOL_LOOP_STALLED":
+        return _recover_tool_stall_with_diff(result, log_path, worktree, reason=failure_reason)
+    if diff_text and _engine_failure_should_not_recover(result, str(result.get("stdout") or stdout_text)):
+        return _preserve_partial_worker_diff(result, log_path, worktree, reason=failure_reason)
     return result
 
 
@@ -591,6 +1042,14 @@ def stream_tandem_prompt(
     if config_path is None:
         session_id: str | None = None
         last_run_id = ""
+        if role == "manager" and not require_tool_use and not write_required:
+            session_tool_allowlist: list[str] | None = []
+            session_permission_rules: list[dict[str, str]] | None = None
+            prompt_tool_mode = "none"
+        else:
+            session_tool_allowlist = SESSION_TOOL_ALLOWLIST
+            session_permission_rules = SESSION_PERMISSION_RULES
+            prompt_tool_mode = "required" if require_tool_use else "auto"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\n=== {role} @ {now_ms()} ===\n")
@@ -609,6 +1068,7 @@ def stream_tandem_prompt(
                             provider=provider,
                             model=model,
                             temperature=session_temperature,
+                            permission_rules=session_permission_rules,
                         )
                         create_exc = None
                         break
@@ -634,13 +1094,13 @@ def stream_tandem_prompt(
                         log.flush()
                         _print_line(role, line)
 
-                def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str]:
+                def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str, str]:
                     async_result = sdk_sessions_prompt_async(
                         cfg,
                         session_id=session_id,
                         prompt=prompt_text,
-                        tool_mode="required" if require_tool_use else "auto",
-                        tool_allowlist=SESSION_TOOL_ALLOWLIST,
+                        tool_mode=prompt_tool_mode,
+                        tool_allowlist=session_tool_allowlist,
                         context_mode=None,
                         write_required=write_required,
                     )
@@ -664,14 +1124,32 @@ def stream_tandem_prompt(
                     nonlocal last_run_id
                     last_run_id = run_id
                     stream_result = (
-                        sdk_stream_run_text(cfg, session_id, run_id, _writer, timeout_seconds=600.0)
+                        sdk_stream_run_text(
+                            cfg,
+                            session_id,
+                            run_id,
+                            _writer,
+                            timeout_seconds=_engine_prompt_timeout_seconds(cfg),
+                            no_text_timeout_seconds=_engine_no_text_timeout_seconds(cfg),
+                            max_events_without_text=_engine_max_events_without_text(cfg, role),
+                            stop_when_text=(
+                                _manager_plan_stream_complete
+                                if role == "manager" and not require_tool_use and not write_required
+                                else None
+                            ),
+                        )
                         if run_id
                         else {"text": "", "completed": False}
                     )
                     streamed_text = str(stream_result.get("text") or "")
                     completed = bool(stream_result.get("completed"))
+                    stream_reason = str(stream_result.get("reason") or "").strip()
+                    if stream_reason:
+                        engine_meta["stream_reason"] = stream_reason
+                    if stream_result.get("event_count") is not None:
+                        engine_meta["stream_event_count"] = stream_result.get("event_count")
                     if completed and streamed_text.strip():
-                        return streamed_text, True, run_id
+                        return streamed_text, True, run_id, stream_reason
                     recovered_text = ""
                     if completed:
                         recovered_text, recovery = _recover_engine_text_from_state(
@@ -687,11 +1165,11 @@ def stream_tandem_prompt(
                             if recovery.get(key):
                                 engine_meta[key] = recovery[key]
                     if completed and recovered_text.strip():
-                        return recovered_text, True, run_id
-                    return streamed_text, completed and bool(streamed_text.strip()), run_id
+                        return recovered_text, True, run_id, stream_reason
+                    return streamed_text, completed and bool(streamed_text.strip()), run_id, stream_reason
 
-                stdout_text, completed, run_id = _run_async_once(prompt, 0)
-                if not completed:
+                stdout_text, completed, run_id, stream_reason = _run_async_once(prompt, 0)
+                if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
                     retry_notice = (
                         f"ENGINE_EMPTY_RESPONSE_RETRY: engine run {run_id or 'unknown'} completed "
                         "without transcript text; retrying once in the same session.\n"
@@ -699,7 +1177,10 @@ def stream_tandem_prompt(
                     log.write(retry_notice)
                     log.flush()
                     _print_line(role, retry_notice)
-                    retry_text, retry_completed, retry_run_id = _run_async_once(_empty_transcript_retry_prompt(), 1)
+                    retry_text, retry_completed, retry_run_id, retry_reason = _run_async_once(
+                        _empty_transcript_retry_prompt(), 1
+                    )
+                    stream_reason = retry_reason or stream_reason
                     if retry_completed:
                         stdout_text = retry_text
                         completed = True
@@ -708,7 +1189,7 @@ def stream_tandem_prompt(
                         stdout_text = retry_text or stdout_text
                         run_id = retry_run_id or run_id
 
-                if not completed:
+                if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
                     engine_meta["fallback_mode"] = "prompt_sync"
                     fallback_notice = (
                         f"ENGINE_EMPTY_RESPONSE_FALLBACK: engine run {run_id or 'unknown'} still had "
@@ -721,7 +1202,8 @@ def stream_tandem_prompt(
                         cfg,
                         session_id=session_id,
                         prompt=_empty_transcript_retry_prompt(),
-                        tool_allowlist=SESSION_TOOL_ALLOWLIST,
+                        tool_allowlist=session_tool_allowlist,
+                        tool_mode=prompt_tool_mode,
                         require_tool_use=require_tool_use,
                         write_required=write_required,
                     )
@@ -740,6 +1222,22 @@ def stream_tandem_prompt(
                 if completed:
                     if stdout_text and not stdout_text.endswith("\n"):
                         stdout_text += "\n"
+                elif stream_reason == "timeout":
+                    failure_reason = "ENGINE_PROMPT_TIMEOUT"
+                    blocker_kind = "engine_prompt_timeout"
+                    stdout_text = (
+                        "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt did not produce a terminal response "
+                        f"within {_engine_prompt_timeout_seconds(cfg):.0f}s. Last engine run: "
+                        f"{run_id or last_run_id or 'unknown'}.\n"
+                    )
+                elif stream_reason in {"no_text_timeout", "max_events_without_text"}:
+                    failure_reason = "ENGINE_TOOL_LOOP_STALLED"
+                    blocker_kind = "engine_tool_loop_stalled"
+                    stdout_text = (
+                        "ENGINE_TOOL_LOOP_STALLED: Tandem engine produced tool/permission activity without "
+                        "assistant progress long enough to trip the ACA watchdog. Last engine run: "
+                        f"{run_id or last_run_id or 'unknown'}.\n"
+                    )
                 else:
                     failure_reason = "ENGINE_EMPTY_RESPONSE"
                     blocker_kind = "engine_empty_response"
@@ -752,6 +1250,35 @@ def stream_tandem_prompt(
                     log.write(stdout_text)
                     log.flush()
                     _print_line(role, stdout_text)
+                if not completed and session_id:
+                    _recovered_text, recovery = _recover_engine_text_from_state(
+                        cfg,
+                        session_id=session_id,
+                        run_id=run_id or last_run_id,
+                        log_path=log_path,
+                    )
+                    recovery["run_id"] = run_id or last_run_id
+                    recovery["attempt"] = engine_meta.get("retry_count", 0)
+                    recovery["stream_reason"] = stream_reason
+                    engine_meta.setdefault("recovery", []).append(recovery)
+                    for key in ("events_path", "messages_path"):
+                        if recovery.get(key):
+                            engine_meta[key] = recovery[key]
+                recovery_action = ""
+                if blocker_kind == "engine_tool_loop_stalled":
+                    recovery_action = (
+                        "Preserve the partial diff and engine messages, reset the checkout before retry, "
+                        "and narrow the worker prompt/tool scope."
+                    )
+                elif blocker_kind == "engine_prompt_timeout":
+                    recovery_action = (
+                        "Inspect engine/session snapshots and retry with a smaller scoped prompt or healthier provider route."
+                    )
+                elif blocker_kind:
+                    recovery_action = (
+                        "Check Tandem engine provider/model routing and persisted engine snapshots, "
+                        "then retry the task after the engine returns assistant text."
+                    )
                 return {
                     "role": role,
                     "returncode": 0 if completed else 1,
@@ -763,12 +1290,7 @@ def stream_tandem_prompt(
                     "engine": engine_meta,
                     "failure_reason": failure_reason,
                     "blocker_kind": blocker_kind,
-                    "recovery_action": (
-                        "Check Tandem engine provider/model routing and persisted engine snapshots, "
-                        "then retry the task after the engine returns assistant text."
-                    )
-                    if blocker_kind
-                    else "",
+                    "recovery_action": recovery_action,
                 }
             except Exception as exc:
                 message = f"Error: {exc}\n"
@@ -796,7 +1318,9 @@ def stream_tandem_prompt(
             finally:
                 if session_id:
                     try:
-                        delete_tandem_session(cfg, session_id)
+                        _call_with_timeout(lambda: delete_tandem_session(cfg, session_id), timeout_seconds=5.0)
+                    except TimeoutError:
+                        logger.debug("Timed out deleting tandem session %s", session_id)
                     except Exception:
                         logger.debug("Failed to delete tandem session", exc_info=True)
     return {"role": role, "returncode": 1, "stdout": "Internal Error: session-less stream requested"}
@@ -888,8 +1412,9 @@ def run_worker_subtask(
         _prepare_worktree_targets(worktree, subtask)
         preflight_ok, preflight_detail = _worktree_preflight(cfg, worktree)
     
-    worker_provider, worker_model = cfg.provider_for_role("worker")
-    worker_cli_provider = effective_tandem_provider(worker_provider, cfg)
+    worker_model_selection = engine_session_provider_model(cfg, "worker")
+    worker_cli_provider = worker_model_selection["provider"]
+    worker_model = worker_model_selection["model"]
     env = engine_env(cfg)
     log_path = layout["logs"] / f"{worker_id}.log"
     config_path = None
@@ -941,8 +1466,45 @@ def run_worker_subtask(
         require_filesystem_changes=require_filesystem_changes,
     )
     
-    if result["returncode"] != 0 and result.get("blocker_kind") != "engine_empty_response":
+    seeded_diff: dict[str, Any] | None = None
+    if (
+        result.get("returncode") != 0
+        and str(result.get("blocker_kind") or "") in {"worker_no_diff", "engine_tool_loop_stalled"}
+        and _subtask_requires_real_diff(subtask)
+        and not _worktree_changed_files(worktree)
+    ):
+        seeded_diff = _seed_pr_candidate_diff(worktree, subtask, log_path)
+        if seeded_diff:
+            append_event(
+                layout["events"],
+                "worker.pr_candidate_seeded",
+                run_id,
+                {
+                    "worker_id": worker_id,
+                    "subtask_id": subtask["id"],
+                    "pr_number": seeded_diff.get("number"),
+                    "ref": seeded_diff.get("ref"),
+                    "files": seeded_diff.get("files") or [],
+                    "changed_files": seeded_diff.get("changed_files") or [],
+                },
+                task_id=task.get("task_id"),
+                role="worker",
+                repo={"path": str(repo_path)},
+            )
+            result = _recover_seeded_pr_candidate_diff(result, seeded_diff, log_path)
+
+    if _worker_result_should_retry(result):
         retry_prompt = prompt + _worker_prompt_retry_suffix(subtask)
+        if seeded_diff:
+            retry_prompt += (
+                "\n\nACA runtime recovery already seeded a conservative candidate diff before this retry.\n"
+                f"- Seeded PR: #{seeded_diff.get('number')} ({seeded_diff.get('ref')})\n"
+                "- Seeded files: "
+                + ", ".join(f"`{path}`" for path in seeded_diff.get("files") or [])
+                + "\n"
+                "- Inspect this diff first. Keep and refine it if it is safe; revert only if it is demonstrably wrong.\n"
+                "- Do not spend the retry on a broad applicability matrix before verifying the seeded diff.\n"
+            )
         retry_result = stream_tandem_prompt(
             cfg,
             role=worker_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -15,16 +16,22 @@ from src.tandem_agents.core.verification.coding_run_contract import build_coding
 from src.tandem_agents.core.engine.prompts import build_manager_prompt
 from src.tandem_agents.core.execution.runner_core import (
     _all_subtasks_verified_existing,
+    _annotate_pr_candidate_current_layout,
     _auto_approve_loop,
+    _collect_worker_changed_files,
     _execute_local_worker_pool,
+    _final_lease_release_decision,
     _has_unresolved_write_required_worker_failure,
     _integration_blocker_message,
+    _integration_failure_can_defer_to_review,
+    _integration_semantic_blocker_can_defer_to_review,
     _linear_comment_task_summary,
     _permission_requests_from_payload,
     _preserve_and_reset_blocked_worktree,
     _prepare_subtasks_with_discovery,
     _pr_candidate_edit_goal,
     _pr_candidate_target_files,
+    _pr_candidate_unexpected_changed_files,
     _task_mentions_external_pr_candidates,
     _worker_failure_blocker,
     _record_worker_result,
@@ -120,6 +127,66 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 _auto_approve_loop(cfg, stop_event)
 
         self.assertEqual(replied, [("perm-1", "allow")])
+
+    def test_final_lease_release_uses_nested_blocked_result(self) -> None:
+        ctx = SimpleNamespace(status={"run": {"status": "running"}}, layout={})
+
+        release_status, release_reason = _final_lease_release_decision(
+            ctx,
+            layout={},
+            crashed_exc=None,
+            result={
+                "status": {
+                    "run": {"status": "blocked"},
+                    "blocker": {
+                        "active": True,
+                        "kind": "verification_failed",
+                        "detail": "smoke test failed",
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(release_status, "blocked")
+        self.assertEqual(release_reason, "smoke test failed")
+
+    def test_final_lease_release_reads_persisted_blocked_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "run": {"status": "blocked"},
+                        "phase": {"detail": "review did not approve"},
+                        "blocker": {"active": True, "kind": "verification_failed"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = SimpleNamespace(status={"run": {"status": "running"}}, layout={"status": status_path})
+
+            release_status, release_reason = _final_lease_release_decision(
+                ctx,
+                layout={"status": status_path},
+                crashed_exc=None,
+                result=None,
+            )
+
+        self.assertEqual(release_status, "blocked")
+        self.assertEqual(release_reason, "review did not approve")
+
+    def test_final_lease_release_fails_closed_on_unknown_status(self) -> None:
+        ctx = SimpleNamespace(status={"run": {"status": "running"}}, layout={})
+
+        release_status, release_reason = _final_lease_release_decision(
+            ctx,
+            layout={},
+            crashed_exc=None,
+            result=None,
+        )
+
+        self.assertEqual(release_status, "blocked")
+        self.assertEqual(release_reason, "run finished without terminal status")
 
     def test_empty_manager_plan_still_injects_discovered_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -242,6 +309,43 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 "src/lib/utils.ts",
             ],
         )
+
+    def test_pr_candidate_target_files_skip_stale_current_layout_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            current = repo_path / "packages" / "tandem-control-panel" / "src" / "pages" / "DashboardPage.tsx"
+            current.parent.mkdir(parents=True)
+            current.write_text("export function DashboardPage() {}\n", encoding="utf-8")
+            contexts = [
+                {
+                    "number": 1459,
+                    "files": [
+                        {
+                            "filename": "packages/tandem-control-panel/src/pages/DashboardPage.tsx",
+                            "status": "modified",
+                        },
+                        {"filename": "src/lib/utils.ts", "status": "modified"},
+                    ],
+                },
+            ]
+
+            annotated = _annotate_pr_candidate_current_layout(contexts, repo_path)
+
+            self.assertEqual(
+                _pr_candidate_target_files(annotated),
+                ["packages/tandem-control-panel/src/pages/DashboardPage.tsx"],
+            )
+            self.assertEqual(annotated[0]["stale_files"], ["src/lib/utils.ts"])
+            self.assertEqual(
+                _pr_candidate_unexpected_changed_files(
+                    [{"pr_candidate_context": annotated}],
+                    [
+                        "packages/tandem-control-panel/src/pages/DashboardPage.tsx",
+                        "src/lib/utils.ts",
+                    ],
+                ),
+                ["src/lib/utils.ts"],
+            )
 
     def test_pr_candidate_edit_goal_replaces_matrix_only_goal(self) -> None:
         goal = _pr_candidate_edit_goal("Produce a concise applicability matrix for each PR.")
@@ -500,6 +604,16 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual(worker_results[0]["status"], "completed")
         self.assertEqual(blackboard["workers"][0]["status"], "completed")
 
+    def test_collect_worker_changed_files_dedupes_and_rejects_parent_paths(self) -> None:
+        files = _collect_worker_changed_files(
+            [
+                {"changed_files": ["./src/app.ts", "src/app.ts", "../outside.txt"]},
+                {"changed_files": ["packages/panel/src/App.tsx", "safe/../unsafe.ts"]},
+            ]
+        )
+
+        self.assertEqual(files, ["src/app.ts", "packages/panel/src/App.tsx"])
+
     def test_integration_blocker_detects_semantic_failure_with_zero_exit(self) -> None:
         result = {
             "returncode": 0,
@@ -516,6 +630,48 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("Integration review did not approve", message or "")
         self.assertIn("Duplicate findLast import remains", message or "")
         self.assertIn("missing PR", message or "")
+
+    def test_integration_engine_watchdog_failure_defers_to_review(self) -> None:
+        result = {
+            "returncode": 1,
+            "stdout": "ENGINE_TOOL_LOOP_STALLED: engine stalled after tool activity.",
+        }
+
+        self.assertTrue(_integration_failure_can_defer_to_review(result))
+
+    def test_integration_plain_failure_does_not_defer_to_review(self) -> None:
+        result = {
+            "returncode": 1,
+            "stdout": "integration command failed",
+        }
+
+        self.assertFalse(_integration_failure_can_defer_to_review(result))
+
+    def test_integration_sandbox_inspection_blocker_defers_to_review(self) -> None:
+        result = {
+            "returncode": 0,
+            "stdout": (
+                '{"status":"blocked","approved":false,'
+                '"summary":"Could not inspect repository status/diff because sandbox blocked git.",'
+                '"tests":["Not run: git/status commands were blocked by bubblewrap_not_available."]}'
+            ),
+        }
+        blocker = _integration_blocker_message(result) or ""
+
+        self.assertTrue(_integration_semantic_blocker_can_defer_to_review(result, blocker))
+
+    def test_integration_concrete_code_finding_does_not_defer(self) -> None:
+        result = {
+            "returncode": 0,
+            "stdout": (
+                '{"status":"blocked","approved":false,'
+                '"summary":"Duplicate findLast import remains.",'
+                '"required_fixes":["Remove the duplicate import."]}'
+            ),
+        }
+        blocker = _integration_blocker_message(result) or ""
+
+        self.assertFalse(_integration_semantic_blocker_can_defer_to_review(result, blocker))
 
     def test_preserve_and_reset_blocked_worktree_cleans_synced_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
