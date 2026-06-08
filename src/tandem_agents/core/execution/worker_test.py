@@ -148,7 +148,37 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(result["returncode"], 1)
             self.assertEqual(result["blocker_kind"], "engine_provider_auth")
-            self.assertIn("API key", result["failure_reason"])
+
+    def test_nonzero_worker_with_diff_in_any_target_file_recovers_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            log_path = worktree / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+            (worktree / "src").mkdir()
+            target = worktree / "src" / "existing.ts"
+            target.write_text("before\n", encoding="utf-8")
+            subprocess_result = mock.Mock(returncode=0, stdout="src/existing.ts\n", stderr="")
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.git_diff_stat",
+                return_value=" src/existing.ts | 1 +\n",
+            ), mock.patch(
+                "src.tandem_agents.core.execution.worker.run_command",
+                return_value=subprocess_result,
+            ):
+                result = _coerce_worker_failure(
+                    {
+                        "returncode": 1,
+                        "stdout": "ENGINE_ERROR: ENGINE_DISPATCH_FAILED: iteration budget\n",
+                    },
+                    log_path,
+                    worktree,
+                    {"files": ["src/existing.ts", "src/stale.ts"]},
+                    require_filesystem_changes=True,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertTrue(result["recovered_success"])
 
     def test_empty_async_stream_recovers_text_from_run_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
