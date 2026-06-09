@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.tandem_agents.core.task_contract import apply_task_contract
+from src.tandem_agents.core.task_contract import apply_task_contract, task_plan_validation
 
 
 class TaskContractBugMonitorTest(unittest.TestCase):
@@ -162,6 +162,79 @@ There are 19 open Bolt/Jules-style PRs.
 
         self.assertEqual(task["execution_kind"], "code_edit")
         self.assertEqual(task["target_files"], ["crates/tandem-server/src/http/linear.rs"])
+        self.assertEqual(task["acceptance_criteria"], ["Implement Linear routing for task intake."])
+
+    def test_plain_acceptance_section_populates_contract_criteria(self) -> None:
+        body = """## Context
+
+Migrated from Signal Triage roadmap.
+
+## Acceptance
+
+* Research/Evidence triage vertical slice can intake a signal and produce a reviewed recommendation proposal.
+* Use-Case Discovery can produce reviewed proposals without auto-enabling workflows.
+
+## Verification
+
+* Demo or tests for both additional vertical slices.
+"""
+
+        task = apply_task_contract(
+            {
+                "title": "SIG-03 Prove Research/Evidence and Use-Case Discovery triage domains",
+                "description": body,
+                "source": {"type": "linear", "identifier": "TAN-69"},
+            }
+        )
+
+        self.assertEqual(
+            task["acceptance_criteria"],
+            [
+                "Research/Evidence triage vertical slice can intake a signal and produce a reviewed recommendation proposal.",
+                "Use-Case Discovery can produce reviewed proposals without auto-enabling workflows.",
+            ],
+        )
+        self.assertEqual(task["verification_commands"], ["Demo or tests for both additional vertical slices."])
+
+    def test_task_plan_validation_accepts_deliverable_as_subtask_checklist(self) -> None:
+        task = {
+            "title": "Verify Bug Monitor gates",
+            "verification_commands": ["node scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+        }
+        subtasks = [
+            {
+                "title": "Map gate flow",
+                "goal": "Confirm existing Bug Monitor gate flow.",
+                "deliverable": "A short note identifying gate APIs and the verification command.",
+            }
+        ]
+
+        validation = task_plan_validation(task, subtasks)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_task_plan_validation_accepts_required_work_as_subtask_checklist(self) -> None:
+        task = {
+            "title": "Verify Bug Monitor gates",
+            "verification_commands": ["node scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+        }
+        subtasks = [
+            {
+                "title": "Add focused fixture coverage",
+                "goal": "Exercise mixed Bug Monitor signal fixtures.",
+                "required_work": [
+                    "Assert minor retries do not create draft work.",
+                    "Assert blocked signals include quality-gate reasons.",
+                ],
+                "verification": ["Run the focused fixture test."],
+            }
+        ]
+
+        validation = task_plan_validation(task, subtasks)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["issues"], [])
 
     def test_linear_github_pr_action_task_is_not_code_edit(self) -> None:
         body = """## Context

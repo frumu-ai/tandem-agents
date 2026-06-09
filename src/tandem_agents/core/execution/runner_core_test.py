@@ -32,6 +32,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _pr_candidate_edit_goal,
     _pr_candidate_target_files,
     _pr_candidate_unexpected_changed_files,
+    _normalize_manager_subtasks,
     _task_mentions_external_pr_candidates,
     _worker_failure_blocker,
     _record_worker_result,
@@ -84,6 +85,58 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 {"id": "req-2", "status": "allow", "permission": "bash"},
             ],
         )
+
+    def test_manager_subtask_deliverable_fills_acceptance_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {"title": "Verify Bug Monitor gates"},
+                [
+                    {
+                        "id": "SIG-01-A",
+                        "title": "Map gate flow",
+                        "goal": "Confirm existing Bug Monitor gate flow.",
+                        "deliverable": "A short note identifying gate APIs and the verification command.",
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        self.assertEqual(
+            subtasks[0]["acceptance_criteria"],
+            ["A short note identifying gate APIs and the verification command."],
+        )
+        self.assertEqual(
+            subtasks[0]["deliverables"],
+            ["A short note identifying gate APIs and the verification command."],
+        )
+
+    def test_manager_subtask_required_work_fills_acceptance_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {"title": "Verify Bug Monitor gates"},
+                [
+                    {
+                        "id": "sig01-e2e-quality-gate-fixture",
+                        "title": "Add focused end-to-end Bug Monitor quality-gate fixture coverage",
+                        "goal": "Exercise a mixed Bug Monitor fixture.",
+                        "required_work": [
+                            "Assert minor retries do not create draft work.",
+                            "Assert blocked signals include quality-gate reasons.",
+                        ],
+                        "verification": ["Run the focused fixture test."],
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        self.assertEqual(
+            subtasks[0]["acceptance_criteria"],
+            [
+                "Assert minor retries do not create draft work.",
+                "Assert blocked signals include quality-gate reasons.",
+            ],
+        )
+        self.assertEqual(subtasks[0]["verification_commands"], ["Run the focused fixture test."])
 
     def test_permission_requests_from_payload_accepts_sdk_permissions_shape(self) -> None:
         payload = {

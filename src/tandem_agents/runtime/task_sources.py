@@ -151,11 +151,28 @@ def _normalize_issue_body(body: str | None) -> tuple[str, list[str]]:
         return "", []
     lines = [line.strip() for line in body.splitlines()]
     summary = next((line for line in lines if line), "")
-    criteria = [
-        line.lstrip("-* ").strip()
-        for line in lines
-        if line.startswith("- [ ]") or line.startswith("* [ ]") or line.startswith("- ")
-    ]
+    criteria: list[str] = []
+    in_acceptance = False
+    for line in lines:
+        if line.startswith("#"):
+            heading = re.sub(r"[^a-z0-9]+", "_", line.lstrip("#").strip().lower()).strip("_")
+            in_acceptance = heading in {"acceptance", "acceptance_criterion", "acceptance_criteria"}
+            continue
+        if not line:
+            continue
+        if in_acceptance:
+            match = re.match(r"^(?:[-*]|\d+[.)])\s+(.*\S)\s*$", line)
+            if match:
+                criteria.append(match.group(1).strip())
+            continue
+        if line.startswith("- [ ]") or line.startswith("* [ ]"):
+            criteria.append(line.split("]", 1)[-1].strip())
+    if not criteria:
+        criteria = [
+            line.lstrip("-* ").strip()
+            for line in lines
+            if line.startswith("- [ ]") or line.startswith("* [ ]") or line.startswith("- ")
+        ]
     criteria = [line for line in criteria if line]
     return summary, criteria
 
@@ -1369,10 +1386,14 @@ def _load_linear_live_data(
                 by_id[identity] = issue
         issues = list(by_id.values())
     selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
-    if selector and not issues:
-        fetched = linear_fetch_issue(cfg, selector)
+    if selector and not any(_linear_issue_matches_selector(issue, selector) for issue in issues):
+        try:
+            fetched = linear_fetch_issue(cfg, selector)
+        except Exception:
+            logger.debug("Failed to fetch selected Linear issue %s during intake", selector, exc_info=True)
+            fetched = None
         if fetched:
-            issues = [fetched]
+            issues = [fetched, *issues]
     if not issues:
         raise RuntimeError(
             f"No Linear issues returned for team '{cfg.task_source.team}'"
@@ -1435,13 +1456,7 @@ def _select_linear_issue(
     selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
     if selector:
         for issue in issues:
-            haystacks = [
-                _linear_issue_id(issue),
-                _linear_issue_identifier(issue),
-                _linear_issue_url(issue),
-                str(issue.get("title") or ""),
-            ]
-            if not any(selector == hay or selector in hay for hay in haystacks if hay):
+            if not _linear_issue_matches_selector(issue, selector):
                 continue
             status_name = _linear_issue_status(issue)
             state_type = _linear_issue_state_type(issue)
@@ -1473,6 +1488,19 @@ def _select_linear_issue(
         "Expected a launchable status like Backlog, Todo, Triage, or Ready. "
         f"Found statuses: {found_statuses}"
     )
+
+
+def _linear_issue_matches_selector(issue: dict[str, Any], selector: str) -> bool:
+    selector = selector.strip()
+    if not selector:
+        return False
+    haystacks = [
+        _linear_issue_id(issue),
+        _linear_issue_identifier(issue),
+        _linear_issue_url(issue),
+        str(issue.get("title") or ""),
+    ]
+    return any(selector == hay or selector in hay for hay in haystacks if hay)
 
 
 def linear_board_snapshot(

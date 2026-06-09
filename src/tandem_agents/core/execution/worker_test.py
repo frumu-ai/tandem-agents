@@ -62,10 +62,10 @@ class WorkerFailureCoercionTest(unittest.TestCase):
         self.assertFalse(_worker_result_should_retry({"returncode": 1, "blocker_kind": "engine_provider_auth"}))
         self.assertTrue(_worker_result_should_retry({"returncode": 1, "blocker_kind": "worker_no_diff"}))
 
-    def test_worker_stream_uses_tighter_empty_event_cap(self) -> None:
+    def test_worker_stream_uses_bounded_empty_event_cap(self) -> None:
         cfg = SimpleNamespace(env={})
 
-        self.assertEqual(_engine_max_events_without_text(cfg, "worker-1"), 50)
+        self.assertEqual(_engine_max_events_without_text(cfg, "worker-1"), 150)
         self.assertEqual(_engine_max_events_without_text(cfg, "manager"), 150)
 
     def test_empty_event_cap_can_be_configured(self) -> None:
@@ -641,20 +641,23 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertNotIn("failure_reason", result)
             self.assertNotIn("blocker_kind", result)
 
-    def test_tool_loop_stream_blocks_without_retry_or_sync_fallback(self) -> None:
+    def test_tool_loop_stream_retries_then_uses_prompt_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
             with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
                 mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
                 mock.patch(
                     "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
-                    return_value={"run_id": "run-1"},
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
                 ) as prompt_async, \
                 mock.patch(
                     "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
                     return_value={"text": "", "completed": False, "reason": "no_text_timeout", "event_count": 251},
                 ), \
-                mock.patch("src.tandem_agents.core.execution.worker.prompt_tandem_session_sync") as prompt_sync:
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    return_value={"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync fallback"}]}]},
+                ) as prompt_sync:
                 result = stream_tandem_prompt(
                     SimpleNamespace(env={}),
                     role="worker-1",
@@ -668,12 +671,13 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                     write_required=True,
                 )
 
-            self.assertEqual(result["returncode"], 1)
-            self.assertEqual(result["blocker_kind"], "engine_tool_loop_stalled")
-            self.assertEqual(result["failure_reason"], "ENGINE_TOOL_LOOP_STALLED")
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("sync fallback", result["stdout"])
             self.assertEqual(result["engine"]["stream_reason"], "no_text_timeout")
-            self.assertEqual(prompt_async.call_count, 1)
-            prompt_sync.assert_not_called()
+            self.assertEqual(result["engine"]["retry_count"], 1)
+            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync")
+            self.assertEqual(prompt_async.call_count, 2)
+            prompt_sync.assert_called_once()
 
     def test_manager_planning_disables_engine_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

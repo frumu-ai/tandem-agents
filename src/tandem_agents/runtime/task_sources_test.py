@@ -703,6 +703,89 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertNotIn("truncated", task["description"])
             self.assertIn("Real criterion", task["acceptance_criteria"])
 
+    def test_linear_task_fetches_selected_issue_missing_from_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.item = "ENG-2"
+            listed_issue = {
+                "id": "lin-1",
+                "identifier": "ENG-1",
+                "title": "Wrong next task",
+                "description": "Not the selected task",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+            selected_issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Explicitly selected task",
+                "description": "Selected body\n\nAcceptance:\n- Selected criterion",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+
+            with (
+                patch("src.tandem_agents.runtime.task_sources.ensure_linear_mcp_connected"),
+                patch(
+                    "src.tandem_agents.runtime.task_sources.linear_list_issue_statuses",
+                    return_value=[{"name": "Todo", "type": "unstarted"}],
+                ),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issue_labels", return_value=[]),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issues", return_value=[listed_issue]),
+                patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=selected_issue) as fetch_issue,
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+
+            fetch_issue.assert_called()
+            self.assertEqual(task["source"]["identifier"], "ENG-2")
+            self.assertEqual(task["title"], "Explicitly selected task")
+            self.assertIn("Selected criterion", task["acceptance_criteria"])
+
+    def test_linear_task_extracts_plain_acceptance_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issue = {
+                "id": "lin-69",
+                "identifier": "TAN-69",
+                "title": "SIG-03 Prove Research/Evidence and Use-Case Discovery triage domains",
+                "description": "\n".join(
+                    [
+                        "## Context",
+                        "",
+                        "Migrated from Signal Triage roadmap.",
+                        "",
+                        "## Acceptance",
+                        "",
+                        "* Research/Evidence triage vertical slice can intake a signal.",
+                        "* Use-Case Discovery can produce reviewed proposals.",
+                        "",
+                        "## Verification",
+                        "",
+                        "* Demo or tests for both additional vertical slices.",
+                    ]
+                ),
+                "url": "https://linear.app/frumu/issue/TAN-69/sig-03",
+                "state": {"name": "Backlog", "type": "backlog"},
+                "team": {"name": "Tandem", "id": "team-1"},
+                "project": {"name": "Signal Triage & Bug Monitor", "id": "project-1"},
+            }
+
+            with (
+                patch(
+                    "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                    return_value=([{"name": "Backlog", "type": "backlog"}], [], [issue]),
+                ),
+                patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=issue),
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+
+            self.assertEqual(
+                task["acceptance_criteria"],
+                [
+                    "Research/Evidence triage vertical slice can intake a signal.",
+                    "Use-Case Discovery can produce reviewed proposals.",
+                ],
+            )
+            self.assertEqual(task["verification_commands"], ["Demo or tests for both additional vertical slices."])
+
     def test_linear_task_source_reports_connector_failure_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))
