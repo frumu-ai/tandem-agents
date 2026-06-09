@@ -294,9 +294,28 @@ def evaluate_verification_policy(
         outcome = "repair_needed"
     else:
         outcome = "pass"
-    validation_blocker = repo_blocker or review_blocker or test_blocker
     repo_blocker_kind = repo_validation_blocker_kind(repo_validation or {})
-    failure_category = repo_blocker_kind if repo_blocker or (repo_validation or {}).get("verification_missing") else None
+    if review_outcome == "human_review_needed":
+        validation_blocker = review_blocker or test_blocker or repo_blocker
+        failure_category = "review_human_review_needed"
+    elif test_outcome == "human_review_needed":
+        validation_blocker = test_blocker or review_blocker or repo_blocker
+        failure_category = "test_human_review_needed"
+    elif review_outcome == "repair_needed":
+        validation_blocker = review_blocker or test_blocker or repo_blocker
+        failure_category = "review_repair_needed"
+    elif test_outcome == "repair_needed":
+        validation_blocker = test_blocker or review_blocker or repo_blocker
+        failure_category = "test_repair_needed"
+    elif review_outcome == "blocked":
+        validation_blocker = review_blocker or test_blocker or repo_blocker
+        failure_category = "review_blocked"
+    elif test_outcome == "blocked":
+        validation_blocker = test_blocker or review_blocker or repo_blocker
+        failure_category = "test_blocked"
+    else:
+        validation_blocker = repo_blocker or review_blocker or test_blocker
+        failure_category = repo_blocker_kind if repo_blocker or (repo_validation or {}).get("verification_missing") else None
     should_retry = bool(
         outcome == "repair_needed"
         and (

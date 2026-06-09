@@ -85,6 +85,7 @@ NON_RETRYABLE_WORKER_BLOCKERS = {
     "engine_session_run_conflict",
     "engine_provider_auth",
     "engine_tool_loop_stalled",
+    "ignored_path_changes",
 }
 PR_CANDIDATE_SEED_CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".py")
 PR_CANDIDATE_IMPORT_EXTENSIONS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json")
@@ -402,6 +403,21 @@ def _recover_engine_text_from_state(
         try:
             messages = _call_with_timeout(lambda: sdk_session_messages(cfg, session_id), timeout_seconds=snapshot_timeout)
             recovery["messages_path"] = _write_engine_snapshot(log_path, f"engine-messages-{session_id}", messages)
+            if isinstance(messages, list):
+                recovery["message_count"] = len(messages)
+                tool_part_count = 0
+                assistant_message_count = 0
+                for message in messages:
+                    message_dict = _message_dict(message)
+                    if not message_dict:
+                        continue
+                    if _message_role(message_dict) == "assistant":
+                        assistant_message_count += 1
+                    parts = message_dict.get("parts") or message_dict.get("content") or []
+                    if isinstance(parts, list):
+                        tool_part_count += sum(1 for part in parts if isinstance(part, dict) and part.get("type") == "tool")
+                recovery["tool_part_count"] = tool_part_count
+                recovery["assistant_message_count"] = assistant_message_count
             if not text.strip():
                 text = _extract_session_reply(messages)
         except Exception as exc:
@@ -509,6 +525,44 @@ def _subtask_targets(subtask: dict[str, Any]) -> list[str]:
             seen.add(rel_path)
             targets.append(rel_path)
     return targets
+
+
+def _git_ignored_paths(worktree: Path, paths: list[str]) -> list[str]:
+    ignored: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        rel_path = str(raw_path or "").strip().replace("\\", "/").strip("/")
+        if not rel_path or rel_path in seen:
+            continue
+        seen.add(rel_path)
+        try:
+            result = run_command(["git", "check-ignore", "--quiet", "--", rel_path], cwd=worktree)
+        except Exception:
+            continue
+        if result.returncode == 0:
+            ignored.append(rel_path)
+    return ignored
+
+
+def _annotate_ignored_target_files(worktree: Path, subtask: dict[str, Any]) -> dict[str, Any]:
+    targets = _subtask_targets(subtask)
+    ignored = set(_git_ignored_paths(worktree, targets))
+    if not ignored:
+        return subtask
+    prepared = dict(subtask)
+    prepared["ignored_target_files"] = sorted(ignored)
+    for key in ("files", "target_files"):
+        current = [str(entry or "").strip().replace("\\", "/").strip("/") for entry in prepared.get(key) or []]
+        filtered = [entry for entry in current if entry and entry not in ignored]
+        prepared[key] = filtered
+    return prepared
+
+
+def _ignored_existing_target_files(worktree: Path, subtask: dict[str, Any]) -> list[str]:
+    candidates = _subtask_targets(subtask)
+    candidates.extend(str(entry or "").strip() for entry in subtask.get("ignored_target_files") or [])
+    ignored = _git_ignored_paths(worktree, candidates)
+    return [path for path in ignored if (worktree / path).exists()]
 
 
 def _prepare_worktree_targets(worktree: Path, subtask: dict[str, Any]) -> None:
@@ -1216,9 +1270,16 @@ def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
         [
             "Then create or edit the target files using `write`, `edit`, or `apply_patch`.",
             "Finish by verifying the changed files with `ls -la`, `read`, or `grep`.",
-            "Do not reply with a summary until you have either produced a filesystem diff or produced a structured no-safe-changes blocker naming every inspected PR.",
         ]
     )
+    if has_pr_context:
+        steps.append(
+            "Do not reply with a summary until you have either produced a filesystem diff or produced a structured no-safe-changes blocker naming every inspected PR."
+        )
+    else:
+        steps.append(
+            "Do not reply with a summary until you have either produced a filesystem diff or produced a structured no-safe-changes blocker naming every inspected target file and the exact safety reason."
+        )
     return "\n\nRetry instructions:\n- " + "\n- ".join(steps) + "\n"
 
 
@@ -1238,6 +1299,7 @@ def _coerce_worker_failure(
     diff_text = git_diff_stat(worktree).strip()
     diff_touches_targets = _diff_touches_target_files(worktree, subtask)
     changed_files = _worktree_changed_files(worktree)
+    ignored_existing_targets = _ignored_existing_target_files(worktree, subtask)
     if result.get("returncode", 0) != 0 and (not targets_exist or not diff_text):
         recovered, recovered_diff = _wait_for_target_files(worktree, subtask)
         if recovered:
@@ -1280,11 +1342,24 @@ def _coerce_worker_failure(
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
     elif result.get("returncode", 0) == 0 and not diff_text:
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
+    if (
+        failure_reason in {"ENGINE_TOOL_LOOP_STALLED", "NO_FILESYSTEM_CHANGES"}
+        and not diff_text
+        and ignored_existing_targets
+    ):
+        result["ignored_files"] = ignored_existing_targets
+        failure_reason = "IGNORED_PATH_CHANGES"
     if not failure_reason:
         return result
     message = ""
     if failure_reason == "NO_FILESYSTEM_CHANGES":
         message = "Worker reported success but produced no filesystem changes in its worktree.\n"
+    elif failure_reason == "IGNORED_PATH_CHANGES":
+        paths = ", ".join(f"`{path}`" for path in ignored_existing_targets)
+        message = (
+            "Worker edited only Git-ignored target files, so the run produced no reviewable repository diff. "
+            f"Ignored files: {paths}.\n"
+        )
     elif failure_reason not in stdout_text:
         message = f"Worker failed: {failure_reason}\n"
     if message:
@@ -1321,6 +1396,12 @@ def _coerce_worker_failure(
         if not result.get("recovery_action"):
             result["recovery_action"] = (
                 "Inspect the worker log and PR candidate context; reset the task to Backlog if another attempt is needed."
+            )
+    elif failure_reason == "IGNORED_PATH_CHANGES":
+        result["blocker_kind"] = "ignored_path_changes"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Move the requested deliverable to tracked repository files, or update the task to name tracked target files, then reset it to Backlog."
             )
     elif failure_reason == "ENGINE_EXCEPTION":
         result["blocker_kind"] = "engine_exception"
@@ -1419,12 +1500,11 @@ def stream_tandem_prompt(
                     failure_reason = ""
                     blocker_kind = ""
                     recovery_action = ""
+                    completed = False
+                    stdout_text = ""
                     try:
-                        sync_response = _prompt_sync_with_connect_retries(
+                        sync_response = prompt_tandem_session_sync(
                             cfg,
-                            engine_meta=engine_meta,
-                            log=log,
-                            role=role,
                             session_id=session_id,
                             prompt=prompt,
                             tool_allowlist=session_tool_allowlist,
@@ -1456,6 +1536,41 @@ def stream_tandem_prompt(
                                 "when ACA attempted prompt_sync on a fresh worker session. "
                                 f"Active run: {conflict_run_id or 'unknown'}.\n"
                             )
+                            log.write(stdout_text)
+                            log.flush()
+                            _print_line(role, stdout_text)
+                            sync_deadline = time.monotonic() + _engine_sync_conflict_wait_seconds(cfg)
+                            recovered_tool_activity = False
+                            while time.monotonic() < sync_deadline:
+                                recovered_text, recovery = _recover_engine_text_from_state(
+                                    cfg,
+                                    session_id=session_id,
+                                    run_id=conflict_run_id or last_run_id,
+                                    log_path=log_path,
+                                )
+                                recovery["run_id"] = conflict_run_id or last_run_id
+                                recovery["attempt"] = engine_meta.get("retry_count", 0)
+                                recovery["stream_reason"] = "prompt_sync_first_session_run_conflict"
+                                engine_meta.setdefault("recovery", []).append(recovery)
+                                for key in ("events_path", "messages_path"):
+                                    if recovery.get(key):
+                                        engine_meta[key] = recovery[key]
+                                recovered_tool_activity = recovered_tool_activity or int(recovery.get("tool_part_count") or 0) > 0
+                                if recovered_text.strip():
+                                    stdout_text = recovered_text
+                                    failure_reason = ""
+                                    blocker_kind = ""
+                                    completed = True
+                                    break
+                                time.sleep(min(max(retry_after_ms / 1000.0, 0.25), 2.0))
+                            if not completed and recovered_tool_activity:
+                                failure_reason = "ENGINE_TOOL_LOOP_STALLED"
+                                blocker_kind = "engine_tool_loop_stalled"
+                                stdout_text = (
+                                    "ENGINE_TOOL_LOOP_STALLED: Tandem engine completed tool activity during "
+                                    "prompt_sync recovery but produced no assistant terminal response. "
+                                    f"Last engine run: {conflict_run_id or last_run_id or 'unknown'}.\n"
+                                )
                         elif _engine_exception_is_timeout(exc):
                             failure_reason = "ENGINE_PROMPT_TIMEOUT"
                             blocker_kind = "engine_prompt_timeout"
@@ -1464,15 +1579,52 @@ def stream_tandem_prompt(
                                 f"did not finish within {_engine_prompt_sync_timeout_seconds(cfg):.0f}s.\n"
                             )
                         elif _engine_exception_is_connection_failure(exc):
-                            failure_reason = "ENGINE_WORKSPACE_UNREACHABLE"
-                            blocker_kind = "engine_workspace_unreachable"
                             stdout_text = (
-                                "ENGINE_WORKSPACE_UNREACHABLE: Tandem engine prompt_sync worker prompt "
-                                "could not reach the engine after connection retries.\n"
+                                "ENGINE_PROMPT_SYNC_CONNECT_LOST: Tandem engine prompt_sync connection was "
+                                "lost after dispatch; checking the session for recovered output.\n"
                             )
+                            log.write(stdout_text)
+                            log.flush()
+                            _print_line(role, stdout_text)
+                            recovery_deadline = time.monotonic() + _engine_sync_conflict_wait_seconds(cfg)
+                            recovered_tool_activity = False
+                            while time.monotonic() < recovery_deadline:
+                                recovered_text, recovery = _recover_engine_text_from_state(
+                                    cfg,
+                                    session_id=session_id,
+                                    run_id=last_run_id,
+                                    log_path=log_path,
+                                )
+                                recovery["run_id"] = last_run_id
+                                recovery["attempt"] = engine_meta.get("retry_count", 0)
+                                recovery["stream_reason"] = "prompt_sync_first_connection_lost"
+                                engine_meta.setdefault("recovery", []).append(recovery)
+                                for key in ("events_path", "messages_path"):
+                                    if recovery.get(key):
+                                        engine_meta[key] = recovery[key]
+                                recovered_tool_activity = recovered_tool_activity or int(recovery.get("tool_part_count") or 0) > 0
+                                if recovered_text.strip():
+                                    stdout_text = recovered_text
+                                    completed = True
+                                    break
+                                time.sleep(0.5)
+                            if not completed and recovered_tool_activity:
+                                failure_reason = "ENGINE_TOOL_LOOP_STALLED"
+                                blocker_kind = "engine_tool_loop_stalled"
+                                stdout_text = (
+                                    "ENGINE_TOOL_LOOP_STALLED: Tandem engine completed tool activity after "
+                                    "prompt_sync dispatch but produced no assistant terminal response.\n"
+                                )
+                            elif not completed:
+                                failure_reason = "ENGINE_WORKSPACE_UNREACHABLE"
+                                blocker_kind = "engine_workspace_unreachable"
+                                stdout_text = (
+                                    "ENGINE_WORKSPACE_UNREACHABLE: Tandem engine prompt_sync worker prompt "
+                                    "lost the connection and no session output could be recovered.\n"
+                                )
                         else:
                             raise
-                    completed = bool(stdout_text.strip()) and not failure_reason
+                    completed = completed or (bool(stdout_text.strip()) and not failure_reason)
                     if not completed and not failure_reason:
                         failure_reason = "ENGINE_EMPTY_RESPONSE"
                         blocker_kind = "engine_empty_response"
@@ -1933,6 +2085,7 @@ def run_worker_subtask(
     worktree_path = layout["worktrees"] / worker_worktree_name(worker_id, subtask.get("id"))
     worktree = create_worktree(repo_path, worktree_path)
     subtask = _materialize_worker_context(worktree, subtask)
+    subtask = _annotate_ignored_target_files(worktree, subtask)
     
     _prepare_worktree_targets(worktree, subtask)
     preflight_ok, preflight_detail = _worktree_preflight(cfg, worktree)

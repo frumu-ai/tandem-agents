@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.tandem_agents.core.execution.worker import (
+    _annotate_ignored_target_files,
     _call_with_timeout,
     _coerce_worker_failure,
     _engine_max_events_without_text,
@@ -613,6 +614,68 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["failure_reason"], "NO_FILESYSTEM_CHANGES")
             self.assertEqual(result["blocker_kind"], "worker_no_diff")
 
+    def test_annotate_ignored_target_files_filters_reviewless_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            (worktree / ".gitignore").write_text("docs/internal/\n", encoding="utf-8")
+
+            subtask = _annotate_ignored_target_files(
+                worktree,
+                {
+                    "files": ["docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md", "scripts/smoke.mjs"],
+                    "target_files": ["docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md", "scripts/smoke.mjs"],
+                },
+            )
+
+            self.assertEqual(subtask["files"], ["scripts/smoke.mjs"])
+            self.assertEqual(subtask["target_files"], ["scripts/smoke.mjs"])
+            self.assertEqual(
+                subtask["ignored_target_files"],
+                ["docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md"],
+            )
+
+    def test_engine_stall_with_only_ignored_target_changes_reports_ignored_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            (worktree / ".gitignore").write_text("docs/internal/\n", encoding="utf-8")
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            subprocess.run(["git", "add", ".gitignore"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "baseline"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            ignored = worktree / "docs" / "internal" / "SIGNAL_TRIAGE_PIPELINE_KANBAN.md"
+            ignored.parent.mkdir(parents=True)
+            ignored.write_text("gap note\n", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 1,
+                    "stdout": "ENGINE_TOOL_LOOP_STALLED\n",
+                    "failure_reason": "ENGINE_TOOL_LOOP_STALLED",
+                    "blocker_kind": "engine_tool_loop_stalled",
+                },
+                log_path,
+                worktree,
+                {"files": ["docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md"]},
+                require_filesystem_changes=True,
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "IGNORED_PATH_CHANGES")
+            self.assertEqual(result["blocker_kind"], "ignored_path_changes")
+            self.assertEqual(
+                result["ignored_files"],
+                ["docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md"],
+            )
+            self.assertIn("Git-ignored target files", result["stdout"])
+
     def test_recover_nonzero_result_with_diff_clears_blocker_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
@@ -718,7 +781,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             prompt_async.assert_not_called()
             prompt_sync.assert_called_once()
 
-    def test_prompt_sync_connection_failure_retries_before_success(self) -> None:
+    def test_prompt_sync_connection_failure_recovers_session_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
             connect_error = RuntimeError(
@@ -730,21 +793,23 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
                 mock.patch(
                     "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
-                    side_effect=[
-                        connect_error,
-                        {"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync worker recovered"}]}]},
-                    ],
+                    side_effect=connect_error,
                 ) as prompt_sync, \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_session_messages",
+                    return_value=[{"info": {"role": "assistant"}, "parts": [{"text": "sync worker recovered"}]}],
+                ), \
                 mock.patch(
                     "src.tandem_agents.core.execution.worker.engine_health",
                     return_value={"ready": True, "healthy": True},
                 ), \
                 mock.patch(
-                    "src.tandem_agents.core.execution.worker._engine_prompt_sync_connect_retry_delay_seconds",
-                    return_value=0.01,
+                    "src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds",
+                    return_value=1.0,
                 ):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(env={"ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRIES": "1"}),
+                    SimpleNamespace(env={}),
                     role="worker-1",
                     prompt="do work",
                     cwd=Path(tmp),
@@ -758,11 +823,10 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(result["returncode"], 0)
             self.assertIn("sync worker recovered", result["stdout"])
-            self.assertEqual(result["engine"]["retry_count"], 1)
-            self.assertEqual(prompt_sync.call_count, 2)
+            self.assertEqual(prompt_sync.call_count, 1)
             prompt_async.assert_not_called()
 
-    def test_prompt_sync_connection_failure_blocks_after_retries(self) -> None:
+    def test_prompt_sync_connection_failure_blocks_without_recovered_session_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
             connect_error = RuntimeError(
@@ -775,16 +839,18 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                     "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
                     side_effect=connect_error,
                 ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_session_messages", return_value=[]), \
                 mock.patch(
                     "src.tandem_agents.core.execution.worker.engine_health",
                     return_value={"ready": True, "healthy": True},
                 ), \
                 mock.patch(
-                    "src.tandem_agents.core.execution.worker._engine_prompt_sync_connect_retry_delay_seconds",
+                    "src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds",
                     return_value=0.01,
                 ):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(env={"ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRIES": "1"}),
+                    SimpleNamespace(env={}),
                     role="worker-1",
                     prompt="do work",
                     cwd=Path(tmp),
@@ -799,7 +865,6 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["returncode"], 1)
             self.assertEqual(result["failure_reason"], "ENGINE_WORKSPACE_UNREACHABLE")
             self.assertEqual(result["blocker_kind"], "engine_workspace_unreachable")
-            self.assertEqual(result["engine"]["retry_count"], 1)
 
     def test_manager_planning_disables_engine_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1017,7 +1082,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                     "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
                     side_effect=conflict_error,
                 ), \
-                mock.patch("src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds", return_value=0.0):
+                mock.patch("src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds", return_value=0.01):
                 result = stream_tandem_prompt(
                     SimpleNamespace(),
                     role="worker-1",
@@ -1035,6 +1100,92 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["failure_reason"], "ENGINE_SESSION_RUN_CONFLICT")
             self.assertEqual(result["blocker_kind"], "engine_session_run_conflict")
             self.assertEqual(result["engine"]["sync_conflict"]["run_id"], "run-active")
+
+    def test_prompt_sync_session_conflict_recovers_active_run_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            conflict_error = RuntimeError(
+                'Engine request failed (409) for /session/session-1/prompt_sync: '
+                '{"activeRun":{"runID":"run-active"},"code":"SESSION_RUN_CONFLICT","retryAfterMs":1}'
+            )
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_session_messages",
+                    return_value=[{"info": {"role": "assistant"}, "parts": [{"text": "recovered sync worker"}]}],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=conflict_error,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds", return_value=1.0):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("recovered sync worker", result["stdout"])
+            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync_first")
+            self.assertEqual(result["engine"]["sync_conflict"]["run_id"], "run-active")
+            prompt_async.assert_not_called()
+
+    def test_prompt_sync_session_conflict_with_tool_activity_blocks_as_tool_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            conflict_error = RuntimeError(
+                'Engine request failed (409) for /session/session-1/prompt_sync: '
+                '{"activeRun":{"runID":"run-active"},"code":"SESSION_RUN_CONFLICT","retryAfterMs":1}'
+            )
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_session_messages",
+                    return_value=[
+                        {
+                            "info": {"role": "user"},
+                            "parts": [
+                                {"text": "do work", "type": "text"},
+                                {"tool": "write", "type": "tool", "result": "ok"},
+                            ],
+                        }
+                    ],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=conflict_error,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds", return_value=0.01):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_TOOL_LOOP_STALLED")
+            self.assertEqual(result["blocker_kind"], "engine_tool_loop_stalled")
+            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync_first")
+            prompt_async.assert_not_called()
 
     def test_prompt_sync_timeout_blocks_with_prompt_timeout_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

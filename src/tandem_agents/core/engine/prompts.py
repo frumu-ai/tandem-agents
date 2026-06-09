@@ -261,6 +261,8 @@ def build_manager_prompt(
         "Do not edit files in this planning pass.\n"
         "Return JSON only with keys: summary, subtasks, risks, tests.\n"
         "Each subtask should be independent and suitable for a dedicated worker worktree.\n\n"
+        "Each subtask must include title, goal, files, and acceptance_criteria. "
+        "Use acceptance_criteria for the concrete worker completion checklist; do not put the only completion criteria in a non-canonical field like scope.\n\n"
         "When listing files in subtasks, use repository-relative paths only, such as `package.json` or `src/app.js`.\n"
         "Do not use absolute container paths like `/workspace/...`.\n\n"
         "Plan around the contract below. Respect out-of-scope boundaries, dependency ordering, and target files.\n"
@@ -311,9 +313,22 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     target_files = subtask.get("files") or subtask.get("target_files") or []
     files = json.dumps(target_files)
     existing_files = json.dumps(subtask.get("existing_files") or [])
+    ignored_target_files = [
+        str(entry).strip()
+        for entry in _as_list(subtask.get("ignored_target_files"))
+        if str(entry).strip()
+    ]
     write_required = bool(subtask.get("write_required", True))
     parent_scope = _task_scope_block(task)
     subtask_contract = _task_contract_block(subtask)
+    write_required_guidance = ""
+    if write_required:
+        write_required_guidance = (
+            "\nThis worker is write-required. Keep initial inspection brief: identify the smallest safe target, "
+            "then make a real filesystem edit before spending more tool calls on broad exploration. "
+            "If you discover missing coverage or missing behavior, implement the smallest focused improvement now; "
+            "do not stop with an analysis-only blocker unless editing would be unsafe.\n"
+        )
     no_target_guidance = ""
     if not target_files:
         pr_numbers = _referenced_pr_numbers(task, subtask)
@@ -323,6 +338,14 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             f"{pr_line}\n"
             "If the task references PRs or branches, inspect them (see the fetched local refs below if present), compare them to latest main, "
             "apply the still-relevant changes into this worktree so a real diff is produced, and leave a clear blocker only if no safe repository diff can be produced.\n"
+        )
+    ignored_target_guidance = ""
+    if ignored_target_files:
+        ignored_target_guidance = (
+            "\nGit-ignored target files were present in the task metadata: "
+            f"{json.dumps(ignored_target_files)}. Do not use those paths as deliverables because Git will ignore them "
+            "and ACA cannot create a reviewable diff from them. Choose tracked source, test, or public docs files that satisfy the task, "
+            "or return a concrete blocker explaining that the task only names ignored/private files.\n"
         )
     pr_context_guidance = ""
     pr_context = subtask.get("pr_candidate_context")
@@ -379,7 +402,9 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Target files: {files}\n"
         f"Existing readable target files in the base repo before this worker: {existing_files}\n"
         f"Write required for this worker: {json.dumps(write_required)}\n"
+        f"{write_required_guidance}"
         f"{no_target_guidance}"
+        f"{ignored_target_guidance}"
         f"{pr_context_guidance}"
     )
 

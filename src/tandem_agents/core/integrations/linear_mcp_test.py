@@ -191,6 +191,27 @@ class LinearMcpIntegrationTest(unittest.TestCase):
             self.assertEqual(calls, ["mcp.linear.save_issue"])
             self.assertEqual(result["metadata"]["result"]["ok"], True)
 
+    def test_execute_linear_tool_preserves_execution_failure_over_missing_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+
+            with patch(
+                "src.tandem_agents.core.integrations.linear_mcp.list_engine_tool_ids",
+                return_value=["mcp.linear.save_issue"],
+            ), patch(
+                "src.tandem_agents.core.integrations.linear_mcp.get_mcp_server",
+                return_value={"connected": True, "last_error": ""},
+            ), patch(
+                "src.tandem_agents.core.integrations.linear_mcp.execute_engine_tool",
+                side_effect=RuntimeError("state field is invalid"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "state field is invalid"):
+                    _execute_linear_tool(
+                        cfg,
+                        ["update_issue", "save_issue", "saveIssue"],
+                        {"id": "TAN-111", "state": "Todo"},
+                    )
+
     def test_linear_update_issue_tries_state_only_payload_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))
@@ -227,6 +248,18 @@ class LinearMcpIntegrationTest(unittest.TestCase):
             self.assertIsNone(warning)
             self.assertIn("saveIssue", aliases_seen[0])
             self.assertIn("updateIssue", aliases_seen[0])
+
+    def test_linear_update_issue_returns_warning_instead_of_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            task = {"source": {"type": "linear", "issue_id": "TAN-111", "identifier": "TAN-111"}}
+            with patch(
+                "src.tandem_agents.core.integrations.linear_mcp._execute_linear_tool",
+                side_effect=RuntimeError("state field is invalid"),
+            ):
+                warning = linear_update_issue(cfg, task, {"status": "Todo"})
+
+            self.assertEqual(warning, "state field is invalid")
 
     def test_linear_list_comments_uses_issue_id_and_parses_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

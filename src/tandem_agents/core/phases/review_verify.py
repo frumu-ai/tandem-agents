@@ -45,6 +45,7 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
     from src.tandem_agents.core.repository.repo_truth import (
         deterministic_repo_validation,
         extract_command_checks,
+        filter_executable_command_checks,
         infer_command_checks,
     )
     from src.tandem_agents.core.verification.coding_run_contract import build_coding_run_contract
@@ -77,7 +78,8 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
                 worker_changed_files.append(rel_path)
     inferred_command_checks = infer_command_checks(ctx.repo_path, worker_changed_files, task=ctx.task)
     combined_command_checks: list[str] = []
-    for command in task_verification_commands + manager_command_checks + inferred_command_checks:
+    executable_task_commands = filter_executable_command_checks(task_verification_commands)
+    for command in executable_task_commands + manager_command_checks + inferred_command_checks:
         if command not in combined_command_checks:
             combined_command_checks.append(command)
 
@@ -239,6 +241,7 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
     ctx.blackboard["verification_plan"] = {
         "commands": combined_command_checks,
         "task_commands": task_verification_commands,
+        "executable_task_commands": executable_task_commands,
         "manager_commands": manager_command_checks,
         "inferred_commands": inferred_command_checks,
         "changed_files": worker_changed_files,

@@ -385,6 +385,59 @@ def _run_events(run_dir: Path, tail: int = 80) -> list[dict[str, Any]]:
     return events
 
 
+def _compact_event_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in (
+        "status",
+        "outcome",
+        "result",
+        "kind",
+        "phase",
+        "detail",
+        "returncode",
+        "worker_id",
+        "subtask_id",
+        "failure_reason",
+        "blocker_kind",
+        "count",
+        "started",
+        "message",
+        "error",
+    ):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            compact[key] = value
+    changed_files = payload.get("changed_files")
+    if isinstance(changed_files, list):
+        compact["changed_files"] = [str(path) for path in changed_files[:20]]
+        if len(changed_files) > 20:
+            compact["changed_files_truncated"] = len(changed_files) - 20
+    return {key: value for key, value in compact.items() if value not in ("", None, [], {})}
+
+
+def _run_event_summaries(run_dir: Path, tail: int = 20) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for event in _run_events(run_dir, tail=tail):
+        if not isinstance(event, dict):
+            continue
+        summary = {
+            "seq": event.get("seq"),
+            "type": event.get("type"),
+            "timestamp_ms": event.get("timestamp_ms"),
+            "timestamp": event.get("timestamp"),
+            "run_id": event.get("run_id"),
+            "task_id": event.get("task_id"),
+            "role": event.get("role"),
+        }
+        payload = _compact_event_payload(event.get("payload"))
+        if payload:
+            summary["payload"] = payload
+        summaries.append({key: value for key, value in summary.items() if value not in ("", None, [], {})})
+    return summaries
+
+
 def _run_diff_snapshot(run_dir: Path) -> dict[str, Any]:
     after_path = run_dir / "diffs" / "after.txt"
     before_path = run_dir / "diffs" / "before.txt"
@@ -447,13 +500,19 @@ def _persisted_run_error(status_payload: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _build_run_snapshot(run_id: str, run_dir: Path, active_state: Optional["RunState"] = None) -> Dict[str, Any]:
+def _build_run_snapshot(
+    run_id: str,
+    run_dir: Path,
+    active_state: Optional["RunState"] = None,
+    *,
+    include_details: bool = False,
+) -> Dict[str, Any]:
     status_payload = load_status(run_dir / "status.json") if run_dir.exists() else {}
     run_meta = status_payload.get("run") if isinstance(status_payload, dict) else {}
     task_meta = status_payload.get("task") if isinstance(status_payload, dict) else {}
     repo_meta = status_payload.get("repo") if isinstance(status_payload, dict) else {}
     phase_meta = status_payload.get("phase") if isinstance(status_payload, dict) else {}
-    blackboard = load_blackboard(run_dir / "blackboard.yaml") if run_dir.exists() else {}
+    blackboard = load_blackboard(run_dir / "blackboard.yaml") if include_details and run_dir.exists() else {}
 
     project_slug = "unknown"
     task_repo = task_meta.get("repo") if isinstance(task_meta, dict) else None
@@ -494,7 +553,7 @@ def _build_run_snapshot(run_id: str, run_dir: Path, active_state: Optional["RunS
         "has_error": bool(error),
         "error": error,
         "summary_available": _run_summary(run_dir) is not None,
-        "events": _run_events(run_dir),
+        "events": _run_events(run_dir) if include_details else _run_event_summaries(run_dir),
         "diff": _run_diff_snapshot(run_dir),
         "artifacts": {
             "run_dir": str(run_dir),
@@ -504,7 +563,7 @@ def _build_run_snapshot(run_id: str, run_dir: Path, active_state: Optional["RunS
             "status_json": str(run_dir / "status.json"),
             "blackboard_yaml": str(run_dir / "blackboard.yaml"),
         },
-        "blackboard": blackboard if isinstance(blackboard, dict) else {},
+        "blackboard": blackboard if include_details and isinstance(blackboard, dict) else {},
     }
 
 
@@ -521,7 +580,7 @@ def _is_run_directory(run_dir: Path) -> bool:
     return (run_dir / "status.json").exists() or (run_dir / "blackboard.yaml").exists()
 
 
-def _list_run_snapshots(cfg) -> List[Dict[str, Any]]:
+def _list_run_snapshots(cfg, *, limit: int = 50) -> List[Dict[str, Any]]:
     output_root = cfg.output_root()
     snapshots: Dict[str, Dict[str, Any]] = {}
     if output_root.exists():
@@ -555,11 +614,14 @@ def _list_run_snapshots(cfg) -> List[Dict[str, Any]]:
             "blackboard": {},
         }
 
-    return sorted(
+    sorted_snapshots = sorted(
         snapshots.values(),
         key=lambda item: item.get("updated_at_ms") or item.get("created_at_ms") or 0,
         reverse=True,
     )
+    if limit > 0:
+        return sorted_snapshots[:limit]
+    return sorted_snapshots
 
 @app.get("/health")
 async def health():
@@ -1089,10 +1151,10 @@ async def get_run_artifact(run_id: str, file_path: str, token: str = Depends(get
     return FileResponse(artifact_path)
 
 @app.get("/runs")
-async def list_runs(token: str = Depends(get_token)):
+async def list_runs(limit: int = 50, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     cfg = resolve_config(root)
-    return {"runs": _list_run_snapshots(cfg)}
+    return {"runs": _list_run_snapshots(cfg, limit=max(1, min(limit, 200)))}
 
 
 def _scheduler_filtered_source_items(root: Path, project_slug: Optional[str], items: list[str]) -> list[str]:
@@ -1217,7 +1279,7 @@ async def get_run(run_id: str, token: str = Depends(get_token)):
             }
         raise HTTPException(status_code=404, detail="Run not found")
     status_payload = load_status(run_dir / "status.json")
-    snapshot = _build_run_snapshot(run_id, run_dir, active_state)
+    snapshot = _build_run_snapshot(run_id, run_dir, active_state, include_details=True)
     return {
         "run_id": run_id,
         "project_slug": snapshot.get("project_slug", "unknown"),

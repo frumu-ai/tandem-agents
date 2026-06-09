@@ -138,6 +138,50 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(subtasks[0]["verification_commands"], ["Run the focused fixture test."])
 
+    def test_manager_subtask_expected_verification_fills_acceptance_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {"title": "Verify Bug Monitor gates"},
+                [
+                    {
+                        "id": "sig01-e2e-quality-gate-fixture",
+                        "title": "Add/refine focused fixture coverage",
+                        "goal": "Exercise Bug Monitor signal quality gates.",
+                        "instructions": [
+                            "Add or refine a focused fixture that covers quality-gate outcomes.",
+                        ],
+                        "expected_verification": [
+                            "Focused Bug Monitor tests pass and cover accepted, retried, and blocked signals.",
+                        ],
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        self.assertEqual(
+            subtasks[0]["acceptance_criteria"],
+            ["Focused Bug Monitor tests pass and cover accepted, retried, and blocked signals."],
+        )
+
+    def test_manager_subtask_scope_fills_acceptance_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {"title": "Add prompt-injection exfiltration evals"},
+                [
+                    {
+                        "title": "Add KB-MCP bulk export scenarios",
+                        "goal": "Cover prompt-injected memory export attempts.",
+                        "scope": "Add YAML eval scenarios and bounded-exposure assertions for no bulk export.",
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        self.assertEqual(
+            subtasks[0]["acceptance_criteria"],
+            ["Add YAML eval scenarios and bounded-exposure assertions for no bulk export."],
+        )
+
     def test_permission_requests_from_payload_accepts_sdk_permissions_shape(self) -> None:
         payload = {
             "permissions": [

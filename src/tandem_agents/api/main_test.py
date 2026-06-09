@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,67 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
 
             self.assertEqual(payload["count"], 1)
             self.assertEqual(payload["approvals"][0]["approval_id"], pending["approval_id"])
+
+    def test_runs_list_uses_compact_events_and_omits_blackboard_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            run_dir = root / "runs" / "run-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run": {
+                            "status": "blocked",
+                            "created_at_ms": 1,
+                            "updated_at_ms": 2,
+                            "error": "review required",
+                        },
+                        "task": {"title": "Compact me"},
+                        "phase": {"name": "handoff"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "blackboard.yaml").write_text(
+                "run_id: run-1\nlarge: should only appear on detail route\n",
+                encoding="utf-8",
+            )
+            (run_dir / "events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "seq": 1,
+                        "type": "worker.completed",
+                        "timestamp_ms": 2,
+                        "run_id": "run-1",
+                        "payload": {
+                            "worker_id": "worker-1",
+                            "returncode": 0,
+                            "engine": {"messages": ["x" * 1000]},
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with TestClient(app) as client:
+                    list_response = client.get("/runs", headers={"Authorization": "Bearer secret-token"})
+                    detail_response = client.get("/runs/run-1", headers={"Authorization": "Bearer secret-token"})
+
+            self.assertEqual(list_response.status_code, 200, list_response.text)
+            listed = list_response.json()["runs"][0]
+            self.assertEqual(listed["blackboard"], {})
+            self.assertEqual(listed["events"][0]["payload"], {"worker_id": "worker-1", "returncode": 0})
+
+            self.assertEqual(detail_response.status_code, 200, detail_response.text)
+            detailed = detail_response.json()
+            self.assertEqual(detailed["blackboard"]["large"], "should only appear on detail route")
+            self.assertIn("engine", detailed["events"][0]["payload"])
 
     def test_workspace_projects_and_guide_include_repo_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
