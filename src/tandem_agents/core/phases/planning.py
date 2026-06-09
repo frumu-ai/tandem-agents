@@ -20,6 +20,14 @@ from src.tandem_agents.core.phases.context import RunContext
 logger = logging.getLogger("aca.phases.planning")
 
 
+def _remote_code_task_requires_worker_execution(task: dict[str, Any]) -> bool:
+    """Remote code tasks need an explicit worker verdict, not file-presence proof."""
+    source = task.get("source") if isinstance(task, dict) else {}
+    source_type = str(source.get("type") or "").strip() if isinstance(source, dict) else ""
+    execution_kind = str(task.get("execution_kind") or "").strip()
+    return execution_kind == "code_edit" and source_type in {"linear", "github_project"}
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Best-effort JSON extraction from model output (imported from runner_core)."""
     # Import here to avoid circular imports; runner_core is the owner of this util
@@ -149,12 +157,8 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     ctx.pending_subtasks = []
     plan_validation = task_plan_validation(ctx.task, subtasks)
     ctx.blackboard["task_plan_validation"] = plan_validation
-    task_source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
     force_worker_execution = (
-        (
-            isinstance(task_source, dict)
-            and str(task_source.get("type") or "").strip() == "github_project"
-        )
+        _remote_code_task_requires_worker_execution(ctx.task)
         or bool(getattr(ctx, "_manager_fallback_required", False))
         or _rc._task_mentions_external_pr_candidates(ctx.task)
     )

@@ -1083,7 +1083,9 @@ def _all_subtasks_verified_existing(
     if not subtasks or not worker_results:
         return False
     source = (task or {}).get("source") if isinstance(task, dict) else {}
-    if isinstance(source, dict) and str(source.get("type") or "").strip() == "github_project":
+    source_type = str(source.get("type") or "").strip() if isinstance(source, dict) else ""
+    execution_kind = str((task or {}).get("execution_kind") or "").strip() if isinstance(task, dict) else ""
+    if source_type == "github_project" or (source_type == "linear" and execution_kind == "code_edit"):
         return False
     if repo_validation is not None and not repo_validation.get("ok"):
         return False

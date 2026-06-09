@@ -484,6 +484,19 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             )
         )
 
+    def test_verified_existing_short_circuit_rejects_linear_code_edit_tasks(self) -> None:
+        subtasks = [{"id": "subtask-1", "files": ["index.html"]}]
+        worker_results = [{"subtask_id": "subtask-1", "status": "skipped_existing"}]
+
+        self.assertFalse(
+            _all_subtasks_verified_existing(
+                subtasks,
+                worker_results,
+                {"ok": True},
+                {"execution_kind": "code_edit", "source": {"type": "linear", "issue_id": "TAN-68"}},
+            )
+        )
+
     def test_write_required_worker_failure_is_unresolved_without_existing_proof(self) -> None:
         self.assertTrue(
             _has_unresolved_write_required_worker_failure(
