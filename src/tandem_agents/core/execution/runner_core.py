@@ -786,6 +786,11 @@ def _normalize_manager_subtasks(
         title = str(item.get("title") or f"Subtask {index}").strip()
         description = str(item.get("description") or "").strip()
         goal = str(item.get("goal") or description or title or task.get("title") or f"Subtask {index}").strip()
+        deliverables = [
+            str(entry).strip()
+            for entry in _as_list(item.get("deliverables") or item.get("deliverable") or task.get("deliverables"))
+            if str(entry).strip()
+        ]
         acceptance = item.get("acceptance_criteria")
         if not acceptance:
             acceptance = item.get("acceptance")
@@ -793,17 +798,18 @@ def _normalize_manager_subtasks(
             acceptance = item.get("acceptance_checklist")
         if not acceptance:
             acceptance = item.get("validation")
+        if not acceptance:
+            acceptance = item.get("required_work")
+        if not acceptance:
+            acceptance = item.get("verification")
+        if not acceptance:
+            acceptance = deliverables
         acceptance_criteria = [str(entry).strip() for entry in _as_list(acceptance) if str(entry).strip()]
         raw_files = [str(entry).strip() for entry in _as_list(item.get("files")) if str(entry).strip()]
         raw_target_files = [str(entry).strip() for entry in _as_list(item.get("target_files")) if str(entry).strip()]
         verification_commands = [
             str(entry).strip()
-            for entry in _as_list(item.get("verification_commands") or task.get("verification_commands"))
-            if str(entry).strip()
-        ]
-        deliverables = [
-            str(entry).strip()
-            for entry in _as_list(item.get("deliverables") or task.get("deliverables"))
+            for entry in _as_list(item.get("verification_commands") or item.get("verification") or task.get("verification_commands"))
             if str(entry).strip()
         ]
         dependencies = [

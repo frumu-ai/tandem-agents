@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.tandem_agents.core.task_contract import apply_task_contract
+from src.tandem_agents.core.task_contract import apply_task_contract, task_plan_validation
 
 
 class TaskContractBugMonitorTest(unittest.TestCase):
@@ -195,6 +195,46 @@ Migrated from Signal Triage roadmap.
             ],
         )
         self.assertEqual(task["verification_commands"], ["Demo or tests for both additional vertical slices."])
+
+    def test_task_plan_validation_accepts_deliverable_as_subtask_checklist(self) -> None:
+        task = {
+            "title": "Verify Bug Monitor gates",
+            "verification_commands": ["node scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+        }
+        subtasks = [
+            {
+                "title": "Map gate flow",
+                "goal": "Confirm existing Bug Monitor gate flow.",
+                "deliverable": "A short note identifying gate APIs and the verification command.",
+            }
+        ]
+
+        validation = task_plan_validation(task, subtasks)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_task_plan_validation_accepts_required_work_as_subtask_checklist(self) -> None:
+        task = {
+            "title": "Verify Bug Monitor gates",
+            "verification_commands": ["node scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+        }
+        subtasks = [
+            {
+                "title": "Add focused fixture coverage",
+                "goal": "Exercise mixed Bug Monitor signal fixtures.",
+                "required_work": [
+                    "Assert minor retries do not create draft work.",
+                    "Assert blocked signals include quality-gate reasons.",
+                ],
+                "verification": ["Run the focused fixture test."],
+            }
+        ]
+
+        validation = task_plan_validation(task, subtasks)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["issues"], [])
 
     def test_linear_github_pr_action_task_is_not_code_edit(self) -> None:
         body = """## Context

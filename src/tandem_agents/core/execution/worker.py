@@ -75,7 +75,7 @@ WORKER_FAILURE_MARKERS = (
     "ENGINE_TOOL_LOOP_STALLED",
 )
 
-TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "max_events_without_text"}
+TERMINAL_ENGINE_STREAM_REASONS = {"timeout"}
 NON_RETRYABLE_WORKER_BLOCKERS = {
     "coordination_lost",
     "engine_empty_response",
@@ -528,7 +528,7 @@ def _engine_max_events_without_text(cfg: ResolvedConfig, role: str) -> int:
         except ValueError:
             logger.debug("Invalid ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT=%s", raw)
     if role.startswith("worker-"):
-        return 50
+        return 150
     return 150
 
 

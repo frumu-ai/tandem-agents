@@ -640,11 +640,16 @@ def task_plan_validation(task: Mapping[str, Any] | None, subtasks: Iterable[Mapp
             for entry in list(subtask.get("files") or [])
             if _normalize_text(entry)
         ]
-        acceptance = [
-            _normalize_text(entry)
-            for entry in list(subtask.get("acceptance_criteria") or [])
-            if _normalize_text(entry)
-        ]
+        acceptance = _coerce_text_list(
+            subtask.get("acceptance_criteria")
+            or subtask.get("acceptance")
+            or subtask.get("acceptance_checklist")
+            or subtask.get("validation")
+            or subtask.get("required_work")
+            or subtask.get("verification")
+            or subtask.get("deliverables")
+            or subtask.get("deliverable")
+        )
         if not goal:
             issues.append({"kind": "missing_goal", "subtask": title, "detail": "Subtask goal is empty."})
         if task_requires_changes and not acceptance:
