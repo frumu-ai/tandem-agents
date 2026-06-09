@@ -1386,10 +1386,14 @@ def _load_linear_live_data(
                 by_id[identity] = issue
         issues = list(by_id.values())
     selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
-    if selector and not issues:
-        fetched = linear_fetch_issue(cfg, selector)
+    if selector and not any(_linear_issue_matches_selector(issue, selector) for issue in issues):
+        try:
+            fetched = linear_fetch_issue(cfg, selector)
+        except Exception:
+            logger.debug("Failed to fetch selected Linear issue %s during intake", selector, exc_info=True)
+            fetched = None
         if fetched:
-            issues = [fetched]
+            issues = [fetched, *issues]
     if not issues:
         raise RuntimeError(
             f"No Linear issues returned for team '{cfg.task_source.team}'"
@@ -1452,13 +1456,7 @@ def _select_linear_issue(
     selector = str(cfg.task_source.item or cfg.task_source.url or "").strip()
     if selector:
         for issue in issues:
-            haystacks = [
-                _linear_issue_id(issue),
-                _linear_issue_identifier(issue),
-                _linear_issue_url(issue),
-                str(issue.get("title") or ""),
-            ]
-            if not any(selector == hay or selector in hay for hay in haystacks if hay):
+            if not _linear_issue_matches_selector(issue, selector):
                 continue
             status_name = _linear_issue_status(issue)
             state_type = _linear_issue_state_type(issue)
@@ -1490,6 +1488,19 @@ def _select_linear_issue(
         "Expected a launchable status like Backlog, Todo, Triage, or Ready. "
         f"Found statuses: {found_statuses}"
     )
+
+
+def _linear_issue_matches_selector(issue: dict[str, Any], selector: str) -> bool:
+    selector = selector.strip()
+    if not selector:
+        return False
+    haystacks = [
+        _linear_issue_id(issue),
+        _linear_issue_identifier(issue),
+        _linear_issue_url(issue),
+        str(issue.get("title") or ""),
+    ]
+    return any(selector == hay or selector in hay for hay in haystacks if hay)
 
 
 def linear_board_snapshot(
