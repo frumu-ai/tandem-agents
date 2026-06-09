@@ -11,7 +11,12 @@ from src.tandem_agents.core.execution.run_lifecycle import build_swarm_config_di
 
 def _config(env: dict[str, str]):
     with tempfile.TemporaryDirectory() as tmp:
-        return resolve_config(Path(tmp), env=env)
+        clean_env = {
+            "TANDEM_BASE_URL": "http://127.0.0.1:9",
+            "TANDEM_CONTROL_PANEL_CONFIG_FILE": "__missing_control_panel_config__.json",
+        }
+        clean_env.update(env)
+        return resolve_config(Path(tmp), env=clean_env)
 
 
 class ProviderRoleResolutionTest(unittest.TestCase):

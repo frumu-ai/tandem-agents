@@ -33,6 +33,7 @@ from src.tandem_agents.core.engine.engine import (
     sync_worktree_changes,
     worker_worktree_name,
     write_provider_override_config,
+    engine_health,
 )
 from src.tandem_agents.core.engine.prompts import build_worker_prompt
 from src.tandem_agents.core.repository.repo_truth import file_is_readable, shell_quote_path
@@ -73,13 +74,15 @@ WORKER_FAILURE_MARKERS = (
     "ENGINE_EMPTY_RESPONSE",
     "ENGINE_PROMPT_TIMEOUT",
     "ENGINE_TOOL_LOOP_STALLED",
+    "ENGINE_SESSION_RUN_CONFLICT",
 )
 
-TERMINAL_ENGINE_STREAM_REASONS = {"timeout"}
+TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "max_events_without_text"}
 NON_RETRYABLE_WORKER_BLOCKERS = {
     "coordination_lost",
     "engine_empty_response",
     "engine_prompt_timeout",
+    "engine_session_run_conflict",
     "engine_provider_auth",
     "engine_tool_loop_stalled",
 }
@@ -229,6 +232,121 @@ def _exception_status_code(exc: Exception) -> int | None:
     return status_code if isinstance(status_code, int) else None
 
 
+def _engine_session_run_conflict(exc: Exception) -> tuple[str, int] | None:
+    text = str(exc)
+    if "SESSION_RUN_CONFLICT" not in text:
+        return None
+    run_match = re.search(r'"(?:runID|runId|run_id)"\s*:\s*"([^"]+)"', text)
+    retry_match = re.search(r'"retryAfterMs"\s*:\s*(\d+)', text)
+    run_id = run_match.group(1) if run_match else ""
+    retry_after_ms = int(retry_match.group(1)) if retry_match else 500
+    return run_id, retry_after_ms
+
+
+def _engine_sync_conflict_wait_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_SYNC_CONFLICT_WAIT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_SYNC_CONFLICT_WAIT_SECONDS=%s", raw)
+    return 12.0
+
+
+def _engine_prompt_sync_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_PROMPT_SYNC_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(5.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_PROMPT_SYNC_TIMEOUT_SECONDS=%s", raw)
+    return 240.0
+
+
+def _engine_prompt_sync_connect_retries(cfg: ResolvedConfig) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRIES", "") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRIES=%s", raw)
+    return 2
+
+
+def _engine_prompt_sync_connect_retry_delay_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRY_DELAY_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRY_DELAY_SECONDS=%s", raw)
+    return 1.0
+
+
+def _engine_exception_is_timeout(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
+def _engine_exception_is_connection_failure(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "could not connect",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "failed to establish",
+            "temporarily unavailable",
+            "name or service not known",
+        )
+    )
+
+
+def _prompt_sync_with_connect_retries(
+    cfg: ResolvedConfig,
+    *,
+    engine_meta: dict[str, Any],
+    log: Any,
+    role: str,
+    **kwargs: Any,
+) -> Any:
+    attempts = _engine_prompt_sync_connect_retries(cfg) + 1
+    delay_seconds = _engine_prompt_sync_connect_retry_delay_seconds(cfg)
+    last_exc: Exception | None = None
+    for attempt_index in range(attempts):
+        try:
+            return prompt_tandem_session_sync(cfg, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if not _engine_exception_is_connection_failure(exc) or attempt_index >= attempts - 1:
+                raise
+            retry_number = attempt_index + 1
+            engine_meta["retry_count"] = max(int(engine_meta.get("retry_count") or 0), retry_number)
+            recovery: dict[str, Any] = {
+                "attempt": retry_number,
+                "stream_reason": "prompt_sync_connect_retry",
+                "error": str(exc),
+            }
+            try:
+                recovery["health"] = engine_health(cfg, timeout=2.0)
+            except Exception as health_exc:
+                recovery["health_error"] = str(health_exc)
+            engine_meta.setdefault("recovery", []).append(recovery)
+            notice = (
+                "ENGINE_PROMPT_SYNC_CONNECT_RETRY: Tandem engine prompt_sync was temporarily "
+                f"unreachable; retry {retry_number}/{attempts - 1}.\n"
+            )
+            log.write(notice)
+            log.flush()
+            _print_line(role, notice)
+            time.sleep(delay_seconds * retry_number)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("prompt_sync retry loop exited without an attempt")
+
+
 def _call_with_timeout(fn: Any, *, timeout_seconds: float) -> Any:
     result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
 
@@ -352,7 +470,26 @@ def _manager_plan_stream_complete(text: str) -> bool:
     return {"summary", "subtasks", "risks", "tests"}.issubset(set(plan))
 
 
-def _empty_transcript_retry_prompt() -> str:
+def _empty_transcript_retry_prompt(
+    *,
+    role: str = "",
+    require_tool_use: bool = False,
+    write_required: bool = False,
+) -> str:
+    if role == "manager" and not require_tool_use and not write_required:
+        return (
+            "The previous async manager run completed without a visible assistant transcript. "
+            "Retry the planning task using the context already in this session. "
+            "Return JSON only with keys: summary, subtasks, risks, tests."
+        )
+    if require_tool_use or write_required:
+        return (
+            "The previous async worker run completed without a visible assistant transcript. "
+            "Continue the original task using repository tools now. "
+            "Do not stop with only a summary. Finish only after you have either produced and verified "
+            "filesystem changes, or inspected the target files and reported a concrete blocker with the "
+            "exact next operator action."
+        )
     return (
         "The previous async engine run completed without a visible assistant transcript. "
         "Retry the same task now using the context already in this session. "
@@ -624,12 +761,23 @@ def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str)
     return (
         "ENGINE_PROMPT_TIMEOUT" in reason
         or "ENGINE_TOOL_LOOP_STALLED" in reason
+        or "ENGINE_EMPTY_RESPONSE" in reason
+        or "ENGINE_EXCEPTION" in reason
+        or "ENGINE_SESSION_RUN_CONFLICT" in reason
         or "ENGINE_ERROR:" in text
         or "ENGINE_DISPATCH_FAILED" in text
         or "ITERATION BUDGET" in text
-        or blocker in {"engine_prompt_timeout", "engine_tool_loop_stalled"}
+        or blocker
+        in {
+            "engine_empty_response",
+            "engine_exception",
+            "engine_prompt_timeout",
+            "engine_session_run_conflict",
+            "engine_tool_loop_stalled",
+        }
         or "ENGINE_PROMPT_TIMEOUT" in text
         or "ENGINE_TOOL_LOOP_STALLED" in text
+        or "ENGINE_SESSION_RUN_CONFLICT" in text
     )
 
 
@@ -1156,6 +1304,12 @@ def _coerce_worker_failure(
             result["recovery_action"] = (
                 "Inspect the preserved engine/session snapshots and reduce prompt/tool scope before retrying."
             )
+    elif failure_reason == "ENGINE_SESSION_RUN_CONFLICT":
+        result["blocker_kind"] = "engine_session_run_conflict"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Wait for the active Tandem engine session run to finish or clear it, then reset the task to Backlog."
+            )
     elif failure_reason == "ENGINE_TOOL_LOOP_STALLED":
         result["blocker_kind"] = "engine_tool_loop_stalled"
         if not result.get("recovery_action"):
@@ -1260,6 +1414,119 @@ def stream_tandem_prompt(
                         log.flush()
                         _print_line(role, line)
 
+                if role.startswith("worker") and write_required:
+                    engine_meta["fallback_mode"] = "prompt_sync_first"
+                    failure_reason = ""
+                    blocker_kind = ""
+                    recovery_action = ""
+                    try:
+                        sync_response = _prompt_sync_with_connect_retries(
+                            cfg,
+                            engine_meta=engine_meta,
+                            log=log,
+                            role=role,
+                            session_id=session_id,
+                            prompt=prompt,
+                            tool_allowlist=session_tool_allowlist,
+                            tool_mode=prompt_tool_mode,
+                            require_tool_use=require_tool_use,
+                            write_required=write_required,
+                            timeout_seconds=_engine_prompt_sync_timeout_seconds(cfg),
+                        )
+                        engine_meta["sync_snapshot_path"] = _write_engine_snapshot(
+                            log_path,
+                            f"engine-sync-{session_id}",
+                            sync_response,
+                        )
+                        stdout_text = _extract_prompt_sync_text(sync_response)
+                    except Exception as exc:
+                        conflict = _engine_session_run_conflict(exc)
+                        if conflict:
+                            conflict_run_id, retry_after_ms = conflict
+                            last_run_id = conflict_run_id or last_run_id
+                            engine_meta["run_id"] = conflict_run_id
+                            engine_meta["sync_conflict"] = {
+                                "run_id": conflict_run_id,
+                                "retry_after_ms": retry_after_ms,
+                            }
+                            failure_reason = "ENGINE_SESSION_RUN_CONFLICT"
+                            blocker_kind = "engine_session_run_conflict"
+                            stdout_text = (
+                                "ENGINE_SESSION_RUN_CONFLICT: Tandem engine had an active run "
+                                "when ACA attempted prompt_sync on a fresh worker session. "
+                                f"Active run: {conflict_run_id or 'unknown'}.\n"
+                            )
+                        elif _engine_exception_is_timeout(exc):
+                            failure_reason = "ENGINE_PROMPT_TIMEOUT"
+                            blocker_kind = "engine_prompt_timeout"
+                            stdout_text = (
+                                "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync worker prompt "
+                                f"did not finish within {_engine_prompt_sync_timeout_seconds(cfg):.0f}s.\n"
+                            )
+                        elif _engine_exception_is_connection_failure(exc):
+                            failure_reason = "ENGINE_WORKSPACE_UNREACHABLE"
+                            blocker_kind = "engine_workspace_unreachable"
+                            stdout_text = (
+                                "ENGINE_WORKSPACE_UNREACHABLE: Tandem engine prompt_sync worker prompt "
+                                "could not reach the engine after connection retries.\n"
+                            )
+                        else:
+                            raise
+                    completed = bool(stdout_text.strip()) and not failure_reason
+                    if not completed and not failure_reason:
+                        failure_reason = "ENGINE_EMPTY_RESPONSE"
+                        blocker_kind = "engine_empty_response"
+                        stdout_text = (
+                            "ENGINE_EMPTY_RESPONSE: Tandem engine prompt_sync worker prompt "
+                            "finished without assistant transcript text.\n"
+                        )
+                    if stdout_text and not stdout_text.endswith("\n"):
+                        stdout_text += "\n"
+                    if stdout_text:
+                        log.write(stdout_text)
+                        log.flush()
+                        _print_line(role, stdout_text)
+                    if not completed and session_id:
+                        _recovered_text, recovery = _recover_engine_text_from_state(
+                            cfg,
+                            session_id=session_id,
+                            run_id=last_run_id,
+                            log_path=log_path,
+                        )
+                        recovery["run_id"] = last_run_id
+                        recovery["attempt"] = 0
+                        recovery["stream_reason"] = blocker_kind or "prompt_sync_first"
+                        engine_meta.setdefault("recovery", []).append(recovery)
+                        for key in ("events_path", "messages_path"):
+                            if recovery.get(key):
+                                engine_meta[key] = recovery[key]
+                    if blocker_kind == "engine_session_run_conflict":
+                        recovery_action = (
+                            "Wait for the active Tandem engine session run to finish or clear it, then reset the task to Backlog."
+                        )
+                    elif blocker_kind == "engine_prompt_timeout":
+                        recovery_action = (
+                            "Inspect engine/session snapshots and retry with a smaller scoped prompt or healthier provider route."
+                        )
+                    elif blocker_kind:
+                        recovery_action = (
+                            "Check Tandem engine provider/model routing and persisted engine snapshots, "
+                            "then retry the task after the engine returns assistant text."
+                        )
+                    return {
+                        "role": role,
+                        "returncode": 0 if completed else 1,
+                        "stdout": stdout_text,
+                        "log_path": str(log_path),
+                        "cwd": str(cwd),
+                        "session_id": session_id,
+                        "engine_run_id": last_run_id,
+                        "engine": engine_meta,
+                        "failure_reason": failure_reason,
+                        "blocker_kind": blocker_kind,
+                        "recovery_action": recovery_action,
+                    }
+
                 def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str, str]:
                     async_result = sdk_sessions_prompt_async(
                         cfg,
@@ -1344,7 +1611,12 @@ def stream_tandem_prompt(
                     log.flush()
                     _print_line(role, retry_notice)
                     retry_text, retry_completed, retry_run_id, retry_reason = _run_async_once(
-                        _empty_transcript_retry_prompt(), 1
+                        _empty_transcript_retry_prompt(
+                            role=role,
+                            require_tool_use=require_tool_use,
+                            write_required=write_required,
+                        ),
+                        1,
                     )
                     stream_reason = retry_reason or stream_reason
                     if retry_completed:
@@ -1355,6 +1627,9 @@ def stream_tandem_prompt(
                         stdout_text = retry_text or stdout_text
                         run_id = retry_run_id or run_id
 
+                fallback_failure_reason = ""
+                fallback_blocker_kind = ""
+                fallback_failure_message = ""
                 if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
                     engine_meta["fallback_mode"] = "prompt_sync"
                     fallback_notice = (
@@ -1364,30 +1639,113 @@ def stream_tandem_prompt(
                     log.write(fallback_notice)
                     log.flush()
                     _print_line(role, fallback_notice)
-                    sync_response = prompt_tandem_session_sync(
-                        cfg,
-                        session_id=session_id,
-                        prompt=_empty_transcript_retry_prompt(),
-                        tool_allowlist=session_tool_allowlist,
-                        tool_mode=prompt_tool_mode,
-                        require_tool_use=require_tool_use,
-                        write_required=write_required,
-                    )
-                    engine_meta["sync_snapshot_path"] = _write_engine_snapshot(
-                        log_path,
-                        f"engine-sync-{session_id}",
-                        sync_response,
-                    )
-                    sync_text = _extract_prompt_sync_text(sync_response)
-                    if sync_text.strip():
-                        stdout_text = sync_text
-                        completed = True
+                    sync_deadline = time.monotonic() + _engine_sync_conflict_wait_seconds(cfg)
+                    while not completed:
+                        try:
+                            sync_response = _prompt_sync_with_connect_retries(
+                                cfg,
+                                engine_meta=engine_meta,
+                                log=log,
+                                role=role,
+                                session_id=session_id,
+                                prompt=_empty_transcript_retry_prompt(
+                                    role=role,
+                                    require_tool_use=require_tool_use,
+                                    write_required=write_required,
+                                ),
+                                tool_allowlist=session_tool_allowlist,
+                                tool_mode=prompt_tool_mode,
+                                require_tool_use=require_tool_use,
+                                write_required=write_required,
+                                timeout_seconds=_engine_prompt_sync_timeout_seconds(cfg),
+                            )
+                        except Exception as exc:
+                            conflict = _engine_session_run_conflict(exc)
+                            if not conflict:
+                                if _engine_exception_is_timeout(exc):
+                                    fallback_failure_reason = "ENGINE_PROMPT_TIMEOUT"
+                                    fallback_blocker_kind = "engine_prompt_timeout"
+                                    fallback_failure_message = (
+                                        "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync fallback timed out "
+                                        "after an empty async transcript. "
+                                        f"Last engine run: {run_id or last_run_id or 'unknown'}.\n"
+                                    )
+                                    break
+                                if _engine_exception_is_connection_failure(exc):
+                                    fallback_failure_reason = "ENGINE_WORKSPACE_UNREACHABLE"
+                                    fallback_blocker_kind = "engine_workspace_unreachable"
+                                    fallback_failure_message = (
+                                        "ENGINE_WORKSPACE_UNREACHABLE: Tandem engine prompt_sync fallback "
+                                        "could not reach the engine after connection retries.\n"
+                                    )
+                                    break
+                                raise
+                            conflict_run_id, retry_after_ms = conflict
+                            if conflict_run_id:
+                                run_id = conflict_run_id
+                                last_run_id = conflict_run_id
+                                engine_meta["run_id"] = conflict_run_id
+                            engine_meta["sync_conflict"] = {
+                                "run_id": conflict_run_id or run_id or last_run_id,
+                                "retry_after_ms": retry_after_ms,
+                            }
+                            conflict_notice = (
+                                "ENGINE_SESSION_RUN_CONFLICT: prompt_sync fallback found an active "
+                                f"engine run {conflict_run_id or run_id or last_run_id or 'unknown'}; "
+                                "waiting for the active run before retrying fallback.\n"
+                            )
+                            log.write(conflict_notice)
+                            log.flush()
+                            _print_line(role, conflict_notice)
+                            recovered_text, recovery = _recover_engine_text_from_state(
+                                cfg,
+                                session_id=session_id,
+                                run_id=conflict_run_id or run_id or last_run_id,
+                                log_path=log_path,
+                            )
+                            recovery["run_id"] = conflict_run_id or run_id or last_run_id
+                            recovery["attempt"] = engine_meta.get("retry_count", 0)
+                            recovery["stream_reason"] = "session_run_conflict"
+                            engine_meta.setdefault("recovery", []).append(recovery)
+                            for key in ("events_path", "messages_path"):
+                                if recovery.get(key):
+                                    engine_meta[key] = recovery[key]
+                            if recovered_text.strip():
+                                stdout_text = recovered_text
+                                completed = True
+                                break
+                            remaining = sync_deadline - time.monotonic()
+                            if remaining <= 0:
+                                fallback_failure_reason = "ENGINE_SESSION_RUN_CONFLICT"
+                                fallback_blocker_kind = "engine_session_run_conflict"
+                                fallback_failure_message = (
+                                    "ENGINE_SESSION_RUN_CONFLICT: Tandem engine still had an active run "
+                                    "when ACA attempted prompt_sync fallback after an empty async transcript. "
+                                    f"Active run: {conflict_run_id or run_id or last_run_id or 'unknown'}.\n"
+                                )
+                                break
+                            time.sleep(min(max(retry_after_ms / 1000.0, 0.1), remaining, 2.0))
+                            continue
+                        engine_meta["sync_snapshot_path"] = _write_engine_snapshot(
+                            log_path,
+                            f"engine-sync-{session_id}",
+                            sync_response,
+                        )
+                        sync_text = _extract_prompt_sync_text(sync_response)
+                        if sync_text.strip():
+                            stdout_text = sync_text
+                            completed = True
+                        break
 
                 failure_reason = ""
                 blocker_kind = ""
                 if completed:
                     if stdout_text and not stdout_text.endswith("\n"):
                         stdout_text += "\n"
+                elif fallback_failure_reason:
+                    failure_reason = fallback_failure_reason
+                    blocker_kind = fallback_blocker_kind
+                    stdout_text = fallback_failure_message
                 elif stream_reason == "timeout":
                     failure_reason = "ENGINE_PROMPT_TIMEOUT"
                     blocker_kind = "engine_prompt_timeout"
@@ -1435,6 +1793,10 @@ def stream_tandem_prompt(
                     recovery_action = (
                         "Preserve the partial diff and engine messages, reset the checkout before retry, "
                         "and narrow the worker prompt/tool scope."
+                    )
+                elif blocker_kind == "engine_session_run_conflict":
+                    recovery_action = (
+                        "Wait for the active Tandem engine session run to finish or clear it, then reset the task to Backlog."
                     )
                 elif blocker_kind == "engine_prompt_timeout":
                     recovery_action = (

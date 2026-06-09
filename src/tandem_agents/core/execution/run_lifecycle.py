@@ -30,9 +30,15 @@ def build_provider_config_dict(cfg: ResolvedConfig) -> dict[str, Any]:
 
     Eliminates the repeated 4-line literal that appeared 6+ times in runner_core.
     """
+    from src.tandem_agents.core.engine.engine_runtime import engine_session_provider_model
+
+    resolved = engine_session_provider_model(cfg, "manager")
     return {
-        "id": cfg.provider.id,
-        "model": cfg.provider.model,
+        "id": resolved["provider"],
+        "model": resolved["model"],
+        "source": resolved.get("source"),
+        "configured_id": cfg.provider.id,
+        "configured_model": cfg.provider.model,
         "fallback_provider": cfg.provider.fallback_provider or None,
         "fallback_model": cfg.provider.fallback_model or None,
     }
@@ -48,21 +54,25 @@ def build_swarm_config_dict(cfg: ResolvedConfig) -> dict[str, Any]:
     silently degrading to the generic fallback model is visible rather than
     hidden.
     """
+    from src.tandem_agents.core.engine.engine_runtime import engine_session_provider_model
+
     roles = ("manager", "worker", "reviewer", "tester")
     role_entries: dict[str, dict[str, Any]] = {}
     defaulted: list[str] = []
     for role in roles:
         resolved = cfg.provider_for_role_with_source(role)
+        session_provider = engine_session_provider_model(cfg, role)
         sampling = cfg.sampling_for_role(role)
         role_entries[role] = {
-            "provider": resolved["provider"],
-            "model": resolved["model"],
+            "provider": session_provider["provider"],
+            "model": session_provider["model"],
+            "session_source": session_provider.get("source"),
             "provider_source": resolved["provider_source"],
             "model_source": resolved["model_source"],
             "temperature": sampling["temperature"],
             "temperature_source": sampling["temperature_source"],
         }
-        if resolved["model_source"] == "default":
+        if session_provider.get("source") == "aca_fallback" and resolved["model_source"] == "default":
             defaulted.append(role)
 
     if defaulted:

@@ -34,7 +34,15 @@ class EngineRuntimePathTest(unittest.TestCase):
 
 
 class EngineRuntimeProviderResolutionTest(unittest.TestCase):
-    def _cfg(self, *, env: dict[str, str] | None = None, provider: str = "openai", model: str = "gpt-4.1-mini"):
+    def _cfg(
+        self,
+        *,
+        env: dict[str, str] | None = None,
+        provider: str = "openai",
+        model: str = "gpt-4.1-mini",
+        provider_source: str = "provider",
+        model_source: str = "provider",
+    ):
         def provider_for_role(_role: str) -> tuple[str, str]:
             return provider, model
 
@@ -43,8 +51,8 @@ class EngineRuntimeProviderResolutionTest(unittest.TestCase):
                 "role": role,
                 "provider": provider,
                 "model": model,
-                "provider_source": "provider",
-                "model_source": "provider",
+                "provider_source": provider_source,
+                "model_source": model_source,
             }
 
         return SimpleNamespace(
@@ -70,8 +78,35 @@ class EngineRuntimeProviderResolutionTest(unittest.TestCase):
         self.assertEqual(resolved["model"], "gpt-5.5")
         self.assertEqual(resolved["source"], "engine_default")
 
+    def test_control_panel_global_model_does_not_force_raw_provider(self) -> None:
+        cfg = self._cfg(provider="openai", model="gpt-5.5")
+
+        with mock.patch(
+            "src.tandem_agents.core.engine.engine_runtime._engine_request_json",
+            return_value={
+                "default": "openai-codex",
+                "providers": {"openai-codex": {"default_model": "gpt-5.5", "api_key": "[REDACTED]"}},
+            },
+        ):
+            resolved = engine_session_provider_model(cfg, "worker")
+
+        self.assertEqual(resolved["provider"], "openai-codex")
+        self.assertEqual(resolved["model"], "gpt-5.5")
+        self.assertEqual(resolved["source"], "engine_default")
+
     def test_aca_env_override_wins_over_engine_default(self) -> None:
         cfg = self._cfg(env={"ACA_PROVIDER": "openai", "ACA_MODEL": "gpt-4.1-mini"})
+
+        with mock.patch("src.tandem_agents.core.engine.engine_runtime._engine_request_json") as request:
+            resolved = engine_session_provider_model(cfg, "worker")
+
+        self.assertEqual(resolved["provider"], "openai")
+        self.assertEqual(resolved["model"], "gpt-4.1-mini")
+        self.assertEqual(resolved["source"], "aca_config")
+        request.assert_not_called()
+
+    def test_role_override_wins_over_engine_default(self) -> None:
+        cfg = self._cfg(provider="openai", model="gpt-4.1-mini", provider_source="role", model_source="role")
 
         with mock.patch("src.tandem_agents.core.engine.engine_runtime._engine_request_json") as request:
             resolved = engine_session_provider_model(cfg, "worker")

@@ -7,8 +7,8 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "http://127.0.0.1:39733"
-DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_PROVIDER = "openai-codex"
+DEFAULT_MODEL = "gpt-5.5"
 # Default sampling temperature for the JSON-emitting roles. Low temperature
 # improves the reliability of the strict-JSON plans/verdicts those roles must
 # produce. Roles not listed here (e.g. worker) use the engine/provider default

@@ -37,8 +37,8 @@ OPENAI_API_KEY=...
 Then make sure the provider and model match your key. The defaults are:
 
 ```bash
-ACA_PROVIDER=openai
-ACA_MODEL=gpt-4.1-mini
+ACA_PROVIDER=openai-codex
+ACA_MODEL=gpt-5.5
 ```
 
 For OpenRouter, use:

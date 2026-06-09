@@ -183,6 +183,7 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
     write_board_snapshot(ctx.run_dir, ctx.board)
 
     # Step 5: Final summary
+    provider_meta = ctx.status.get("provider") if isinstance(ctx.status.get("provider"), dict) else {}
     save_run_text(
         ctx.layout["summary"],
         build_completed_summary(
@@ -194,8 +195,8 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
                 or ctx.status.get("engine", {}).get("build_id")
                 or "unknown"
             ),
-            provider_id=ctx.cfg.provider.id,
-            provider_model=ctx.cfg.provider.model,
+            provider_id=str(provider_meta.get("id") or ctx.cfg.provider.id),
+            provider_model=str(provider_meta.get("model") or ctx.cfg.provider.model),
             worker_results=ctx.worker_results,
             review_returncode=ctx.review_result.get("returncode"),
             test_returncode=ctx.test_result.get("returncode"),
