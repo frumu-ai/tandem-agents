@@ -34,7 +34,7 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
         commit_repository_changes,
         current_repository_branch,
         git_diff_stat,
-        push_repository_changes,
+        push_repository_changes_result,
     )
     from src.tandem_agents.core.execution import runner_core as _rc
     from src.tandem_agents.runtime.runstate import append_event, save_blackboard
@@ -89,7 +89,8 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
             ctx.blackboard,
             f"Committed validated changes as `{commit_info['commit'][:7]}`.",
         )
-        if push_repository_changes(ctx.cfg, ctx.repo_path, ctx.branch_name):
+        push_result = push_repository_changes_result(ctx.cfg, ctx.repo_path, ctx.branch_name)
+        if push_result.returncode == 0:
             _rc._append_blackboard_note(
                 ctx.blackboard,
                 f"Pushed branch `{ctx.branch_name}` to remote.",
@@ -111,11 +112,17 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
                     ),
                 )
         else:
+            push_detail = (push_result.stderr or push_result.stdout or "git push failed").strip()
             _rc._append_blackboard_note(
                 ctx.blackboard,
-                f"Warning: Failed to push branch `{ctx.branch_name}`.",
+                f"Warning: Failed to push branch `{ctx.branch_name}`: {push_detail}",
             )
-            logger.warning("Failed to push branch %s (run_id=%s)", ctx.branch_name, ctx.run_id)
+            logger.warning(
+                "Failed to push branch %s (run_id=%s): %s",
+                ctx.branch_name,
+                ctx.run_id,
+                push_detail,
+            )
             save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
             write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
             return _block_finalization_failure(
@@ -123,8 +130,8 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
                 kind="push_failed",
                 message=(
                     f"ACA committed local changes as `{commit_info['commit'][:7]}`, "
-                    f"but failed to push branch `{ctx.branch_name}`. No pull request "
-                    "was created, so the task remains blocked."
+                    f"but failed to push branch `{ctx.branch_name}`: {push_detail}. "
+                    "No pull request was created, so the task remains blocked."
                 ),
             )
 

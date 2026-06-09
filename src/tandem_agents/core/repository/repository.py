@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from src.tandem_agents.config.config import ResolvedConfig
-from src.tandem_agents.core.engine.process_utils import run_command
+from src.tandem_agents.core.engine.process_utils import CommandResult, run_command
 from src.tandem_agents.utils.utils import slugify
 
 
@@ -437,11 +437,26 @@ def current_repository_branch(repo_path: Path, *, cfg: ResolvedConfig | None = N
 
 def push_repository_changes(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> bool:
     """Pushes the current branch to the remote."""
+    return push_repository_changes_result(cfg, repo_path, branch_name).returncode == 0
+
+
+def push_repository_changes_result(
+    cfg: ResolvedConfig, repo_path: Path, branch_name: str
+) -> CommandResult:
+    """Pushes the current branch and returns git's stdout/stderr for diagnostics."""
     if current_repository_branch(repo_path, cfg=cfg) != branch_name:
-        return False
+        return CommandResult(
+            1,
+            "",
+            f"current branch is not expected run branch: {branch_name}",
+        )
     remote_name = cfg.repository.remote_name or "origin"
-    result = run_command(_git_repo_args(repo_path, "push", "-u", remote_name, branch_name), env=cfg.env)
-    return result.returncode == 0
+    remote_url = _remote_url_for_existing_repo(cfg, repo_path)
+    prefix, env = _git_auth_args(cfg, remote_url)
+    return run_command(
+        _git_repo_args(repo_path, "push", "-u", remote_name, branch_name, prefix=prefix),
+        env=env,
+    )
 
 
 def repository_status(repo_path: Path, remote_name: str = "origin", default_branch: str = "main") -> dict[str, Any]:

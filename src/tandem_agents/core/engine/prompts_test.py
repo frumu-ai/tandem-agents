@@ -27,6 +27,18 @@ class ReviewTestPromptDiffTest(unittest.TestCase):
         self.assertIn("Uncommitted changes", prompt)
         self.assertIn("app.py", prompt)
 
+    def test_test_prompt_embeds_inferred_verification_commands(self) -> None:
+        prompt = build_test_prompt(
+            "run1",
+            _TASK,
+            {},
+            _NOTES,
+            verification_commands=["pnpm -C packages/tandem-control-panel run build"],
+        )
+
+        self.assertIn("ACA inferred these verification commands", prompt)
+        self.assertIn("pnpm -C packages/tandem-control-panel run build", prompt)
+
     def test_review_prompt_notes_empty_diff(self) -> None:
         prompt = build_review_prompt("run1", _TASK, _NOTES, repo_diff="")
         self.assertIn("none detected", prompt)
@@ -36,6 +48,13 @@ class ReviewTestPromptDiffTest(unittest.TestCase):
         # Backwards-compatible call without the new argument must still work.
         prompt = build_review_prompt("run1", _TASK, _NOTES)
         self.assertIn("none detected", prompt)
+
+    def test_review_prompt_does_not_require_finalization_artifacts(self) -> None:
+        prompt = build_review_prompt("run1", _TASK, _NOTES, repo_diff="diff --git a/app.py b/app.py\n")
+
+        self.assertIn("before final handoff/publish", prompt)
+        self.assertIn("Do not require a PR branch", prompt)
+        self.assertIn("worker applicability notes", prompt)
 
 
 class CompactPrContextTest(unittest.TestCase):

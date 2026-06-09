@@ -16,7 +16,7 @@ from typing import Any
 
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.engine.engine import engine_health, ensure_engine, resolve_repository
-from src.tandem_agents.core.repository.repository import repository_binding_issues
+from src.tandem_agents.core.repository.repository import repository_binding_issues, repository_status
 from src.tandem_agents.core.execution.run_lifecycle import block_run
 
 logger = logging.getLogger("aca.phases.engine_check")
@@ -131,4 +131,11 @@ def resolve_repo_after_checkout(cfg: ResolvedConfig) -> dict[str, Any]:
     The branch name changes after ``checkout_run_branch`` so the repo dict
     must be refreshed to reflect the new HEAD.
     """
+    repo_path = cfg.repository_path()
+    if repo_path and (repo_path / ".git").exists():
+        return repository_status(
+            repo_path.resolve(),
+            cfg.repository.remote_name,
+            cfg.repository.default_branch,
+        )
     return resolve_repository(cfg)

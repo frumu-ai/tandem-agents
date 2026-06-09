@@ -429,6 +429,9 @@ def build_review_prompt(
         f"You are ACA reviewer for run {run_id}.\n"
         "Review the current repository state and the worker outputs.\n"
         "Treat existing readable files in the repository as the source of truth, even if a worker had a noisy tool error.\n"
+        "This review happens before final handoff/publish. Do not require a PR branch, PR URL, merge, or branch deletion in this phase; those are finalized later if verification passes.\n"
+        "If the task asks for lint/typecheck but the touched package exposes no matching script, accept the available deterministic build/test commands as verification and note the missing script instead of requiring an impossible command.\n"
+        "For PR-candidate consolidation tasks, worker applicability notes that name skipped candidates and reasons count as handoff documentation; require extra documentation only if those reasons are missing or unsafe.\n"
         "Return JSON only with keys: next_action, findings, required_fixes, notes.\n"
         "Set next_action to one of `pass`, `repair_needed`, `blocked`, or `human_review_needed`.\n"
         "CRITICAL: You MUST use ONLY relative paths (e.g., `package.json` or `src/app.js`) for ALL tool calls.\n"
@@ -447,8 +450,17 @@ def build_test_prompt(
     repo: dict[str, Any],
     worker_notes: list[dict[str, Any]],
     repo_diff: str | None = None,
+    verification_commands: list[str] | None = None,
 ) -> str:
     contract_block = _task_contract_block(task)
+    command_block = ""
+    commands = [str(command).strip() for command in (verification_commands or []) if str(command).strip()]
+    if commands:
+        command_block = (
+            "ACA inferred these verification commands from the changed files and task contract. "
+            "Run them if the environment allows it, and include exact pass/fail results in JSON:\n"
+            f"{json.dumps(commands)}\n\n"
+        )
     return (
         f"You are ACA tester for run {run_id}.\n"
         "Run the most relevant validation commands for this repository and task.\n"
@@ -462,6 +474,7 @@ def build_test_prompt(
         "Repository: (mounted as current directory)\n"
         f"Task title: {task['title']}\n"
         f"Task contract:\n{contract_block}\n\n"
+        f"{command_block}"
         f"{_diff_block(repo_diff)}\n"
         f"Worker notes: {json.dumps(worker_notes, indent=2)}\n"
     )

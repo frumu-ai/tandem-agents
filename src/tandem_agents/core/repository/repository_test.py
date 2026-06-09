@@ -11,6 +11,7 @@ from src.tandem_agents.core.engine.process_utils import run_command
 import os
 
 from src.tandem_agents.config.config_loader import resolve_config as _resolve_config
+from src.tandem_agents.core.phases.engine_check import resolve_repo_after_checkout
 from src.tandem_agents.core.repository.repository import (
     _git_clone_args_and_env,
     _git_repo_args,
@@ -24,6 +25,7 @@ from src.tandem_agents.core.repository.repository import (
     list_worktree_changes,
     pr_head_ref,
     push_repository_changes,
+    push_repository_changes_result,
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
@@ -95,6 +97,23 @@ class RepositoryNamingTest(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"ACA_ROOT": str(root)}):
                 self.assertIn("README.md", git_diff_stat(worktree))
+
+    def test_resolve_repo_after_checkout_preserves_run_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            cfg = _config_for_repo(root, repo)
+            checkout_run_branch(cfg, repo, "aca/test-run")
+
+            refreshed = resolve_repo_after_checkout(cfg)
+
+            self.assertEqual(refreshed["branch"], "aca/test-run")
+            self.assertEqual(current_repository_branch(repo, cfg=cfg), "aca/test-run")
 
     def test_create_worktree_gitdir_is_visible_to_engine_and_aca(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -605,6 +624,50 @@ class RepositoryNamingTest(unittest.TestCase):
             cfg = _config_for_repo(root, repo)
 
             self.assertFalse(push_repository_changes(cfg, repo, "aca/test-run"))
+
+    def test_push_repository_changes_uses_github_auth_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "checkout"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            run_command(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/acme/repo.git"])
+            run_command(["git", "-C", str(repo), "checkout", "-b", "aca/test-run"])
+            cfg = _config_for_repo(root, repo)
+            cfg.env["GITHUB_TOKEN"] = "push-token"
+
+            seen: list[tuple[list[str], dict[str, str] | None]] = []
+
+            def fake_run_command(args, *, cwd=None, env=None):
+                del cwd
+                seen.append((args, env))
+                if args[-2:] == ["--abbrev-ref", "HEAD"]:
+                    return mock.Mock(returncode=0, stdout="aca/test-run\n", stderr="")
+                if args[-3:] == ["remote", "get-url", "origin"]:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout="https://github.com/acme/repo.git\n",
+                        stderr="",
+                    )
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch(
+                "src.tandem_agents.core.repository.repository.run_command",
+                side_effect=fake_run_command,
+            ):
+                result = push_repository_changes_result(cfg, repo, "aca/test-run")
+
+            self.assertEqual(result.returncode, 0)
+            push_args, push_env = seen[-1]
+            self.assertEqual(push_env["GIT_TERMINAL_PROMPT"], "0")
+            self.assertIn("push", push_args)
+            self.assertIn("-c", push_args)
+            self.assertTrue(
+                any(
+                    arg.startswith("http.https://github.com/.extraheader=AUTHORIZATION: basic ")
+                    for arg in push_args
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -165,7 +165,14 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
     _rc._wait_for_engine(ctx.cfg)
 
     # --- Tester ---
-    test_prompt = build_test_prompt(ctx.run_id, ctx.task, ctx.repo, ctx.worker_results, repo_diff=repo_diff)
+    test_prompt = build_test_prompt(
+        ctx.run_id,
+        ctx.task,
+        ctx.repo,
+        ctx.worker_results,
+        repo_diff=repo_diff,
+        verification_commands=combined_command_checks,
+    )
     test_model_selection = engine_session_provider_model(ctx.cfg, "tester")
     test_cli_provider = test_model_selection["provider"]
     test_model = test_model_selection["model"]
@@ -254,8 +261,19 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         ctx.review_result, ctx.test_result, repo_validation=ctx.repo_validation
     )
     ctx.blackboard["verification"] = verification.as_dict()
+    ctx.status["verification"] = verification.as_dict()
     save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
     write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    write_status(ctx.layout["status"], ctx.status)
+    append_event(
+        ctx.layout["events"],
+        "verification.completed",
+        ctx.run_id,
+        verification.as_dict(),
+        task_id=ctx.task.get("task_id"),
+        role="tester",
+        repo={"path": ctx.repo.get("path")},
+    )
 
     logger.info(
         "Verification outcome=%s should_retry=%s (run_id=%s)",

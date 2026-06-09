@@ -597,38 +597,62 @@ def _command_check_env() -> dict[str, str]:
     return env
 
 
+def _command_check_attempt_count() -> int:
+    raw = str(os.environ.get("ACA_COMMAND_CHECK_ATTEMPTS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(5, int(raw)))
+        except ValueError:
+            pass
+    return 2
+
+
+def _run_single_command_check(repo_path: Path, command: str, timeout_seconds: int) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", "-c", command],
+            cwd=str(repo_path),
+            env=_command_check_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        return {
+            "command": command,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "status": "pass" if proc.returncode == 0 else "fail",
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": command,
+            "returncode": None,
+            "stdout": (exc.stdout or "").strip(),
+            "stderr": ((exc.stderr or "").strip() or "timed out"),
+            "status": "fail",
+        }
+
+
 def run_command_checks(repo_path: Path, commands: list[str], timeout_seconds: int = 60) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    attempt_count = _command_check_attempt_count()
     for command in commands:
-        try:
-            proc = subprocess.run(
-                ["/bin/bash", "-c", command],
-                cwd=str(repo_path),
-                env=_command_check_env(),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            results.append(
-                {
-                    "command": command,
-                    "returncode": proc.returncode,
-                    "stdout": proc.stdout.strip(),
-                    "stderr": proc.stderr.strip(),
-                    "status": "pass" if proc.returncode == 0 else "fail",
-                }
-            )
-        except subprocess.TimeoutExpired as exc:
-            results.append(
-                {
-                    "command": command,
-                    "returncode": None,
-                    "stdout": (exc.stdout or "").strip(),
-                    "stderr": ((exc.stderr or "").strip() or "timed out"),
-                    "status": "fail",
-                }
-            )
+        attempts: list[dict[str, Any]] = []
+        result: dict[str, Any] | None = None
+        for attempt in range(1, attempt_count + 1):
+            result = _run_single_command_check(repo_path, command, timeout_seconds)
+            result["attempt"] = attempt
+            attempts.append(dict(result))
+            if result.get("status") == "pass":
+                break
+        if result is None:
+            continue
+        result["attempt_count"] = len(attempts)
+        if len(attempts) > 1:
+            result["attempts"] = attempts
+        results.append(result)
     return results
 
 

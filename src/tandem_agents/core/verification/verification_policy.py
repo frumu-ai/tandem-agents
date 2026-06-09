@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from src.tandem_agents.core.repository.repo_truth import (
@@ -64,6 +65,43 @@ def _normalized_text(value: Any) -> str:
 
 def _normalized_action(value: Any) -> str:
     return _normalized_text(value).replace("-", "_")
+
+
+def _repo_validation_passed_command_checks(repo_validation: dict[str, Any] | None) -> bool:
+    if not repo_validation or not repo_validation.get("ok"):
+        return False
+    command_checks = list(repo_validation.get("command_checks") or [])
+    if not command_checks:
+        return False
+    command_failures = list(repo_validation.get("command_failures") or [])
+    if command_failures:
+        return False
+    return all(isinstance(check, dict) and _normalized_action(check.get("status")) == "pass" for check in command_checks)
+
+
+def _tester_outcome_is_only_missing_validation(
+    payload: dict[str, Any],
+    repo_validation: dict[str, Any] | None,
+) -> bool:
+    if not _repo_validation_passed_command_checks(repo_validation):
+        return False
+    if payload.get("findings") or payload.get("required_fixes"):
+        return False
+    text = json.dumps(payload, sort_keys=True).lower()
+    gap_markers = (
+        "missing_validation",
+        "missing validation",
+        "not successfully run",
+        "not run",
+        "not executed",
+        "no validation",
+        "validation is inconclusive",
+        "could not run",
+        "unable to run",
+        "commands were not",
+        "checks were not",
+    )
+    return any(marker in text for marker in gap_markers)
 
 
 @dataclass(frozen=True)
@@ -215,6 +253,8 @@ def test_blocker_message(test_result: dict[str, Any], repo_validation: dict[str,
     payload = _extract_json(test_result.get("stdout") or "") or {}
     status = _normalized_text(payload.get("status") or payload.get("overall_status") or payload.get("verdict"))
     outcome, message = _severity_label(status, payload, source="test")
+    if outcome in {"human_review_needed", "blocked"} and _tester_outcome_is_only_missing_validation(payload, repo_validation):
+        return None
     if outcome == "pass":
         return None
     if message:
@@ -244,6 +284,8 @@ def evaluate_verification_policy(
     test_status = _normalized_text(test_payload.get("status") or test_payload.get("overall_status") or test_payload.get("verdict"))
     review_outcome, _ = _severity_label(review_status, review_payload, source="review")
     test_outcome, _ = _severity_label(test_status, test_payload, source="test")
+    if test_outcome in {"human_review_needed", "blocked"} and _tester_outcome_is_only_missing_validation(test_payload, repo_validation):
+        test_outcome = "pass"
     if review_outcome == "human_review_needed" or test_outcome == "human_review_needed":
         outcome = "human_review_needed"
     elif review_outcome == "blocked" or test_outcome == "blocked" or repo_blocker:

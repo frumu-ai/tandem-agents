@@ -84,6 +84,7 @@ NON_RETRYABLE_WORKER_BLOCKERS = {
     "engine_tool_loop_stalled",
 }
 PR_CANDIDATE_SEED_CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".py")
+PR_CANDIDATE_IMPORT_EXTENSIONS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json")
 PR_CANDIDATE_SEED_EXCLUDED_PREFIXES = (".jules/", "jules/")
 PR_CANDIDATE_SEED_EXCLUDED_FILES = {".jules/bolt.md", "jules/bolt.md"}
 
@@ -655,13 +656,31 @@ def _pr_candidate_ref_map(subtask: dict[str, Any]) -> dict[str, str]:
     return refs
 
 
+def _candidate_seed_file_decision(
+    entry: dict[str, Any],
+    target_files: set[str],
+) -> tuple[str, str | None]:
+    path = str(entry.get("filename") or "").strip().lstrip("/")
+    if not path:
+        return "", "missing_filename"
+    if path in PR_CANDIDATE_SEED_EXCLUDED_FILES or path.startswith(PR_CANDIDATE_SEED_EXCLUDED_PREFIXES):
+        return path, "excluded_generated_or_private_file"
+    if entry.get("current_layout_stale") or not entry.get("base_path_exists"):
+        return path, "stale_or_missing_current_layout"
+    if target_files and path not in target_files:
+        return path, "outside_candidate_target_files"
+    if not path.endswith(PR_CANDIDATE_SEED_CODE_EXTENSIONS):
+        return path, "unsupported_file_type"
+    return path, None
+
+
 def _seedable_pr_candidate_specs(subtask: dict[str, Any]) -> list[dict[str, Any]]:
     """Return conservative PR candidates ACA can seed before retrying a no-diff worker.
 
-    The seed path is intentionally narrow: it only applies candidates whose changed
-    files all exist in the current layout, are code files, and have fetched refs.
-    This keeps the runtime from blindly resurrecting stale docs, generated churn,
-    lockfiles, or policy scripts when the model stalls before editing.
+    The seed path is intentionally narrow: it only applies candidate files that
+    exist in the current layout, are source/script files, and have fetched refs.
+    Stale docs, generated churn, and lockfiles are skipped per file so one stale
+    file does not discard an otherwise safe current-layout candidate.
     """
 
     ref_by_number = _pr_candidate_ref_map(subtask)
@@ -680,32 +699,112 @@ def _seedable_pr_candidate_specs(subtask: dict[str, Any]) -> list[dict[str, Any]
         if not isinstance(file_entries, list) or not file_entries:
             continue
         files: list[str] = []
-        rejected = False
+        skipped: list[dict[str, str]] = []
         for entry in file_entries:
             if not isinstance(entry, dict):
-                rejected = True
+                skipped.append({"path": "", "reason": "malformed_file_entry"})
                 break
-            path = str(entry.get("filename") or "").strip().lstrip("/")
-            if not path:
-                rejected = True
-                break
-            if path in PR_CANDIDATE_SEED_EXCLUDED_FILES or path.startswith(PR_CANDIDATE_SEED_EXCLUDED_PREFIXES):
-                rejected = True
-                break
-            if entry.get("current_layout_stale") or not entry.get("base_path_exists"):
-                rejected = True
-                break
-            if target_files and path not in target_files:
-                rejected = True
-                break
-            if not path.endswith(PR_CANDIDATE_SEED_CODE_EXTENSIONS):
-                rejected = True
-                break
+            path, reason = _candidate_seed_file_decision(entry, target_files)
+            if reason:
+                skipped.append({"path": path, "reason": reason})
+                continue
             files.append(path)
-        if rejected or not files:
+        if not files:
             continue
-        specs.append({"number": number, "ref": ref, "files": files})
+        specs.append({"number": number, "ref": ref, "files": files, "skipped_files": skipped})
     return specs
+
+
+def _unseedable_pr_candidate_summaries(
+    subtask: dict[str, Any],
+    seedable_specs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seedable_numbers = {str(spec.get("number") or "").strip() for spec in seedable_specs}
+    ref_by_number = _pr_candidate_ref_map(subtask)
+    target_files = set(_subtask_targets(subtask))
+    summaries: list[dict[str, Any]] = []
+    for context in subtask.get("pr_candidate_context") or []:
+        if not isinstance(context, dict):
+            continue
+        number = str(context.get("number") or "").strip()
+        if not number or number in seedable_numbers:
+            continue
+        ref = ref_by_number.get(number)
+        reasons: list[str] = []
+        if context.get("error"):
+            reasons.append(str(context.get("error")))
+        if not ref:
+            reasons.append("candidate ref unavailable")
+        file_entries = context.get("files")
+        if not isinstance(file_entries, list) or not file_entries:
+            reasons.append("no file entries in candidate context")
+        else:
+            for entry in file_entries:
+                if not isinstance(entry, dict):
+                    reasons.append("malformed file entry")
+                    continue
+                path, reason = _candidate_seed_file_decision(entry, target_files)
+                if reason:
+                    reasons.append(f"{path or '<unknown>'}: {reason}")
+        summaries.append(
+            {
+                "number": number,
+                "ref": ref,
+                "reason": "no seedable current-layout source files"
+                + (f": {'; '.join(reasons)}" if reasons else ""),
+            }
+        )
+    return summaries
+
+
+def _resolve_relative_import(worktree: Path, importer: str, import_path: str) -> Path | None:
+    if not import_path.startswith(("./", "../")):
+        return None
+    base = (worktree / importer).parent / import_path
+    for extension in PR_CANDIDATE_IMPORT_EXTENSIONS:
+        candidate = Path(str(base) + extension)
+        if candidate.is_file():
+            return candidate
+    for extension in PR_CANDIDATE_IMPORT_EXTENSIONS[1:]:
+        candidate = base / f"index{extension}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _missing_relative_imports(worktree: Path, files: list[str]) -> list[dict[str, str]]:
+    missing: list[dict[str, str]] = []
+    import_pattern = re.compile(r"(?:import|export)\s+(?:[^\"']+?\s+from\s+)?[\"'](\.{1,2}/[^\"']+)[\"']")
+    for file_path in files:
+        if not file_path.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+            continue
+        target = worktree / file_path
+        if not target.is_file():
+            continue
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for match in import_pattern.finditer(text):
+            import_path = match.group(1)
+            if _resolve_relative_import(worktree, file_path, import_path) is None:
+                missing.append({"file": file_path, "import": import_path})
+    return missing
+
+
+def _reverse_apply_candidate_diff(worktree: Path, diff_text: str) -> subprocess.CompletedProcess[str]:
+    reverse_cmd = [
+        "--work-tree=." if arg.startswith("--work-tree=") else arg
+        for arg in git_command_for_worktree(worktree, "apply", "-R", "--3way", "--whitespace=nowarn")
+    ]
+    return subprocess.run(
+        reverse_cmd,
+        cwd=str(worktree),
+        input=diff_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _seed_pr_candidate_diff(
@@ -717,7 +816,10 @@ def _seed_pr_candidate_diff(
         previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         log_path.write_text(previous + message, encoding="utf-8")
 
-    for spec in _seedable_pr_candidate_specs(subtask):
+    specs = _seedable_pr_candidate_specs(subtask)
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = _unseedable_pr_candidate_summaries(subtask, specs)
+    for spec in specs:
         files = [str(path) for path in spec.get("files") or [] if str(path).strip()]
         ref = str(spec.get("ref") or "").strip()
         number = str(spec.get("number") or "").strip()
@@ -730,6 +832,12 @@ def _seed_pr_candidate_diff(
             append_log(
                 f"ACA PR candidate seed skipped for PR #{number}: {diff_result.stderr or 'empty diff'}\n"
             )
+            skipped.append({
+                "number": number,
+                "ref": ref,
+                "files": files,
+                "reason": diff_result.stderr or "empty diff",
+            })
             continue
         apply_cmd = [
             "--work-tree=." if arg.startswith("--work-tree=") else arg
@@ -745,23 +853,59 @@ def _seed_pr_candidate_diff(
         )
         if apply_proc.returncode != 0:
             append_log(f"ACA PR candidate seed failed for PR #{number}: {apply_proc.stderr or apply_proc.stdout}\n")
+            skipped.append({
+                "number": number,
+                "ref": ref,
+                "files": files,
+                "reason": apply_proc.stderr or apply_proc.stdout or "apply failed",
+            })
             continue
-        changed_files = _worktree_changed_files(worktree)
-        diff_stat = git_diff_stat(worktree).strip()
-        if not changed_files or not diff_stat:
+        missing_imports = _missing_relative_imports(worktree, files)
+        if missing_imports:
+            reverse_proc = _reverse_apply_candidate_diff(worktree, diff_result.stdout)
+            detail = ", ".join(
+                f"{item.get('file')} imports {item.get('import')}" for item in missing_imports
+            )
+            reason = f"introduced missing relative import: {detail}"
+            dirty_after_reverse = any(path in set(_worktree_changed_files(worktree)) for path in files)
+            if reverse_proc.returncode != 0 or dirty_after_reverse:
+                checkout_proc = run_command(git_command_for_worktree(worktree, "checkout", "--", *files))
+                if checkout_proc.returncode != 0:
+                    reason += f"; rollback failed: {reverse_proc.stderr or reverse_proc.stdout or checkout_proc.stderr or checkout_proc.stdout}"
+            append_log(f"ACA PR candidate seed rejected for PR #{number}: {reason}\n")
+            skipped.append({
+                "number": number,
+                "ref": ref,
+                "files": files,
+                "reason": reason,
+            })
             continue
         message = (
             f"ACA seeded PR candidate #{number} into the worker worktree before retry "
             f"because the first worker attempt produced no diff. Files: {', '.join(files)}\n"
         )
         append_log(message)
-        return {
+        applied.append({
             "number": number,
             "ref": ref,
             "files": files,
-            "changed_files": changed_files,
-            "diff_stat": diff_stat,
-        }
+            "skipped_files": list(spec.get("skipped_files") or []),
+        })
+    changed_files = _worktree_changed_files(worktree)
+    diff_stat = git_diff_stat(worktree).strip()
+    if not applied or not changed_files or not diff_stat:
+        return None
+    return {
+        "number": applied[0].get("number"),
+        "numbers": [item.get("number") for item in applied if item.get("number")],
+        "ref": applied[0].get("ref"),
+        "refs": [item.get("ref") for item in applied if item.get("ref")],
+        "files": sorted({path for item in applied for path in (item.get("files") or [])}),
+        "candidates": applied,
+        "skipped_candidates": skipped,
+        "changed_files": changed_files,
+        "diff_stat": diff_stat,
+    }
     return None
 
 
@@ -774,11 +918,33 @@ def _recover_seeded_pr_candidate_diff(
         "\nACA recovered this worker by applying a conservative pre-fetched PR candidate diff "
         "after the engine did not produce a usable worker result. The seeded diff will continue "
         "through normal review and verification gates.\n"
-        f"Seeded PR: #{seeded_diff.get('number')} ({seeded_diff.get('ref')})\n"
+        "Seeded PR candidates: "
+        + ", ".join(f"#{number}" for number in seeded_diff.get("numbers") or [seeded_diff.get("number")])
+        + "\n"
         "Changed files:\n"
         + "\n".join(f"- {path}" for path in seeded_diff.get("changed_files") or [])
         + "\n"
     )
+    candidate_notes: list[str] = []
+    for candidate in seeded_diff.get("candidates") or []:
+        skipped_files = candidate.get("skipped_files") or []
+        if not skipped_files:
+            candidate_notes.append(f"- #{candidate.get('number')}: applied {', '.join(candidate.get('files') or [])}")
+            continue
+        skipped_text = "; ".join(
+            f"{item.get('path') or '<unknown>'} ({item.get('reason')})" for item in skipped_files
+        )
+        candidate_notes.append(
+            f"- #{candidate.get('number')}: applied {', '.join(candidate.get('files') or [])}; skipped {skipped_text}"
+        )
+    skipped_candidates = seeded_diff.get("skipped_candidates") or []
+    if candidate_notes or skipped_candidates:
+        message += "\nPR candidate applicability:\n" + "\n".join(candidate_notes)
+        if skipped_candidates:
+            message += "\nSkipped candidate diffs:\n" + "\n".join(
+                f"- #{item.get('number')}: {item.get('reason')}" for item in skipped_candidates
+            )
+        message += "\n"
     previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
     log_path.write_text(previous + message, encoding="utf-8")
     result["stdout"] = f"{result.get('stdout') or ''}{message}"
@@ -1483,8 +1649,12 @@ def run_worker_subtask(
                     "worker_id": worker_id,
                     "subtask_id": subtask["id"],
                     "pr_number": seeded_diff.get("number"),
+                    "pr_numbers": seeded_diff.get("numbers") or [],
                     "ref": seeded_diff.get("ref"),
+                    "refs": seeded_diff.get("refs") or [],
                     "files": seeded_diff.get("files") or [],
+                    "candidates": seeded_diff.get("candidates") or [],
+                    "skipped_candidates": seeded_diff.get("skipped_candidates") or [],
                     "changed_files": seeded_diff.get("changed_files") or [],
                 },
                 task_id=task.get("task_id"),
