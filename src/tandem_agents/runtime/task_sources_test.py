@@ -732,9 +732,12 @@ class LinearTaskSourceTest(unittest.TestCase):
                 "project": {"name": "Signal Triage & Bug Monitor", "id": "project-1"},
             }
 
-            with patch(
-                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
-                return_value=([{"name": "Backlog", "type": "backlog"}], [], [issue]),
+            with (
+                patch(
+                    "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                    return_value=([{"name": "Backlog", "type": "backlog"}], [], [issue]),
+                ),
+                patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=issue),
             ):
                 task, _board, _path = _task_from_linear(cfg)
 
