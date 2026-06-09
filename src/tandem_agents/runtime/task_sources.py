@@ -151,11 +151,28 @@ def _normalize_issue_body(body: str | None) -> tuple[str, list[str]]:
         return "", []
     lines = [line.strip() for line in body.splitlines()]
     summary = next((line for line in lines if line), "")
-    criteria = [
-        line.lstrip("-* ").strip()
-        for line in lines
-        if line.startswith("- [ ]") or line.startswith("* [ ]") or line.startswith("- ")
-    ]
+    criteria: list[str] = []
+    in_acceptance = False
+    for line in lines:
+        if line.startswith("#"):
+            heading = re.sub(r"[^a-z0-9]+", "_", line.lstrip("#").strip().lower()).strip("_")
+            in_acceptance = heading in {"acceptance", "acceptance_criterion", "acceptance_criteria"}
+            continue
+        if not line:
+            continue
+        if in_acceptance:
+            match = re.match(r"^(?:[-*]|\d+[.)])\s+(.*\S)\s*$", line)
+            if match:
+                criteria.append(match.group(1).strip())
+            continue
+        if line.startswith("- [ ]") or line.startswith("* [ ]"):
+            criteria.append(line.split("]", 1)[-1].strip())
+    if not criteria:
+        criteria = [
+            line.lstrip("-* ").strip()
+            for line in lines
+            if line.startswith("- [ ]") or line.startswith("* [ ]") or line.startswith("- ")
+        ]
     criteria = [line for line in criteria if line]
     return summary, criteria
 

@@ -162,6 +162,39 @@ There are 19 open Bolt/Jules-style PRs.
 
         self.assertEqual(task["execution_kind"], "code_edit")
         self.assertEqual(task["target_files"], ["crates/tandem-server/src/http/linear.rs"])
+        self.assertEqual(task["acceptance_criteria"], ["Implement Linear routing for task intake."])
+
+    def test_plain_acceptance_section_populates_contract_criteria(self) -> None:
+        body = """## Context
+
+Migrated from Signal Triage roadmap.
+
+## Acceptance
+
+* Research/Evidence triage vertical slice can intake a signal and produce a reviewed recommendation proposal.
+* Use-Case Discovery can produce reviewed proposals without auto-enabling workflows.
+
+## Verification
+
+* Demo or tests for both additional vertical slices.
+"""
+
+        task = apply_task_contract(
+            {
+                "title": "SIG-03 Prove Research/Evidence and Use-Case Discovery triage domains",
+                "description": body,
+                "source": {"type": "linear", "identifier": "TAN-69"},
+            }
+        )
+
+        self.assertEqual(
+            task["acceptance_criteria"],
+            [
+                "Research/Evidence triage vertical slice can intake a signal and produce a reviewed recommendation proposal.",
+                "Use-Case Discovery can produce reviewed proposals without auto-enabling workflows.",
+            ],
+        )
+        self.assertEqual(task["verification_commands"], ["Demo or tests for both additional vertical slices."])
 
     def test_linear_github_pr_action_task_is_not_code_edit(self) -> None:
         body = """## Context

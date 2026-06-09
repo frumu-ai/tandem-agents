@@ -29,6 +29,8 @@ _SECTION_ALIASES = {
     "likely_files_to_edit": "target_files",
     "verification": "verification_commands",
     "verification_steps": "verification_commands",
+    "acceptance": "acceptance_criteria",
+    "acceptance_criterion": "acceptance_criteria",
     "acceptance_criteria": "acceptance_criteria",
     "notes_for_agent": "notes_for_agent",
     "recommended_fix": "notes_for_agent",

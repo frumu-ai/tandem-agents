@@ -703,6 +703,50 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertNotIn("truncated", task["description"])
             self.assertIn("Real criterion", task["acceptance_criteria"])
 
+    def test_linear_task_extracts_plain_acceptance_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issue = {
+                "id": "lin-69",
+                "identifier": "TAN-69",
+                "title": "SIG-03 Prove Research/Evidence and Use-Case Discovery triage domains",
+                "description": "\n".join(
+                    [
+                        "## Context",
+                        "",
+                        "Migrated from Signal Triage roadmap.",
+                        "",
+                        "## Acceptance",
+                        "",
+                        "* Research/Evidence triage vertical slice can intake a signal.",
+                        "* Use-Case Discovery can produce reviewed proposals.",
+                        "",
+                        "## Verification",
+                        "",
+                        "* Demo or tests for both additional vertical slices.",
+                    ]
+                ),
+                "url": "https://linear.app/frumu/issue/TAN-69/sig-03",
+                "state": {"name": "Backlog", "type": "backlog"},
+                "team": {"name": "Tandem", "id": "team-1"},
+                "project": {"name": "Signal Triage & Bug Monitor", "id": "project-1"},
+            }
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=([{"name": "Backlog", "type": "backlog"}], [], [issue]),
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+
+            self.assertEqual(
+                task["acceptance_criteria"],
+                [
+                    "Research/Evidence triage vertical slice can intake a signal.",
+                    "Use-Case Discovery can produce reviewed proposals.",
+                ],
+            )
+            self.assertEqual(task["verification_commands"], ["Demo or tests for both additional vertical slices."])
+
     def test_linear_task_source_reports_connector_failure_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))
