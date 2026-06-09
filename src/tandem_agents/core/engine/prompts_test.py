@@ -107,6 +107,19 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("pr_candidate_context.json", prompt)
         self.assertNotIn("refs/aca/pr-", prompt)
 
+    def test_worker_prompt_warns_about_git_ignored_targets(self) -> None:
+        subtask = self._subtask(
+            files=[],
+            target_files=[],
+            ignored_target_files=["docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md"],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Git-ignored target files", prompt)
+        self.assertIn("docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md", prompt)
+        self.assertIn("cannot create a reviewable diff", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

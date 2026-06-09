@@ -236,6 +236,47 @@ Migrated from Signal Triage roadmap.
         self.assertTrue(validation["ok"])
         self.assertEqual(validation["issues"], [])
 
+    def test_task_plan_validation_accepts_expected_verification_as_subtask_checklist(self) -> None:
+        task = {
+            "title": "Verify Bug Monitor gates",
+            "verification_commands": ["node scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+        }
+        subtasks = [
+            {
+                "title": "Add focused fixture coverage",
+                "goal": "Exercise mixed Bug Monitor signal fixtures.",
+                "instructions": [
+                    "Add or refine a focused fixture that covers quality-gate outcomes.",
+                ],
+                "expected_verification": [
+                    "Focused Bug Monitor tests pass and cover accepted, retried, and blocked signals.",
+                ],
+            }
+        ]
+
+        validation = task_plan_validation(task, subtasks)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_task_plan_validation_accepts_scope_as_subtask_checklist(self) -> None:
+        task = {
+            "title": "Add prompt-injection exfiltration evals",
+            "verification_commands": ["cargo test -p tandem-server eval"],
+        }
+        subtasks = [
+            {
+                "title": "Add KB-MCP bulk export scenarios",
+                "goal": "Cover prompt-injected memory export attempts.",
+                "scope": "Add YAML eval scenarios and bounded-exposure assertions for no bulk export.",
+            }
+        ]
+
+        validation = task_plan_validation(task, subtasks)
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["issues"], [])
+
     def test_linear_github_pr_action_task_is_not_code_edit(self) -> None:
         body = """## Context
 

@@ -225,6 +225,15 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
             first.get("recovery_action")
             or "Inspect the worker log and PR candidate context, then reset the task to Backlog if another attempt is needed."
         )
+    elif kind == "ignored_path_changes":
+        ignored = first.get("ignored_files") or []
+        ignored_text = f" Ignored files: {', '.join(str(path) for path in ignored)}." if ignored else ""
+        message = f"Worker edited only Git-ignored files, so no reviewable repository diff was produced.{ignored_text}"
+        phase_detail = f"{worker_id} edited only ignored files"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Move the requested deliverable to tracked repository files, then reset the task to Backlog."
+        )
     elif kind == "engine_exception":
         message = failure_reason or "Tandem engine prompt failed with an exception."
         phase_detail = f"{worker_id} hit an engine prompt exception"
@@ -801,7 +810,17 @@ def _normalize_manager_subtasks(
         if not acceptance:
             acceptance = item.get("required_work")
         if not acceptance:
+            acceptance = item.get("scope")
+        if not acceptance:
+            acceptance = item.get("objective")
+        if not acceptance:
             acceptance = item.get("verification")
+        if not acceptance:
+            acceptance = item.get("expected_verification")
+        if not acceptance:
+            acceptance = item.get("instructions")
+        if not acceptance:
+            acceptance = item.get("handoff")
         if not acceptance:
             acceptance = deliverables
         acceptance_criteria = [str(entry).strip() for entry in _as_list(acceptance) if str(entry).strip()]

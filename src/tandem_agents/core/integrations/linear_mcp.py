@@ -269,14 +269,15 @@ def _resolve_linear_tool_id(cfg: ResolvedConfig, aliases: list[str]) -> str:
 
 
 def _execute_linear_tool(cfg: ResolvedConfig, aliases: list[str], args: dict[str, Any]) -> dict[str, Any]:
-    last_error: Exception | None = None
+    last_resolve_error: Exception | None = None
+    last_execution_error: Exception | None = None
     tried: set[str] = set()
     for alias in aliases:
         for variant in _alias_variants(alias):
             try:
                 tool_id = _resolve_linear_tool_id(cfg, [variant])
             except RuntimeError as exc:
-                last_error = exc
+                last_resolve_error = exc
                 continue
             if tool_id in tried:
                 continue
@@ -284,14 +285,16 @@ def _execute_linear_tool(cfg: ResolvedConfig, aliases: list[str], args: dict[str
             try:
                 result = execute_engine_tool(cfg, tool_id, args)
             except RuntimeError as exc:
-                last_error = exc
+                last_execution_error = exc
                 continue
             if _tool_failed(result):
-                last_error = RuntimeError(_tool_error_message(result))
+                last_execution_error = RuntimeError(_tool_error_message(result))
                 continue
             return result
-    if last_error is not None:
-        raise last_error
+    if last_execution_error is not None:
+        raise last_execution_error
+    if last_resolve_error is not None:
+        raise last_resolve_error
     raise RuntimeError("Could not execute a Linear MCP tool.")
 
 
@@ -665,7 +668,7 @@ def linear_update_issue(cfg: ResolvedConfig, task: dict[str, Any], fields: dict[
             return None
         except Exception as exc:
             last_error = exc
-    raise RuntimeError(str(last_error) if last_error else "Linear issue update failed.")
+    return str(last_error) if last_error else "Linear issue update failed."
 
 
 def linear_add_comment(cfg: ResolvedConfig, task: dict[str, Any], body: str) -> str | None:

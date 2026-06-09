@@ -8,7 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.tandem_agents.core.repository.repo_truth import (
+    command_check_is_executable,
     discover_repo_files,
+    filter_executable_command_checks,
     infer_command_checks,
     repo_context_summary,
     run_command_checks,
@@ -209,6 +211,26 @@ class RepoTruthDiscoveryTest(unittest.TestCase):
             self.assertEqual(results[0]["status"], "pass")
             self.assertEqual(results[0]["attempt_count"], 2)
             self.assertEqual(results[0]["attempts"][0]["status"], "fail")
+
+    def test_filter_executable_command_checks_drops_natural_language_verification(self) -> None:
+        commands = filter_executable_command_checks(
+            [
+                "Evals fail before containment controls and pass after gateway controls are implemented.",
+                "cargo test -p tandem-server eval",
+                "pnpm -C packages/tandem-control-panel run build",
+                "./scripts/ci-file-size-check.sh",
+            ]
+        )
+
+        self.assertEqual(
+            commands,
+            [
+                "cargo test -p tandem-server eval",
+                "pnpm -C packages/tandem-control-panel run build",
+                "./scripts/ci-file-size-check.sh",
+            ],
+        )
+        self.assertFalse(command_check_is_executable("Demo or tests for both additional vertical slices."))
 
 
 if __name__ == "__main__":

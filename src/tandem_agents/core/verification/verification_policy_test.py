@@ -171,6 +171,33 @@ class VerificationPolicyTest(unittest.TestCase):
         self.assertEqual(decision.outcome, "blocked")
         self.assertEqual(decision.failure_category, "verification_missing")
 
+    def test_repair_needed_takes_category_precedence_over_missing_verification(self) -> None:
+        decision = evaluate_verification_policy(
+            {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "next_action": "repair_needed",
+                        "required_fixes": ["add concrete eval cases"],
+                    }
+                ),
+            },
+            {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "next_action": "repair_needed",
+                        "results": [{"status": "failed", "message": "manifest is scaffold-only"}],
+                    }
+                ),
+            },
+            repo_validation={"ok": False, "verification_missing": True},
+        )
+
+        self.assertEqual(decision.outcome, "blocked")
+        self.assertEqual(decision.failure_category, "review_repair_needed")
+        self.assertEqual(decision.validation_blocker, "Reviewer reported required fixes.")
+
 
 if __name__ == "__main__":
     unittest.main()

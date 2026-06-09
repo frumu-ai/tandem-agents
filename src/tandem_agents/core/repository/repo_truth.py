@@ -475,6 +475,68 @@ def extract_command_checks(manager_plan: dict[str, Any]) -> list[str]:
     return commands
 
 
+_COMMAND_CHECK_PROGRAMS = {
+    "bash",
+    "bun",
+    "cargo",
+    "cat",
+    "deno",
+    "find",
+    "git",
+    "go",
+    "grep",
+    "head",
+    "just",
+    "ls",
+    "make",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "python",
+    "python3",
+    "pytest",
+    "sed",
+    "sh",
+    "tail",
+    "test",
+    "wc",
+    "yarn",
+}
+
+
+def command_check_is_executable(command: str) -> bool:
+    """Return true for verification strings that look like shell commands.
+
+    Linear issue verification often contains prose like "Evals fail before X
+    and pass after Y." Those lines are useful acceptance context, but running
+    them under bash creates false verification failures. Keep this check
+    conservative and let deterministic inference supply extra commands.
+    """
+    command = str(command or "").strip()
+    if not command:
+        return False
+    try:
+        parts = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    program = parts[0].strip()
+    if program.startswith("./") or program.startswith("scripts/") or "/" in program:
+        return True
+    return program in _COMMAND_CHECK_PROGRAMS
+
+
+def filter_executable_command_checks(commands: list[str]) -> list[str]:
+    filtered: list[str] = []
+    for raw_command in commands:
+        command = str(raw_command or "").strip()
+        if command and command_check_is_executable(command) and command not in filtered:
+            filtered.append(command)
+    return filtered
+
+
 def _safe_rel_path(raw_path: Any) -> str:
     rel_path = str(raw_path or "").strip().replace("\\", "/")
     while rel_path.startswith("./"):
