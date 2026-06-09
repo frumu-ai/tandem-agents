@@ -246,7 +246,10 @@ def build_manager_prompt(
     repo_context: str | None = None,
     previous_feedback: str | None = None,
 ) -> str:
+    from src.tandem_agents.core.engine.engine_runtime import engine_session_provider_model
+
     contract_block = _task_contract_block(task)
+    provider_model = engine_session_provider_model(cfg, "manager")
     prompt = f"You are the ACA manager for run {run_id}.\n"
     if previous_feedback:
         prompt += (
@@ -271,7 +274,7 @@ def build_manager_prompt(
         f"Repository: {repo['path']}\n"
         f"Existing relevant repo files:\n{repo_context or 'No relevant repo files were discovered.'}\n"
         f"Board lane: {task.get('lane') or 'ready'}\n"
-        f"Provider/model: {cfg.provider_for_role('manager')[0]} / {cfg.provider_for_role('manager')[1]}\n"
+        f"Provider/model: {provider_model['provider']} / {provider_model['model']}\n"
     )
 
 

@@ -3170,10 +3170,12 @@ def _complete_pre_satisfied(ctx: "_PhaseRunContext") -> dict[str, Any]:
         metrics={**_worker_result_metrics(ctx.worker_results),
                  "planned_workers": len(ctx.planned_subtasks), "tests_passed": True},
     )
+    provider_meta = ctx.status.get("provider") if isinstance(ctx.status.get("provider"), dict) else {}
     save_run_text(ctx.layout["summary"], build_completed_summary(
         run_id=ctx.run_id, task_title=ctx.task["title"], repo_path=ctx.repo.get("path"),
         engine_label=ctx.engine.get("version") or ctx.engine.get("status") or "unknown",
-        provider_id=ctx.cfg.provider.id, provider_model=ctx.cfg.provider.model,
+        provider_id=str(provider_meta.get("id") or ctx.cfg.provider.id),
+        provider_model=str(provider_meta.get("model") or ctx.cfg.provider.model),
         worker_results=ctx.worker_results, review_returncode=0, test_returncode=0, diff_snapshot=diff,
     ))
     sync_failed = _finalize_github_sync(

@@ -26,10 +26,14 @@ def runtime_role(cfg: ResolvedConfig) -> str:
 
 
 def _worker_capabilities(cfg: ResolvedConfig, role: str) -> dict[str, object]:
+    from src.tandem_agents.core.engine.engine_runtime import engine_session_provider_model
+
+    provider_model = engine_session_provider_model(cfg, "worker")
     return {
         "mode": role,
-        "provider": cfg.provider.id,
-        "model": cfg.provider.model,
+        "provider": provider_model["provider"],
+        "model": provider_model["model"],
+        "provider_source": provider_model.get("source"),
         "repo_slug": cfg.repository.slug or "",
         "source_type": cfg.task_source.type,
     }

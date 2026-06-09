@@ -61,9 +61,15 @@ def _repository_snapshot(cfg: ResolvedConfig) -> dict[str, Any]:
 
 
 def _provider_snapshot(cfg: ResolvedConfig) -> dict[str, Any]:
+    from src.tandem_agents.core.engine.engine_runtime import engine_session_provider_model
+
+    provider_model = engine_session_provider_model(cfg, "manager")
     return {
-        "id": str(cfg.provider.id or "").strip(),
-        "model": str(cfg.provider.model or "").strip(),
+        "id": str(provider_model.get("provider") or "").strip(),
+        "model": str(provider_model.get("model") or "").strip(),
+        "source": str(provider_model.get("source") or "").strip(),
+        "configured_id": str(cfg.provider.id or "").strip(),
+        "configured_model": str(cfg.provider.model or "").strip(),
         "base_url": str(cfg.provider.base_url or "").strip(),
         "fallback_provider": str(cfg.provider.fallback_provider or "").strip(),
         "fallback_model": str(cfg.provider.fallback_model or "").strip(),

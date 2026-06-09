@@ -142,7 +142,7 @@ def _operator_provider_override_present(cfg: ResolvedConfig, role: str) -> bool:
     resolved = cfg.provider_for_role_with_source(role)
     if resolved["provider_source"] in {"role", "fallback"} or resolved["model_source"] in {"role", "fallback"}:
         return True
-    return (resolved["provider"], resolved["model"]) != (DEFAULT_PROVIDER, DEFAULT_MODEL)
+    return False
 
 
 def engine_default_provider_model(cfg: ResolvedConfig) -> tuple[str, str] | None:
@@ -477,6 +477,7 @@ def prompt_tandem_session_sync(
     require_tool_use: bool = False,
     write_required: bool = False,
     prewrite_requirements: dict[str, Any] | None = None,
+    timeout_seconds: float = 600.0,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "parts": [{"type": "text", "text": prompt}],
@@ -493,7 +494,7 @@ def prompt_tandem_session_sync(
         f"/session/{session_id}/prompt_sync",
         method="POST",
         payload=payload,
-        timeout=600.0,
+        timeout=timeout_seconds,
     )
     return {"messages": response}
 

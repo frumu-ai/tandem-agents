@@ -103,7 +103,7 @@ def run_task_intake(
         ctx.run_id,
         task,
         ctx.repo,
-        {"id": ctx.cfg.provider.id, "model": ctx.cfg.provider.model},
+        build_provider_config_dict(ctx.cfg),
         ctx.engine,
         {
             "enabled": ctx.cfg.swarm.enabled,

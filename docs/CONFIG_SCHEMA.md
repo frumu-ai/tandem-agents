@@ -446,8 +446,8 @@ repository:
   remote_name: origin
 
 provider:
-  id: openai
-  model: gpt-4.1-mini
+  id: openai-codex
+  model: gpt-5.5
 
 swarm:
   enabled: true

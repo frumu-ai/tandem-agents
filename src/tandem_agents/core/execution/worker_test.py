@@ -11,6 +11,7 @@ from src.tandem_agents.core.execution.worker import (
     _call_with_timeout,
     _coerce_worker_failure,
     _engine_max_events_without_text,
+    _empty_transcript_retry_prompt,
     _extract_prompt_sync_text,
     _extract_session_reply,
     _manager_plan_stream_complete,
@@ -72,6 +73,14 @@ class WorkerFailureCoercionTest(unittest.TestCase):
         cfg = SimpleNamespace(env={"ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT": "12"})
 
         self.assertEqual(_engine_max_events_without_text(cfg, "worker-1"), 12)
+
+    def test_empty_transcript_retry_prompt_is_role_aware(self) -> None:
+        manager_prompt = _empty_transcript_retry_prompt(role="manager", write_required=False)
+        worker_prompt = _empty_transcript_retry_prompt(role="worker-1", require_tool_use=True, write_required=True)
+
+        self.assertIn("Return JSON only", manager_prompt)
+        self.assertIn("Continue the original task using repository tools", worker_prompt)
+        self.assertIn("produced and verified filesystem changes", worker_prompt)
 
     def test_call_with_timeout_raises_for_stalled_operation(self) -> None:
         import time
@@ -641,7 +650,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertNotIn("failure_reason", result)
             self.assertNotIn("blocker_kind", result)
 
-    def test_tool_loop_stream_retries_then_uses_prompt_sync(self) -> None:
+    def test_tool_loop_stream_blocks_without_prompt_sync_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
             with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
@@ -668,16 +677,129 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                     env={},
                     log_path=log_path,
                     require_tool_use=True,
+                    write_required=False,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_TOOL_LOOP_STALLED")
+            self.assertEqual(result["blocker_kind"], "engine_tool_loop_stalled")
+            self.assertEqual(result["engine"]["stream_reason"], "no_text_timeout")
+            self.assertEqual(result["engine"]["retry_count"], 0)
+            self.assertIsNone(result["engine"]["fallback_mode"])
+            self.assertEqual(prompt_async.call_count, 1)
+            prompt_sync.assert_not_called()
+
+    def test_write_required_worker_uses_prompt_sync_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    return_value={"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync worker done"}]}]},
+                ) as prompt_sync:
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
                     write_required=True,
                 )
 
             self.assertEqual(result["returncode"], 0)
-            self.assertIn("sync fallback", result["stdout"])
-            self.assertEqual(result["engine"]["stream_reason"], "no_text_timeout")
-            self.assertEqual(result["engine"]["retry_count"], 1)
-            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync")
-            self.assertEqual(prompt_async.call_count, 2)
+            self.assertIn("sync worker done", result["stdout"])
+            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync_first")
+            prompt_async.assert_not_called()
             prompt_sync.assert_called_once()
+
+    def test_prompt_sync_connection_failure_retries_before_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            connect_error = RuntimeError(
+                "Engine request failed for /session/session-1/prompt_sync: "
+                "could not connect to http://127.0.0.1:39731 - is the engine running?"
+            )
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=[
+                        connect_error,
+                        {"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync worker recovered"}]}]},
+                    ],
+                ) as prompt_sync, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_health",
+                    return_value={"ready": True, "healthy": True},
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._engine_prompt_sync_connect_retry_delay_seconds",
+                    return_value=0.01,
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={"ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRIES": "1"}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("sync worker recovered", result["stdout"])
+            self.assertEqual(result["engine"]["retry_count"], 1)
+            self.assertEqual(prompt_sync.call_count, 2)
+            prompt_async.assert_not_called()
+
+    def test_prompt_sync_connection_failure_blocks_after_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            connect_error = RuntimeError(
+                "Engine request failed for /session/session-1/prompt_sync: "
+                "could not connect to http://127.0.0.1:39731 - is the engine running?"
+            )
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=connect_error,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_health",
+                    return_value={"ready": True, "healthy": True},
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._engine_prompt_sync_connect_retry_delay_seconds",
+                    return_value=0.01,
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={"ACA_ENGINE_PROMPT_SYNC_CONNECT_RETRIES": "1"}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_WORKSPACE_UNREACHABLE")
+            self.assertEqual(result["blocker_kind"], "engine_workspace_unreachable")
+            self.assertEqual(result["engine"]["retry_count"], 1)
 
     def test_manager_planning_disables_engine_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -872,6 +994,87 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["failure_reason"], "ENGINE_EMPTY_RESPONSE")
             self.assertEqual(result["blocker_kind"], "engine_empty_response")
 
+    def test_prompt_sync_session_conflict_blocks_with_specific_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            conflict_error = RuntimeError(
+                'Engine request failed (409) for /session/session-1/prompt_sync: '
+                '{"activeRun":{"runID":"run-active"},"code":"SESSION_RUN_CONFLICT","retryAfterMs":500}'
+            )
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={"text": "", "completed": False, "reason": "max_events_without_text", "event_count": 151},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_run_events", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_session_messages", return_value=[]), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=conflict_error,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_sync_conflict_wait_seconds", return_value=0.0):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_SESSION_RUN_CONFLICT")
+            self.assertEqual(result["blocker_kind"], "engine_session_run_conflict")
+            self.assertEqual(result["engine"]["sync_conflict"]["run_id"], "run-active")
+
+    def test_prompt_sync_timeout_blocks_with_prompt_timeout_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            timeout_error = RuntimeError(
+                "Engine request failed for /session/session-1/prompt_sync: operation timed out"
+            )
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={"text": "", "completed": False, "reason": "max_events_without_text", "event_count": 151},
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=timeout_error,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=5.0):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_PROMPT_TIMEOUT")
+            self.assertEqual(result["blocker_kind"], "engine_prompt_timeout")
+            self.assertIn("prompt_sync worker prompt", result["stdout"])
+
     def test_github_tasks_do_not_treat_readable_targets_as_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
@@ -935,6 +1138,32 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["returncode"], 1)
             self.assertEqual(result["failure_reason"], "ENGINE_TOOL_LOOP_STALLED")
             self.assertEqual(result["blocker_kind"], "engine_tool_loop_stalled")
+            self.assertNotEqual(result.get("verified_existing"), True)
+
+    def test_engine_exception_with_readable_targets_stays_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            target = worktree / "src/lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            log_path = worktree / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 1,
+                    "stdout": "Error: Engine request failed (409) for /session/session-1/prompt_sync\n",
+                    "failure_reason": "ENGINE_EXCEPTION",
+                    "blocker_kind": "engine_exception",
+                },
+                log_path,
+                worktree,
+                {"files": ["src/lib.rs"]},
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_EXCEPTION")
+            self.assertEqual(result["blocker_kind"], "engine_exception")
             self.assertNotEqual(result.get("verified_existing"), True)
 
     def test_pr_candidate_subtask_requires_real_diff(self) -> None:
