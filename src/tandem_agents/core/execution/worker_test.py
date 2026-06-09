@@ -190,7 +190,20 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(specs, [{"number": "1459", "ref": "refs/aca/pr-1459", "files": ["src/current.ts"]}])
+        self.assertEqual(
+            specs,
+            [
+                {"number": "1459", "ref": "refs/aca/pr-1459", "files": ["src/current.ts"], "skipped_files": []},
+                {
+                    "number": "1449",
+                    "ref": "refs/aca/pr-1449",
+                    "files": ["src/missing.ts"],
+                    "skipped_files": [
+                        {"path": ".jules/bolt.md", "reason": "excluded_generated_or_private_file"}
+                    ],
+                },
+            ],
+        )
 
     def test_seed_pr_candidate_diff_applies_first_safe_candidate_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,11 +232,171 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             seeded = _seed_pr_candidate_diff(
                 worktree,
                 {
-                    "files": ["src/current.ts"],
-                    "pr_candidate_refs": [{"number": 1459, "ok": True, "ref": "refs/aca/pr-1459"}],
+                    "files": ["src/current.ts", "scripts/ci-file-size-check.sh"],
+                    "pr_candidate_refs": [
+                        {"number": 1459, "ok": True, "ref": "refs/aca/pr-1459"},
+                        {"number": 1414, "ok": True, "ref": "refs/aca/pr-1414"},
+                    ],
                     "pr_candidate_context": [
                         {
                             "number": 1459,
+                            "files": [
+                                {
+                                    "filename": "src/current.ts",
+                                    "base_path_exists": True,
+                                    "current_layout_stale": False,
+                                }
+                            ],
+                        },
+                        {
+                            "number": 1414,
+                            "files": [
+                                {
+                                    "filename": "scripts/ci-file-size-check.sh",
+                                    "base_path_exists": True,
+                                    "current_layout_stale": False,
+                                },
+                                {
+                                    "filename": "src/old.ts",
+                                    "base_path_exists": False,
+                                    "current_layout_stale": True,
+                                },
+                            ],
+                        }
+                    ],
+                },
+                log_path,
+            )
+
+            self.assertIsNotNone(seeded)
+            self.assertEqual(seeded["number"], "1459")
+            self.assertEqual(seeded["numbers"], ["1459"])
+            self.assertEqual(seeded["skipped_candidates"][0]["number"], "1414")
+            self.assertIn("unsupported_file_type", seeded["skipped_candidates"][0]["reason"])
+            self.assertIn("stale_or_missing_current_layout", seeded["skipped_candidates"][0]["reason"])
+            self.assertEqual(_worktree_changed_files(worktree), ["src/current.ts"])
+            self.assertIn("reduce", target.read_text(encoding="utf-8"))
+
+    def test_seed_pr_candidate_diff_applies_multiple_safe_candidate_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "logs"
+            logs.mkdir()
+            log_path = logs / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            (worktree / "src").mkdir()
+            first = worktree / "src" / "current.ts"
+            second = worktree / "src" / "other.ts"
+            first.write_text("export const value = Math.max(...items.map((item) => item.count), 0);\n", encoding="utf-8")
+            second.write_text("export const newest = items[items.length - 1];\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/current.ts", "src/other.ts"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "branch", "main"], cwd=worktree, check=True)
+
+            subprocess.run(["git", "checkout", "-b", "candidate-one", "main"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            first.write_text("export const value = items.reduce((max, item) => Math.max(max, item.count), 0);\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/current.ts"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "candidate-one"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "update-ref", "refs/aca/pr-1459", "HEAD"], cwd=worktree, check=True)
+            subprocess.run(["git", "checkout", "main"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+
+            subprocess.run(["git", "checkout", "-b", "candidate-two", "main"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            second.write_text("export const newest = items.at(-1);\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/other.ts"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "candidate-two"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "update-ref", "refs/aca/pr-1414", "HEAD"], cwd=worktree, check=True)
+            subprocess.run(["git", "checkout", "main"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+
+            seeded = _seed_pr_candidate_diff(
+                worktree,
+                {
+                    "files": ["src/current.ts", "src/other.ts"],
+                    "pr_candidate_refs": [
+                        {"number": 1459, "ok": True, "ref": "refs/aca/pr-1459"},
+                        {"number": 1414, "ok": True, "ref": "refs/aca/pr-1414"},
+                    ],
+                    "pr_candidate_context": [
+                        {
+                            "number": 1459,
+                            "files": [
+                                {
+                                    "filename": "src/current.ts",
+                                    "base_path_exists": True,
+                                    "current_layout_stale": False,
+                                }
+                            ],
+                        },
+                        {
+                            "number": 1414,
+                            "files": [
+                                {
+                                    "filename": "src/other.ts",
+                                    "base_path_exists": True,
+                                    "current_layout_stale": False,
+                                },
+                                {
+                                    "filename": ".jules/bolt.md",
+                                    "base_path_exists": False,
+                                    "current_layout_stale": True,
+                                },
+                            ],
+                        },
+                    ],
+                },
+                log_path,
+            )
+
+            self.assertIsNotNone(seeded)
+            self.assertEqual(seeded["numbers"], ["1459", "1414"])
+            self.assertEqual(
+                _worktree_changed_files(worktree),
+                ["src/current.ts", "src/other.ts"],
+            )
+            self.assertIn("reduce", first.read_text(encoding="utf-8"))
+            self.assertIn("at(-1)", second.read_text(encoding="utf-8"))
+            self.assertEqual(
+                seeded["candidates"][1]["skipped_files"],
+                [{"path": ".jules/bolt.md", "reason": "excluded_generated_or_private_file"}],
+            )
+
+    def test_seed_pr_candidate_diff_rejects_missing_relative_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "logs"
+            logs.mkdir()
+            log_path = logs / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            (worktree / "src").mkdir()
+            target = worktree / "src" / "current.ts"
+            target.write_text("export const value = 1;\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/current.ts"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "branch", "main"], cwd=worktree, check=True)
+            subprocess.run(["git", "checkout", "-b", "candidate", "main"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("import { missing } from './missing';\nexport const value = missing();\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/current.ts"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "candidate"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "update-ref", "refs/aca/pr-1449", "HEAD"], cwd=worktree, check=True)
+            subprocess.run(["git", "checkout", "main"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+
+            seeded = _seed_pr_candidate_diff(
+                worktree,
+                {
+                    "files": ["src/current.ts"],
+                    "pr_candidate_refs": [{"number": 1449, "ok": True, "ref": "refs/aca/pr-1449"}],
+                    "pr_candidate_context": [
+                        {
+                            "number": 1449,
                             "files": [
                                 {
                                     "filename": "src/current.ts",
@@ -237,10 +410,9 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 log_path,
             )
 
-            self.assertIsNotNone(seeded)
-            self.assertEqual(seeded["number"], "1459")
-            self.assertEqual(_worktree_changed_files(worktree), ["src/current.ts"])
-            self.assertIn("reduce", target.read_text(encoding="utf-8"))
+            self.assertIsNone(seeded)
+            self.assertEqual(_worktree_changed_files(worktree), [])
+            self.assertIn("missing relative import", log_path.read_text(encoding="utf-8"))
 
     def test_run_worker_subtask_syncs_successful_worktree_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

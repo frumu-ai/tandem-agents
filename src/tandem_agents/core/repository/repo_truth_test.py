@@ -183,6 +183,33 @@ class RepoTruthDiscoveryTest(unittest.TestCase):
             self.assertIn("/home/node/npm/bin", path_parts)
             self.assertNotIn("-lc", args[0])
 
+    def test_run_command_checks_retries_once_before_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            failed = subprocess.CompletedProcess(
+                args=["/bin/bash", "-c", "pnpm test"],
+                returncode=1,
+                stdout="flaky timeout\n",
+                stderr="",
+            )
+            passed = subprocess.CompletedProcess(
+                args=["/bin/bash", "-c", "pnpm test"],
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+
+            with patch(
+                "src.tandem_agents.core.repository.repo_truth.subprocess.run",
+                side_effect=[failed, passed],
+            ) as run_mock:
+                results = run_command_checks(repo_path, ["pnpm test"])
+
+            self.assertEqual(run_mock.call_count, 2)
+            self.assertEqual(results[0]["status"], "pass")
+            self.assertEqual(results[0]["attempt_count"], 2)
+            self.assertEqual(results[0]["attempts"][0]["status"], "fail")
+
 
 if __name__ == "__main__":
     unittest.main()

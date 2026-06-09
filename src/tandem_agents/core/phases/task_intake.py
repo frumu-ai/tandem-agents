@@ -41,7 +41,6 @@ def run_task_intake(
     """
     from src.tandem_agents.core.engine.engine import (
         checkout_run_branch,
-        resolve_repository,
         task_run_branch_name,
     )
     from src.tandem_agents.core.integrations.github_mcp import github_mcp_scope, github_remote_sync_mode
@@ -59,6 +58,7 @@ def run_task_intake(
     from src.tandem_agents.runtime.task_sources import normalize_task
     from src.tandem_agents.core.task_contract import classify_task_execution_kind, task_contract_completeness
     from src.tandem_agents.core.execution.run_lifecycle import build_provider_config_dict, build_swarm_config_dict
+    from src.tandem_agents.core.repository.repository import repository_status
 
     # 1. Source MCP for intake
     if ctx.cfg.task_source.type == "linear":
@@ -182,7 +182,11 @@ def run_task_intake(
         task, ctx.run_id, ctx.repo.get("slug") or ctx.cfg.repository.slug
     )
     checkout_run_branch(ctx.cfg, ctx.repo_path, ctx.branch_name)
-    ctx.repo = resolve_repository(ctx.cfg)  # refresh after checkout
+    ctx.repo = repository_status(
+        ctx.repo_path,
+        ctx.cfg.repository.remote_name,
+        ctx.cfg.repository.default_branch,
+    )
 
     # 6. Register task + worker
     registered_task = ctx.coordination.register_task(task, repo=ctx.repo, status="queued")

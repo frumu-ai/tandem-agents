@@ -58,6 +58,81 @@ class VerificationPolicyTest(unittest.TestCase):
         self.assertEqual(decision.outcome, "human_review_needed")
         self.assertEqual(decision.review_blocker, "Reviewer status is `review_inconclusive_verification_required`.")
 
+    def test_passed_repo_commands_clear_tester_missing_validation_human_review(self) -> None:
+        review_result = {"returncode": 0, "stdout": json.dumps({"status": "pass"})}
+        test_result = {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "next_action": "human_review_needed",
+                    "results": {
+                        "missing_validation": "Frontend checks were not successfully run by the tester.",
+                    },
+                }
+            ),
+        }
+        repo_validation = {
+            "ok": True,
+            "command_checks": [{"command": "pnpm -C packages/tandem-control-panel run build", "status": "pass"}],
+            "command_failures": [],
+        }
+
+        decision = evaluate_verification_policy(review_result, test_result, repo_validation=repo_validation)
+
+        self.assertEqual(decision.outcome, "pass")
+        self.assertIsNone(decision.test_blocker)
+        self.assertEqual(decision.test_outcome, "pass")
+
+    def test_tester_human_review_still_blocks_without_passed_command_checks(self) -> None:
+        review_result = {"returncode": 0, "stdout": json.dumps({"status": "pass"})}
+        test_result = {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "next_action": "human_review_needed",
+                    "results": {"missing_validation": "Frontend checks were not run."},
+                }
+            ),
+        }
+
+        decision = evaluate_verification_policy(review_result, test_result, repo_validation={"ok": True})
+
+        self.assertEqual(decision.outcome, "human_review_needed")
+        self.assertEqual(decision.test_blocker, "Tester status is `human_review_needed`.")
+
+    def test_passed_repo_commands_clear_tester_blocked_missing_validation(self) -> None:
+        review_result = {"returncode": 0, "stdout": json.dumps({"status": "pass"})}
+        test_result = {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "next_action": "blocked",
+                    "commands": [
+                        {"command": "pnpm -C packages/tandem-control-panel run build", "status": "not_run"},
+                    ],
+                    "results": {
+                        "build_verified": False,
+                        "smoke_tests_verified": False,
+                    },
+                    "notes": ["Validation is inconclusive because build and smoke tests were not run."],
+                }
+            ),
+        }
+        repo_validation = {
+            "ok": True,
+            "command_checks": [
+                {"command": "pnpm -C packages/tandem-control-panel run build", "status": "pass"},
+                {"command": "pnpm -C packages/tandem-control-panel run test:smoke", "status": "pass"},
+            ],
+            "command_failures": [],
+        }
+
+        decision = evaluate_verification_policy(review_result, test_result, repo_validation=repo_validation)
+
+        self.assertEqual(decision.outcome, "pass")
+        self.assertIsNone(decision.test_blocker)
+        self.assertEqual(decision.test_outcome, "pass")
+
     def test_verification_policy_categorizes_command_failure(self) -> None:
         decision = evaluate_verification_policy(
             {"returncode": 0, "stdout": json.dumps({"status": "pass"})},
