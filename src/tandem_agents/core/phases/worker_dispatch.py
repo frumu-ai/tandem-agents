@@ -21,6 +21,15 @@ from src.tandem_agents.core.phases.context import RunContext
 logger = logging.getLogger("aca.phases.worker_dispatch")
 
 
+_TERMINAL_WORKER_BLOCKER_KINDS = {
+    "approval_failed",
+    "github_context_unavailable",
+    "unsupported_task",
+    "worker_corrupt_diff",
+    "worker_no_diff",
+}
+
+
 def dispatch_workers(ctx: RunContext) -> None:
     """Execute the pending subtask worker pool and collect results.
 
@@ -237,6 +246,7 @@ def _apply_tolerated_failures(ctx: RunContext) -> None:
             failure_reason.startswith("ENGINE_")
             or failure_reason.startswith("ENGINE_ERROR:")
             or blocker_kind.startswith("engine_")
+            or blocker_kind in _TERMINAL_WORKER_BLOCKER_KINDS
             or (matching and (matching.get("pr_candidate_context") or matching.get("pr_candidate_refs")))
         ):
             continue
@@ -266,6 +276,11 @@ def _post_dispatch_validation(ctx: RunContext) -> None:
         changed_files = _rc._collect_worker_changed_files(ctx.worker_results)
         if changed_files:
             ctx.expected_repo_files = changed_files
+    else:
+        ctx.expected_repo_files = _rc._sticky_expected_repo_files(
+            ctx.blackboard,
+            ctx.expected_repo_files,
+        )
     ctx.repo_validation = _rc._deterministic_repo_validation(ctx.repo_path, ctx.expected_repo_files)
     if changed_files:
         unexpected_files = _rc._pr_candidate_unexpected_changed_files(ctx.planned_subtasks, changed_files)

@@ -43,11 +43,15 @@ def _prepare_subtasks(ctx: RunContext) -> tuple[list[str], list[dict[str, Any]]]
     """
     from src.tandem_agents.core.execution import runner_core as _rc  # noqa: PLC0415
     from pathlib import Path
+    # max_workers limits dispatch concurrency later. When swarm is disabled,
+    # preparation compacts manager subtasks into one complete serial contract so
+    # dependent files are edited in the same worktree instead of isolated slices.
+    planning_subtask_limit = max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1)
     return _rc._prepare_subtasks_with_discovery(
         ctx.task,
         ctx.manager_plan,
         Path(ctx.repo.get("path") or "."),
-        ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1,
+        planning_subtask_limit,
     )
 
 
@@ -155,6 +159,25 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
 
     ctx.planned_subtasks = subtasks
     ctx.pending_subtasks = []
+    current_expected_files = _rc._collect_expected_repo_files(ctx.planned_subtasks)
+    sticky_expected_files = _rc._sticky_expected_repo_files(ctx.blackboard, current_expected_files)
+    sticky_missing_from_plan = [path for path in sticky_expected_files if path not in current_expected_files]
+    if sticky_missing_from_plan and ctx.planned_subtasks:
+        first = ctx.planned_subtasks[0]
+        for key in ("files", "target_files"):
+            values = [str(entry).strip() for entry in (first.get(key) or []) if str(entry).strip()]
+            for path in sticky_missing_from_plan:
+                if path not in values:
+                    values.append(path)
+            first[key] = values
+        existing_scope_note = str(first.get("scope_note") or "").strip()
+        sticky_note = (
+            "ACA kept these expected files from an earlier retry attempt because later manager plans "
+            "must not narrow the run contract: "
+            + ", ".join(sticky_missing_from_plan)
+            + "."
+        )
+        first["scope_note"] = f"{existing_scope_note}\n{sticky_note}".strip()
     plan_validation = task_plan_validation(ctx.task, subtasks)
     ctx.blackboard["task_plan_validation"] = plan_validation
     force_worker_execution = (
@@ -230,7 +253,10 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
         else:
             ctx.pending_subtasks.append(subtask)
 
-    ctx.expected_repo_files = _rc._collect_expected_repo_files(ctx.planned_subtasks)
+    ctx.expected_repo_files = _rc._sticky_expected_repo_files(
+        ctx.blackboard,
+        _rc._collect_expected_repo_files(ctx.planned_subtasks),
+    )
     ctx.repo_validation = _rc._deterministic_repo_validation(repo_path, ctx.expected_repo_files)
     ctx.blackboard["repo_validation"] = ctx.repo_validation
 

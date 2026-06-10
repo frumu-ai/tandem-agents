@@ -12,12 +12,62 @@ No state is written to disk here — callers drive that.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+import shlex
 from typing import Any
 
 from src.tandem_agents.core.phases.context import RunContext
 from src.tandem_agents.core.verification.verification_policy import evaluate_verification_policy
 
 logger = logging.getLogger("aca.phases.review_verify")
+
+
+def _run_engine_command_checks(
+    cfg: Any,
+    repo_path: Path,
+    commands: list[str],
+    *,
+    timeout_seconds: int = 120,
+) -> list[dict[str, Any]]:
+    from src.tandem_agents.core.engine.engine import execute_engine_tool, engine_visible_path
+
+    host_repo_path = engine_visible_path(repo_path)
+    results: list[dict[str, Any]] = []
+    for command in commands:
+        shell_command = f"cd {shlex.quote(str(host_repo_path))} && {command}"
+        try:
+            payload = execute_engine_tool(
+                cfg,
+                "bash",
+                {
+                    "command": shell_command,
+                    "timeout_ms": max(1000, int(timeout_seconds * 1000)),
+                },
+            )
+            metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            exit_code = metadata.get("exit_code")
+            returncode = int(exit_code) if isinstance(exit_code, int) else 1
+            output_value = payload.get("output") if isinstance(payload, dict) else ""
+            stdout = str(output_value or "").strip()
+            stderr = str(metadata.get("stderr") or "").strip()
+        except Exception as exc:
+            returncode = 1
+            stdout = ""
+            stderr = str(exc)
+        results.append(
+            {
+                "command": command,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "status": "pass" if returncode == 0 else "fail",
+                "executor": "tandem_engine",
+                "engine_repo_path": str(host_repo_path),
+            }
+        )
+    return results
 
 
 def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
@@ -214,8 +264,14 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         ctx.repo_validation = deterministic_repo_validation(
             ctx.repo_path,
             ctx.expected_repo_files,
-            command_checks=combined_command_checks,
+            command_checks=[],
         )
+        command_results = _run_engine_command_checks(ctx.cfg, ctx.repo_path, combined_command_checks)
+        command_failures = [result for result in command_results if result.get("status") != "pass"]
+        ctx.repo_validation = dict(ctx.repo_validation)
+        ctx.repo_validation["command_checks"] = command_results
+        ctx.repo_validation["command_failures"] = command_failures
+        ctx.repo_validation["ok"] = bool(ctx.repo_validation.get("ok")) and not command_failures
     if worker_changed_files and _rc._task_mentions_external_pr_candidates(ctx.task):
         unexpected_files = _rc._pr_candidate_unexpected_changed_files(ctx.planned_subtasks, worker_changed_files)
         if unexpected_files:

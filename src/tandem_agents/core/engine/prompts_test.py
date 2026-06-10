@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from src.tandem_agents.core.engine.prompts import (
     _compact_pr_context,
+    build_manager_prompt,
     build_review_prompt,
     build_test_prompt,
     build_worker_prompt,
@@ -11,6 +13,26 @@ from src.tandem_agents.core.engine.prompts import (
 
 _TASK = {"title": "Add feature", "task_contract": {}}
 _NOTES = [{"worker_id": "w1", "status": "completed"}]
+
+
+class _StubConfig:
+    env = {"ACA_PROVIDER": "openai-codex", "ACA_MODEL": "gpt-5.5"}
+    provider = SimpleNamespace(base_url="")
+
+    def provider_for_role(self, role: str) -> tuple[str, str]:
+        return "openai-codex", "gpt-5.5"
+
+    def provider_for_role_with_source(self, role: str) -> dict[str, str]:
+        return {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "provider_source": "provider",
+            "model_source": "provider",
+        }
+
+
+def _stub_config() -> _StubConfig:
+    return _StubConfig()
 
 
 class ReviewTestPromptDiffTest(unittest.TestCase):
@@ -119,6 +141,83 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("Git-ignored target files", prompt)
         self.assertIn("docs/internal/SIGNAL_TRIAGE_PIPELINE_KANBAN.md", prompt)
         self.assertIn("cannot create a reviewable diff", prompt)
+
+    def test_worker_prompt_requires_real_verification_path_without_import_side_effects(self) -> None:
+        subtask = self._subtask(
+            title="Verify quality gates",
+            goal="Exercise end-to-end signal quality gates",
+            files=["scripts/bug-monitor-external-log-intake-smoke.mjs"],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("exercise the existing production path", prompt)
+        self.assertIn("standalone simulation", prompt)
+        self.assertIn("importing it does not execute its CLI main routine", prompt)
+        self.assertIn("tracked fixtures should stay deterministic", prompt)
+        self.assertIn("Do not define the quality-gate rules inside the test", prompt)
+        self.assertIn("Preserve existing live smoke/API behavior", prompt)
+
+    def test_manager_prompt_warns_against_duplicate_quality_gate_implementation(self) -> None:
+        prompt = build_manager_prompt(
+            "run1",
+            {
+                "title": "Verify Bug Monitor quality gates",
+                "description": "End-to-end smoke against quality gates",
+                "task_contract": {},
+            },
+            {"path": "/repo"},
+            _stub_config(),
+            repo_context="crates/tandem-server/src/bug_monitor/service.rs",
+        )
+
+        self.assertIn("existing product implementation", prompt)
+        self.assertIn("standalone duplicate implementation", prompt)
+        self.assertIn("live smoke/API path", prompt)
+        self.assertIn("prefer 1-3 high-signal files", prompt)
+
+    def test_write_required_prompt_rejects_marker_files(self) -> None:
+        subtask = self._subtask(
+            files=["scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+            target_files=["scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Inspect the smallest relevant slice of a declared target file first", prompt)
+        self.assertIn("Briefly read one declared target before editing it", prompt)
+        self.assertIn("Required substantive write targets", prompt)
+        self.assertIn("scripts/bug-monitor-external-log-intake-fixture.test.mjs", prompt)
+        self.assertIn("Do not create marker files", prompt)
+        self.assertIn("Do not use no-op patches, comment-only changes", prompt)
+        self.assertIn("temporary files", prompt)
+        self.assertIn("will fail review", prompt)
+
+    def test_write_required_prompt_treats_metadata_targets_as_support_only(self) -> None:
+        subtask = self._subtask(
+            files=["scripts/bug-monitor-external-log-intake-fixture.test.mjs", "package.json"],
+            target_files=["scripts/bug-monitor-external-log-intake-fixture.test.mjs", "package.json"],
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Required substantive write targets", prompt)
+        self.assertIn("Metadata/support targets", prompt)
+        self.assertIn("A package.json-only or lockfile-only diff fails this worker", prompt)
+
+    def test_worker_prompt_includes_scope_note(self) -> None:
+        subtask = self._subtask(
+            files=["crates/tandem-server/src/http/tests/bug_monitor_parts/part03.rs"],
+            target_files=["crates/tandem-server/src/http/tests/bug_monitor_parts/part03.rs"],
+            scope_note="ACA narrowed an overbroad one-worker target set.",
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("ACA scope note", prompt)
+        self.assertIn("overbroad one-worker target set", prompt)
 
 
 if __name__ == "__main__":

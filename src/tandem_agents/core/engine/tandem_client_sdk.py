@@ -584,7 +584,26 @@ def sdk_stream_run_text(
 
             async def _consume() -> None:
                 nonlocal completed, event_count, events_without_text, last_text_at, reason
-                async for evt in client.stream(session_id, run_id):
+                started_at = time.monotonic()
+                stream = client.stream(session_id, run_id)
+                iterator = stream.__aiter__()
+                while True:
+                    now = time.monotonic()
+                    wait_seconds = max(0.1, float(timeout_seconds or 1.0) - (now - started_at))
+                    if no_text_timeout is not None and event_count >= 5:
+                        wait_seconds = min(wait_seconds, max(0.1, no_text_timeout - (now - last_text_at)))
+                    try:
+                        evt = await asyncio.wait_for(iterator.__anext__(), timeout=wait_seconds)
+                    except StopAsyncIteration:
+                        completed = True
+                        return
+                    except asyncio.TimeoutError:
+                        now = time.monotonic()
+                        if no_text_timeout is not None and event_count >= 5 and now - last_text_at >= no_text_timeout:
+                            reason = "no_text_timeout"
+                        else:
+                            reason = "timeout"
+                        return
                     event_count += 1
                     t = str(getattr(evt, "type", "") or "").strip()
                     delta = _extract_event_text_delta(evt)

@@ -229,7 +229,7 @@ def _version_satisfies(version_text: str | None, spec_text: str | None) -> tuple
         return None, f"could not compare versions ({exc})"
 
 
-def engine_status_report(cfg: ResolvedConfig) -> dict[str, Any]:
+def engine_status_report(cfg: ResolvedConfig, *, health_timeout: float = 5.0) -> dict[str, Any]:
     report: dict[str, Any] = {
         "base_url": cfg.tandem.base_url,
         "required_version": cfg.tandem.required_version or None,
@@ -246,7 +246,7 @@ def engine_status_report(cfg: ResolvedConfig) -> dict[str, Any]:
         "checked_at_ms": now_ms(),
     }
     try:
-        health = engine_health(cfg)
+        health = engine_health(cfg, timeout=health_timeout)
     except Exception as exc:
         report["detail"] = str(exc)
         return report

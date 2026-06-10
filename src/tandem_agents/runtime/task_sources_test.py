@@ -18,6 +18,7 @@ from src.tandem_agents.runtime.task_sources import (
     _task_from_linear,
     github_project_board_snapshot,
     linear_board_snapshot,
+    preview_task,
 )
 
 
@@ -642,6 +643,49 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertEqual(by_identifier["ENG-3"]["launch_state"], "in_progress")
             self.assertFalse(by_identifier["ENG-3"]["actionable"])
             self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
+
+    def test_linear_task_preview_uses_all_project_statuses_for_scheduler_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            filtered_issues = [
+                {"id": "lin-3", "identifier": "ENG-3", "title": "Filtered backlog", "priority": 4, "state": {"name": "Backlog", "type": "backlog"}},
+            ]
+            todo_issue = {
+                "id": "lin-1",
+                "identifier": "ENG-1",
+                "title": "Todo should run first",
+                "priority": 2,
+                "description": "Todo body\n\nAcceptance:\n- Run the Todo issue",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+            all_issues = [
+                *filtered_issues,
+                todo_issue,
+                {"id": "lin-2", "identifier": "ENG-2", "title": "Later todo", "priority": 3, "state": {"name": "Todo", "type": "unstarted"}},
+            ]
+            statuses = [
+                {"id": "st-1", "name": "Backlog", "type": "backlog"},
+                {"id": "st-2", "name": "Todo", "type": "unstarted"},
+            ]
+
+            def fake_list_issues(_cfg, **kwargs):
+                return filtered_issues if kwargs.get("statuses") else all_issues
+
+            with (
+                patch("src.tandem_agents.runtime.task_sources.ensure_linear_mcp_connected"),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issue_statuses", return_value=statuses),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issue_labels", return_value=[]),
+                patch("src.tandem_agents.runtime.task_sources.linear_list_issues", side_effect=fake_list_issues),
+                patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=todo_issue),
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+                preview = preview_task(cfg)
+
+            self.assertEqual(task["source"]["identifier"], "ENG-1")
+            self.assertEqual(task["title"], "Todo should run first")
+            self.assertIn("Run the Todo issue", task["acceptance_criteria"])
+            self.assertEqual(preview["task"]["source"]["identifier"], "ENG-1")
+            self.assertEqual(preview["task"]["title"], "Todo should run first")
 
     def test_linear_task_carries_repo_and_issue_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
