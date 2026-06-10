@@ -21,6 +21,19 @@ from src.tandem_agents.core.verification.verification_policy import evaluate_ver
 
 logger = logging.getLogger("aca.phases.review_verify")
 
+PROSE_VERIFIED_SUFFIXES = {".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc"}
+
+
+def _changes_require_command_verification(changed_files: list[str], expected_files: list[str]) -> bool:
+    paths = [str(path or "").strip() for path in changed_files or expected_files if str(path or "").strip()]
+    if not paths:
+        return False
+    for raw_path in paths:
+        suffix = Path(raw_path).suffix.lower()
+        if suffix not in PROSE_VERIFIED_SUFFIXES:
+            return True
+    return False
+
 
 def _run_engine_command_checks(
     cfg: Any,
@@ -285,7 +298,15 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         branch_name=ctx.branch_name,
         expected_repo_files=ctx.expected_repo_files,
     )
-    if coding_run_contract.requires_minimal_verification_before_handoff and not combined_command_checks:
+    needs_command_verification = _changes_require_command_verification(
+        worker_changed_files,
+        list(ctx.expected_repo_files or []),
+    )
+    if (
+        coding_run_contract.requires_minimal_verification_before_handoff
+        and needs_command_verification
+        and not combined_command_checks
+    ):
         ctx.repo_validation = dict(ctx.repo_validation)
         ctx.repo_validation["verification_missing"] = True
         ctx.repo_validation["ok"] = False
@@ -302,6 +323,7 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         "inferred_commands": inferred_command_checks,
         "changed_files": worker_changed_files,
         "expected_files": list(ctx.expected_repo_files or []),
+        "requires_command_verification": needs_command_verification,
     }
     ctx.blackboard["expected_deliverables"] = {
         "deliverables": [str(entry).strip() for entry in _as_list(ctx.task.get("deliverables")) if str(entry).strip()],
