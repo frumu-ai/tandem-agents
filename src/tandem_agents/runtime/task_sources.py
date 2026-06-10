@@ -2087,7 +2087,11 @@ def _task_from_linear(
     coordination: CoordinationStore | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], Path | None]:
     try:
-        _statuses, _labels, issues = _load_linear_live_data(cfg, refresh_server=False)
+        _statuses, _labels, issues = _load_linear_live_data(
+            cfg,
+            refresh_server=False,
+            include_all_project_statuses=True,
+        )
     except RuntimeError as exc:
         raise RuntimeError(
             "Could not read Linear issues through Tandem's connected Linear MCP path. "
@@ -2301,7 +2305,11 @@ def preview_task(cfg: ResolvedConfig, coordination: CoordinationStore | None = N
         return preview
     if source_type == "linear":
         try:
-            _statuses, _labels, issues = _load_linear_live_data(cfg, refresh_server=False)
+            _statuses, _labels, issues = _load_linear_live_data(
+                cfg,
+                refresh_server=False,
+                include_all_project_statuses=True,
+            )
             chosen, eligible, warning = _select_linear_issue(
                 cfg,
                 issues=issues,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -156,6 +157,42 @@ class TandemClientSdkEventTextTest(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertEqual(result["reason"], "max_events_without_text")
         self.assertEqual(result["event_count"], 3)
+
+    def test_stream_run_text_times_out_after_tool_events_go_silent(self) -> None:
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def stream(self, session_id, run_id):
+                for _ in range(5):
+                    yield SimpleNamespace(type="tool.event", properties={})
+                await asyncio.sleep(5)
+
+        cfg = SimpleNamespace(
+            tandem=SimpleNamespace(base_url="http://engine"),
+            tandem_token=lambda: "token",
+        )
+
+        from src.tandem_agents.core.engine import tandem_client_sdk as sdk
+
+        with unittest.mock.patch.object(sdk, "_import_async_client", return_value=FakeClient):
+            result = sdk_stream_run_text(
+                cfg,
+                "session-1",
+                "run-1",
+                timeout_seconds=5,
+                no_text_timeout_seconds=0.1,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["reason"], "no_text_timeout")
+        self.assertEqual(result["event_count"], 5)
 
     def test_stream_run_text_stops_when_text_predicate_matches(self) -> None:
         class FakeClient:

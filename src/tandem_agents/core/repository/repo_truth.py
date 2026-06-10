@@ -5,6 +5,7 @@ import json
 import shlex
 import subprocess
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +223,7 @@ def discover_repo_files(repo_path: Path, task: dict[str, Any] | None = None, lim
         "createdat",
         "created_at",
     ]))
+    bug_monitor_mode = "bug" in keywords and "monitor" in keywords
     content_matches: set[str] = set()
     if search_terms:
         pattern = "|".join(re.escape(term) for term in search_terms if term)
@@ -273,6 +275,25 @@ def discover_repo_files(repo_path: Path, task: dict[str, Any] | None = None, lim
                 score += 2
             if lower_rel.startswith("examples/"):
                 score -= 2
+        if bug_monitor_mode:
+            if lower_rel.startswith("crates/tandem-server/src/bug_monitor/"):
+                score += 16
+            if lower_rel.endswith("crates/tandem-server/src/bug_monitor/service.rs"):
+                score += 14
+            if lower_rel.endswith("crates/tandem-server/src/bug_monitor/types.rs"):
+                score += 6
+            if lower_rel.startswith("crates/tandem-server/src/http/bug_monitor"):
+                score += 12
+            if lower_rel.startswith("crates/tandem-server/src/http/tests/bug_monitor"):
+                score += 18
+            if "packages/tandem-client-ts/test/bug-monitor" in lower_rel:
+                score += 10
+            if lower_rel.startswith("scripts/bug-monitor"):
+                score += 8
+            if "quality_gate" in lower_rel or "quality-gate" in lower_rel:
+                score += 6
+            if lower_rel.startswith("docs/internal/"):
+                score -= 6
         for keyword in keywords:
             if keyword in lower_rel:
                 score += 4
@@ -324,10 +345,17 @@ def collect_expected_repo_files(subtasks: list[dict[str, Any]]) -> list[str]:
     seen: set[str] = set()
     files: list[str] = []
     for subtask in subtasks:
+        ignored_paths = {
+            str(raw_path or "").strip().replace("\\", "/")
+            for raw_path in list(subtask.get("ignored_target_files") or [])
+            if str(raw_path or "").strip()
+        }
         for raw_path in list(subtask.get("files") or []) + list(subtask.get("target_files") or []):
             rel_path = str(raw_path or "").strip().replace("\\", "/")
             while rel_path.startswith("./"):
                 rel_path = rel_path[2:]
+            if rel_path in ignored_paths:
+                continue
             if rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
                 continue
             if not rel_path or rel_path in seen:
@@ -456,12 +484,28 @@ def repo_context_summary(repo_path: Path, task: dict[str, Any] | None = None, li
 
 def extract_command_checks(manager_plan: dict[str, Any]) -> list[str]:
     commands: list[str] = []
-    safe_prefixes = ("ls ", "cat ", "grep ", "test ", "find ", "wc ", "head ", "tail ", "sed ", "git diff")
+    safe_prefixes = (
+        "ls ",
+        "cat ",
+        "grep ",
+        "test ",
+        "find ",
+        "wc ",
+        "head ",
+        "tail ",
+        "sed ",
+        "git diff",
+        "cargo check ",
+        "cargo test ",
+        "cargo fmt ",
+        "cargo clippy ",
+    )
     unsafe_tokens = ("npm start", "npm run", "curl http://", "curl https://", "localhost:", "serve ", "&")
     for entry in manager_plan.get("tests") or []:
-        if not isinstance(entry, dict):
-            continue
-        command = str(entry.get("command") or "").strip()
+        if isinstance(entry, dict):
+            command = str(entry.get("command") or "").strip()
+        else:
+            command = str(entry or "").strip()
         if not command:
             continue
         lower = command.lower()
@@ -557,6 +601,24 @@ def _load_package_scripts(package_json: Path) -> dict[str, str]:
     return {str(name): str(command) for name, command in scripts.items() if str(name).strip() and str(command).strip()}
 
 
+def _script_references_changed_file(repo_path: Path, package_dir: Path, script_command: str, changed_files: list[str]) -> bool:
+    command = str(script_command or "").replace("\\", "/")
+    if not command:
+        return False
+    for rel_path in changed_files:
+        candidates = [rel_path]
+        try:
+            package_rel_path = (repo_path / rel_path).relative_to(package_dir).as_posix()
+        except ValueError:
+            package_rel_path = ""
+        if package_rel_path and package_rel_path not in candidates:
+            candidates.append(package_rel_path)
+        for candidate in candidates:
+            if candidate and candidate in command:
+                return True
+    return False
+
+
 def _nearest_package_dir(repo_path: Path, rel_path: str) -> Path | None:
     target_parent = (repo_path / rel_path).parent
     try:
@@ -586,6 +648,40 @@ def _package_runner(repo_path: Path, package_dir: Path) -> str:
     return f"npm --prefix {quoted} run"
 
 
+def _nearest_cargo_package_dir(repo_path: Path, rel_path: str) -> Path | None:
+    target = repo_path / rel_path
+    target_parent = target if target.is_dir() else target.parent
+    try:
+        target_parent.relative_to(repo_path)
+    except ValueError:
+        return None
+    for candidate in [target_parent, *target_parent.parents]:
+        if candidate == repo_path.parent:
+            break
+        manifest = candidate / "Cargo.toml"
+        if manifest.is_file():
+            try:
+                data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            if isinstance(data.get("package"), dict) and str(data["package"].get("name") or "").strip():
+                return candidate
+        if candidate == repo_path:
+            break
+    return None
+
+
+def _cargo_package_name(manifest_path: Path) -> str:
+    try:
+        data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    package = data.get("package")
+    if not isinstance(package, dict):
+        return ""
+    return str(package.get("name") or "").strip()
+
+
 def infer_command_checks(
     repo_path: Path,
     changed_files: list[str],
@@ -604,14 +700,27 @@ def infer_command_checks(
 
     package_dirs: list[Path] = []
     seen_dirs: set[Path] = set()
+    cargo_package_dirs: list[Path] = []
+    seen_cargo_dirs: set[Path] = set()
     for rel_path in normalized_files:
         package_dir = _nearest_package_dir(repo_path, rel_path)
-        if package_dir is None or package_dir in seen_dirs:
-            continue
-        seen_dirs.add(package_dir)
-        package_dirs.append(package_dir)
+        if package_dir is not None and package_dir not in seen_dirs:
+            seen_dirs.add(package_dir)
+            package_dirs.append(package_dir)
+        cargo_package_dir = _nearest_cargo_package_dir(repo_path, rel_path)
+        if cargo_package_dir is not None and cargo_package_dir not in seen_cargo_dirs:
+            seen_cargo_dirs.add(cargo_package_dir)
+            cargo_package_dirs.append(cargo_package_dir)
 
     commands: list[str] = []
+    for cargo_package_dir in sorted(cargo_package_dirs, key=lambda path: path.relative_to(repo_path).as_posix()):
+        package_name = _cargo_package_name(cargo_package_dir / "Cargo.toml")
+        if not package_name:
+            continue
+        command = f"cargo check -p {shlex.quote(package_name)}"
+        if command not in commands:
+            commands.append(command)
+
     raw_acceptance = (task or {}).get("acceptance_criteria")
     acceptance = raw_acceptance if isinstance(raw_acceptance, (list, tuple, set)) else [raw_acceptance]
     task_text = " ".join(
@@ -637,6 +746,15 @@ def infer_command_checks(
                 if script_name in scripts:
                     package_commands.append(f"{runner} {script_name}")
                     break
+        if prefer_tests:
+            for script_name, script_command in sorted(scripts.items()):
+                name_text = str(script_name).lower()
+                command_text = str(script_command).lower()
+                if not any(token in f"{name_text} {command_text}" for token in ("test", "smoke", "check")):
+                    continue
+                if not _script_references_changed_file(repo_path, package_dir, script_command, normalized_files):
+                    continue
+                package_commands.append(f"{runner} {script_name}")
         for command in package_commands:
             if command not in commands:
                 commands.append(command)

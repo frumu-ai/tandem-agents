@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from src.tandem_agents.core.repository.repo_truth import (
     command_check_is_executable,
+    collect_expected_repo_files,
     discover_repo_files,
+    extract_command_checks,
     filter_executable_command_checks,
     infer_command_checks,
     repo_context_summary,
@@ -164,6 +166,127 @@ class RepoTruthDiscoveryTest(unittest.TestCase):
             (repo_path / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
 
             self.assertEqual(infer_command_checks(repo_path, ["src/app.py"], task={}), [])
+
+    def test_infer_command_checks_adds_cargo_check_for_changed_crate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            crate_dir = repo_path / "crates" / "tandem-meta-harness-eval"
+            (crate_dir / "src").mkdir(parents=True)
+            (crate_dir / "Cargo.toml").write_text(
+                """
+                [package]
+                name = "tandem-meta-harness-eval"
+                version = "0.1.0"
+                edition = "2021"
+                """.strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (crate_dir / "src" / "lib.rs").write_text("pub fn ok() {}\n", encoding="utf-8")
+
+            commands = infer_command_checks(
+                repo_path,
+                [
+                    "Cargo.toml",
+                    "crates/tandem-meta-harness-eval/Cargo.toml",
+                    "crates/tandem-meta-harness-eval/src/lib.rs",
+                ],
+                task={"title": "Define meta-harness eval crate"},
+            )
+
+            self.assertEqual(commands, ["cargo check -p tandem-meta-harness-eval"])
+
+    def test_extract_command_checks_accepts_safe_string_cargo_commands(self) -> None:
+        commands = extract_command_checks(
+            {
+                "tests": [
+                    "cargo check -p tandem-meta-harness-eval",
+                    {"command": "cargo test -p tandem-meta-harness-eval"},
+                    "curl https://example.com",
+                ]
+            }
+        )
+
+        self.assertEqual(
+            commands,
+            [
+                "cargo check -p tandem-meta-harness-eval",
+                "cargo test -p tandem-meta-harness-eval",
+            ],
+        )
+
+    def test_collect_expected_repo_files_excludes_ignored_targets(self) -> None:
+        files = collect_expected_repo_files(
+            [
+                {
+                    "files": ["docs/internal/meta-harness/KANBAN.md", "Cargo.toml"],
+                    "target_files": ["docs/internal/meta-harness/KANBAN.md"],
+                    "ignored_target_files": ["docs/internal/meta-harness/KANBAN.md"],
+                }
+            ]
+        )
+
+        self.assertEqual(files, ["Cargo.toml"])
+
+    def test_infer_command_checks_uses_script_that_references_changed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            (repo_path / "scripts").mkdir()
+            (repo_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+            (repo_path / "package.json").write_text(
+                """
+                {
+                  "scripts": {
+                    "bug-monitor:fixture:test": "node --test scripts/bug-monitor-external-log-intake-fixture.test.mjs",
+                    "docs:check": "node scripts/check-docs.mjs"
+                  }
+                }
+                """.strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            commands = infer_command_checks(
+                repo_path,
+                ["scripts/bug-monitor-external-log-intake-fixture.test.mjs"],
+                task={"title": "Verify Bug Monitor smoke", "acceptance_criteria": ["Run focused test coverage."]},
+            )
+
+            self.assertEqual(commands, ["pnpm -C . run bug-monitor:fixture:test"])
+
+    def test_discover_repo_files_prioritizes_bug_monitor_backend_for_quality_gate_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            files = [
+                "scripts/bug-monitor-external-log-intake-smoke.mjs",
+                "packages/tandem-control-panel/src/pages/BugMonitorPage.tsx",
+                "crates/tandem-server/src/bug_monitor/service.rs",
+                "crates/tandem-server/src/http/bug_monitor.rs",
+                "crates/tandem-server/src/http/tests/bug_monitor_parts/part01.rs",
+            ]
+            for rel_path in files:
+                path = repo_path / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("bug monitor quality_gate draft blocked\n", encoding="utf-8")
+
+            discovered = discover_repo_files(
+                repo_path,
+                {
+                    "title": "SIG-01 Verify Bug Monitor end-to-end against signal quality gates",
+                    "acceptance_criteria": [
+                        "Minor retries and duplicate failures do not create draft work.",
+                        "Blocked signals remain inspectable with quality-gate reasons.",
+                    ],
+                },
+                limit=5,
+            )
+
+            self.assertIn("crates/tandem-server/src/bug_monitor/service.rs", discovered)
+            self.assertIn("crates/tandem-server/src/http/tests/bug_monitor_parts/part01.rs", discovered)
+            self.assertLess(
+                discovered.index("crates/tandem-server/src/http/tests/bug_monitor_parts/part01.rs"),
+                discovered.index("scripts/bug-monitor-external-log-intake-smoke.mjs"),
+            )
 
     def test_run_command_checks_preserves_npm_global_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

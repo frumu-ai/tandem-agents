@@ -77,20 +77,28 @@ WORKER_FAILURE_MARKERS = (
     "ENGINE_SESSION_RUN_CONFLICT",
 )
 
-TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "max_events_without_text"}
+TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout"}
 NON_RETRYABLE_WORKER_BLOCKERS = {
     "coordination_lost",
     "engine_empty_response",
     "engine_prompt_timeout",
     "engine_session_run_conflict",
+    "engine_tool_loop_stalled_no_diff",
     "engine_provider_auth",
-    "engine_tool_loop_stalled",
+    "worker_corrupt_diff",
     "ignored_path_changes",
 }
 PR_CANDIDATE_SEED_CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".py")
 PR_CANDIDATE_IMPORT_EXTENSIONS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json")
 PR_CANDIDATE_SEED_EXCLUDED_PREFIXES = (".jules/", "jules/")
 PR_CANDIDATE_SEED_EXCLUDED_FILES = {".jules/bolt.md", "jules/bolt.md"}
+METADATA_ONLY_TARGET_FILES = {
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+}
 
 
 def _print_line(prefix: str, line: str) -> None:
@@ -261,7 +269,33 @@ def _engine_prompt_sync_timeout_seconds(cfg: ResolvedConfig) -> float:
             return max(5.0, float(raw))
         except ValueError:
             logger.debug("Invalid ACA_ENGINE_PROMPT_SYNC_TIMEOUT_SECONDS=%s", raw)
-    return 240.0
+    return 90.0
+
+
+def _worker_prompt_sync_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(30.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS=%s", raw)
+    return 90.0
+
+
+def _prompt_sync_timeout_seconds(cfg: ResolvedConfig, role: str, write_required: bool) -> float:
+    if role.startswith("worker") and write_required:
+        return _worker_prompt_sync_timeout_seconds(cfg)
+    return _engine_prompt_sync_timeout_seconds(cfg)
+
+
+def _worker_terminalize_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(10.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS=%s", raw)
+    return 60.0
 
 
 def _engine_prompt_sync_connect_retries(cfg: ResolvedConfig) -> int:
@@ -284,9 +318,44 @@ def _engine_prompt_sync_connect_retry_delay_seconds(cfg: ResolvedConfig) -> floa
     return 1.0
 
 
+def _worker_prompt_sync_first_enabled(cfg: ResolvedConfig) -> bool:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_PROMPT_SYNC_FIRST", "") or "").strip().lower()
+    if raw:
+        return raw not in {"0", "false", "no", "off"}
+    return True
+
+
+def _use_prompt_sync_first(cfg: ResolvedConfig, override: bool | None) -> bool:
+    if override is not None:
+        return override
+    return _worker_prompt_sync_first_enabled(cfg)
+
+
+def _scaled_timeout_seconds(timeout_seconds: float, multiplier: float) -> float:
+    return min(600.0, max(1.0, float(timeout_seconds) * max(1.0, float(multiplier or 1.0))))
+
+
+def _worker_timeout_multiplier(subtask: dict[str, Any]) -> float:
+    merged_count = len(subtask.get("merged_subtasks") or [])
+    targets = _subtask_targets(subtask)
+    target_count = len(targets)
+    if merged_count <= 1 and target_count <= 6:
+        new_crate_contract = "Cargo.toml" in targets and any(
+            path.startswith("crates/") and path.endswith("/Cargo.toml")
+            for path in targets
+        )
+        module_contract = target_count >= 5 and any("/src/" in path for path in targets)
+        if not new_crate_contract and not module_contract:
+            return 1.0
+        return min(2.5, 1.4 + (0.12 * target_count))
+    if merged_count > 1:
+        return min(3.0, 1.0 + (0.25 * merged_count) + (0.05 * target_count))
+    return min(2.0, 1.0 + (0.08 * max(0, target_count - 6)))
+
+
 def _engine_exception_is_timeout(exc: Exception) -> bool:
     text = str(exc).lower()
-    return "timed out" in text or "timeout" in text
+    return "timed out" in text or "timeout" in text or "operation did not finish within" in text
 
 
 def _engine_exception_is_connection_failure(exc: Exception) -> bool:
@@ -318,7 +387,11 @@ def _prompt_sync_with_connect_retries(
     last_exc: Exception | None = None
     for attempt_index in range(attempts):
         try:
-            return prompt_tandem_session_sync(cfg, **kwargs)
+            timeout_seconds = float(kwargs.get("timeout_seconds") or _engine_prompt_sync_timeout_seconds(cfg))
+            return _call_with_timeout(
+                lambda: prompt_tandem_session_sync(cfg, **kwargs),
+                timeout_seconds=timeout_seconds,
+            )
         except Exception as exc:
             last_exc = exc
             if not _engine_exception_is_connection_failure(exc) or attempt_index >= attempts - 1:
@@ -527,6 +600,57 @@ def _subtask_targets(subtask: dict[str, Any]) -> list[str]:
     return targets
 
 
+def _normalize_target_path(path: str) -> str:
+    return str(path or "").strip().replace("\\", "/").strip("/")
+
+
+def _subtask_search_text(subtask: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            str(subtask.get("title") or ""),
+            str(subtask.get("goal") or ""),
+            str(subtask.get("description") or ""),
+            " ".join(str(entry or "") for entry in subtask.get("acceptance_criteria") or []),
+            " ".join(str(entry or "") for entry in subtask.get("deliverables") or []),
+        ]
+    ).lower()
+
+
+def _is_metadata_only_target_path(path: str) -> bool:
+    rel_path = _normalize_target_path(path)
+    return bool(rel_path) and Path(rel_path).name.lower() in METADATA_ONLY_TARGET_FILES
+
+
+def _substantive_target_files(subtask: dict[str, Any]) -> list[str]:
+    return [path for path in _subtask_targets(subtask) if not _is_metadata_only_target_path(path)]
+
+
+def _subtask_requires_substantive_target_diff(
+    subtask: dict[str, Any],
+    *,
+    requires_real_diff: bool,
+) -> bool:
+    if not requires_real_diff or not _substantive_target_files(subtask):
+        return False
+    text = f" {_subtask_search_text(subtask).replace('-', ' ')} "
+    markers = (
+        " coverage",
+        " fixture",
+        " assertion",
+        " assertions",
+        " quality gate",
+        " quality gates",
+        " end to end",
+        " smoke",
+        " test ",
+        " tests ",
+        " behavior",
+        " behaviour",
+        " regression",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _git_ignored_paths(worktree: Path, paths: list[str]) -> list[str]:
     ignored: list[str] = []
     seen: set[str] = set()
@@ -536,7 +660,7 @@ def _git_ignored_paths(worktree: Path, paths: list[str]) -> list[str]:
             continue
         seen.add(rel_path)
         try:
-            result = run_command(["git", "check-ignore", "--quiet", "--", rel_path], cwd=worktree)
+            result = run_command(git_command_for_worktree(worktree, "check-ignore", "--quiet", "--", rel_path))
         except Exception:
             continue
         if result.returncode == 0:
@@ -647,6 +771,39 @@ def _diff_touches_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
     return bool(changed.intersection(targets))
 
 
+def _diff_touches_substantive_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
+    targets = set(_substantive_target_files(subtask))
+    if not targets:
+        return False
+    try:
+        changes = list_worktree_changes(worktree)
+    except Exception:
+        return False
+    changed = {str(change.get("path") or "").strip() for change in changes}
+    return bool(changed.intersection(targets))
+
+
+def _diff_satisfies_targeted_subtask(
+    subtask: dict[str, Any],
+    *,
+    requires_real_diff: bool,
+    targets_exist: bool,
+    diff_touches_targets: bool,
+    diff_touches_substantive_targets: bool,
+) -> bool:
+    targets = _subtask_targets(subtask)
+    if not targets:
+        return True
+    if _subtask_requires_substantive_target_diff(
+        subtask,
+        requires_real_diff=requires_real_diff,
+    ):
+        return diff_touches_substantive_targets
+    if requires_real_diff:
+        return diff_touches_targets
+    return targets_exist or diff_touches_targets
+
+
 def _is_aca_repo_artifact_path(path: str) -> bool:
     rel_path = str(path or "").strip().replace("\\", "/")
     name = Path(rel_path).name
@@ -711,6 +868,40 @@ def _engine_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
     return 210.0
 
 
+def _worker_async_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_ASYNC_PROMPT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(30.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_WORKER_ASYNC_PROMPT_TIMEOUT_SECONDS=%s", raw)
+    return 120.0
+
+
+def _worker_async_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(15.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS=%s", raw)
+    return 60.0
+
+
+def _async_prompt_timeout_seconds(cfg: ResolvedConfig, role: str, write_required: bool) -> float:
+    timeout = _engine_prompt_timeout_seconds(cfg)
+    if role.startswith("worker") and write_required:
+        return min(timeout, _worker_async_prompt_timeout_seconds(cfg))
+    return timeout
+
+
+def _async_no_text_timeout_seconds(cfg: ResolvedConfig, role: str, write_required: bool) -> float:
+    timeout = _engine_no_text_timeout_seconds(cfg)
+    if role.startswith("worker") and write_required:
+        return min(timeout, _worker_async_no_text_timeout_seconds(cfg))
+    return timeout
+
+
 def _engine_max_events_without_text(cfg: ResolvedConfig, role: str) -> int:
     raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT", "") or "").strip()
     if raw:
@@ -718,9 +909,7 @@ def _engine_max_events_without_text(cfg: ResolvedConfig, role: str) -> int:
             return max(10, int(raw))
         except ValueError:
             logger.debug("Invalid ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT=%s", raw)
-    if role.startswith("worker-"):
-        return 150
-    return 150
+    return 0
 
 
 def _preserve_partial_worker_diff(
@@ -732,7 +921,14 @@ def _preserve_partial_worker_diff(
 ) -> dict[str, Any]:
     stdout_text = str(result.get("stdout") or "")
     normalized_reason = str(result.get("failure_reason") or reason or "").strip()
-    if "ENGINE_ERROR:" in stdout_text:
+    preserve_existing_reason = normalized_reason in {
+        "TARGET_FILES_UNCHANGED",
+        "IGNORED_PATH_CHANGES",
+        "NO_FILESYSTEM_CHANGES",
+    }
+    if preserve_existing_reason:
+        pass
+    elif "ENGINE_ERROR:" in stdout_text:
         normalized_reason = next(
             (line.strip() for line in stdout_text.splitlines() if "ENGINE_ERROR:" in line),
             "ENGINE_ERROR:",
@@ -776,6 +972,7 @@ def _preserve_partial_worker_diff(
     )
     result.setdefault("artifacts", {})["partial_diff"] = str(artifact_path)
     result["partial_diff_artifact"] = str(artifact_path)
+    result["changed_files"] = _worktree_changed_files(worktree)
     return result
 
 
@@ -789,23 +986,84 @@ def _recover_tool_stall_with_diff(
     changed_files = _worktree_changed_files(worktree)
     if not changed_files:
         return _preserve_partial_worker_diff(result, log_path, worktree, reason=reason)
+    corrupt_reason = _corrupt_repeated_source_diff_reason(worktree)
+    if corrupt_reason:
+        return _fail_corrupt_worker_diff(result, log_path, corrupt_reason)
     recovered = _preserve_partial_worker_diff(result, log_path, worktree, reason=reason)
     changed_summary = "\n".join(f"- {path}" for path in changed_files)
     message = (
-        "\nACA recovered this worker because the Tandem engine stalled after producing a real diff.\n"
-        "The partial diff was preserved and will be sent through normal review/verification gates.\n"
+        "\nACA preserved this partial worker diff because the Tandem engine stalled before a terminal response.\n"
+        "The partial diff is not treated as a completed worker result; retry or block with this evidence.\n"
         f"Changed files:\n{changed_summary}\n"
     )
     log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
     recovered["stdout"] = f"{recovered.get('stdout') or ''}{message}"
-    recovered["returncode"] = 0
-    recovered["recovered_from_engine_stall"] = True
+    recovered["returncode"] = 1
+    recovered["partial_diff_preserved_after_engine_stall"] = True
     recovered["changed_files"] = changed_files
-    recovered.setdefault("warnings", []).append("engine_tool_loop_stalled_after_diff")
-    recovered.pop("failure_reason", None)
-    recovered.pop("blocker_kind", None)
-    recovered.pop("recovery_action", None)
+    recovered.setdefault("warnings", []).append("engine_tool_loop_stalled_partial_diff")
     return recovered
+
+
+def _corrupt_repeated_source_diff_reason(worktree: Path) -> str | None:
+    try:
+        diff_text = git_working_diff(worktree, max_chars=120000, max_file_chars=60000)
+    except TypeError:
+        diff_text = git_working_diff(worktree)
+    except Exception:
+        return None
+    if not diff_text.strip():
+        return None
+    source_exts = (".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
+    current_source_file = False
+    counts: dict[str, int] = {}
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("diff --git "):
+            parts = raw_line.split()
+            target = parts[-1][2:] if len(parts) >= 4 and parts[-1].startswith("b/") else ""
+            current_source_file = target.endswith(source_exts)
+            continue
+        if not current_source_file or raw_line.startswith("+++") or not raw_line.startswith("+"):
+            continue
+        line = raw_line[1:].strip()
+        if len(line) < 24:
+            continue
+        if _repeat_line_is_common_source_syntax(line):
+            continue
+        counts[line] = counts.get(line, 0) + 1
+        if counts[line] >= 5:
+            preview = line[:120]
+            return f"repeated added source line appears {counts[line]} times: {preview}"
+    return None
+
+
+def _repeat_line_is_common_source_syntax(line: str) -> bool:
+    stripped = line.strip()
+    if stripped.startswith(("#[", "@", "use ", "import ", "from ")):
+        return True
+    if stripped in {"}", "};", "),"}:
+        return True
+    return False
+
+
+def _fail_corrupt_worker_diff(
+    result: dict[str, Any],
+    log_path: Path,
+    reason: str,
+) -> dict[str, Any]:
+    message = (
+        "WORKER_CORRUPT_DIFF: Worker produced a target-touching diff, but ACA rejected it "
+        f"because it appears mechanically corrupted ({reason}).\n"
+    )
+    log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
+    result["stdout"] = f"{result.get('stdout') or ''}{message}"
+    result["returncode"] = 1
+    result["failure_reason"] = "WORKER_CORRUPT_DIFF"
+    result["blocker_kind"] = "worker_corrupt_diff"
+    result["recovery_action"] = (
+        "Reset the worktree to a clean checkout before retrying; do not continue from this corrupted diff."
+    )
+    return result
 
 
 def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str) -> bool:
@@ -828,6 +1086,7 @@ def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str)
             "engine_prompt_timeout",
             "engine_session_run_conflict",
             "engine_tool_loop_stalled",
+            "engine_tool_loop_stalled_no_diff",
         }
         or "ENGINE_PROMPT_TIMEOUT" in text
         or "ENGINE_TOOL_LOOP_STALLED" in text
@@ -843,7 +1102,27 @@ def _worker_result_should_retry(result: dict[str, Any]) -> bool:
 
 
 def _subtask_requires_real_diff(subtask: dict[str, Any]) -> bool:
-    return bool(subtask.get("pr_candidate_context") or subtask.get("pr_candidate_refs"))
+    if subtask.get("pr_candidate_context") or subtask.get("pr_candidate_refs"):
+        return True
+    if not _subtask_targets(subtask):
+        return False
+    text = _subtask_search_text(subtask)
+    diff_markers = (
+        " add ",
+        " extend",
+        " implement",
+        " create",
+        " update",
+        " fix ",
+        " coverage",
+        " assertion",
+        " assertions",
+        " test ",
+        " tests ",
+        " documented command",
+    )
+    padded = f" {text} "
+    return any(marker in padded for marker in diff_markers)
 
 
 def _pr_candidate_ref_map(subtask: dict[str, Any]) -> dict[str, str]:
@@ -1178,8 +1457,11 @@ def _recover_nonzero_result_with_diff(
     blocker_kind = str(result.get("blocker_kind") or "").lower()
     if (
         "ENGINE_TOOL_LOOP_STALLED" in reason_text
+        or "ENGINE_PROMPT_TIMEOUT" in reason_text
         or blocker_kind == "engine_tool_loop_stalled"
+        or blocker_kind == "engine_prompt_timeout"
         or "ENGINE_TOOL_LOOP_STALLED" in stdout_text.upper()
+        or "ENGINE_PROMPT_TIMEOUT" in stdout_text.upper()
     ):
         return _recover_tool_stall_with_diff(result, log_path, worktree, reason=reason)
     if _engine_failure_should_not_recover(result, str(result.get("stdout") or "")):
@@ -1199,6 +1481,32 @@ def _recover_nonzero_result_with_diff(
     result["changed_files"] = changed_files
     result["diff_stat"] = diff_text
     return result
+
+
+def _recover_nonzero_result_if_diff_satisfies_subtask(
+    result: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+    subtask: dict[str, Any],
+    *,
+    require_filesystem_changes: bool,
+    reason: str,
+) -> dict[str, Any]:
+    if result.get("returncode", 0) == 0:
+        return result
+    diff_text = git_diff_stat(worktree).strip()
+    if not diff_text:
+        return result
+    requires_real_diff = require_filesystem_changes or _subtask_requires_real_diff(subtask)
+    if not _diff_satisfies_targeted_subtask(
+        subtask,
+        requires_real_diff=requires_real_diff,
+        targets_exist=_target_files_exist(worktree, subtask),
+        diff_touches_targets=_diff_touches_target_files(worktree, subtask),
+        diff_touches_substantive_targets=_diff_touches_substantive_target_files(worktree, subtask),
+    ):
+        return result
+    return _recover_nonzero_result_with_diff(result, log_path, worktree, reason=reason)
 
 
 def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]:
@@ -1230,6 +1538,142 @@ def _worktree_preflight(cfg: ResolvedConfig, worktree: Path) -> tuple[bool, str]
     except Exception as exc:
         return False, f"engine worktree preflight failed: {exc}"
     return True, "ok"
+
+
+def _result_is_terminalizable_engine_stall(result: dict[str, Any]) -> bool:
+    reason = str(result.get("failure_reason") or "").upper()
+    blocker = str(result.get("blocker_kind") or "").lower()
+    stdout = str(result.get("stdout") or "").upper()
+    return (
+        "ENGINE_TOOL_LOOP_STALLED" in reason
+        or "ENGINE_PROMPT_TIMEOUT" in reason
+        or blocker == "engine_tool_loop_stalled"
+        or blocker == "engine_prompt_timeout"
+        or "ENGINE_TOOL_LOOP_STALLED" in stdout
+        or "ENGINE_PROMPT_TIMEOUT" in stdout
+    )
+
+
+def _terminalize_worker_after_tool_loop(
+    cfg: ResolvedConfig,
+    result: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+    subtask: dict[str, Any],
+    *,
+    role: str,
+    provider: str,
+    model: str,
+    require_filesystem_changes: bool,
+) -> dict[str, Any]:
+    if result.get("returncode", 0) == 0 or not _result_is_terminalizable_engine_stall(result):
+        return result
+    changed_files = _worktree_changed_files(worktree)
+    if not changed_files:
+        return result
+    if _corrupt_repeated_source_diff_reason(worktree):
+        return result
+    requires_real_diff = require_filesystem_changes or _subtask_requires_real_diff(subtask)
+    if not _diff_satisfies_targeted_subtask(
+        subtask,
+        requires_real_diff=requires_real_diff,
+        targets_exist=_target_files_exist(worktree, subtask),
+        diff_touches_targets=_diff_touches_target_files(worktree, subtask),
+        diff_touches_substantive_targets=_diff_touches_substantive_target_files(worktree, subtask),
+    ):
+        return result
+    try:
+        diff_stat = git_diff_stat(worktree).strip()
+        diff_excerpt = git_working_diff(worktree, max_chars=32000, max_file_chars=16000).strip()
+    except TypeError:
+        diff_excerpt = git_working_diff(worktree).strip()
+        diff_stat = "\n".join(changed_files)
+    except Exception:
+        logger.debug("Failed to capture terminalization diff", exc_info=True)
+        return result
+    if not diff_excerpt:
+        return result
+
+    prompt = (
+        "ACA detected that the previous worker run edited files but never produced a terminal assistant response.\n"
+        "Do not call tools. Do not make more edits. Use only the diff excerpt below.\n"
+        "Return a concise worker completion note with:\n"
+        "- changed files\n"
+        "- what the diff appears to implement\n"
+        "- verification that was actually performed, or `verification not run` if none is visible\n"
+        "- any remaining blockers\n\n"
+        f"Subtask: {subtask.get('title') or subtask.get('id') or role}\n"
+        f"Changed files:\n{chr(10).join(f'- {path}' for path in changed_files)}\n\n"
+        f"Diff stat:\n{diff_stat}\n\n"
+        f"Diff excerpt:\n```diff\n{diff_excerpt}\n```\n"
+    )
+    terminal_session_id = ""
+    terminal_meta: dict[str, Any] = {}
+    try:
+        session_temperature = None
+        if hasattr(cfg, "sampling_for_role"):
+            session_temperature = cfg.sampling_for_role(role).get("temperature")
+        terminal_session_id = create_tandem_session(
+            cfg,
+            title=f"ACA {role} terminalize",
+            directory=worktree,
+            provider=provider,
+            model=model,
+            temperature=session_temperature,
+            permission_rules=None,
+        )
+        terminal_meta["session_id"] = terminal_session_id
+        with log_path.open("a", encoding="utf-8") as terminal_log:
+            terminal_response = _prompt_sync_with_connect_retries(
+                cfg,
+                engine_meta=terminal_meta,
+                log=terminal_log,
+                role=role,
+                session_id=terminal_session_id,
+                prompt=prompt,
+                tool_allowlist=[],
+                tool_mode="none",
+                require_tool_use=False,
+                write_required=False,
+                timeout_seconds=_worker_terminalize_timeout_seconds(cfg),
+            )
+    except Exception as exc:
+        terminal_meta["error"] = str(exc)
+        engine_meta = dict(result.get("engine") or {})
+        engine_meta["terminalize"] = terminal_meta
+        result["engine"] = engine_meta
+        logger.debug("Failed to terminalize worker tool-loop result", exc_info=True)
+        return result
+    text = _extract_prompt_sync_text(terminal_response)
+    engine_meta = dict(result.get("engine") or {})
+    terminal_meta["snapshot_path"] = _write_engine_snapshot(
+        log_path,
+        f"engine-terminalize-{terminal_session_id or 'unknown'}",
+        terminal_response,
+    )
+    terminal_meta["recovered_text"] = bool(text.strip())
+    engine_meta["terminalize"] = terminal_meta
+    result["engine"] = engine_meta
+    if not text.strip():
+        return result
+
+    note = (
+        "\nENGINE_TOOL_LOOP_TERMINALIZED: ACA recovered a terminal worker note from the preserved diff "
+        "using a no-tools prompt.\n"
+        f"{text.strip()}\n"
+    )
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(note)
+    recovered = dict(result)
+    recovered["returncode"] = 0
+    recovered["stdout"] = note
+    recovered["changed_files"] = changed_files
+    recovered["terminalized_after_tool_loop"] = True
+    recovered["engine"] = engine_meta
+    recovered.pop("failure_reason", None)
+    recovered.pop("blocker_kind", None)
+    recovered.pop("recovery_action", None)
+    return recovered
 
 
 def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
@@ -1269,6 +1713,8 @@ def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
     steps.extend(
         [
             "Then create or edit the target files using `write`, `edit`, or `apply_patch`.",
+            "Do not create marker files, status files, temporary files, scratch notes, or placeholder files to satisfy write-required mode.",
+            "Missing test coverage or missing behavior is not a blocker; implement the smallest safe improvement in one of the target files.",
             "Finish by verifying the changed files with `ls -la`, `read`, or `grep`.",
         ]
     )
@@ -1278,8 +1724,9 @@ def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
         )
     else:
         steps.append(
-            "Do not reply with a summary until you have either produced a filesystem diff or produced a structured no-safe-changes blocker naming every inspected target file and the exact safety reason."
+            "Do not reply with `changed_files: []` or a no-safe-changes blocker unless editing every listed target would be unsafe; name that concrete safety reason if so."
         )
+        steps.append("Do not claim tool access is disallowed; this retry is sent with repository tool access required.")
     return "\n\nRetry instructions:\n- " + "\n- ".join(steps) + "\n"
 
 
@@ -1298,8 +1745,12 @@ def _coerce_worker_failure(
     readable_targets = _readable_target_files(worktree, subtask)
     diff_text = git_diff_stat(worktree).strip()
     diff_touches_targets = _diff_touches_target_files(worktree, subtask)
+    diff_touches_substantive_targets = _diff_touches_substantive_target_files(worktree, subtask)
     changed_files = _worktree_changed_files(worktree)
     ignored_existing_targets = _ignored_existing_target_files(worktree, subtask)
+    corrupt_reason = _corrupt_repeated_source_diff_reason(worktree) if diff_text and changed_files else None
+    if corrupt_reason:
+        return _fail_corrupt_worker_diff(result, log_path, corrupt_reason)
     if result.get("returncode", 0) != 0 and (not targets_exist or not diff_text):
         recovered, recovered_diff = _wait_for_target_files(worktree, subtask)
         if recovered:
@@ -1307,7 +1758,15 @@ def _coerce_worker_failure(
             diff_text = recovered_diff
             readable_targets = _readable_target_files(worktree, subtask)
             diff_touches_targets = _diff_touches_target_files(worktree, subtask)
-    if result.get("returncode", 0) != 0 and diff_text and (targets_exist or diff_touches_targets):
+            diff_touches_substantive_targets = _diff_touches_substantive_target_files(worktree, subtask)
+    diff_satisfies_subtask = _diff_satisfies_targeted_subtask(
+        subtask,
+        requires_real_diff=requires_real_diff,
+        targets_exist=targets_exist,
+        diff_touches_targets=diff_touches_targets,
+        diff_touches_substantive_targets=diff_touches_substantive_targets,
+    )
+    if result.get("returncode", 0) != 0 and diff_text and diff_satisfies_subtask:
         return _recover_nonzero_result_with_diff(
             result,
             log_path,
@@ -1338,6 +1797,18 @@ def _coerce_worker_failure(
             else:
                 failure_reason = marker
             break
+    if (
+        result.get("returncode", 0) != 0
+        and diff_text
+        and changed_files
+        and requires_real_diff
+        and _substantive_target_files(subtask)
+        and all(_is_metadata_only_target_path(path) for path in changed_files)
+        and not diff_satisfies_subtask
+    ):
+        if failure_reason:
+            result["engine_failure_reason"] = failure_reason
+        failure_reason = "TARGET_FILES_UNCHANGED"
     if result.get("returncode", 0) == 0 and requires_real_diff and not changed_files:
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
     elif result.get("returncode", 0) == 0 and not diff_text:
@@ -1349,11 +1820,45 @@ def _coerce_worker_failure(
     ):
         result["ignored_files"] = ignored_existing_targets
         failure_reason = "IGNORED_PATH_CHANGES"
+    if (
+        failure_reason == "ENGINE_TOOL_LOOP_STALLED"
+        and not diff_text
+        and not ignored_existing_targets
+    ):
+        failure_reason = "ENGINE_TOOL_LOOP_STALLED_NO_DIFF"
+    if (
+        not failure_reason
+        and result.get("returncode", 0) == 0
+        and requires_real_diff
+        and _subtask_targets(subtask)
+        and changed_files
+        and not diff_satisfies_subtask
+    ):
+        failure_reason = "TARGET_FILES_UNCHANGED"
     if not failure_reason:
         return result
     message = ""
     if failure_reason == "NO_FILESYSTEM_CHANGES":
         message = "Worker reported success but produced no filesystem changes in its worktree.\n"
+    elif failure_reason == "TARGET_FILES_UNCHANGED":
+        targets = ", ".join(f"`{path}`" for path in _subtask_targets(subtask))
+        substantive_targets = ", ".join(f"`{path}`" for path in _substantive_target_files(subtask))
+        changes = ", ".join(f"`{path}`" for path in changed_files)
+        if _subtask_requires_substantive_target_diff(
+            subtask,
+            requires_real_diff=requires_real_diff,
+        ):
+            message = (
+                "Worker produced repository changes, but none touched the substantive target files "
+                "required for this test or fixture task. "
+                f"Substantive targets: {substantive_targets}. Declared targets: {targets}. "
+                f"Changed files: {changes}.\n"
+            )
+        else:
+            message = (
+                "Worker produced repository changes, but none touched the declared target files. "
+                f"Targets: {targets}. Changed files: {changes}.\n"
+            )
     elif failure_reason == "IGNORED_PATH_CHANGES":
         paths = ", ".join(f"`{path}`" for path in ignored_existing_targets)
         message = (
@@ -1391,11 +1896,24 @@ def _coerce_worker_failure(
             result["recovery_action"] = (
                 "Inspect the preserved partial diff and engine messages, reset the task to Backlog, and retry from a clean checkout."
             )
+    elif failure_reason == "ENGINE_TOOL_LOOP_STALLED_NO_DIFF":
+        result["blocker_kind"] = "engine_tool_loop_stalled_no_diff"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Inspect the engine/session messages and tool permissions; the engine made tool calls but produced no tracked diff."
+            )
     elif failure_reason == "NO_FILESYSTEM_CHANGES":
         result["blocker_kind"] = "worker_no_diff"
         if not result.get("recovery_action"):
             result["recovery_action"] = (
                 "Inspect the worker log and PR candidate context; reset the task to Backlog if another attempt is needed."
+            )
+    elif failure_reason == "TARGET_FILES_UNCHANGED":
+        result["blocker_kind"] = "target_files_unchanged"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Retry with a narrower worker prompt that edits one of the declared target files, "
+                "or update the task target files if the current targets are wrong."
             )
     elif failure_reason == "IGNORED_PATH_CHANGES":
         result["blocker_kind"] = "ignored_path_changes"
@@ -1419,7 +1937,7 @@ def _coerce_worker_failure(
                 result["recovery_action"] = (
                     "Inspect Tandem engine dispatch logs and provider routing, then reset the task to Backlog."
                 )
-    if diff_text and failure_reason == "ENGINE_TOOL_LOOP_STALLED":
+    if diff_text and failure_reason in {"ENGINE_TOOL_LOOP_STALLED", "ENGINE_PROMPT_TIMEOUT"} and diff_satisfies_subtask:
         return _recover_tool_stall_with_diff(result, log_path, worktree, reason=failure_reason)
     if diff_text and _engine_failure_should_not_recover(result, str(result.get("stdout") or stdout_text)):
         return _preserve_partial_worker_diff(result, log_path, worktree, reason=failure_reason)
@@ -1439,6 +1957,8 @@ def stream_tandem_prompt(
     config_path: Path | None = None,
     require_tool_use: bool = False,
     write_required: bool = False,
+    prompt_sync_first: bool | None = None,
+    timeout_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     if config_path is None:
         session_id: str | None = None
@@ -1488,6 +2008,26 @@ def stream_tandem_prompt(
                     "fallback_mode": None,
                     "recovery": [],
                 }
+                timeout_multiplier = max(1.0, float(timeout_multiplier or 1.0))
+                prompt_sync_timeout = _scaled_timeout_seconds(
+                    _prompt_sync_timeout_seconds(cfg, role, write_required),
+                    timeout_multiplier,
+                )
+                async_prompt_timeout = _scaled_timeout_seconds(
+                    _async_prompt_timeout_seconds(cfg, role, write_required),
+                    timeout_multiplier,
+                )
+                async_no_text_timeout = _scaled_timeout_seconds(
+                    _async_no_text_timeout_seconds(cfg, role, write_required),
+                    timeout_multiplier,
+                )
+                if timeout_multiplier > 1.0:
+                    engine_meta["timeout_multiplier"] = timeout_multiplier
+                    engine_meta["timeouts"] = {
+                        "prompt_sync_seconds": prompt_sync_timeout,
+                        "async_prompt_seconds": async_prompt_timeout,
+                        "async_no_text_seconds": async_no_text_timeout,
+                    }
 
                 def _writer(delta: str) -> None:
                     for line in delta.splitlines(keepends=True):
@@ -1495,7 +2035,7 @@ def stream_tandem_prompt(
                         log.flush()
                         _print_line(role, line)
 
-                if role.startswith("worker") and write_required:
+                if role.startswith("worker") and write_required and _use_prompt_sync_first(cfg, prompt_sync_first):
                     engine_meta["fallback_mode"] = "prompt_sync_first"
                     failure_reason = ""
                     blocker_kind = ""
@@ -1503,15 +2043,18 @@ def stream_tandem_prompt(
                     completed = False
                     stdout_text = ""
                     try:
-                        sync_response = prompt_tandem_session_sync(
+                        sync_response = _prompt_sync_with_connect_retries(
                             cfg,
+                            engine_meta=engine_meta,
+                            log=log,
+                            role=role,
                             session_id=session_id,
                             prompt=prompt,
                             tool_allowlist=session_tool_allowlist,
                             tool_mode=prompt_tool_mode,
                             require_tool_use=require_tool_use,
                             write_required=write_required,
-                            timeout_seconds=_engine_prompt_sync_timeout_seconds(cfg),
+                            timeout_seconds=prompt_sync_timeout,
                         )
                         engine_meta["sync_snapshot_path"] = _write_engine_snapshot(
                             log_path,
@@ -1576,7 +2119,7 @@ def stream_tandem_prompt(
                             blocker_kind = "engine_prompt_timeout"
                             stdout_text = (
                                 "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync worker prompt "
-                                f"did not finish within {_engine_prompt_sync_timeout_seconds(cfg):.0f}s.\n"
+                                f"did not finish within {prompt_sync_timeout:.0f}s.\n"
                             )
                         elif _engine_exception_is_connection_failure(exc):
                             stdout_text = (
@@ -1632,14 +2175,8 @@ def stream_tandem_prompt(
                             "ENGINE_EMPTY_RESPONSE: Tandem engine prompt_sync worker prompt "
                             "finished without assistant transcript text.\n"
                         )
-                    if stdout_text and not stdout_text.endswith("\n"):
-                        stdout_text += "\n"
-                    if stdout_text:
-                        log.write(stdout_text)
-                        log.flush()
-                        _print_line(role, stdout_text)
                     if not completed and session_id:
-                        _recovered_text, recovery = _recover_engine_text_from_state(
+                        recovered_text, recovery = _recover_engine_text_from_state(
                             cfg,
                             session_id=session_id,
                             run_id=last_run_id,
@@ -1652,7 +2189,60 @@ def stream_tandem_prompt(
                         for key in ("events_path", "messages_path"):
                             if recovery.get(key):
                                 engine_meta[key] = recovery[key]
-                    if blocker_kind == "engine_session_run_conflict":
+                        if recovered_text.strip():
+                            stdout_text = recovered_text
+                            completed = True
+                            failure_reason = ""
+                            blocker_kind = ""
+                            recovery_action = ""
+                    if stdout_text and not stdout_text.endswith("\n"):
+                        stdout_text += "\n"
+                    if stdout_text:
+                        log.write(stdout_text)
+                        log.flush()
+                        _print_line(role, stdout_text)
+                    recover_with_async = (
+                        not completed
+                        and blocker_kind in {
+                            "engine_prompt_timeout",
+                            "engine_empty_response",
+                        }
+                    )
+                    if recover_with_async:
+                        previous_session_id = session_id
+                        engine_meta["prompt_sync_first_session_id"] = previous_session_id
+                        recovery_notice = (
+                            "ENGINE_PROMPT_SYNC_ASYNC_RECOVERY: prompt_sync produced tool activity or timed out "
+                            "without assistant output; retrying this worker once through async streaming in a fresh session.\n"
+                        )
+                        log.write(recovery_notice)
+                        log.flush()
+                        _print_line(role, recovery_notice)
+                        if previous_session_id:
+                            try:
+                                _call_with_timeout(
+                                    lambda: delete_tandem_session(cfg, previous_session_id),
+                                    timeout_seconds=5.0,
+                                )
+                            except Exception:
+                                logger.debug("Failed to delete prompt_sync-first session before async recovery", exc_info=True)
+                        session_temperature = None
+                        if hasattr(cfg, "sampling_for_role"):
+                            session_temperature = cfg.sampling_for_role(role).get("temperature")
+                        session_id = create_tandem_session(
+                            cfg,
+                            title=f"ACA {role} async recovery",
+                            directory=cwd,
+                            provider=provider,
+                            model=model,
+                            temperature=session_temperature,
+                            permission_rules=session_permission_rules,
+                        )
+                        engine_meta["session_id"] = session_id
+                        engine_meta["fallback_mode"] = "prompt_sync_first_async_recovery"
+                        engine_meta["run_id"] = ""
+                        last_run_id = ""
+                    elif blocker_kind == "engine_session_run_conflict":
                         recovery_action = (
                             "Wait for the active Tandem engine session run to finish or clear it, then reset the task to Backlog."
                         )
@@ -1665,19 +2255,20 @@ def stream_tandem_prompt(
                             "Check Tandem engine provider/model routing and persisted engine snapshots, "
                             "then retry the task after the engine returns assistant text."
                         )
-                    return {
-                        "role": role,
-                        "returncode": 0 if completed else 1,
-                        "stdout": stdout_text,
-                        "log_path": str(log_path),
-                        "cwd": str(cwd),
-                        "session_id": session_id,
-                        "engine_run_id": last_run_id,
-                        "engine": engine_meta,
-                        "failure_reason": failure_reason,
-                        "blocker_kind": blocker_kind,
-                        "recovery_action": recovery_action,
-                    }
+                    if not recover_with_async:
+                        return {
+                            "role": role,
+                            "returncode": 0 if completed else 1,
+                            "stdout": stdout_text,
+                            "log_path": str(log_path),
+                            "cwd": str(cwd),
+                            "session_id": session_id,
+                            "engine_run_id": last_run_id,
+                            "engine": engine_meta,
+                            "failure_reason": failure_reason,
+                            "blocker_kind": blocker_kind,
+                            "recovery_action": recovery_action,
+                        }
 
                 def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str, str]:
                     async_result = sdk_sessions_prompt_async(
@@ -1714,8 +2305,8 @@ def stream_tandem_prompt(
                             session_id,
                             run_id,
                             _writer,
-                            timeout_seconds=_engine_prompt_timeout_seconds(cfg),
-                            no_text_timeout_seconds=_engine_no_text_timeout_seconds(cfg),
+                            timeout_seconds=async_prompt_timeout,
+                            no_text_timeout_seconds=async_no_text_timeout,
                             max_events_without_text=_engine_max_events_without_text(cfg, role),
                             stop_when_text=(
                                 _manager_plan_stream_complete
@@ -1809,7 +2400,7 @@ def stream_tandem_prompt(
                                 tool_mode=prompt_tool_mode,
                                 require_tool_use=require_tool_use,
                                 write_required=write_required,
-                                timeout_seconds=_engine_prompt_sync_timeout_seconds(cfg),
+                                timeout_seconds=prompt_sync_timeout,
                             )
                         except Exception as exc:
                             conflict = _engine_session_run_conflict(exc)
@@ -1903,7 +2494,7 @@ def stream_tandem_prompt(
                     blocker_kind = "engine_prompt_timeout"
                     stdout_text = (
                         "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt did not produce a terminal response "
-                        f"within {_engine_prompt_timeout_seconds(cfg):.0f}s. Last engine run: "
+                        f"within {async_prompt_timeout:.0f}s. Last engine run: "
                         f"{run_id or last_run_id or 'unknown'}.\n"
                     )
                 elif stream_reason in {"no_text_timeout", "max_events_without_text"}:
@@ -1922,12 +2513,8 @@ def stream_tandem_prompt(
                         "retry, and prompt_sync fallback without transcript text. "
                         f"Last engine run: {run_id or last_run_id or 'unknown'}.\n"
                     )
-                if stdout_text:
-                    log.write(stdout_text)
-                    log.flush()
-                    _print_line(role, stdout_text)
                 if not completed and session_id:
-                    _recovered_text, recovery = _recover_engine_text_from_state(
+                    recovered_text, recovery = _recover_engine_text_from_state(
                         cfg,
                         session_id=session_id,
                         run_id=run_id or last_run_id,
@@ -1940,6 +2527,18 @@ def stream_tandem_prompt(
                     for key in ("events_path", "messages_path"):
                         if recovery.get(key):
                             engine_meta[key] = recovery[key]
+                    if recovered_text.strip():
+                        stdout_text = recovered_text
+                        completed = True
+                        failure_reason = ""
+                        blocker_kind = ""
+                        recovery_action = ""
+                        if stdout_text and not stdout_text.endswith("\n"):
+                            stdout_text += "\n"
+                if stdout_text:
+                    log.write(stdout_text)
+                    log.flush()
+                    _print_line(role, stdout_text)
                 recovery_action = ""
                 if blocker_kind == "engine_tool_loop_stalled":
                     recovery_action = (
@@ -2106,11 +2705,15 @@ def run_worker_subtask(
         and str(task_source.get("type") or "").strip() == "github_project"
     )
 
-    worktree_satisfied = bool(subtask.get("pre_satisfied")) and not require_filesystem_changes
-    if not worktree_satisfied and not require_filesystem_changes:
+    requires_real_diff = require_filesystem_changes or _subtask_requires_real_diff(subtask)
+    worktree_satisfied = bool(subtask.get("pre_satisfied")) and not requires_real_diff
+    if not worktree_satisfied and not requires_real_diff:
         worktree_satisfied = _target_files_exist(worktree, subtask) and bool(_readable_target_files(worktree, subtask))
     
-    write_required = not worktree_satisfied
+    write_required = requires_real_diff or not worktree_satisfied
+    subtask = dict(subtask)
+    subtask["write_required"] = write_required
+    timeout_multiplier = _worker_timeout_multiplier(subtask)
     prompt = build_worker_prompt(run_id, worker_id, subtask, task, worktree)
     if not preflight_ok:
         prompt += (
@@ -2133,18 +2736,39 @@ def run_worker_subtask(
         config_path=config_path,
         require_tool_use=True,
         write_required=write_required,
+        timeout_multiplier=timeout_multiplier,
     )
     result["write_required"] = write_required
     
     # Sync artifacts after turn
     sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
-    
+
+    result = _terminalize_worker_after_tool_loop(
+        cfg,
+        result,
+        log_path,
+        worktree,
+        subtask,
+        role=worker_id,
+        provider=worker_cli_provider,
+        model=worker_model,
+        require_filesystem_changes=require_filesystem_changes,
+    )
+
     result = _coerce_worker_failure(
         result,
         log_path,
         worktree,
         subtask,
         require_filesystem_changes=require_filesystem_changes,
+    )
+    result = _recover_nonzero_result_if_diff_satisfies_subtask(
+        result,
+        log_path,
+        worktree,
+        subtask,
+        require_filesystem_changes=require_filesystem_changes,
+        reason=str(result.get("failure_reason") or "late target diff"),
     )
     
     seeded_diff: dict[str, Any] | None = None
@@ -2190,6 +2814,23 @@ def run_worker_subtask(
                 "- Inspect this diff first. Keep and refine it if it is safe; revert only if it is demonstrably wrong.\n"
                 "- Do not spend the retry on a broad applicability matrix before verifying the seeded diff.\n"
             )
+        retry_prompt_sync_first = str(result.get("blocker_kind") or "") != "engine_tool_loop_stalled"
+        append_event(
+            layout["events"],
+            "worker.retry_started",
+            run_id,
+            {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "previous_failure_reason": result.get("failure_reason"),
+                "previous_blocker_kind": result.get("blocker_kind"),
+                "write_required": write_required,
+                "prompt_sync_first": retry_prompt_sync_first,
+            },
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
         retry_result = stream_tandem_prompt(
             cfg,
             role=worker_id,
@@ -2202,12 +2843,26 @@ def run_worker_subtask(
             config_path=config_path,
             require_tool_use=True,
             write_required=write_required,
+            prompt_sync_first=retry_prompt_sync_first,
+            timeout_multiplier=timeout_multiplier,
         )
         retry_result["write_required"] = write_required
         
         # Sync artifacts after retry turn
         sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
-        
+
+        retry_result = _terminalize_worker_after_tool_loop(
+            cfg,
+            retry_result,
+            log_path,
+            worktree,
+            subtask,
+            role=worker_id,
+            provider=worker_cli_provider,
+            model=worker_model,
+            require_filesystem_changes=require_filesystem_changes,
+        )
+
         retry_result = _coerce_worker_failure(
             retry_result,
             log_path,
@@ -2216,10 +2871,12 @@ def run_worker_subtask(
             require_filesystem_changes=require_filesystem_changes,
         )
         if retry_result["returncode"] != 0:
-            retry_result = _recover_nonzero_result_with_diff(
+            retry_result = _recover_nonzero_result_if_diff_satisfies_subtask(
                 retry_result,
                 log_path,
                 worktree,
+                subtask,
+                require_filesystem_changes=require_filesystem_changes,
                 reason=str(retry_result.get("failure_reason") or "retry produced diff"),
             )
         if retry_result["returncode"] == 0:

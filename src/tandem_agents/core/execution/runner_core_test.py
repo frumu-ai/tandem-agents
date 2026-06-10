@@ -38,6 +38,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
+    _sticky_expected_repo_files,
 )
 from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.engine.prompts import build_worker_prompt
@@ -182,6 +183,61 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             ["Add YAML eval scenarios and bounded-exposure assertions for no bulk export."],
         )
 
+    def test_manager_subtask_filters_gitignored_target_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            run_command(["git", "init"], cwd=repo_path)
+            (repo_path / ".gitignore").write_text("docs/internal/\n", encoding="utf-8")
+            subtasks = _normalize_manager_subtasks(
+                {"title": "Define meta-harness eval crate"},
+                [
+                    {
+                        "title": "Define docs and crate",
+                        "goal": "Define tracked crate contracts without private docs deliverables.",
+                        "files": [
+                            "docs/internal/meta-harness/KANBAN.md",
+                            "crates/tandem-meta-harness-eval/src/lib.rs",
+                        ],
+                        "acceptance_criteria": ["Tracked crate contract is defined."],
+                    }
+                ],
+                str(repo_path),
+            )
+
+        self.assertEqual(subtasks[0]["files"], ["crates/tandem-meta-harness-eval/src/lib.rs"])
+        self.assertEqual(subtasks[0]["target_files"], ["crates/tandem-meta-harness-eval/src/lib.rs"])
+        self.assertEqual(subtasks[0]["ignored_target_files"], ["docs/internal/meta-harness/KANBAN.md"])
+
+    def test_manager_subtask_drops_root_manifest_only_target_after_ignored_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            run_command(["git", "init"], cwd=repo_path)
+            (repo_path / ".gitignore").write_text("docs/internal/\n", encoding="utf-8")
+            subtasks = _normalize_manager_subtasks(
+                {"title": "Define meta-harness eval crate"},
+                [
+                    {
+                        "title": "Define docs and manifest metadata",
+                        "goal": "Define private docs and root manifest metadata.",
+                        "files": [
+                            "docs/internal/meta-harness/KANBAN.md",
+                            "docs/internal/meta-harness/eval-crate.md",
+                            "Cargo.toml",
+                        ],
+                        "acceptance_criteria": ["Tracked crate contract is defined."],
+                    }
+                ],
+                str(repo_path),
+            )
+
+        self.assertEqual(subtasks[0]["files"], [])
+        self.assertEqual(subtasks[0]["target_files"], [])
+        self.assertEqual(
+            subtasks[0]["ignored_target_files"],
+            ["docs/internal/meta-harness/KANBAN.md", "docs/internal/meta-harness/eval-crate.md"],
+        )
+        self.assertIn("Do not satisfy this task by placing a prose specification", subtasks[0]["scope_note"])
+
     def test_permission_requests_from_payload_accepts_sdk_permissions_shape(self) -> None:
         payload = {
             "permissions": [
@@ -306,6 +362,53 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertTrue(subtasks)
             self.assertTrue(subtasks[0]["files"])
 
+    def test_single_worker_bug_monitor_subtask_narrows_overbroad_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            paths = [
+                "crates/tandem-server/src/http/tests/bug_monitor.rs",
+                "crates/tandem-server/src/http/tests/bug_monitor_parts/part01.rs",
+                "crates/tandem-server/src/http/tests/bug_monitor_parts/part02.rs",
+                "crates/tandem-server/src/http/tests/bug_monitor_parts/part03.rs",
+                "crates/tandem-server/src/http/tests/bug_monitor_parts/part04.rs",
+                "crates/tandem-server/src/bug_monitor/log_parser.rs",
+                "crates/tandem-server/src/bug_monitor/service.rs",
+            ]
+            for rel_path in paths:
+                target = repo_path / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("bug monitor quality gate draft duplicate confidence retry\n", encoding="utf-8")
+
+            task = {
+                "title": "SIG-01 Verify Bug Monitor end-to-end against signal quality gates",
+                "description": "Bug Monitor should prove quality gates block noisy signals.",
+                "acceptance_criteria": [
+                    "Minor retries, routine progress, low-confidence speculation, and duplicate failures do not create new draft work.",
+                ],
+            }
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "title": "Add focused Bug Monitor quality-gate regression tests",
+                        "goal": "Extend the existing Bug Monitor server/control-panel test path.",
+                        "files": paths[:-1],
+                    }
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(task, manager_plan, repo_path, 1)
+
+            self.assertEqual(
+                subtasks[0]["files"],
+                [
+                    "crates/tandem-server/src/http/tests/bug_monitor_parts/part03.rs",
+                    "crates/tandem-server/src/http/tests/bug_monitor_parts/part04.rs",
+                    "crates/tandem-server/src/bug_monitor/service.rs",
+                ],
+            )
+            self.assertEqual(subtasks[0]["target_files"], subtasks[0]["files"])
+            self.assertIn("ACA narrowed", subtasks[0]["scope_note"])
+
     def test_pr_candidate_task_does_not_use_discovered_files_as_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)
@@ -338,7 +441,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(subtasks[0]["files"], [])
             self.assertEqual(subtasks[0]["target_files"], [])
 
-    def test_manager_subtasks_are_capped_to_max_workers(self) -> None:
+    def test_manager_subtasks_are_preserved_for_serial_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)
             raw_subtasks = [
@@ -353,7 +456,109 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 3,
             )
 
-            self.assertEqual([subtask["id"] for subtask in subtasks], ["subtask-1", "subtask-2", "subtask-3"])
+            self.assertEqual(
+                [subtask["id"] for subtask in subtasks],
+                ["subtask-1", "subtask-2", "subtask-3", "subtask-4", "subtask-5"],
+            )
+
+    def test_manager_subtasks_merge_for_single_worker_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "id": "crate",
+                        "title": "Define crate boundary",
+                        "goal": "Create the eval crate boundary.",
+                        "files": ["Cargo.toml", "crates/tandem-eval/src/lib.rs"],
+                        "acceptance_criteria": ["Eval crate boundaries are defined."],
+                        "verification_commands": ["cargo check -p tandem-eval"],
+                    },
+                    {
+                        "id": "trace",
+                        "title": "Define trace contracts",
+                        "goal": "Add trace-store contracts.",
+                        "files": [
+                            "crates/tandem-eval/src/lib.rs",
+                            "crates/tandem-eval/src/trace.rs",
+                            "crates/tandem-eval/tests/trace_contract.rs",
+                        ],
+                        "acceptance_criteria": ["Trace store and replayable trace model are specified."],
+                        "verification_commands": ["cargo test -p tandem-eval --test trace_contract"],
+                    },
+                    {
+                        "id": "scoring",
+                        "title": "Define scoring contracts",
+                        "goal": "Add workflow version scoring contracts.",
+                        "files": [
+                            "crates/tandem-eval/src/lib.rs",
+                            "crates/tandem-eval/src/scoring.rs",
+                            "crates/tandem-eval/tests/scoring_contract.rs",
+                        ],
+                        "acceptance_criteria": ["Scored workflow/version model is specified."],
+                    },
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(
+                {"title": "MH-01 Define meta-harness eval crate"},
+                manager_plan,
+                repo_path,
+                1,
+            )
+
+            self.assertEqual(len(subtasks), 1)
+            self.assertEqual(subtasks[0]["id"], "subtask-1")
+            self.assertEqual(
+                subtasks[0]["files"],
+                [
+                    "Cargo.toml",
+                    "crates/tandem-eval/src/lib.rs",
+                    "crates/tandem-eval/src/trace.rs",
+                    "crates/tandem-eval/tests/trace_contract.rs",
+                    "crates/tandem-eval/src/scoring.rs",
+                    "crates/tandem-eval/tests/scoring_contract.rs",
+                ],
+            )
+            self.assertEqual(subtasks[0]["target_files"], subtasks[0]["files"])
+            self.assertEqual(
+                subtasks[0]["acceptance_criteria"],
+                [
+                    "Eval crate boundaries are defined.",
+                    "Trace store and replayable trace model are specified.",
+                    "Scored workflow/version model is specified.",
+                ],
+            )
+            self.assertIn("ACA merged multiple manager subtasks", subtasks[0]["scope_note"])
+            self.assertEqual([item["id"] for item in subtasks[0]["merged_subtasks"]], ["crate", "trace", "scoring"])
+
+    def test_expected_repo_files_are_sticky_across_retries(self) -> None:
+        blackboard = {
+            "repo_validation": {
+                "expected_files": [
+                    "crates/tandem-meta-harness-eval/src/lib.rs",
+                    "crates/tandem-meta-harness-eval/src/scoring.rs",
+                ]
+            }
+        }
+
+        expected = _sticky_expected_repo_files(
+            blackboard,
+            [
+                "crates/tandem-meta-harness-eval/src/lib.rs",
+                "crates/tandem-meta-harness-eval/src/trace.rs",
+            ],
+        )
+
+        self.assertEqual(
+            expected,
+            [
+                "crates/tandem-meta-harness-eval/src/lib.rs",
+                "crates/tandem-meta-harness-eval/src/scoring.rs",
+                "crates/tandem-meta-harness-eval/src/trace.rs",
+            ],
+        )
+        self.assertEqual(blackboard["expected_repo_files"], expected)
 
     def test_worker_prompt_includes_pr_candidate_context_artifact(self) -> None:
         task = {

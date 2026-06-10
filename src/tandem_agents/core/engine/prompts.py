@@ -7,6 +7,14 @@ from typing import Any
 
 from src.tandem_agents.config.config_types import ResolvedConfig
 
+METADATA_ONLY_TARGET_FILENAMES = {
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+}
+
 
 def _chunk_list(values: list[Any], chunks: int) -> list[list[Any]]:
     if not values:
@@ -26,6 +34,11 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, set):
         return list(value)
     return [value]
+
+
+def _is_metadata_only_target_path(path: str) -> bool:
+    name = str(path or "").strip().replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    return bool(name) and name in METADATA_ONLY_TARGET_FILENAMES
 
 
 def _task_contract_value(task: dict[str, Any], field: str) -> Any:
@@ -263,10 +276,18 @@ def build_manager_prompt(
         "Each subtask should be independent and suitable for a dedicated worker worktree.\n\n"
         "Each subtask must include title, goal, files, and acceptance_criteria. "
         "Use acceptance_criteria for the concrete worker completion checklist; do not put the only completion criteria in a non-canonical field like scope.\n\n"
+        "Keep each subtask narrow: prefer 1-3 high-signal files. For large split test suites or subsystem-wide tasks, "
+        "choose the smallest existing test/API surface plus the direct implementation file, and leave other follow-up slices as separate subtasks or risks.\n\n"
         "When listing files in subtasks, use repository-relative paths only, such as `package.json` or `src/app.js`.\n"
         "Do not use absolute container paths like `/workspace/...`.\n\n"
+        "Do not use git-ignored or private source-note paths such as `docs/internal/...` as worker deliverables. "
+        "Those paths may be context only; plan tracked source, tests, or public docs that can produce a reviewable Git diff. "
+        "If the task only names ignored/private files and no tracked implementation target is clear, return a blocker risk instead of a docs/internal write plan.\n\n"
         "Plan around the contract below. Respect out-of-scope boundaries, dependency ordering, and target files.\n"
         "If dependencies are unresolved, call that out instead of pretending the work can be completed.\n\n"
+        "For smoke, verification, quality-gate, or end-to-end tasks, plan around the existing product implementation "
+        "and its existing tests/API surfaces. Do not plan a standalone duplicate implementation of the behavior under "
+        "test, and do not replace a live smoke/API path with a local-only mock unless the task explicitly asks for that.\n\n"
         f"{contract_block}\n\n"
         "If the repository already contains relevant files, prefer planning only missing or refinement work.\n"
         "Do not recreate files that already exist and appear readable unless the task clearly requires changing them.\n\n"
@@ -310,9 +331,15 @@ def _compact_pr_context(pr_context: Any) -> Any:
 
 def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], task: dict[str, Any], worktree: str) -> str:
     deliverables = json.dumps(subtask.get("deliverables") or [])
-    target_files = subtask.get("files") or subtask.get("target_files") or []
+    target_files = [
+        str(entry).strip()
+        for entry in _as_list(subtask.get("files") or subtask.get("target_files") or [])
+        if str(entry).strip()
+    ]
     files = json.dumps(target_files)
     existing_files = json.dumps(subtask.get("existing_files") or [])
+    substantive_target_files = [path for path in target_files if not _is_metadata_only_target_path(path)]
+    metadata_only_target_files = [path for path in target_files if _is_metadata_only_target_path(path)]
     ignored_target_files = [
         str(entry).strip()
         for entry in _as_list(subtask.get("ignored_target_files"))
@@ -321,13 +348,41 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     write_required = bool(subtask.get("write_required", True))
     parent_scope = _task_scope_block(task)
     subtask_contract = _task_contract_block(subtask)
+    scope_note = str(subtask.get("scope_note") or "").strip()
+    scope_note_block = f"\nACA scope note: {scope_note}\n" if scope_note else ""
+    tracked_target_guidance = ""
     write_required_guidance = ""
     if write_required:
+        if substantive_target_files:
+            support_line = (
+                f" Metadata/support targets such as {json.dumps(metadata_only_target_files)} may be updated only after "
+                "a substantive target has a real diff."
+                if metadata_only_target_files
+                else ""
+            )
+            tracked_target_guidance = (
+                "\nRequired substantive write targets for this worker: "
+                f"{json.dumps(substantive_target_files)}. Briefly read one declared target before editing it, then make the first "
+                "substantive edit in one of these files unless a nearby tracked "
+                f"source or test file is clearly safer for the same acceptance criterion.{support_line} "
+                "A package.json-only or lockfile-only diff fails this worker.\n"
+            )
+        elif target_files:
+            tracked_target_guidance = (
+                "\nPreferred tracked write targets for this worker: "
+                f"{json.dumps(target_files)}. Briefly read one declared target before editing it, then make the first "
+                "substantive edit in one of these files unless a nearby tracked source or test file is clearly safer "
+                "for the same acceptance criterion.\n"
+            )
         write_required_guidance = (
-            "\nThis worker is write-required. Keep initial inspection brief: identify the smallest safe target, "
-            "then make a real filesystem edit before spending more tool calls on broad exploration. "
-            "If you discover missing coverage or missing behavior, implement the smallest focused improvement now; "
-            "do not stop with an analysis-only blocker unless editing would be unsafe.\n"
+            "\nThis worker is write-required. Inspect the smallest relevant slice of a declared target file first, "
+            "then make a real semantic write/edit against a declared tracked target file or an existing nearby tracked source/test file that directly "
+            "satisfies the subtask. Do not create marker files, status files, temporary files, scratch notes, "
+            "or placeholder files to prove that writing works; those do not count as work and will fail review. "
+            "Do not use no-op patches, comment-only changes, formatting-only churn, or add-then-remove edits to satisfy write-required mode. "
+            "If you discover missing coverage or missing behavior, implement the smallest focused improvement now. "
+            "Do not stop with an analysis-only blocker unless editing the tracked target files would be unsafe, "
+            "and name that concrete safety reason.\n"
         )
     no_target_guidance = ""
     if not target_files:
@@ -344,9 +399,22 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         ignored_target_guidance = (
             "\nGit-ignored target files were present in the task metadata: "
             f"{json.dumps(ignored_target_files)}. Do not use those paths as deliverables because Git will ignore them "
-            "and ACA cannot create a reviewable diff from them. Choose tracked source, test, or public docs files that satisfy the task, "
-            "or return a concrete blocker explaining that the task only names ignored/private files.\n"
+            "and ACA cannot create a reviewable diff from them. If tracked target files remain, edit those tracked targets first. "
+            "Otherwise choose tracked source, test, or public docs files that satisfy the task, or return a concrete blocker "
+            "explaining that the task only names ignored/private files.\n"
         )
+    verification_path_guidance = (
+        "\nFor smoke, verification, quality-gate, or end-to-end tasks, exercise the existing production path, "
+        "server path, control-panel path, or deterministic repository fixture path that the product already uses. "
+        "Do not satisfy those tasks by inventing a standalone simulation unless the task explicitly asks for one. "
+        "Do not define the quality-gate rules inside the test or smoke script and then assert those same local rules; "
+        "drive existing product code, existing server/API behavior, or an existing exported implementation instead. "
+        "Preserve existing live smoke/API behavior such as dry-run modes and endpoint calls unless the task explicitly "
+        "requires replacing it. "
+        "If a script must export helpers for tests, make sure importing it does not execute its CLI main routine, "
+        "perform network calls, append runtime output, or mutate stable fixtures. Runtime smoke output should be "
+        "temporary or cleaned up, while tracked fixtures should stay deterministic.\n"
+    )
     pr_context_guidance = ""
     pr_context = subtask.get("pr_candidate_context")
     pr_context_artifact = str(subtask.get("pr_candidate_context_artifact") or "").strip()
@@ -396,13 +464,16 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Parent task scope:\n{parent_scope}\n\n"
         f"Subtask title: {subtask['title']}\n"
         f"Subtask goal: {subtask['goal']}\n"
+        f"{scope_note_block}"
         f"Subtask contract:\n{subtask_contract}\n\n"
         f"Acceptance criteria: {json.dumps(subtask.get('acceptance_criteria') or [])}\n"
         f"Expected deliverables: {deliverables}\n"
         f"Target files: {files}\n"
         f"Existing readable target files in the base repo before this worker: {existing_files}\n"
         f"Write required for this worker: {json.dumps(write_required)}\n"
+        f"{tracked_target_guidance}"
         f"{write_required_guidance}"
+        f"{verification_path_guidance}"
         f"{no_target_guidance}"
         f"{ignored_target_guidance}"
         f"{pr_context_guidance}"

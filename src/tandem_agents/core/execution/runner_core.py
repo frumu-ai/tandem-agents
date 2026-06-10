@@ -764,6 +764,194 @@ def _move_task_card_if_present(
         return
 
 
+def _subtask_scope_text(task: dict[str, Any], subtask: dict[str, Any]) -> str:
+    parts = [
+        task.get("title"),
+        task.get("description"),
+        subtask.get("title"),
+        subtask.get("goal"),
+        subtask.get("description"),
+    ]
+    parts.extend(_as_list(task.get("acceptance_criteria")))
+    parts.extend(_as_list(subtask.get("acceptance_criteria")))
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _subtask_file_score(rel_path: str, scope_text: str, original_index: int) -> tuple[int, int, str]:
+    lower_rel = rel_path.lower()
+    score = 0
+    for token in re.findall(r"[a-z0-9]+", scope_text):
+        if len(token) >= 3 and token not in {"and", "for", "the", "with"} and token in lower_rel:
+            score += 4
+
+    verification_task = any(
+        token in scope_text
+        for token in (
+            "bug monitor",
+            "quality gate",
+            "quality-gate",
+            "end-to-end",
+            "smoke",
+            "verification",
+        )
+    )
+    test_task = any(token in scope_text for token in ("test", "tests", "regression", "coverage", "verify"))
+    if test_task and "/tests/" in f"/{lower_rel}":
+        score += 28
+    if verification_task and lower_rel.startswith("crates/tandem-server/src/http/tests/bug_monitor"):
+        score += 16
+    if verification_task and "bug_monitor_parts/part03.rs" in lower_rel:
+        score += 18
+    if verification_task and "bug_monitor_parts/part04.rs" in lower_rel:
+        score += 18
+    if verification_task and lower_rel.endswith("crates/tandem-server/src/http/tests/bug_monitor.rs"):
+        score -= 20
+    if verification_task and lower_rel.endswith("crates/tandem-server/src/bug_monitor/service.rs"):
+        score += 46
+    if verification_task and lower_rel.endswith("crates/tandem-server/src/bug_monitor/types.rs"):
+        score += 10
+    if verification_task and re.search(r"bug_monitor_parts/part0[12]\.rs$", lower_rel):
+        score -= 8
+    if lower_rel.startswith("crates/tandem-server/src/bug_monitor/"):
+        score += 10
+    if lower_rel.startswith("scripts/bug-monitor"):
+        score += 8 if "smoke" in scope_text else -4
+    if lower_rel.startswith("docs/internal/"):
+        score -= 20
+    return (-score, original_index, lower_rel)
+
+
+def _compact_overbroad_single_worker_subtask(
+    task: dict[str, Any],
+    subtask: dict[str, Any],
+    discovered_files: list[str] | None,
+    max_files: int = 3,
+) -> dict[str, Any]:
+    files = [str(entry).strip() for entry in _as_list(subtask.get("files")) if str(entry).strip()]
+    target_files = [str(entry).strip() for entry in _as_list(subtask.get("target_files")) if str(entry).strip()]
+    declared = list(dict.fromkeys(files + target_files))
+    if len(declared) <= max_files:
+        return subtask
+
+    candidates = list(dict.fromkeys(declared + list(discovered_files or [])))
+    scope_text = _subtask_scope_text(task, subtask)
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda item: _subtask_file_score(item[1], scope_text, item[0]),
+    )
+    selected = [path for _, path in ranked[:max_files]]
+    if not selected or selected == declared:
+        return subtask
+
+    compacted = dict(subtask)
+    compacted["files"] = selected
+    compacted["target_files"] = selected
+    compacted["scope_note"] = (
+        "ACA narrowed an overbroad one-worker target set from "
+        f"{len(declared)} files to {len(selected)} high-signal files. Stay inside this slice unless a directly adjacent "
+        "tracked source or test file is required for the same acceptance criterion."
+    )
+    compacted["discovered_context_files"] = [path for path in candidates if path not in selected][:12]
+    return compacted
+
+
+def _merge_manager_subtasks_for_single_worker(
+    task: dict[str, Any],
+    subtasks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse a manager plan into one coherent serial worker contract.
+
+    Disabled swarm mode runs workers serially, but each worker still uses an
+    isolated worktree. Multiple manager subtasks that create or edit a shared
+    crate/module tree can overwrite each other or miss prerequisite files when
+    they are dispatched as separate worktrees. In single-worker mode, preserve
+    all manager coverage by merging the contracts into one worker instead of
+    dropping or independently syncing slices.
+    """
+    if len(subtasks) <= 1:
+        return subtasks
+
+    def _extend_unique(target: list[str], values: Any) -> None:
+        for value in _as_list(values):
+            text = str(value or "").strip()
+            if text and text not in target:
+                target.append(text)
+
+    files: list[str] = []
+    target_files: list[str] = []
+    ignored_target_files: list[str] = []
+    acceptance_criteria: list[str] = []
+    deliverables: list[str] = []
+    verification_commands: list[str] = []
+    dependencies: list[str] = []
+    in_scope: list[str] = []
+    out_of_scope: list[str] = []
+    scope_notes: list[str] = []
+    titles: list[str] = []
+    goals: list[str] = []
+
+    for subtask in subtasks:
+        _extend_unique(files, subtask.get("files"))
+        _extend_unique(target_files, subtask.get("target_files"))
+        _extend_unique(ignored_target_files, subtask.get("ignored_target_files"))
+        _extend_unique(acceptance_criteria, subtask.get("acceptance_criteria"))
+        _extend_unique(deliverables, subtask.get("deliverables"))
+        _extend_unique(verification_commands, subtask.get("verification_commands"))
+        _extend_unique(dependencies, subtask.get("dependencies"))
+        _extend_unique(in_scope, subtask.get("in_scope"))
+        _extend_unique(out_of_scope, subtask.get("out_of_scope"))
+        title = str(subtask.get("title") or "").strip()
+        if title:
+            titles.append(title)
+        goal = str(subtask.get("goal") or subtask.get("local_goal") or "").strip()
+        if goal:
+            goals.append(goal)
+        scope_note = str(subtask.get("scope_note") or "").strip()
+        if scope_note:
+            scope_notes.append(scope_note)
+
+    if not target_files and files:
+        target_files = list(files)
+
+    combined_goal = str(task.get("local_goal") or task.get("title") or "").strip()
+    if goals:
+        combined_goal = (
+            f"{combined_goal}\n\nMerged manager subtasks:\n"
+            + "\n".join(f"- {goal}" for goal in goals)
+        ).strip()
+
+    scope_note = (
+        "ACA merged multiple manager subtasks into one serial worker because swarm mode is disabled. "
+        "Implement the combined contract in one coherent worktree so shared files, new crate/module boundaries, "
+        "tests, and documentation stay consistent."
+    )
+    if scope_notes:
+        scope_note += "\n" + "\n".join(scope_notes)
+
+    merged = {
+        "id": "subtask-1",
+        "title": str(task.get("title") or "Combined manager implementation").strip()
+        or "Combined manager implementation",
+        "goal": combined_goal or "Complete the combined manager implementation.",
+        "description": "\n".join(titles),
+        "acceptance_criteria": acceptance_criteria,
+        "deliverables": deliverables,
+        "files": files,
+        "target_files": target_files,
+        "ignored_target_files": ignored_target_files,
+        "verification_commands": verification_commands,
+        "dependencies": dependencies,
+        "program_goal": str(task.get("program_goal") or "").strip() or None,
+        "local_goal": str(task.get("local_goal") or task.get("title") or "").strip(),
+        "in_scope": in_scope,
+        "out_of_scope": out_of_scope,
+        "status": "pending",
+        "scope_note": scope_note,
+        "merged_subtasks": subtasks,
+    }
+    return [merged]
+
+
 def _normalize_manager_subtasks(
     task: dict[str, Any],
     raw_subtasks: list[dict[str, Any]],
@@ -788,7 +976,27 @@ def _normalize_manager_subtasks(
             return Path(entry).name
         return entry
 
+    def _git_ignored_repo_file(entry: str) -> bool:
+        rel_path = str(entry or "").strip()
+        if not rel_path or rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
+            return False
+        result = run_command(_git_repo_args(Path(repo_path), "check-ignore", "--quiet", "--", rel_path))
+        return result.returncode == 0
+
+    def _filter_ignored_files(entries: list[str]) -> tuple[list[str], list[str]]:
+        kept: list[str] = []
+        ignored: list[str] = []
+        for entry in entries:
+            if _git_ignored_repo_file(entry):
+                if entry not in ignored:
+                    ignored.append(entry)
+                continue
+            if entry not in kept:
+                kept.append(entry)
+        return kept, ignored
+
     normalized_task_target_files = [_normalize_repo_file(entry) for entry in task_target_files]
+    normalized_task_target_files, ignored_task_target_files = _filter_ignored_files(normalized_task_target_files)
     for index, item in enumerate(raw_subtasks, start=1):
         if not isinstance(item, dict):
             continue
@@ -852,6 +1060,26 @@ def _normalize_manager_subtasks(
         normalized_target_files: list[str] = []
         for entry in raw_target_files:
             normalized_target_files.append(_normalize_repo_file(entry))
+        normalized_files, ignored_files = _filter_ignored_files(normalized_files)
+        normalized_target_files, ignored_target_files = _filter_ignored_files(normalized_target_files)
+        ignored_files = list(dict.fromkeys(ignored_files + ignored_target_files + ignored_task_target_files))
+        manifest_only_after_ignored_docs = (
+            bool(ignored_files)
+            and set(normalized_files + normalized_target_files) == {"Cargo.toml"}
+            and not any(
+                str(entry or "").strip().replace("\\", "/").startswith("crates/")
+                for entry in raw_files + raw_target_files
+            )
+        )
+        scope_note = ""
+        if manifest_only_after_ignored_docs:
+            normalized_files = []
+            normalized_target_files = []
+            scope_note = (
+                "ACA removed root Cargo.toml as the only remaining target after filtering git-ignored docs. "
+                "Do not satisfy this task by placing a prose specification in workspace metadata; discover or create "
+                "tracked implementation, test, or public documentation files instead."
+            )
         if not normalized_files and normalized_target_files:
             normalized_files = list(normalized_target_files)
         if contract_constrained:
@@ -872,6 +1100,7 @@ def _normalize_manager_subtasks(
                 "deliverables": deliverables,
                 "files": normalized_files,
                 "target_files": normalized_target_files,
+                "ignored_target_files": ignored_files,
                 "verification_commands": verification_commands,
                 "dependencies": dependencies,
                 "program_goal": str(item.get("program_goal") or task.get("program_goal") or "").strip() or None,
@@ -879,6 +1108,7 @@ def _normalize_manager_subtasks(
                 "in_scope": in_scope,
                 "out_of_scope": out_of_scope,
                 "status": str(item.get("status") or "pending").strip(),
+                "scope_note": scope_note,
             }
         )
     if normalized:
@@ -906,12 +1136,14 @@ def _prepare_subtasks_with_discovery(
     max_workers: int,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     discovered_files = discover_repo_files(repo_path, task, limit=12)
+    manager_subtasks = list(manager_plan.get("subtasks") or [])
     subtasks = _normalize_manager_subtasks(
         task,
-        list(manager_plan.get("subtasks") or []),
+        manager_subtasks,
         str(repo_path),
         discovered_files,
     )
+    has_manager_subtasks = bool(subtasks)
     if not subtasks:
         subtasks = derive_subtasks(task, max_workers)
         contract = task_contract_payload(task)
@@ -925,6 +1157,15 @@ def _prepare_subtasks_with_discovery(
             subtasks[0]["target_files"] = list(task_target_files)
         elif discovered_files and not _task_mentions_external_pr_candidates(task):
             subtasks[0]["files"] = list(discovered_files)
+    if max_workers <= 1 and len(subtasks) == 1:
+        subtasks = [
+            _compact_overbroad_single_worker_subtask(task, subtask, discovered_files)
+            for subtask in subtasks
+        ]
+    elif max_workers <= 1 and has_manager_subtasks and len(subtasks) > 1:
+        subtasks = _merge_manager_subtasks_for_single_worker(task, subtasks)
+    if has_manager_subtasks:
+        return discovered_files, subtasks
     return discovered_files, subtasks[: max(1, max_workers)]
 
 
@@ -946,6 +1187,34 @@ def _as_list(value: Any) -> list[Any]:
 
 def _collect_expected_repo_files(subtasks: list[dict[str, Any]]) -> list[str]:
     return collect_expected_repo_files(subtasks)
+
+
+def _sticky_expected_repo_files(
+    blackboard: dict[str, Any],
+    expected_files: list[str],
+) -> list[str]:
+    previous: list[str] = []
+    stored = blackboard.get("expected_repo_files")
+    if isinstance(stored, list):
+        previous.extend(str(path).strip() for path in stored if str(path).strip())
+    repo_validation = blackboard.get("repo_validation")
+    if isinstance(repo_validation, dict):
+        previous.extend(
+            str(path).strip()
+            for path in (repo_validation.get("expected_files") or [])
+            if str(path).strip()
+        )
+    merged = list(
+        dict.fromkeys(
+            [
+                str(path).strip()
+                for path in [*previous, *expected_files]
+                if str(path).strip()
+            ]
+        )
+    )
+    blackboard["expected_repo_files"] = merged
+    return merged
 
 
 def _collect_worker_changed_files(worker_results: list[dict[str, Any]]) -> list[str]:
@@ -2446,6 +2715,65 @@ def _run_once_internal_impl(
             )
             save_blackboard(layout["blackboard"], ctx.blackboard)
             write_blackboard_snapshot(run_dir, ctx.blackboard)
+
+        repo_blocker = _repo_validation_blocker_message(ctx.repo_validation)
+        if repo_blocker:
+            missing_files = [
+                str(path)
+                for path in (ctx.repo_validation.get("missing_files") or [])
+                if str(path).strip()
+            ]
+            command_failures = ctx.repo_validation.get("command_failures") or []
+            feedback_parts = [
+                "CRITICAL: Deterministic repository validation failed after worker sync.",
+                repo_blocker,
+            ]
+            if missing_files:
+                feedback_parts.append(
+                    "Missing expected files:\n"
+                    + "\n".join(f"- {path}" for path in missing_files)
+                )
+            if command_failures:
+                feedback_parts.append(
+                    "Verification command failures:\n"
+                    + json.dumps(command_failures, indent=2, default=str)[:4000]
+                )
+            feedback_parts.append(
+                "Preserve any useful existing diff, then add the missing tracked source, test, and documentation files. "
+                "Do not proceed to review until deterministic validation passes."
+            )
+            repo_feedback = "\n\n".join(feedback_parts)
+            _append_blackboard_note(
+                ctx.blackboard,
+                f"Attempt {attempt + 1} failed deterministic repo validation: {repo_blocker}",
+            )
+            append_event(
+                layout["events"],
+                "repo_validation.failed",
+                run_id,
+                {
+                    "reason": repo_blocker,
+                    "missing_files": missing_files,
+                    "will_retry": attempt < max_loops - 1,
+                },
+                task_id=ctx.task.get("task_id"),
+                role="manager",
+                repo={"path": ctx.repo.get("path")},
+            )
+            save_blackboard(layout["blackboard"], ctx.blackboard)
+            write_blackboard_snapshot(run_dir, ctx.blackboard)
+            if attempt < max_loops - 1:
+                previous_feedback = repo_feedback
+                continue
+            return _block_from_decision(
+                ctx,
+                RepairDecision(
+                    action="block",
+                    message=repo_blocker,
+                    kind="repo_validation_failed",
+                    phase="handoff",
+                ),
+            )
 
         # 4e. Integration prompt  (still inline — small and tightly coupled to result handling)
         integration_result = _run_integration_prompt(ctx)

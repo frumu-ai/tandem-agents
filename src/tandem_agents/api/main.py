@@ -126,6 +126,7 @@ _coordination_reaper_task: Optional[asyncio.Task[None]] = None
 _coordination_reaper_stop = threading.Event()
 _coder_supervisor_task: Optional[asyncio.Task[None]] = None
 _coder_supervisor_stop = threading.Event()
+DEFAULT_READY_ENGINE_TIMEOUT_SECONDS = 5.0
 _start_time = time.monotonic()
 
 
@@ -641,7 +642,29 @@ async def readiness(token: str = Depends(get_token)):
     """
     root = Path(os.environ.get("ACA_ROOT", "."))
     cfg = resolve_config(root)
-    engine_info = engine_status_report(cfg)
+    raw_timeout = str(cfg.env.get("ACA_READY_ENGINE_TIMEOUT_SECONDS") or "").strip()
+    try:
+        ready_engine_timeout = max(0.5, float(raw_timeout)) if raw_timeout else DEFAULT_READY_ENGINE_TIMEOUT_SECONDS
+    except ValueError:
+        ready_engine_timeout = DEFAULT_READY_ENGINE_TIMEOUT_SECONDS
+    try:
+        engine_info = await asyncio.wait_for(
+            asyncio.to_thread(engine_status_report, cfg, health_timeout=ready_engine_timeout),
+            timeout=ready_engine_timeout + 0.75,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        engine_info = {
+            "base_url": str(cfg.tandem.base_url or "").strip(),
+            "healthy": False,
+            "running": False,
+            "status": "timeout",
+            "version": None,
+            "update_available": False,
+            "update_policy": str(cfg.tandem.update_policy or "").strip(),
+            "startup_mode": str(cfg.tandem.startup_mode or "").strip(),
+            "detail": f"engine health probe exceeded {ready_engine_timeout:.1f}s",
+            "checked_at_ms": int(time.time() * 1000),
+        }
     engine_healthy = bool(engine_info.get("healthy"))
 
     coord_ok = False
@@ -1075,6 +1098,20 @@ async def update_project_task_state(
                 "issue_id": item,
             },
         }
+        try:
+            from src.tandem_agents.runtime.task_sources import (
+                _hydrate_linear_issue_for_task,
+                _linear_issue_to_task,
+            )
+
+            fetched_issue = await asyncio.to_thread(
+                _hydrate_linear_issue_for_task,
+                cfg,
+                {"id": item, "identifier": item, "title": item},
+            )
+            task_for_key = _linear_issue_to_task(cfg, fetched_issue)
+        except Exception:
+            logger.debug("Could not hydrate Linear task %s before coordination update", item, exc_info=True)
         repo = {
             "slug": cfg.repository.slug,
             "path": cfg.repository.path,
