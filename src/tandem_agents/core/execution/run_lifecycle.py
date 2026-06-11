@@ -89,6 +89,7 @@ def build_swarm_config_dict(cfg: ResolvedConfig) -> dict[str, Any]:
         "enabled": cfg.swarm.enabled,
         "shared_model": cfg.swarm.shared_model,
         "max_workers": cfg.swarm.max_workers,
+        "max_retries": cfg.swarm.max_retries,
         "using_default_model_fallback": bool(defaulted),
         "default_model_fallback_roles": defaulted,
         **role_entries,

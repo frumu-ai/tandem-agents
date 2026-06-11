@@ -271,9 +271,8 @@ def _post_dispatch_validation(ctx: RunContext) -> None:
     from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
 
     ctx.expected_repo_files = _rc._collect_expected_repo_files(ctx.planned_subtasks)
-    changed_files: list[str] = []
+    changed_files: list[str] = _rc._collect_worker_changed_files(ctx.worker_results)
     if _rc._task_mentions_external_pr_candidates(ctx.task):
-        changed_files = _rc._collect_worker_changed_files(ctx.worker_results)
         if changed_files:
             ctx.expected_repo_files = changed_files
     else:
@@ -281,6 +280,12 @@ def _post_dispatch_validation(ctx: RunContext) -> None:
             ctx.blackboard,
             ctx.expected_repo_files,
         )
+        ctx.expected_repo_files = _rc._validation_expected_repo_files(
+            ctx.repo_path,
+            ctx.expected_repo_files,
+            changed_files,
+        )
+        ctx.blackboard["expected_repo_files"] = ctx.expected_repo_files
     ctx.repo_validation = _rc._deterministic_repo_validation(ctx.repo_path, ctx.expected_repo_files)
     if changed_files:
         unexpected_files = _rc._pr_candidate_unexpected_changed_files(ctx.planned_subtasks, changed_files)

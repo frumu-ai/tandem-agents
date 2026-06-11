@@ -8,12 +8,25 @@ from typing import Any
 from src.tandem_agents.config.config_types import ResolvedConfig
 
 METADATA_ONLY_TARGET_FILENAMES = {
+    "cargo.lock",
     "package.json",
     "package-lock.json",
     "pnpm-lock.yaml",
     "yarn.lock",
     "bun.lockb",
 }
+SOURCE_OR_TEST_TARGET_EXTENSIONS = {
+    ".rs",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".sh",
+}
+SUPPORT_ONLY_TARGET_EXTENSIONS = {".md", ".mdx", ".rst", ".adoc", ".yml", ".yaml", ".toml", ".json"}
 
 
 def _chunk_list(values: list[Any], chunks: int) -> list[list[Any]]:
@@ -37,8 +50,44 @@ def _as_list(value: Any) -> list[Any]:
 
 
 def _is_metadata_only_target_path(path: str) -> bool:
-    name = str(path or "").strip().replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    rel_path = str(path or "").strip().replace("\\", "/").rstrip("/")
+    name = rel_path.rsplit("/", 1)[-1].lower()
     return bool(name) and name in METADATA_ONLY_TARGET_FILENAMES
+
+
+def _is_source_or_test_target_path(path: str) -> bool:
+    rel_path = str(path or "").strip().replace("\\", "/").rstrip("/")
+    if not rel_path:
+        return False
+    lowered = rel_path.lower()
+    if "/tests/" in f"/{lowered}/" or lowered.startswith("tests/"):
+        return True
+    if lowered.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx")):
+        return True
+    return any(lowered.endswith(ext) for ext in SOURCE_OR_TEST_TARGET_EXTENSIONS)
+
+
+def _is_support_only_target_path(path: str) -> bool:
+    rel_path = str(path or "").strip().replace("\\", "/").rstrip("/")
+    if not rel_path:
+        return False
+    lowered = rel_path.lower()
+    if _is_metadata_only_target_path(lowered):
+        return True
+    if lowered.startswith("docs/") or "/docs/" in f"/{lowered}/":
+        return True
+    return any(lowered.endswith(ext) for ext in SUPPORT_ONLY_TARGET_EXTENSIONS)
+
+
+def _split_substantive_and_support_targets(target_files: list[str]) -> tuple[list[str], list[str]]:
+    source_or_test_targets = [path for path in target_files if _is_source_or_test_target_path(path)]
+    if source_or_test_targets:
+        support_targets = [path for path in target_files if path not in source_or_test_targets]
+        return source_or_test_targets, support_targets
+    return (
+        [path for path in target_files if not _is_metadata_only_target_path(path)],
+        [path for path in target_files if _is_metadata_only_target_path(path)],
+    )
 
 
 def _task_contract_value(task: dict[str, Any], field: str) -> Any:
@@ -338,8 +387,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     ]
     files = json.dumps(target_files)
     existing_files = json.dumps(subtask.get("existing_files") or [])
-    substantive_target_files = [path for path in target_files if not _is_metadata_only_target_path(path)]
-    metadata_only_target_files = [path for path in target_files if _is_metadata_only_target_path(path)]
+    substantive_target_files, metadata_only_target_files = _split_substantive_and_support_targets(target_files)
     ignored_target_files = [
         str(entry).strip()
         for entry in _as_list(subtask.get("ignored_target_files"))
@@ -355,7 +403,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     if write_required:
         if substantive_target_files:
             support_line = (
-                f" Metadata/support targets such as {json.dumps(metadata_only_target_files)} may be updated only after "
+                f" Support targets such as {json.dumps(metadata_only_target_files)} may be updated only after "
                 "a substantive target has a real diff."
                 if metadata_only_target_files
                 else ""
@@ -454,6 +502,9 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         "You must use tools to inspect the worktree, create or edit the required files, and verify the result.\n"
         "Do not merely describe intended changes. If you did not actually change files, report a blocker instead.\n"
         "Before finishing, verify the changed files with read/glob/grep or bash commands in the worktree.\n"
+        "Once a substantive diff exists, stop expanding scope: run one lightweight verification or file readback, then return the final completion note.\n"
+        "When a subtask needs coverage for private helpers, add real tests inside the source module that defines those helpers; do not add placeholder integration or contract test files.\n"
+        "When adding tests, prefer additive test modules or additive cases; do not rewrite existing tests unless the task explicitly requires changing them.\n"
         "If browser tools are available, use them to verify your changes.\n"
         "IMPORTANT: Save any browser screenshots to the `./screenshots/` directory so they can be displayed in the Control Panel.\n"
         "Your final response must describe the real files you changed and the verification you actually performed.\n"

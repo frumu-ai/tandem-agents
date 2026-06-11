@@ -47,6 +47,34 @@ class VerificationPolicyTest(unittest.TestCase):
         self.assertEqual(decision.outcome, "repair_needed")
         self.assertEqual(decision.test_blocker, "Tester results are `failed`.")
 
+    def test_verification_policy_retries_repair_needed_with_command_failure(self) -> None:
+        review_result = {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "next_action": "repair_needed",
+                    "required_fixes": ["export the test API or use public APIs"],
+                }
+            ),
+        }
+        test_result = {"returncode": 0, "stdout": json.dumps({"status": "repair_needed"})}
+        repo_validation = {
+            "ok": False,
+            "command_failures": [
+                {
+                    "command": "cargo test -p tandem-tools registry_resolution",
+                    "status": "fail",
+                }
+            ],
+        }
+
+        decision = evaluate_verification_policy(review_result, test_result, repo_validation=repo_validation)
+
+        self.assertTrue(decision.should_retry)
+        self.assertEqual(decision.outcome, "blocked")
+        self.assertEqual(decision.failure_category, "review_repair_needed")
+        self.assertEqual(decision.repo_blocker, "Repository validation command failed: cargo test -p tandem-tools registry_resolution")
+
     def test_verification_policy_reports_human_review_needed(self) -> None:
         review_result = {
             "returncode": 0,

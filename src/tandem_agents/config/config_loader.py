@@ -408,6 +408,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         enabled=_as_bool(pick("ACA_ENABLE_SWARM", "AUTOCODER_ENABLE_SWARM", yaml_value=swarm_data.get("enabled"), default=False)),
         shared_model=_as_bool(pick("ACA_SHARED_MODEL", "AUTOCODER_SHARED_MODEL", yaml_value=swarm_data.get("shared_model"), default=False)),
         max_workers=max(1, _as_int(pick("ACA_MAX_WORKERS", "AUTOCODER_MAX_WORKERS", yaml_value=swarm_data.get("max_workers"), default=DEFAULT_MAX_WORKERS), DEFAULT_MAX_WORKERS)),
+        max_retries=max(0, _as_int(pick("ACA_MAX_RETRIES", "AUTOCODER_MAX_RETRIES", yaml_value=swarm_data.get("max_retries"), default=1), 1)),
         manager=RoleSelection(
             provider=str(pick("ACA_MANAGER_PROVIDER", "AUTOCODER_MANAGER_PROVIDER", yaml_value=(swarm_data.get("manager") or {}).get("provider"), default="")),
             model=str(pick("ACA_MANAGER_MODEL", "AUTOCODER_MANAGER_MODEL", yaml_value=(swarm_data.get("manager") or {}).get("model"), default="")),

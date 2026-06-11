@@ -6,6 +6,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -75,6 +76,7 @@ WORKER_FAILURE_MARKERS = (
     "ENGINE_PROMPT_TIMEOUT",
     "ENGINE_TOOL_LOOP_STALLED",
     "ENGINE_SESSION_RUN_CONFLICT",
+    "TERMINALIZED_WITH_REMAINING_BLOCKERS",
 )
 
 TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout"}
@@ -93,12 +95,25 @@ PR_CANDIDATE_IMPORT_EXTENSIONS = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cj
 PR_CANDIDATE_SEED_EXCLUDED_PREFIXES = (".jules/", "jules/")
 PR_CANDIDATE_SEED_EXCLUDED_FILES = {".jules/bolt.md", "jules/bolt.md"}
 METADATA_ONLY_TARGET_FILES = {
+    "cargo.lock",
     "package.json",
     "package-lock.json",
     "pnpm-lock.yaml",
     "yarn.lock",
     "bun.lockb",
 }
+SOURCE_OR_TEST_TARGET_EXTENSIONS = {
+    ".rs",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".sh",
+}
+SUPPORT_ONLY_TARGET_EXTENSIONS = {".md", ".mdx", ".rst", ".adoc", ".yml", ".yaml", ".toml", ".json"}
 
 
 def _print_line(prefix: str, line: str) -> None:
@@ -279,13 +294,38 @@ def _worker_prompt_sync_timeout_seconds(cfg: ResolvedConfig) -> float:
             return max(30.0, float(raw))
         except ValueError:
             logger.debug("Invalid ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS=%s", raw)
-    return 90.0
+    return 180.0
+
+
+def _worker_prompt_sync_max_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(30.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS=%s", raw)
+    return 300.0
 
 
 def _prompt_sync_timeout_seconds(cfg: ResolvedConfig, role: str, write_required: bool) -> float:
     if role.startswith("worker") and write_required:
         return _worker_prompt_sync_timeout_seconds(cfg)
     return _engine_prompt_sync_timeout_seconds(cfg)
+
+
+def _scaled_prompt_sync_timeout_seconds(
+    cfg: ResolvedConfig,
+    role: str,
+    write_required: bool,
+    timeout_multiplier: float,
+) -> float:
+    timeout = _scaled_timeout_seconds(
+        _prompt_sync_timeout_seconds(cfg, role, write_required),
+        timeout_multiplier,
+    )
+    if role.startswith("worker") and write_required:
+        return min(timeout, _worker_prompt_sync_max_timeout_seconds(cfg))
+    return timeout
 
 
 def _worker_terminalize_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -329,6 +369,24 @@ def _use_prompt_sync_first(cfg: ResolvedConfig, override: bool | None) -> bool:
     if override is not None:
         return override
     return _worker_prompt_sync_first_enabled(cfg)
+
+
+def _skip_tool_recovery_when_partial_diff_exists(
+    *,
+    role: str,
+    write_required: bool,
+    cwd: Path,
+    blocker_kind: str,
+) -> bool:
+    if not role.startswith("worker") or not write_required:
+        return False
+    if blocker_kind not in {"engine_prompt_timeout", "engine_empty_response"}:
+        return False
+    try:
+        return bool(_worktree_changed_files(cwd))
+    except Exception:
+        logger.debug("Failed to inspect worker worktree before async recovery", exc_info=True)
+        return False
 
 
 def _scaled_timeout_seconds(timeout_seconds: float, multiplier: float) -> float:
@@ -616,13 +674,72 @@ def _subtask_search_text(subtask: dict[str, Any]) -> str:
     ).lower()
 
 
+def _subtask_is_ci_workflow_task(subtask: dict[str, Any]) -> bool:
+    text = f" {_subtask_search_text(subtask).replace('-', ' ')} "
+    ci_markers = (" ci ", " workflow ", " github actions ", " pull request ", " pull_request ", " pr ")
+    action_markers = (" run ", " gate ", " check ", " tests ", " test ")
+    return any(marker in text for marker in ci_markers) and any(marker in text for marker in action_markers)
+
+
+def _subtask_requires_in_module_private_helper_tests(subtask: dict[str, Any]) -> bool:
+    text = _subtask_search_text(subtask)
+    private_helper_markers = (
+        "resolve_registered_tool",
+        "resolve_tool_path",
+        "is_within_workspace_root",
+        "approval_classifier::classify",
+        "standing_allow_is_unsafe",
+    )
+    return any(marker in text for marker in private_helper_markers)
+
+
+def _is_ci_workflow_path(path: str) -> bool:
+    rel_path = _normalize_target_path(path).lower()
+    return rel_path.startswith(".github/workflows/") and rel_path.endswith((".yml", ".yaml"))
+
+
 def _is_metadata_only_target_path(path: str) -> bool:
     rel_path = _normalize_target_path(path)
     return bool(rel_path) and Path(rel_path).name.lower() in METADATA_ONLY_TARGET_FILES
 
 
+def _is_source_or_test_target_path(path: str) -> bool:
+    rel_path = _normalize_target_path(path).lower()
+    if not rel_path:
+        return False
+    if "/tests/" in f"/{rel_path}/" or rel_path.startswith("tests/"):
+        return True
+    name = Path(rel_path).name
+    if name.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx")):
+        return True
+    return any(rel_path.endswith(ext) for ext in SOURCE_OR_TEST_TARGET_EXTENSIONS)
+
+
+def _is_support_only_target_path(path: str) -> bool:
+    rel_path = _normalize_target_path(path).lower()
+    if not rel_path:
+        return False
+    if _is_metadata_only_target_path(rel_path):
+        return True
+    if rel_path.startswith("docs/") or "/docs/" in f"/{rel_path}/":
+        return True
+    return any(rel_path.endswith(ext) for ext in SUPPORT_ONLY_TARGET_EXTENSIONS)
+
+
 def _substantive_target_files(subtask: dict[str, Any]) -> list[str]:
-    return [path for path in _subtask_targets(subtask) if not _is_metadata_only_target_path(path)]
+    targets = _subtask_targets(subtask)
+    source_or_test_targets = [path for path in targets if _is_source_or_test_target_path(path)]
+    if source_or_test_targets:
+        return source_or_test_targets
+    return [path for path in targets if not _is_metadata_only_target_path(path)]
+
+
+def _support_only_changed_files_for_subtask(subtask: dict[str, Any], changed_files: list[str]) -> bool:
+    if not _substantive_target_files(subtask):
+        return False
+    if _subtask_is_ci_workflow_task(subtask) and all(_is_ci_workflow_path(path) for path in changed_files):
+        return False
+    return bool(changed_files) and all(_is_support_only_target_path(path) for path in changed_files)
 
 
 def _subtask_requires_substantive_target_diff(
@@ -772,6 +889,8 @@ def _diff_touches_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
 
 
 def _diff_touches_substantive_target_files(worktree: Path, subtask: dict[str, Any]) -> bool:
+    if _diff_touches_ci_workflow_files(worktree, subtask):
+        return True
     targets = set(_substantive_target_files(subtask))
     if not targets:
         return False
@@ -781,6 +900,63 @@ def _diff_touches_substantive_target_files(worktree: Path, subtask: dict[str, An
         return False
     changed = {str(change.get("path") or "").strip() for change in changes}
     return bool(changed.intersection(targets))
+
+
+def _package_root_for_path(path: str) -> str:
+    rel_path = _normalize_target_path(path)
+    parts = [part for part in rel_path.split("/") if part]
+    if len(parts) >= 2 and parts[0] in {"crates", "packages", "apps"}:
+        return "/".join(parts[:2])
+    if len(parts) >= 1 and parts[-1] in {"Cargo.toml", "package.json", "pyproject.toml"}:
+        return "/".join(parts[:-1])
+    return ""
+
+
+def _path_is_test_file(path: str) -> bool:
+    rel_path = _normalize_target_path(path)
+    name = Path(rel_path).name.lower()
+    return (
+        "/tests/" in f"/{rel_path}/"
+        or rel_path.startswith("tests/")
+        or name.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+        or (name.endswith(".rs") and rel_path.endswith("/tests/" + name))
+    )
+
+
+def _diff_touches_nearby_test_files(worktree: Path, subtask: dict[str, Any]) -> bool:
+    if _subtask_requires_in_module_private_helper_tests(subtask):
+        return False
+    if not _subtask_requires_substantive_target_diff(subtask, requires_real_diff=True):
+        return False
+    roots = {
+        root
+        for root in (_package_root_for_path(path) for path in _subtask_targets(subtask))
+        if root
+    }
+    if not roots:
+        return False
+    try:
+        changes = list_worktree_changes(worktree)
+    except Exception:
+        return False
+    for change in changes:
+        changed_path = _normalize_target_path(str(change.get("path") or ""))
+        if not changed_path or _is_aca_repo_artifact_path(changed_path) or not _path_is_test_file(changed_path):
+            continue
+        for root in roots:
+            if changed_path == root or changed_path.startswith(f"{root}/"):
+                return True
+    return False
+
+
+def _diff_touches_ci_workflow_files(worktree: Path, subtask: dict[str, Any]) -> bool:
+    if not _subtask_is_ci_workflow_task(subtask):
+        return False
+    try:
+        changes = list_worktree_changes(worktree)
+    except Exception:
+        return False
+    return any(_is_ci_workflow_path(str(change.get("path") or "")) for change in changes)
 
 
 def _diff_satisfies_targeted_subtask(
@@ -811,6 +987,8 @@ def _is_aca_repo_artifact_path(path: str) -> bool:
         return True
     if rel_path.startswith(".aca/"):
         return True
+    if name == ".aca_worker_blocker_note.txt":
+        return True
     if name.startswith("aca-") and name.endswith(".md"):
         return True
     if name.startswith("ACA_") and name.endswith(".md"):
@@ -818,15 +996,24 @@ def _is_aca_repo_artifact_path(path: str) -> bool:
     return False
 
 
-def _worktree_changed_files(worktree: Path) -> list[str]:
+def _non_aca_worktree_changes(worktree: Path) -> list[dict[str, Any]]:
     try:
         changes = list_worktree_changes(worktree)
     except Exception:
-        changes = []
-    changed: list[str] = []
+        return []
+    filtered: list[dict[str, Any]] = []
     for change in changes:
         path = str(change.get("path") or "").strip()
         if path and not _is_aca_repo_artifact_path(path):
+            filtered.append(change)
+    return filtered
+
+
+def _worktree_changed_files(worktree: Path) -> list[str]:
+    changed: list[str] = []
+    for change in _non_aca_worktree_changes(worktree):
+        path = str(change.get("path") or "").strip()
+        if path:
             changed.append(path)
     if changed:
         return changed
@@ -843,6 +1030,54 @@ def _worktree_changed_files(worktree: Path) -> list[str]:
         if path and not _is_aca_repo_artifact_path(path):
             changed.append(path)
     return changed
+
+
+def _changed_files_have_substantive_content(worktree: Path, changed_files: list[str]) -> bool:
+    """Return true when changed files contain reviewable content.
+
+    `git status --short` reports a new zero-byte file as a change, but that is
+    not enough to satisfy write-required ACA work. Tracked deletions and binary
+    changes are still considered substantive.
+    """
+
+    paths = [path for path in changed_files if path and not _is_aca_repo_artifact_path(path)]
+    if not paths:
+        return False
+    try:
+        changes = list_worktree_changes(worktree)
+    except Exception:
+        return True
+    if not changes:
+        return True
+    status_by_path = {str(change.get("path") or ""): str(change.get("status") or "") for change in changes}
+    for path in paths:
+        status = status_by_path.get(path, "")
+        file_path = worktree / path
+        if status.strip().startswith("?"):
+            try:
+                if file_path.is_file() and file_path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+            continue
+        if "D" in status or "R" in status:
+            return True
+        diff_proc = run_command(git_command_for_worktree(worktree, "diff", "--numstat", "HEAD", "--", path))
+        if diff_proc.returncode != 0:
+            return True
+        for line in diff_proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            added, deleted = parts[0], parts[1]
+            if added == "-" or deleted == "-":
+                return True
+            try:
+                if int(added) + int(deleted) > 0:
+                    return True
+            except ValueError:
+                return True
+    return False
 
 
 def _engine_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -902,6 +1137,36 @@ def _async_no_text_timeout_seconds(cfg: ResolvedConfig, role: str, write_require
     return timeout
 
 
+def _scaled_async_prompt_timeout_seconds(
+    cfg: ResolvedConfig,
+    role: str,
+    write_required: bool,
+    timeout_multiplier: float,
+) -> float:
+    timeout = _scaled_timeout_seconds(
+        _async_prompt_timeout_seconds(cfg, role, write_required),
+        timeout_multiplier,
+    )
+    if role.startswith("worker") and write_required:
+        return min(timeout, _worker_async_prompt_timeout_seconds(cfg))
+    return timeout
+
+
+def _scaled_async_no_text_timeout_seconds(
+    cfg: ResolvedConfig,
+    role: str,
+    write_required: bool,
+    timeout_multiplier: float,
+) -> float:
+    timeout = _scaled_timeout_seconds(
+        _async_no_text_timeout_seconds(cfg, role, write_required),
+        timeout_multiplier,
+    )
+    if role.startswith("worker") and write_required:
+        return min(timeout, _worker_async_no_text_timeout_seconds(cfg))
+    return timeout
+
+
 def _engine_max_events_without_text(cfg: ResolvedConfig, role: str) -> int:
     raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_MAX_EVENTS_WITHOUT_TEXT", "") or "").strip()
     if raw:
@@ -952,28 +1217,110 @@ def _preserve_partial_worker_diff(
         )
     diff_text = ""
     status_text = ""
-    try:
-        diff_text = git_working_diff(worktree)
-    except Exception:
-        logger.debug("Failed to capture partial worker diff", exc_info=True)
-    try:
-        status_text = git_diff_stat(worktree)
-    except Exception:
-        logger.debug("Failed to capture partial worker status", exc_info=True)
-    artifacts_dir = log_path.parent.parent / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifacts_dir / f"{log_path.stem}.partial-worker-diff.patch"
-    artifact_path.write_text(
-        f"# Partial worker diff preserved after nonterminal engine result\n"
-        f"# Reason: {reason}\n\n"
-        f"## git status --short --untracked-files=all\n\n{status_text}\n"
-        f"## git diff --binary\n\n{diff_text}\n",
-        encoding="utf-8",
-    )
-    result.setdefault("artifacts", {})["partial_diff"] = str(artifact_path)
-    result["partial_diff_artifact"] = str(artifact_path)
     result["changed_files"] = _worktree_changed_files(worktree)
+    if result["changed_files"]:
+        try:
+            diff_text = _applyable_working_diff(worktree)
+            if not diff_text.strip():
+                diff_text = git_working_diff(worktree)
+        except Exception:
+            logger.debug("Failed to capture partial worker diff", exc_info=True)
+        status_rows = []
+        for change in _non_aca_worktree_changes(worktree):
+            status = str(change.get("status") or "").strip() or "??"
+            path = str(change.get("path") or "").strip()
+            if path:
+                status_rows.append(f"{status:>2} {path}")
+        status_text = "\n".join(status_rows)
+    if diff_text.strip():
+        artifacts_dir = log_path.parent.parent / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifacts_dir / f"{log_path.stem}.partial-worker-diff.patch"
+        artifact_path.write_text(
+            f"# Partial worker diff preserved after nonterminal engine result\n"
+            f"# Reason: {reason}\n\n"
+            f"## git status --short --untracked-files=all\n\n{status_text}\n"
+            f"## git diff --binary\n\n{diff_text}\n",
+            encoding="utf-8",
+        )
+        result.setdefault("artifacts", {})["partial_diff"] = str(artifact_path)
+        result["partial_diff_artifact"] = str(artifact_path)
     return result
+
+
+def _applyable_working_diff(worktree: Path) -> str:
+    """Return a git-applyable patch for tracked and untracked worktree changes."""
+
+    changes = _non_aca_worktree_changes(worktree)
+    if not changes:
+        return ""
+    untracked = [
+        str(change.get("path") or "").strip()
+        for change in changes
+        if str(change.get("status") or "").strip().startswith("?")
+        and str(change.get("path") or "").strip()
+    ]
+    with tempfile.NamedTemporaryFile(prefix="aca-git-index-") as index_file:
+        env = {"GIT_INDEX_FILE": index_file.name}
+        read_tree = run_command(git_command_for_worktree(worktree, "read-tree", "HEAD"), env=env)
+        if read_tree.returncode != 0:
+            return ""
+        if untracked:
+            add_intent = run_command(
+                git_command_for_worktree(worktree, "add", "-N", "--", *untracked),
+                env=env,
+            )
+            if add_intent.returncode != 0:
+                return ""
+        diff = run_command(git_command_for_worktree(worktree, "diff", "--binary", "HEAD"), env=env)
+        return diff.stdout if diff.returncode == 0 else ""
+
+
+def _extract_partial_worker_diff_artifact(artifact_text: str) -> str:
+    marker = "## git diff --binary"
+    index = artifact_text.find(marker)
+    if index < 0:
+        return artifact_text.strip()
+    return artifact_text[index + len(marker):].lstrip("\r\n")
+
+
+def _apply_carry_forward_patch(worktree: Path, patch_path: Path, log_path: Path) -> bool:
+    def append_log(message: str) -> None:
+        previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        log_path.write_text(previous + message, encoding="utf-8")
+
+    if not patch_path.is_file():
+        append_log(f"ACA carry-forward patch was missing: {patch_path}\n")
+        return False
+    try:
+        artifact_text = patch_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        append_log(f"ACA carry-forward patch could not be read: {patch_path}: {exc}\n")
+        return False
+    diff_text = _extract_partial_worker_diff_artifact(artifact_text)
+    if not diff_text.strip():
+        append_log(f"ACA carry-forward patch contained no git diff: {patch_path}\n")
+        return False
+    apply_cmd = [
+        "--work-tree=." if arg.startswith("--work-tree=") else arg
+        for arg in git_command_for_worktree(worktree, "apply", "--3way", "--whitespace=nowarn")
+    ]
+    apply_proc = subprocess.run(
+        apply_cmd,
+        cwd=str(worktree),
+        input=diff_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if apply_proc.returncode != 0:
+        append_log(
+            "ACA carry-forward patch did not apply cleanly: "
+            f"{patch_path}: {apply_proc.stderr or apply_proc.stdout or 'git apply failed'}\n"
+        )
+        return False
+    append_log(f"ACA applied carry-forward partial diff before retry: {patch_path}\n")
+    return True
 
 
 def _recover_tool_stall_with_diff(
@@ -1043,6 +1390,10 @@ def _repeat_line_is_common_source_syntax(line: str) -> bool:
         return True
     if stripped in {"}", "};", "),"}:
         return True
+    if "remove_dir_all" in stripped and stripped.endswith(".ok();"):
+        return True
+    if re.match(r"^let\s+\w+\s*=\s*\w*Test\w*::new\(", stripped):
+        return True
     return False
 
 
@@ -1076,9 +1427,11 @@ def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str)
         or "ENGINE_EMPTY_RESPONSE" in reason
         or "ENGINE_EXCEPTION" in reason
         or "ENGINE_SESSION_RUN_CONFLICT" in reason
+        or "TERMINALIZED_WITH_REMAINING_BLOCKERS" in reason
         or "ENGINE_ERROR:" in text
         or "ENGINE_DISPATCH_FAILED" in text
         or "ITERATION BUDGET" in text
+        or "TERMINALIZED_WITH_REMAINING_BLOCKERS" in text
         or blocker
         in {
             "engine_empty_response",
@@ -1087,11 +1440,92 @@ def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str)
             "engine_session_run_conflict",
             "engine_tool_loop_stalled",
             "engine_tool_loop_stalled_no_diff",
+            "worker_incomplete_diff",
         }
         or "ENGINE_PROMPT_TIMEOUT" in text
         or "ENGINE_TOOL_LOOP_STALLED" in text
         or "ENGINE_SESSION_RUN_CONFLICT" in text
     )
+
+
+def _terminalized_note_reports_blockers(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return False
+    hard_blocker_markers = (
+        "placeholder",
+        "not yet implement",
+        "not yet implemented",
+        "not implemented",
+        "only partially implemented",
+        "only partial",
+        "partially implemented",
+        "need to inspect",
+        "needs source inspection",
+        "source inspection is still required",
+        "requested subtask also mentioned",
+        "visible diff only",
+        "diff only adds",
+        "does not implement",
+        "missing required",
+        "missing coverage",
+        "would not compile",
+        "does not compile",
+        "won't compile",
+        "will not compile",
+        "compile failure",
+        "compile failures",
+        "compilation failure",
+        "type mismatch",
+        "type mismatches",
+        "unresolved name",
+        "undefined name",
+        "not in scope",
+    )
+    if any(marker in normalized for marker in hard_blocker_markers):
+        return True
+    no_blocker_markers = (
+        "no blocker",
+        "no blockers",
+        "blocker: none",
+        "blockers: none",
+        "no remaining blocker",
+        "no remaining blockers",
+        "remaining blockers: none",
+        "remaining blockers: - none",
+        "remaining blockers: none visible",
+        "remaining blockers: - none visible",
+        "remaining implementation blockers: none",
+        "remaining implementation blockers: - none",
+        "remaining implementation blockers: none visible",
+        "remaining implementation blockers: - none visible",
+        "remaining implementation blockers: none visible from the diff",
+        "remaining implementation blockers: - none visible from the diff",
+        "remaining implementation blockers: none visible from the provided diff",
+        "remaining implementation blockers: - none visible from the provided diff",
+        "remaining implementation blockers: none visible from the provided diff excerpt",
+        "remaining implementation blockers: - none visible from the provided diff excerpt",
+        "remaining blockers: no actual test run visible",
+        "remaining blockers: - no actual test run visible",
+        "remaining blockers: no test run visible",
+        "remaining blockers: - no test run visible",
+        "remaining blockers: verification not run",
+        "remaining blockers: - verification not run",
+        "remaining blockers: no verification visible",
+        "remaining blockers: - no verification visible",
+        "remaining blockers - none",
+        "remaining blockers: n/a",
+    )
+    if any(marker in normalized for marker in no_blocker_markers):
+        return False
+    blocker_markers = (
+        "remaining blocker",
+        "remaining blockers",
+        "blocker:",
+        "blockers:",
+        "blocked by",
+    )
+    return any(marker in normalized for marker in blocker_markers)
 
 
 def _worker_result_should_retry(result: dict[str, Any]) -> bool:
@@ -1452,6 +1886,8 @@ def _recover_nonzero_result_with_diff(
     diff_text = git_diff_stat(worktree).strip()
     if result.get("returncode", 0) == 0 or not diff_text or not changed_files:
         return result
+    if not _changed_files_have_substantive_content(worktree, changed_files):
+        return result
     stdout_text = str(result.get("stdout") or "")
     reason_text = str(result.get("failure_reason") or reason or "").upper()
     blocker_kind = str(result.get("blocker_kind") or "").lower()
@@ -1504,7 +1940,7 @@ def _recover_nonzero_result_if_diff_satisfies_subtask(
         targets_exist=_target_files_exist(worktree, subtask),
         diff_touches_targets=_diff_touches_target_files(worktree, subtask),
         diff_touches_substantive_targets=_diff_touches_substantive_target_files(worktree, subtask),
-    ):
+    ) and not _diff_touches_nearby_test_files(worktree, subtask):
         return result
     return _recover_nonzero_result_with_diff(result, log_path, worktree, reason=reason)
 
@@ -1571,6 +2007,8 @@ def _terminalize_worker_after_tool_loop(
     changed_files = _worktree_changed_files(worktree)
     if not changed_files:
         return result
+    if not _changed_files_have_substantive_content(worktree, changed_files):
+        return result
     if _corrupt_repeated_source_diff_reason(worktree):
         return result
     requires_real_diff = require_filesystem_changes or _subtask_requires_real_diff(subtask)
@@ -1580,7 +2018,7 @@ def _terminalize_worker_after_tool_loop(
         targets_exist=_target_files_exist(worktree, subtask),
         diff_touches_targets=_diff_touches_target_files(worktree, subtask),
         diff_touches_substantive_targets=_diff_touches_substantive_target_files(worktree, subtask),
-    ):
+    ) and not _diff_touches_nearby_test_files(worktree, subtask):
         return result
     try:
         diff_stat = git_diff_stat(worktree).strip()
@@ -1601,7 +2039,9 @@ def _terminalize_worker_after_tool_loop(
         "- changed files\n"
         "- what the diff appears to implement\n"
         "- verification that was actually performed, or `verification not run` if none is visible\n"
-        "- any remaining blockers\n\n"
+        "- any remaining implementation blockers\n\n"
+        "Do not list missing verification as a remaining blocker by itself; ACA runs a separate review/verification phase. "
+        "Do list incomplete implementation, placeholder tests/files, missing required coverage, or unsafe/no-op diffs as blockers.\n\n"
         f"Subtask: {subtask.get('title') or subtask.get('id') or role}\n"
         f"Changed files:\n{chr(10).join(f'- {path}' for path in changed_files)}\n\n"
         f"Diff stat:\n{diff_stat}\n\n"
@@ -1664,6 +2104,16 @@ def _terminalize_worker_after_tool_loop(
     )
     with log_path.open("a", encoding="utf-8") as log:
         log.write(note)
+    if _terminalized_note_reports_blockers(text):
+        result["stdout"] = f"{result.get('stdout') or ''}{note}"
+        result["failure_reason"] = "TERMINALIZED_WITH_REMAINING_BLOCKERS"
+        result["blocker_kind"] = "worker_incomplete_diff"
+        result["recovery_action"] = (
+            "Inspect the preserved worker diff and rerun with a narrower repair prompt for the unmet acceptance criteria."
+        )
+        result["changed_files"] = changed_files
+        result["engine"] = engine_meta
+        return result
     recovered = dict(result)
     recovered["returncode"] = 0
     recovered["stdout"] = note
@@ -1714,8 +2164,11 @@ def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
         [
             "Then create or edit the target files using `write`, `edit`, or `apply_patch`.",
             "Do not create marker files, status files, temporary files, scratch notes, or placeholder files to satisfy write-required mode.",
+            "For private helper coverage, add real tests inside the source module that defines the helper; do not add placeholder integration or contract test files.",
+            "When adding tests, prefer additive test modules or additive cases; do not rewrite existing tests unless the task explicitly requires changing them.",
             "Missing test coverage or missing behavior is not a blocker; implement the smallest safe improvement in one of the target files.",
-            "Finish by verifying the changed files with `ls -la`, `read`, or `grep`.",
+            "Once a substantive diff exists, stop expanding scope: run one lightweight verification or file readback, then return the final completion note.",
+            "Finish by verifying the changed files with `ls -la`, `read`, `grep`, or the narrowest relevant test command.",
         ]
     )
     if has_pr_context:
@@ -1747,6 +2200,7 @@ def _coerce_worker_failure(
     diff_touches_targets = _diff_touches_target_files(worktree, subtask)
     diff_touches_substantive_targets = _diff_touches_substantive_target_files(worktree, subtask)
     changed_files = _worktree_changed_files(worktree)
+    substantive_changes = _changed_files_have_substantive_content(worktree, changed_files) if changed_files else False
     ignored_existing_targets = _ignored_existing_target_files(worktree, subtask)
     corrupt_reason = _corrupt_repeated_source_diff_reason(worktree) if diff_text and changed_files else None
     if corrupt_reason:
@@ -1765,7 +2219,7 @@ def _coerce_worker_failure(
         targets_exist=targets_exist,
         diff_touches_targets=diff_touches_targets,
         diff_touches_substantive_targets=diff_touches_substantive_targets,
-    )
+    ) or _diff_touches_nearby_test_files(worktree, subtask)
     if result.get("returncode", 0) != 0 and diff_text and diff_satisfies_subtask:
         return _recover_nonzero_result_with_diff(
             result,
@@ -1803,13 +2257,13 @@ def _coerce_worker_failure(
         and changed_files
         and requires_real_diff
         and _substantive_target_files(subtask)
-        and all(_is_metadata_only_target_path(path) for path in changed_files)
+        and _support_only_changed_files_for_subtask(subtask, changed_files)
         and not diff_satisfies_subtask
     ):
         if failure_reason:
             result["engine_failure_reason"] = failure_reason
         failure_reason = "TARGET_FILES_UNCHANGED"
-    if result.get("returncode", 0) == 0 and requires_real_diff and not changed_files:
+    if result.get("returncode", 0) == 0 and requires_real_diff and (not changed_files or not substantive_changes):
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
     elif result.get("returncode", 0) == 0 and not diff_text:
         failure_reason = failure_reason or "NO_FILESYSTEM_CHANGES"
@@ -2009,16 +2463,22 @@ def stream_tandem_prompt(
                     "recovery": [],
                 }
                 timeout_multiplier = max(1.0, float(timeout_multiplier or 1.0))
-                prompt_sync_timeout = _scaled_timeout_seconds(
-                    _prompt_sync_timeout_seconds(cfg, role, write_required),
+                prompt_sync_timeout = _scaled_prompt_sync_timeout_seconds(
+                    cfg,
+                    role,
+                    write_required,
                     timeout_multiplier,
                 )
-                async_prompt_timeout = _scaled_timeout_seconds(
-                    _async_prompt_timeout_seconds(cfg, role, write_required),
+                async_prompt_timeout = _scaled_async_prompt_timeout_seconds(
+                    cfg,
+                    role,
+                    write_required,
                     timeout_multiplier,
                 )
-                async_no_text_timeout = _scaled_timeout_seconds(
-                    _async_no_text_timeout_seconds(cfg, role, write_required),
+                async_no_text_timeout = _scaled_async_no_text_timeout_seconds(
+                    cfg,
+                    role,
+                    write_required,
                     timeout_multiplier,
                 )
                 if timeout_multiplier > 1.0:
@@ -2208,6 +2668,18 @@ def stream_tandem_prompt(
                             "engine_empty_response",
                         }
                     )
+                    if recover_with_async and _skip_tool_recovery_when_partial_diff_exists(
+                        role=role,
+                        write_required=write_required,
+                        cwd=cwd,
+                        blocker_kind=blocker_kind,
+                    ):
+                        recover_with_async = False
+                        engine_meta["partial_diff_recovery_deferred"] = True
+                        recovery_action = (
+                            "ACA preserved the partial worker diff instead of launching overlapping "
+                            "tool-capable recovery on the same worktree."
+                        )
                     if recover_with_async:
                         previous_session_id = session_id
                         engine_meta["prompt_sync_first_session_id"] = previous_session_id
@@ -2632,6 +3104,8 @@ def summarize_worker_notes(
         "blocker_kind": str(result.get("blocker_kind") or ""),
         "recovery_action": str(result.get("recovery_action") or ""),
         "engine": dict(result.get("engine") or {}),
+        "artifacts": dict(result.get("artifacts") or {}),
+        "partial_diff_artifact": str(result.get("partial_diff_artifact") or ""),
         "write_required": bool(result.get("write_required", True)),
         "verified_existing": bool(result.get("verified_existing")),
         "changed_files": [path for path in changed_files if path],
@@ -2683,6 +3157,10 @@ def run_worker_subtask(
     # Create an isolated worktree for this worker/subtask ownership pair.
     worktree_path = layout["worktrees"] / worker_worktree_name(worker_id, subtask.get("id"))
     worktree = create_worktree(repo_path, worktree_path)
+    log_path = layout["logs"] / f"{worker_id}.log"
+    carry_forward_patch = str(subtask.get("carry_forward_patch") or "").strip()
+    if carry_forward_patch:
+        _apply_carry_forward_patch(worktree, Path(carry_forward_patch), log_path)
     subtask = _materialize_worker_context(worktree, subtask)
     subtask = _annotate_ignored_target_files(worktree, subtask)
     
@@ -2696,7 +3174,6 @@ def run_worker_subtask(
     worker_cli_provider = worker_model_selection["provider"]
     worker_model = worker_model_selection["model"]
     env = engine_env(cfg)
-    log_path = layout["logs"] / f"{worker_id}.log"
     config_path = None
     
     task_source = task.get("source") if isinstance(task, dict) else {}
@@ -2879,8 +3356,7 @@ def run_worker_subtask(
                 require_filesystem_changes=require_filesystem_changes,
                 reason=str(retry_result.get("failure_reason") or "retry produced diff"),
             )
-        if retry_result["returncode"] == 0:
-            result = retry_result
+        result = retry_result
             
     append_event(
         layout["events"],
