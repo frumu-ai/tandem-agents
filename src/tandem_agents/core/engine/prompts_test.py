@@ -175,6 +175,9 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("standalone duplicate implementation", prompt)
         self.assertIn("live smoke/API path", prompt)
         self.assertIn("prefer 1-3 high-signal files", prompt)
+        self.assertIn("graph-derived likely files", prompt)
+        self.assertIn("discovery evidence, not final proof", prompt)
+        self.assertIn("read concrete files before changing code", prompt)
 
     def test_write_required_prompt_rejects_marker_files(self) -> None:
         subtask = self._subtask(
