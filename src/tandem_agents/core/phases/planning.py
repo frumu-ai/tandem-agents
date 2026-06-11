@@ -144,22 +144,44 @@ def run_manager_prompt(ctx: RunContext) -> None:
     """
     from src.tandem_agents.core.engine.engine import engine_env, engine_session_provider_model
     from src.tandem_agents.core.execution.worker import stream_tandem_prompt
-    from src.tandem_agents.core.repository.repo_truth import repo_context_summary
+    from src.tandem_agents.core.repository.repo_context import repo_context_for_task
     from src.tandem_agents.core.engine.prompts import build_manager_prompt
     from src.tandem_agents.core.execution import runner_core as _rc
-    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+    from src.tandem_agents.runtime.runstate import append_event, save_blackboard, write_status
     from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
 
     manager_model_selection = engine_session_provider_model(ctx.cfg, "manager")
     manager_provider = manager_model_selection["provider"]
     manager_model = manager_model_selection["model"]
+    repo_context = repo_context_for_task(
+        ctx.cfg,
+        ctx.repo_path,
+        ctx.task,
+        artifact_path=ctx.layout["artifacts"] / "repo_context_bundle.json",
+    )
+    ctx.blackboard["repo_context"] = {
+        "source": repo_context.source,
+        "fallback_used": repo_context.fallback_used,
+        "error": repo_context.error,
+        "artifact_path": repo_context.artifact_path,
+        "index_source": repo_context.index_source,
+        "index_status": repo_context.index_status,
+        "index_error": repo_context.index_error,
+    }
+    ctx.status.setdefault("artifacts", {})
+    if repo_context.artifact_path:
+        ctx.status["artifacts"]["repo_context_bundle"] = repo_context.artifact_path
+    ctx.status["repo_context"] = dict(ctx.blackboard["repo_context"])
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.layout["run_dir"], ctx.blackboard)
+    write_status(ctx.layout["status"], ctx.status)
 
     manager_prompt = build_manager_prompt(
         ctx.run_id,
         ctx.task,
         ctx.repo,
         ctx.cfg,
-        repo_context=repo_context_summary(ctx.repo_path, ctx.task),
+        repo_context=repo_context.text,
         previous_feedback=getattr(ctx, "_previous_feedback", None),
     )
 
@@ -167,7 +189,7 @@ def run_manager_prompt(ctx: RunContext) -> None:
         ctx.layout["events"],
         "manager.started",
         ctx.run_id,
-        {"role": "manager"},
+        {"role": "manager", "repo_context": dict(ctx.blackboard["repo_context"])},
         task_id=ctx.task.get("task_id"),
         role="manager",
         repo={"path": ctx.repo.get("path")},
