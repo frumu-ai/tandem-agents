@@ -130,6 +130,30 @@ from src.tandem_agents.core.engine.tandem_client_sdk import (
 
 logger = logging.getLogger("aca.runner_core")
 
+_RETRYABLE_WORKER_BLOCKER_KINDS = {
+    "worker_incomplete_diff",
+    "worker_no_diff",
+    "engine_tool_loop_stalled",
+    "engine_tool_loop_stalled_no_diff",
+    "engine_prompt_timeout",
+}
+
+_EXPLICIT_REPO_PATH_PREFIXES = (
+    ".github/",
+    "apps/",
+    "crates/",
+    "docs/",
+    "packages/",
+    "scripts/",
+    "src/",
+    "tests/",
+)
+_EXPLICIT_REPO_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@+-])((?:\.github|apps|crates|docs|packages|scripts|src|tests)"
+    r"(?:/[A-Za-z0-9_.@+-]+)+/?)"
+)
+_SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_:]*)`|\b([A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_:]+|[A-Za-z_][A-Za-z0-9_]{4,})\b")
+
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
@@ -199,6 +223,168 @@ def _task_mentions_external_pr_candidates(task: dict[str, Any] | None) -> bool:
     )
 
 
+def _task_scope_text(task: dict[str, Any] | None) -> str:
+    if not isinstance(task, dict):
+        return ""
+    contract = task_contract_payload(task)
+    parts = [
+        task.get("title"),
+        task.get("description"),
+        task.get("raw_issue_body"),
+        task.get("body"),
+        contract.get("local_goal"),
+        contract.get("notes_for_agent"),
+    ]
+    for key in ("acceptance_criteria", "deliverables", "in_scope", "verification_commands"):
+        parts.extend(_as_list(task.get(key)))
+        parts.extend(_as_list(contract.get(key)))
+    return "\n".join(str(part or "") for part in parts if str(part or "").strip())
+
+
+def _repo_path_mentions_from_task(task: dict[str, Any] | None) -> list[str]:
+    text = _task_scope_text(task).replace("\\", "/")
+    candidates: list[str] = []
+    for match in _EXPLICIT_REPO_PATH_RE.finditer(text):
+        candidate = match.group(1).strip().strip("`'\".,;:)(")
+        while candidate.startswith("./"):
+            candidate = candidate[2:]
+        if candidate and candidate.startswith(_EXPLICIT_REPO_PATH_PREFIXES) and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _symbol_mentions_from_task(task: dict[str, Any] | None) -> list[str]:
+    text = _task_scope_text(task)
+    symbols: list[str] = []
+    noisy = {
+        "acceptance",
+        "criteria",
+        "deliverables",
+        "linear",
+        "project",
+        "repository",
+        "tandem",
+    }
+    for match in _SYMBOL_RE.finditer(text):
+        symbol = (match.group(1) or match.group(2) or "").strip("`")
+        if not symbol:
+            continue
+        parts = [part for part in symbol.split("::") if part]
+        for part in [symbol, *parts]:
+            lower = part.lower()
+            if len(part) < 5 or lower in noisy:
+                continue
+            if part not in symbols:
+                symbols.append(part)
+    return symbols
+
+
+def _candidate_source_files_under(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        return []
+    allowed_suffixes = {
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".py",
+        ".go",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".md",
+    }
+    files: list[Path] = []
+    for candidate in path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        rel = candidate.relative_to(path).as_posix()
+        if "/target/" in f"/{rel}/" or "/node_modules/" in f"/{rel}/":
+            continue
+        if candidate.suffix.lower() in allowed_suffixes:
+            files.append(candidate)
+    return files
+
+
+def _explicit_file_score(path: Path, repo_path: Path, symbols: list[str], scope_text: str, original_index: int) -> tuple[int, int, str]:
+    try:
+        rel = path.relative_to(repo_path).as_posix()
+    except ValueError:
+        rel = path.as_posix()
+    lower_rel = rel.lower()
+    lower_scope = scope_text.lower()
+    score = 0
+    if lower_rel.endswith((".rs", ".ts", ".tsx", ".py", ".js", ".mjs")):
+        score += 8
+    if "/tests/" in f"/{lower_rel}/" or re.search(r"(?:^|/)(?:[^/]*test[^/]*)\.", lower_rel):
+        score += 12 if any(word in lower_scope for word in ("test", "tests", "suite", "coverage")) else 2
+    if lower_rel.endswith("/lib.rs") or lower_rel.endswith("/mod.rs"):
+        score += 8
+    for token in re.findall(r"[a-z0-9]+", lower_scope):
+        if len(token) >= 5 and token in lower_rel:
+            score += 4
+    text = ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        text = ""
+    for symbol in symbols:
+        parts = [symbol, *symbol.split("::")]
+        if any(part and part in text for part in parts):
+            score += 28
+        if any(part and part.lower() in lower_rel for part in parts):
+            score += 18
+    if "approval_classifier" in lower_scope and "approval_classifier" in lower_rel:
+        score += 36
+    if "path sandbox" in lower_scope and "builtin_tools" in lower_rel:
+        score += 24
+    if "registry resolution" in lower_scope and lower_rel.endswith("/lib.rs"):
+        score += 20
+    if lower_rel.startswith("docs/internal/"):
+        score -= 100
+    if lower_rel.endswith(("Cargo.lock", "package-lock.json", "pnpm-lock.yaml")):
+        score -= 50
+    return (-score, original_index, lower_rel)
+
+
+def _explicit_task_target_files(repo_path: Path, task: dict[str, Any] | None, limit: int = 8) -> list[str]:
+    mentions = _repo_path_mentions_from_task(task)
+    if not mentions:
+        return []
+    scope_text = _task_scope_text(task)
+    symbols = _symbol_mentions_from_task(task)
+    exact_files: list[str] = []
+    scored_candidates: list[tuple[tuple[int, int, str], str]] = []
+    for mention in mentions:
+        candidate = repo_path / mention.rstrip("/")
+        if candidate.is_file():
+            rel = candidate.relative_to(repo_path).as_posix()
+            if rel not in exact_files:
+                exact_files.append(rel)
+            continue
+        for index, file_path in enumerate(_candidate_source_files_under(candidate)):
+            try:
+                rel = file_path.relative_to(repo_path).as_posix()
+            except ValueError:
+                continue
+            score = _explicit_file_score(file_path, repo_path, symbols, scope_text, index)
+            if score[0] < 0:
+                scored_candidates.append((score, rel))
+    selected = list(exact_files)
+    for _, rel in sorted(scored_candidates):
+        if rel not in selected:
+            selected.append(rel)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, Any]:
     failed = [
         result
@@ -224,6 +410,13 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
         recovery_action = (
             first.get("recovery_action")
             or "Inspect the worker log and PR candidate context, then reset the task to Backlog if another attempt is needed."
+        )
+    elif kind == "worker_incomplete_diff":
+        message = "Worker produced a partial repository diff but reported remaining blockers."
+        phase_detail = f"{worker_id} produced an incomplete diff"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Retry with a narrower repair prompt focused on the unmet acceptance criteria."
         )
     elif kind == "ignored_path_changes":
         ignored = first.get("ignored_files") or []
@@ -281,6 +474,68 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
         "engine": engine,
         "worker": first,
     }
+
+
+def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, Any], attempt: int) -> str | None:
+    kind = str(blocker.get("kind") or "").strip()
+    if kind not in _RETRYABLE_WORKER_BLOCKER_KINDS:
+        return None
+    changed_files = _collect_worker_changed_files(ctx.worker_results)
+    changed_text = "\n".join(f"- {path}" for path in changed_files) if changed_files else "- none"
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    patch_path = str(worker.get("partial_diff_artifact") or ((worker.get("artifacts") or {}).get("partial_diff") if isinstance(worker.get("artifacts"), dict) else "") or "").strip()
+    stdout_excerpt = str(worker.get("stdout") or "").strip()
+    if len(stdout_excerpt) > 2000:
+        stdout_excerpt = stdout_excerpt[:2000] + "\n..."
+    return "\n\n".join(
+        part
+        for part in (
+            f"CRITICAL: Worker attempt {attempt + 1} failed with retryable blocker `{kind}`.",
+            str(blocker.get("message") or "").strip(),
+            f"Detail: {blocker.get('detail')}" if blocker.get("detail") else "",
+            "Changed files from the failed attempt:\n" + changed_text,
+            f"Preserved partial patch: `{patch_path}`" if patch_path else "",
+            "Worker output excerpt:\n" + stdout_excerpt if stdout_excerpt else "",
+            (
+                "Plan a smaller repair slice that preserves any useful existing diff, then explicitly addresses the unmet "
+                "acceptance criteria. Do not repeat only the same partial change, and do not mark the task complete "
+                "until required tests or deterministic verification pass."
+            ),
+        )
+        if part
+    )
+
+
+def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for result in worker_results:
+        patch_path = str(result.get("partial_diff_artifact") or "").strip()
+        if not patch_path and isinstance(result.get("artifacts"), dict):
+            patch_path = str(result["artifacts"].get("partial_diff") or "").strip()
+        if not patch_path:
+            continue
+        subtask_id = str(result.get("subtask_id") or "").strip()
+        worker_id = str(result.get("worker_id") or "").strip()
+        entry = {
+            "subtask_id": subtask_id,
+            "worker_id": worker_id,
+            "patch_path": patch_path,
+        }
+        if entry not in artifacts:
+            artifacts.append(entry)
+    return artifacts
+
+
+def _completed_subtask_ids_for_retry(worker_results: list[dict[str, Any]]) -> list[str]:
+    completed: list[str] = []
+    for result in worker_results:
+        status = _normalized_text(result.get("status"))
+        if status not in {"completed", "skipped_existing", "tolerated_failure"} and not result.get("verified_existing"):
+            continue
+        subtask_id = str(result.get("subtask_id") or "").strip()
+        if subtask_id and subtask_id not in completed:
+            completed.append(subtask_id)
+    return completed
 
 
 def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | None:
@@ -961,12 +1216,15 @@ def _normalize_manager_subtasks(
     normalized: list[dict[str, Any]] = []
     repo_prefix = str(Path(repo_path)).rstrip("/") + "/"
     contract = task_contract_payload(task)
-    task_target_files = [
+    declared_task_target_files = [
         str(entry).strip()
         for entry in _as_list(contract.get("target_files") or task.get("target_files"))
         if str(entry).strip()
     ]
-    contract_constrained = bool(task_target_files)
+    task_target_files = list(declared_task_target_files)
+    if not task_target_files:
+        task_target_files = _explicit_task_target_files(Path(repo_path), task)
+    contract_constrained = bool(declared_task_target_files)
     suppress_discovered_targets = _task_mentions_external_pr_candidates(task) and not contract_constrained
 
     def _normalize_repo_file(entry: str) -> str:
@@ -994,6 +1252,33 @@ def _normalize_manager_subtasks(
             if entry not in kept:
                 kept.append(entry)
         return kept, ignored
+
+    def _repo_file_exists(entry: str) -> bool:
+        rel_path = str(entry or "").strip()
+        return bool(rel_path) and (Path(repo_path) / rel_path).is_file()
+
+    def _missing_target_can_be_created(entry: str) -> bool:
+        rel_path = str(entry or "").strip().replace("\\", "/").lower()
+        if not rel_path:
+            return False
+        if rel_path.startswith(".github/workflows/") and rel_path.endswith((".yml", ".yaml")):
+            return True
+        if "/tests/" in f"/{rel_path}/" or rel_path.startswith("tests/"):
+            return True
+        name = Path(rel_path).name
+        return name.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+
+    def _drop_hallucinated_missing_source_targets(entries: list[str]) -> tuple[list[str], list[str]]:
+        if contract_constrained or not any(_repo_file_exists(entry) for entry in entries):
+            return entries, []
+        kept: list[str] = []
+        dropped: list[str] = []
+        for entry in entries:
+            if _repo_file_exists(entry) or _missing_target_can_be_created(entry):
+                kept.append(entry)
+            elif entry not in dropped:
+                dropped.append(entry)
+        return kept, dropped
 
     normalized_task_target_files = [_normalize_repo_file(entry) for entry in task_target_files]
     normalized_task_target_files, ignored_task_target_files = _filter_ignored_files(normalized_task_target_files)
@@ -1082,6 +1367,17 @@ def _normalize_manager_subtasks(
             )
         if not normalized_files and normalized_target_files:
             normalized_files = list(normalized_target_files)
+        normalized_files, dropped_missing_files = _drop_hallucinated_missing_source_targets(normalized_files)
+        normalized_target_files, dropped_missing_target_files = _drop_hallucinated_missing_source_targets(normalized_target_files)
+        dropped_missing = list(dict.fromkeys(dropped_missing_files + dropped_missing_target_files))
+        if dropped_missing:
+            extra = (
+                "ACA dropped non-existing manager file targets because this subtask already has an existing "
+                "source target and the missing paths were not recognized test/workflow files: "
+                + ", ".join(dropped_missing)
+                + "."
+            )
+            scope_note = f"{scope_note}\n{extra}".strip()
         if contract_constrained:
             allowed = set(normalized_task_target_files)
             if not normalized_files or any(entry not in allowed for entry in normalized_files):
@@ -1134,6 +1430,8 @@ def _prepare_subtasks_with_discovery(
     manager_plan: dict[str, Any],
     repo_path: Path,
     max_workers: int,
+    *,
+    merge_manager_subtasks: bool = True,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     discovered_files = discover_repo_files(repo_path, task, limit=12)
     manager_subtasks = list(manager_plan.get("subtasks") or [])
@@ -1152,6 +1450,8 @@ def _prepare_subtasks_with_discovery(
             for entry in _as_list(contract.get("target_files") or task.get("target_files"))
             if str(entry).strip()
         ]
+        if not task_target_files:
+            task_target_files = _explicit_task_target_files(repo_path, task)
         if task_target_files:
             subtasks[0]["files"] = list(task_target_files)
             subtasks[0]["target_files"] = list(task_target_files)
@@ -1162,7 +1462,7 @@ def _prepare_subtasks_with_discovery(
             _compact_overbroad_single_worker_subtask(task, subtask, discovered_files)
             for subtask in subtasks
         ]
-    elif max_workers <= 1 and has_manager_subtasks and len(subtasks) > 1:
+    elif max_workers <= 1 and merge_manager_subtasks and has_manager_subtasks and len(subtasks) > 1:
         subtasks = _merge_manager_subtasks_for_single_worker(task, subtasks)
     if has_manager_subtasks:
         return discovered_files, subtasks
@@ -1232,6 +1532,40 @@ def _collect_worker_changed_files(worker_results: list[dict[str, Any]]) -> list[
             seen.add(rel_path)
             files.append(rel_path)
     return files
+
+
+def _validation_expected_repo_files(
+    repo_path: Path,
+    expected_files: list[str],
+    changed_files: list[str],
+) -> list[str]:
+    """Return concrete files deterministic validation should require.
+
+    Manager plans often contain candidate target paths. After a worker has
+    produced a diff, a missing untouched candidate should not force a retry into
+    creating that speculative file. Validate files that already exist plus files
+    the worker actually changed.
+    """
+
+    def _normalize(raw_path: str) -> str:
+        rel_path = str(raw_path).strip().replace("\\", "/")
+        while rel_path.startswith("./"):
+            rel_path = rel_path[2:]
+        return rel_path
+
+    normalized_expected = [_normalize(str(path)) for path in expected_files if str(path).strip()]
+    normalized_changed = [_normalize(str(path)) for path in changed_files if str(path).strip()]
+    normalized_changed_set = set(normalized_changed)
+    if not normalized_changed:
+        return list(dict.fromkeys(normalized_expected))
+
+    concrete: list[str] = []
+    for rel_path in [*normalized_expected, *normalized_changed]:
+        if not rel_path or rel_path in concrete:
+            continue
+        if rel_path in normalized_changed_set or (repo_path / rel_path).is_file():
+            concrete.append(rel_path)
+    return concrete
 
 
 def _upsert_worker_result(collection: list[dict[str, Any]], result: dict[str, Any]) -> None:
@@ -1324,6 +1658,50 @@ def _execute_local_worker_pool(
     if not pending_subtasks:
         return []
     results: list[dict[str, Any]] = []
+
+    def _run_one(index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        try:
+            result = worker_runner(cfg, run_id, repo_path, run_dir, task, subtask, worker_id, index)
+        except Exception as exc:
+            result = {
+                "worker_id": worker_id,
+                "subtask_index": index,
+                "subtask_id": subtask["id"],
+                "title": subtask["title"],
+                "status": "failed",
+                "returncode": 1,
+                "worktree": "",
+                "log_path": "",
+                "output_excerpt": f"Worker execution raised an exception: {exc}",
+                "write_required": bool(subtask.get("write_required", True)),
+                "verified_existing": False,
+            }
+        if not isinstance(result, dict):
+            result = {}
+        result.setdefault("worker_id", worker_id)
+        result.setdefault("subtask_index", index)
+        result.setdefault("subtask_id", subtask["id"])
+        result.setdefault("title", subtask["title"])
+        result.setdefault("status", "failed" if result.get("returncode", 1) else "completed")
+        result.setdefault("returncode", 0 if _normalized_text(result.get("status")) == "completed" else 1)
+        subtask_write_required = bool(subtask.get("write_required", True))
+        result["write_required"] = subtask_write_required or bool(result.get("write_required"))
+        result.setdefault("verified_existing", False)
+        return result
+
+    def _record_result(result: dict[str, Any]) -> None:
+        results.append(result)
+        if on_result is not None:
+            on_result(result)
+
+    if worker_limit <= 1:
+        for index, subtask in enumerate(pending_subtasks, start=1):
+            result = _run_one(index, subtask, f"worker-{index}")
+            _record_result(result)
+            if _has_unresolved_write_required_worker_failure([result]):
+                break
+        return results
+
     with ThreadPoolExecutor(max_workers=max(1, worker_limit)) as executor:
         futures = {
             executor.submit(worker_runner, cfg, run_id, repo_path, run_dir, task, subtask, f"worker-{index}", index): (
@@ -1362,9 +1740,7 @@ def _execute_local_worker_pool(
             subtask_write_required = bool(subtask.get("write_required", True))
             result["write_required"] = subtask_write_required or bool(result.get("write_required"))
             result.setdefault("verified_existing", False)
-            results.append(result)
-            if on_result is not None:
-                on_result(result)
+            _record_result(result)
     return results
 
 
@@ -2548,10 +2924,23 @@ def _run_once_internal_impl(
     # ------------------------------------------------------------------
     # Phase 4: Repair loop
     # ------------------------------------------------------------------
-    max_loops = getattr(cfg.swarm, "max_retries", 1) + 1
+    configured_max_retries = max(0, int(getattr(cfg.swarm, "max_retries", 1) or 0))
+    max_loops = configured_max_retries + 1
+    ctx.status["repair"] = {
+        "configured_max_retries": configured_max_retries,
+        "max_loops": max_loops,
+        "attempt": 0,
+    }
+    ctx.blackboard["repair"] = dict(ctx.status["repair"])
+    write_status(layout["status"], ctx.status)
+    save_blackboard(layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(run_dir, ctx.blackboard)
     previous_feedback: str | None = None
 
     for attempt in range(max_loops):
+        ctx.status.setdefault("repair", {})["attempt"] = attempt + 1
+        ctx.blackboard.setdefault("repair", {})["attempt"] = attempt + 1
+        write_status(layout["status"], ctx.status)
         # If coordination has been lost (3+ consecutive heartbeat misses) we
         # must not continue mutating run state on a dead lease — another
         # worker may have already reclaimed the task. Block early so the
@@ -2702,6 +3091,38 @@ def _run_once_internal_impl(
 
         if ctx.status["metrics"]["failed_workers"]:
             source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+            worker_blocker = _worker_failure_blocker(ctx.worker_results)
+            retry_feedback = _worker_failure_retry_feedback(ctx, worker_blocker, attempt)
+            if retry_feedback and attempt < max_loops - 1:
+                previous_feedback = retry_feedback
+                partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
+                completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
+                if partial_diff_artifacts:
+                    ctx.blackboard.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
+                if completed_subtask_ids:
+                    ctx.blackboard.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
+                _append_blackboard_note(
+                    ctx.blackboard,
+                    f"Attempt {attempt + 1} hit retryable worker blocker `{worker_blocker['kind']}`. Retrying.",
+                )
+                append_event(
+                    layout["events"],
+                    "worker.retry_deferred_to_repair_loop",
+                    run_id,
+                    {
+                        "attempt": attempt + 1,
+                        "kind": worker_blocker["kind"],
+                        "detail": worker_blocker.get("detail"),
+                        "partial_diff_artifacts": partial_diff_artifacts,
+                        "completed_subtask_ids": completed_subtask_ids,
+                    },
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                save_blackboard(layout["blackboard"], ctx.blackboard)
+                write_blackboard_snapshot(run_dir, ctx.blackboard)
+                continue
             if _has_unresolved_write_required_worker_failure(ctx.worker_results):
                 return _block_worker_failure(ctx)
             if isinstance(source, dict) and str(source.get("type") or "").strip() == "github_project":
@@ -2969,6 +3390,22 @@ def _integration_semantic_blocker_can_defer_to_review(
             payload.get("tests") if isinstance(payload, dict) else "",
         )
     ).lower()
+    concrete_worker_failure_markers = (
+        "placeholder",
+        "requested",
+        "not implemented",
+        "incomplete",
+        "acceptance criteria unmet",
+        "unmet acceptance",
+        "missing implementation",
+        "missing coverage",
+        "no repository diff",
+        "no filesystem changes",
+        "worker output only",
+        "cargo test",
+    )
+    if any(marker in combined for marker in concrete_worker_failure_markers):
+        return False
     inspection_markers = (
         "bubblewrap_not_available",
         "sandbox",

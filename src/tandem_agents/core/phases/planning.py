@@ -43,16 +43,96 @@ def _prepare_subtasks(ctx: RunContext) -> tuple[list[str], list[dict[str, Any]]]
     """
     from src.tandem_agents.core.execution import runner_core as _rc  # noqa: PLC0415
     from pathlib import Path
-    # max_workers limits dispatch concurrency later. When swarm is disabled,
-    # preparation compacts manager subtasks into one complete serial contract so
-    # dependent files are edited in the same worktree instead of isolated slices.
+    # Dispatch concurrency is limited later. When swarm is disabled, preserve
+    # manager subtasks and run them serially instead of compacting a broad plan
+    # into one prompt that can exhaust the engine iteration/timeout budget.
     planning_subtask_limit = max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1)
     return _rc._prepare_subtasks_with_discovery(
         ctx.task,
         ctx.manager_plan,
         Path(ctx.repo.get("path") or "."),
         planning_subtask_limit,
+        merge_manager_subtasks=ctx.cfg.swarm.enabled,
     )
+
+
+def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[str, Any]]) -> None:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    artifacts = repair.get("partial_diff_artifacts") if isinstance(repair, dict) else []
+    if not isinstance(artifacts, list) or not artifacts:
+        return
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        patch_path = str(artifact.get("patch_path") or "").strip()
+        if not patch_path:
+            continue
+        target_subtask_id = str(artifact.get("subtask_id") or "").strip()
+        for subtask in subtasks:
+            subtask_id = str(subtask.get("id") or "").strip()
+            if target_subtask_id and subtask_id and target_subtask_id != subtask_id and len(subtasks) > 1:
+                continue
+            subtask["carry_forward_patch"] = patch_path
+            existing_scope_note = str(subtask.get("scope_note") or "").strip()
+            carry_note = (
+                "ACA will apply the preserved partial worker diff before this retry so the worker can continue "
+                "from the previous attempt instead of repeating it."
+            )
+            subtask["scope_note"] = f"{existing_scope_note}\n{carry_note}".strip()
+            break
+
+
+def _completed_repair_subtask_ids(ctx: RunContext) -> set[str]:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    raw_ids = repair.get("completed_subtask_ids") if isinstance(repair, dict) else []
+    if not isinstance(raw_ids, list):
+        return set()
+    return {str(item).strip() for item in raw_ids if str(item).strip()}
+
+
+def _completed_repair_worker_results(
+    ctx: RunContext,
+    recorded_subtask_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Return successful prior-attempt worker results missing from this retry plan."""
+    from src.tandem_agents.core.execution import runner_core as _rc  # noqa: PLC0415
+
+    completed_ids = _completed_repair_subtask_ids(ctx)
+    if not completed_ids:
+        return []
+    missing_ids = {subtask_id for subtask_id in completed_ids if subtask_id not in recorded_subtask_ids}
+    if not missing_ids:
+        return []
+    workers = ctx.blackboard.get("workers") if isinstance(ctx.blackboard, dict) else []
+    if not isinstance(workers, list):
+        return []
+    carried: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for result in reversed(workers):
+        if not isinstance(result, dict):
+            continue
+        subtask_id = str(result.get("subtask_id") or "").strip()
+        if not subtask_id or subtask_id not in missing_ids or subtask_id in seen:
+            continue
+        status = _rc._normalized_text(result.get("status"))
+        if status not in {"completed", "skipped_existing", "tolerated_failure"} and not result.get("verified_existing"):
+            continue
+        cloned = dict(result)
+        cloned["worker_id"] = f"repo-check-{subtask_id}"
+        cloned["subtask_index"] = 0
+        cloned["status"] = "skipped_existing"
+        cloned["returncode"] = 0
+        cloned["worktree"] = str(ctx.repo_path)
+        cloned["write_required"] = False
+        cloned["verified_existing"] = True
+        cloned["output_excerpt"] = (
+            "Subtask carried forward from a completed repair-loop worker even though "
+            "the retry manager narrowed the current plan away from this subtask."
+        )
+        carried.append(cloned)
+        seen.add(subtask_id)
+    carried.reverse()
+    return carried
 
 
 def run_manager_prompt(ctx: RunContext) -> None:
@@ -156,6 +236,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
 
     repo_path = ctx.repo_path
     discovered_files, subtasks = _prepare_subtasks(ctx)
+    _carry_forward_partial_diff_artifacts(ctx, subtasks)
 
     ctx.planned_subtasks = subtasks
     ctx.pending_subtasks = []
@@ -185,6 +266,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
         or bool(getattr(ctx, "_manager_fallback_required", False))
         or _rc._task_mentions_external_pr_candidates(ctx.task)
     )
+    completed_repair_subtask_ids = _completed_repair_subtask_ids(ctx)
     if not plan_validation.get("ok", True):
         blocker_kind = str(plan_validation.get("blocker_kind") or "contract_incomplete")
         blocker_message = str(plan_validation.get("blocker_message") or "Subtask plan is incomplete or unsafe.")
@@ -215,10 +297,23 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
             and file_is_readable(repo_path / str(rel_path).strip())
         ]
         subtask["existing_files"] = readable_existing
-        subtask["pre_satisfied"] = False if force_worker_execution else subtask_satisfied(repo_path, subtask)
+        carried_forward_success = (
+            str(subtask.get("id") or "").strip() in completed_repair_subtask_ids
+            and subtask_satisfied(repo_path, subtask)
+        )
+        subtask["pre_satisfied"] = (
+            True
+            if carried_forward_success
+            else (False if force_worker_execution else subtask_satisfied(repo_path, subtask))
+        )
         subtask["write_required"] = not subtask["pre_satisfied"]
 
         if subtask["pre_satisfied"]:
+            skip_reason = (
+                "carried forward from a completed repair-loop worker"
+                if carried_forward_success
+                else "already satisfied"
+            )
             skipped_result = {
                 "worker_id": f"repo-check-{subtask['id']}",
                 "subtask_index": 0,
@@ -229,8 +324,8 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
                 "worktree": str(repo_path),
                 "log_path": "",
                 "output_excerpt": (
-                    "Subtask skipped because all target files already exist "
-                    "and are readable in the base repository."
+                    "Subtask skipped because it was "
+                    f"{skip_reason} and its target files are readable in the base repository."
                 ),
                 "write_required": False,
                 "verified_existing": True,
@@ -245,13 +340,33 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
                 ctx.layout["events"],
                 "worker.skipped",
                 ctx.run_id,
-                {"subtask_id": subtask["id"], "reason": "already satisfied"},
+                {"subtask_id": subtask["id"], "reason": skip_reason},
                 task_id=ctx.task.get("task_id"),
                 role="worker",
                 repo={"path": ctx.repo.get("path")},
             )
         else:
             ctx.pending_subtasks.append(subtask)
+
+    recorded_subtask_ids = {
+        str(result.get("subtask_id") or "").strip()
+        for result in ctx.worker_results
+        if str(result.get("subtask_id") or "").strip()
+    }
+    for carried_result in _completed_repair_worker_results(ctx, recorded_subtask_ids):
+        _rc._record_worker_result(ctx.blackboard, ctx.worker_results, carried_result)
+        append_event(
+            ctx.layout["events"],
+            "worker.skipped",
+            ctx.run_id,
+            {
+                "subtask_id": carried_result["subtask_id"],
+                "reason": "carried forward from a previous repair-loop plan",
+            },
+            task_id=ctx.task.get("task_id"),
+            role="worker",
+            repo={"path": ctx.repo.get("path")},
+        )
 
     ctx.expected_repo_files = _rc._sticky_expected_repo_files(
         ctx.blackboard,

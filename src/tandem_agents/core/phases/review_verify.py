@@ -272,6 +272,12 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
     )
 
     # --- Deterministic repo validation ---
+    ctx.expected_repo_files = _rc._validation_expected_repo_files(
+        ctx.repo_path,
+        list(ctx.expected_repo_files or []),
+        worker_changed_files,
+    )
+    ctx.blackboard["expected_repo_files"] = ctx.expected_repo_files
     ctx.repo_validation = _rc._deterministic_repo_validation(ctx.repo_path, ctx.expected_repo_files)
     if combined_command_checks:
         ctx.repo_validation = deterministic_repo_validation(

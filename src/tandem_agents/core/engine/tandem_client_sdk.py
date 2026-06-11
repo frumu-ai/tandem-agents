@@ -570,7 +570,7 @@ def sdk_stream_run_text(
             reason = ""
             event_count = 0
             events_without_text = 0
-            last_text_at = time.monotonic()
+            last_activity_at = time.monotonic()
             no_text_timeout = (
                 float(no_text_timeout_seconds)
                 if no_text_timeout_seconds is not None and no_text_timeout_seconds > 0
@@ -583,7 +583,7 @@ def sdk_stream_run_text(
             )
 
             async def _consume() -> None:
-                nonlocal completed, event_count, events_without_text, last_text_at, reason
+                nonlocal completed, event_count, events_without_text, last_activity_at, reason
                 started_at = time.monotonic()
                 stream = client.stream(session_id, run_id)
                 iterator = stream.__aiter__()
@@ -591,7 +591,7 @@ def sdk_stream_run_text(
                     now = time.monotonic()
                     wait_seconds = max(0.1, float(timeout_seconds or 1.0) - (now - started_at))
                     if no_text_timeout is not None and event_count >= 5:
-                        wait_seconds = min(wait_seconds, max(0.1, no_text_timeout - (now - last_text_at)))
+                        wait_seconds = min(wait_seconds, max(0.1, no_text_timeout - (now - last_activity_at)))
                     try:
                         evt = await asyncio.wait_for(iterator.__anext__(), timeout=wait_seconds)
                     except StopAsyncIteration:
@@ -599,18 +599,18 @@ def sdk_stream_run_text(
                         return
                     except asyncio.TimeoutError:
                         now = time.monotonic()
-                        if no_text_timeout is not None and event_count >= 5 and now - last_text_at >= no_text_timeout:
+                        if no_text_timeout is not None and event_count >= 5 and now - last_activity_at >= no_text_timeout:
                             reason = "no_text_timeout"
                         else:
                             reason = "timeout"
                         return
                     event_count += 1
+                    last_activity_at = time.monotonic()
                     t = str(getattr(evt, "type", "") or "").strip()
                     delta = _extract_event_text_delta(evt)
                     if delta:
                         parts.append(delta)
                         events_without_text = 0
-                        last_text_at = time.monotonic()
                         if log_writer is not None:
                             try:
                                 log_writer(delta)
@@ -626,7 +626,7 @@ def sdk_stream_run_text(
                         completed = True
                         return
                     now = time.monotonic()
-                    if no_text_timeout is not None and event_count >= 5 and now - last_text_at >= no_text_timeout:
+                    if no_text_timeout is not None and event_count >= 5 and now - last_activity_at >= no_text_timeout:
                         reason = "no_text_timeout"
                         return
                     if max_empty_events is not None and events_without_text >= max_empty_events:

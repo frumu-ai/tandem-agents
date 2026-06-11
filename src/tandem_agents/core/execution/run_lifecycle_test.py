@@ -88,6 +88,13 @@ class SwarmConfigDictTest(unittest.TestCase):
         # Backwards-compatible keys preserved.
         self.assertEqual(payload["manager"]["provider"], "openai")
 
+    def test_max_retries_is_configurable_and_serialized(self) -> None:
+        cfg = _config({"ACA_MAX_RETRIES": "2"})
+        payload = build_swarm_config_dict(cfg)
+
+        self.assertEqual(cfg.swarm.max_retries, 2)
+        self.assertEqual(payload["max_retries"], 2)
+
 
 class SamplingResolutionTest(unittest.TestCase):
     def test_json_roles_default_to_zero_worker_to_none(self) -> None:

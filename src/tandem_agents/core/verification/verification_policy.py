@@ -316,12 +316,14 @@ def evaluate_verification_policy(
     else:
         validation_blocker = repo_blocker or review_blocker or test_blocker
         failure_category = repo_blocker_kind if repo_blocker or (repo_validation or {}).get("verification_missing") else None
+    repair_requested = review_outcome == "repair_needed" or test_outcome == "repair_needed"
     should_retry = bool(
-        outcome == "repair_needed"
+        repair_requested
         and (
             int(review_result.get("returncode") or 0) == 0
             or int(test_result.get("returncode") or 0) == 0
             or validation_blocker
+            or repo_blocker
         )
     )
     return VerificationPolicyDecision(

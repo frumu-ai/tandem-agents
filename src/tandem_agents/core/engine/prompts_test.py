@@ -204,8 +204,35 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
 
         self.assertIn("Required substantive write targets", prompt)
-        self.assertIn("Metadata/support targets", prompt)
+        self.assertIn("Support targets", prompt)
         self.assertIn("A package.json-only or lockfile-only diff fails this worker", prompt)
+
+    def test_write_required_prompt_treats_docs_as_support_when_code_targets_exist(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "crates/tandem-tools/src/lib_parts/part01.rs",
+                "TESTING_UPDATES.md",
+                "SECURITY.md",
+                ".github/workflows/ci.yml",
+            ],
+            target_files=[
+                "crates/tandem-tools/src/lib_parts/part01.rs",
+                "TESTING_UPDATES.md",
+                "SECURITY.md",
+                ".github/workflows/ci.yml",
+            ],
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn(
+            'Required substantive write targets for this worker: ["crates/tandem-tools/src/lib_parts/part01.rs"]',
+            prompt,
+        )
+        self.assertIn("TESTING_UPDATES.md", prompt)
+        self.assertIn("Support targets", prompt)
+        self.assertIn("may be updated only after a substantive target has a real diff", prompt)
 
     def test_worker_prompt_includes_scope_note(self) -> None:
         subtask = self._subtask(

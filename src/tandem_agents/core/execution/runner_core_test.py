@@ -15,6 +15,7 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.verification.coding_run_contract import build_coding_run_contract
 from src.tandem_agents.core.engine.prompts import build_manager_prompt
 from src.tandem_agents.core.execution.runner_core import (
+    _completed_subtask_ids_for_retry,
     _all_subtasks_verified_existing,
     _annotate_pr_candidate_current_layout,
     _auto_approve_loop,
@@ -27,6 +28,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _integration_semantic_blocker_can_defer_to_review,
     _linear_comment_task_summary,
     _permission_requests_from_payload,
+    _partial_diff_artifacts_for_retry,
     _preserve_and_reset_blocked_worktree,
     _prepare_subtasks_with_discovery,
     _pr_candidate_edit_goal,
@@ -35,10 +37,12 @@ from src.tandem_agents.core.execution.runner_core import (
     _normalize_manager_subtasks,
     _task_mentions_external_pr_candidates,
     _worker_failure_blocker,
+    _worker_failure_retry_feedback,
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
     _sticky_expected_repo_files,
+    _validation_expected_repo_files,
 )
 from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.engine.prompts import build_worker_prompt
@@ -532,6 +536,127 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertIn("ACA merged multiple manager subtasks", subtasks[0]["scope_note"])
             self.assertEqual([item["id"] for item in subtasks[0]["merged_subtasks"]], ["crate", "trace", "scoring"])
 
+    def test_manager_subtasks_can_run_serially_without_merge_when_swarm_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "id": "registry",
+                        "title": "Add registry tests",
+                        "goal": "Cover registry normalization.",
+                        "files": ["crates/tandem-tools/src/lib.rs"],
+                        "acceptance_criteria": ["Registry cases pass."],
+                    },
+                    {
+                        "id": "sandbox",
+                        "title": "Add path sandbox tests",
+                        "goal": "Cover workspace path sandboxing.",
+                        "files": ["crates/tandem-tools/src/builtin_tools.rs"],
+                        "acceptance_criteria": ["Path sandbox cases pass."],
+                    },
+                    {
+                        "id": "approval",
+                        "title": "Add approval tests",
+                        "goal": "Cover approval classifier policy.",
+                        "files": ["crates/tandem-tools/src/approval_classifier.rs"],
+                        "acceptance_criteria": ["Approval cases pass."],
+                    },
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(
+                {"title": "TAN-216 Add tandem-tools tests"},
+                manager_plan,
+                repo_path,
+                1,
+                merge_manager_subtasks=False,
+            )
+
+            self.assertEqual([subtask["id"] for subtask in subtasks], ["registry", "sandbox", "approval"])
+            self.assertEqual(
+                [subtask["files"] for subtask in subtasks],
+                [
+                    ["crates/tandem-tools/src/lib.rs"],
+                    ["crates/tandem-tools/src/builtin_tools.rs"],
+                    ["crates/tandem-tools/src/approval_classifier.rs"],
+                ],
+            )
+            self.assertTrue(all("merged_subtasks" not in subtask for subtask in subtasks))
+
+    def test_inferred_repo_targets_do_not_overwrite_manager_subtask_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            for rel_path, text in {
+                "crates/tandem-tools/src/lib.rs": "resolve_registered_tool todo_write default_api bash\n",
+                "crates/tandem-tools/src/builtin_tools.rs": "resolve_tool_path workspace sandbox symlink\n",
+                "crates/tandem-tools/src/approval_classifier.rs": "approval_classifier classify mcp stripe\n",
+            }.items():
+                path = repo_path / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            task = {
+                "title": "Add unit test suite for tandem-tools: registry resolution, path sandbox, approval classifier",
+                "description": "Add tests for registry resolution, path sandbox, and approval classifier.",
+                "acceptance_criteria": ["cargo test -p tandem-tools passes"],
+            }
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "id": "registry",
+                        "title": "Add registry-resolution unit tests",
+                        "goal": "Cover resolve_registered_tool only.",
+                        "files": ["crates/tandem-tools/src/lib.rs"],
+                        "acceptance_criteria": ["Registry cases pass."],
+                    }
+                ]
+            }
+
+            discovered_files, subtasks = _prepare_subtasks_with_discovery(
+                task,
+                manager_plan,
+                repo_path,
+                4,
+            )
+
+            self.assertGreaterEqual(len(discovered_files), 2)
+            self.assertEqual(subtasks[0]["files"], ["crates/tandem-tools/src/lib.rs"])
+            self.assertEqual(subtasks[0]["target_files"], ["crates/tandem-tools/src/lib.rs"])
+
+    def test_missing_manager_source_targets_are_dropped_when_existing_target_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            path = repo_path / "crates/tandem-tools/src/lib.rs"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("pub fn resolve_registered_tool() {}\n", encoding="utf-8")
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "id": "registry",
+                        "title": "Registry tests",
+                        "goal": "Add registry resolution tests.",
+                        "files": [
+                            "crates/tandem-tools/src/lib.rs",
+                            "crates/tandem-tools/src/registry.rs",
+                            "crates/tandem-tools/src/registry_tests.rs",
+                        ],
+                        "acceptance_criteria": ["Registry cases pass."],
+                    }
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(
+                {"title": "Add tandem-tools registry tests"},
+                manager_plan,
+                repo_path,
+                4,
+            )
+
+            self.assertEqual(subtasks[0]["files"], ["crates/tandem-tools/src/lib.rs"])
+            self.assertEqual(subtasks[0]["target_files"], ["crates/tandem-tools/src/lib.rs"])
+            self.assertIn("dropped non-existing manager file targets", subtasks[0]["scope_note"])
+            self.assertIn("crates/tandem-tools/src/registry.rs", subtasks[0]["scope_note"])
+
     def test_expected_repo_files_are_sticky_across_retries(self) -> None:
         blackboard = {
             "repo_validation": {
@@ -559,6 +684,35 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             ],
         )
         self.assertEqual(blackboard["expected_repo_files"], expected)
+
+    def test_validation_expected_repo_files_drops_missing_untouched_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            (repo_path / "crates/tandem-tools/src").mkdir(parents=True)
+            (repo_path / "crates/tandem-tools/src/lib.rs").write_text("// tests\n", encoding="utf-8")
+
+            expected = _validation_expected_repo_files(
+                repo_path,
+                [
+                    "crates/tandem-tools/src/lib.rs",
+                    ".github/workflows/rust.yml",
+                ],
+                ["crates/tandem-tools/src/lib.rs"],
+            )
+
+        self.assertEqual(expected, ["crates/tandem-tools/src/lib.rs"])
+
+    def test_validation_expected_repo_files_keeps_changed_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+
+            expected = _validation_expected_repo_files(
+                repo_path,
+                [".github/workflows/rust.yml"],
+                [".github/workflows/rust.yml"],
+            )
+
+        self.assertEqual(expected, [".github/workflows/rust.yml"])
 
     def test_worker_prompt_includes_pr_candidate_context_artifact(self) -> None:
         task = {
@@ -746,6 +900,60 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             )
             self.assertEqual(subtasks[0]["target_files"], subtasks[0]["files"])
 
+    def test_explicit_crate_path_and_symbols_override_fuzzy_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            files = {
+                "crates/tandem-tools/src/lib.rs": (
+                    "#[cfg(test)]\nmod tests {\n"
+                    "fn registry_resolution() { resolve_registered_tool(); }\n}\n"
+                ),
+                "crates/tandem-tools/src/builtin_tools.rs": (
+                    "fn resolve_tool_path() {}\nfn is_within_workspace_root() {}\n"
+                ),
+                "crates/tandem-tools/src/approval_classifier.rs": (
+                    "pub fn classify() {}\nfn standing_allow_is_unsafe() {}\n"
+                ),
+                "crates/tandem-server/src/http/tests/approval_gate_matrix.rs": (
+                    "approval gate matrix governance tests\n"
+                ),
+            }
+            for rel_path, contents in files.items():
+                target = repo_path / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents, encoding="utf-8")
+            task = {
+                "title": "Add unit test suite for tandem-tools: registry resolution, path sandbox, approval classifier",
+                "description": "\n".join(
+                    [
+                        "Add focused coverage in `crates/tandem-tools`.",
+                        "Cover `resolve_registered_tool`, `resolve_tool_path`, `is_within_workspace_root`,",
+                        "and `approval_classifier::classify` / `standing_allow_is_unsafe`.",
+                    ]
+                ),
+                "acceptance_criteria": [
+                    "Tests cover registry resolution aliases.",
+                    "Tests cover path sandbox rejection cases.",
+                    "Tests cover approval classifier allow/deny behavior.",
+                ],
+            }
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "title": "wrong fuzzy target",
+                        "files": ["crates/tandem-server/src/http/tests/approval_gate_matrix.rs"],
+                    }
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(task, manager_plan, repo_path, 1)
+
+            self.assertIn("crates/tandem-tools/src/lib.rs", subtasks[0]["files"])
+            self.assertIn("crates/tandem-tools/src/builtin_tools.rs", subtasks[0]["files"])
+            self.assertIn("crates/tandem-tools/src/approval_classifier.rs", subtasks[0]["files"])
+            self.assertNotIn("crates/tandem-server/src/http/tests/approval_gate_matrix.rs", subtasks[0]["files"])
+            self.assertEqual(subtasks[0]["target_files"], subtasks[0]["files"])
+
     def test_verified_existing_short_circuit_requires_all_subtasks_satisfied(self) -> None:
         subtasks = [
             {"id": "subtask-1", "files": ["index.html", "styles.css"]},
@@ -929,6 +1137,75 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertEqual(files, ["src/app.ts", "packages/panel/src/App.tsx"])
 
+    def test_retryable_worker_failure_builds_repair_feedback(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "ENGINE_TOOL_LOOP_STALLED",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "changed_files": ["crates/tandem-tools/tests/registry_resolution.rs"],
+                    "stdout": "Remaining blockers: path sandbox and approval classifier tests are missing.",
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("retryable blocker `worker_incomplete_diff`", feedback or "")
+        self.assertIn("crates/tandem-tools/tests/registry_resolution.rs", feedback or "")
+        self.assertIn("unmet acceptance criteria", feedback or "")
+
+    def test_retryable_worker_failure_collects_partial_diff_artifact(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.partial-worker-diff.patch",
+                },
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "artifacts": {"partial_diff": "/runs/run-1/artifacts/worker-2.partial-worker-diff.patch"},
+                },
+                {"worker_id": "worker-3", "subtask_id": "subtask-3"},
+            ]
+        )
+
+        self.assertEqual(
+            artifacts,
+            [
+                {
+                    "subtask_id": "subtask-1",
+                    "worker_id": "worker-1",
+                    "patch_path": "/runs/run-1/artifacts/worker-1.partial-worker-diff.patch",
+                },
+                {
+                    "subtask_id": "subtask-2",
+                    "worker_id": "worker-2",
+                    "patch_path": "/runs/run-1/artifacts/worker-2.partial-worker-diff.patch",
+                },
+            ],
+        )
+
+    def test_retryable_worker_failure_collects_completed_subtasks(self) -> None:
+        completed = _completed_subtask_ids_for_retry(
+            [
+                {"worker_id": "worker-1", "subtask_id": "subtask-1", "status": "completed"},
+                {"worker_id": "worker-2", "subtask_id": "subtask-2", "status": "failed"},
+                {"worker_id": "worker-3", "subtask_id": "subtask-3", "verified_existing": True},
+                {"worker_id": "worker-4", "subtask_id": "subtask-1", "status": "completed"},
+            ]
+        )
+
+        self.assertEqual(completed, ["subtask-1", "subtask-3"])
+
     def test_integration_blocker_detects_semantic_failure_with_zero_exit(self) -> None:
         result = {
             "returncode": 0,
@@ -974,6 +1251,21 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         blocker = _integration_blocker_message(result) or ""
 
         self.assertTrue(_integration_semantic_blocker_can_defer_to_review(result, blocker))
+
+    def test_integration_placeholder_output_does_not_defer(self) -> None:
+        result = {
+            "returncode": 0,
+            "stdout": (
+                '{"status":"blocked","approved":false,'
+                '"summary":"Worker output only added crates/tandem-tools/tests/unit_suite_placeholder.rs '
+                'containing a placeholder comment. The requested tandem-tools unit suite was not implemented.",'
+                '"risks":["Acceptance criteria unmet: no table-driven tests were added."],'
+                '"tests":["Not run; worker reported verification was not run."]}'
+            ),
+        }
+        blocker = _integration_blocker_message(result) or ""
+
+        self.assertFalse(_integration_semantic_blocker_can_defer_to_review(result, blocker))
 
     def test_integration_concrete_code_finding_does_not_defer(self) -> None:
         result = {
@@ -1196,6 +1488,59 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(len(results), 2)
             self.assertEqual(results[0]["worker_id"], "worker-2")
             self.assertCountEqual(call_order, ["worker-1", "worker-2"])
+
+    def test_serial_worker_pool_stops_after_write_required_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "runs" / "run-1"
+            repo_path.mkdir(parents=True, exist_ok=True)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            pending_subtasks = [
+                {"id": "subtask-1", "title": "first", "goal": "first", "write_required": True},
+                {"id": "subtask-2", "title": "second", "goal": "second", "write_required": True},
+            ]
+            call_order: list[str] = []
+
+            def fake_worker_runner(
+                _cfg,
+                _run_id,
+                _repo_path,
+                _run_dir,
+                _task,
+                subtask,
+                worker_id,
+                index,
+            ):
+                call_order.append(worker_id)
+                return {
+                    "worker_id": worker_id,
+                    "subtask_index": index,
+                    "subtask_id": subtask["id"],
+                    "title": subtask["title"],
+                    "status": "failed",
+                    "returncode": 1,
+                    "worktree": str(repo_path),
+                    "log_path": "",
+                    "output_excerpt": "timed out with partial diff",
+                    "write_required": True,
+                    "verified_existing": False,
+                    "blocker_kind": "worker_incomplete_diff",
+                }
+
+            results = _execute_local_worker_pool(
+                resolve_config(root),
+                "run-1",
+                repo_path,
+                run_dir,
+                {"title": "Serial work"},
+                pending_subtasks,
+                1,
+                worker_runner=fake_worker_runner,
+            )
+
+            self.assertEqual([result["worker_id"] for result in results], ["worker-1"])
+            self.assertEqual(call_order, ["worker-1"])
 
 
 if __name__ == "__main__":
