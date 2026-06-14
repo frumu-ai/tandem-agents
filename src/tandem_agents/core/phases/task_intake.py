@@ -15,6 +15,7 @@ raises/blocks early if the claim fails.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +88,32 @@ def run_task_intake(
         )
 
     # 2. Normalize task
-    task, board, board_path = normalize_task(ctx.cfg, coordination=ctx.coordination)
+    intake_started_at = time.monotonic()
+    intake_payload = _task_source_intake_payload(ctx)
+    append_event(
+        ctx.layout["events"],
+        "task_source.intake_started",
+        ctx.run_id,
+        intake_payload,
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    try:
+        task, board, board_path = normalize_task(ctx.cfg, coordination=ctx.coordination)
+    except Exception as exc:
+        append_event(
+            ctx.layout["events"],
+            "task_source.intake_failed",
+            ctx.run_id,
+            {
+                **intake_payload,
+                "duration_ms": int((time.monotonic() - intake_started_at) * 1000),
+                "error": str(exc),
+            },
+            role="manager",
+            repo={"path": ctx.repo.get("path")},
+        )
+        raise
     if board_path is None:
         board_path = ctx.layout["board"]
     ctx.task = task
@@ -115,6 +141,13 @@ def run_task_intake(
     ctx.blackboard["program_goal"] = task.get("program_goal") or task_contract.get("program_goal")
     ctx.blackboard["local_goal"] = task.get("local_goal") or task_contract.get("local_goal")
     ctx.blackboard["dependency_status"] = dependency_status
+    ctx.blackboard["task_source_intake"] = {
+        **intake_payload,
+        "duration_ms": int((time.monotonic() - intake_started_at) * 1000),
+        "identifier": (task.get("source") or {}).get("identifier") if isinstance(task.get("source"), dict) else None,
+        "issue_id": (task.get("source") or {}).get("issue_id") if isinstance(task.get("source"), dict) else None,
+        "selected_status": (task.get("source") or {}).get("initial_status_name") if isinstance(task.get("source"), dict) else None,
+    }
     ctx.blackboard["contract_completeness"] = contract_completeness
     ctx.blackboard["verification_plan"] = {
         "commands": list(task.get("verification_commands") or task_contract.get("verification_commands") or []),
@@ -129,6 +162,15 @@ def run_task_intake(
     _rc._append_blackboard_note(
         ctx.blackboard,
         "Task contract loaded during intake; verification and dependency status are recorded before claim.",
+    )
+    append_event(
+        ctx.layout["events"],
+        "task_source.intake_completed",
+        ctx.run_id,
+        dict(ctx.blackboard["task_source_intake"]),
+        task_id=task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
     )
     write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
 
@@ -445,3 +487,23 @@ def run_task_intake(
         ctx.run_id,
     )
     return None  # success
+
+
+def _task_source_intake_payload(ctx: RunContext) -> dict[str, Any]:
+    cfg = ctx.cfg
+    payload: dict[str, Any] = {
+        "source_type": cfg.task_source.type,
+        "team": cfg.task_source.team,
+        "project": cfg.task_source.project,
+        "filters": {
+            "statuses": cfg.task_source.statuses,
+            "labels": cfg.task_source.labels,
+            "query": cfg.task_source.query,
+            "item": cfg.task_source.item or cfg.task_source.url,
+        },
+    }
+    if cfg.task_source.type == "linear":
+        from src.tandem_agents.core.integrations.linear_mcp import linear_mcp_server_name
+
+        payload["mcp_server"] = linear_mcp_server_name(cfg)
+    return payload

@@ -9,7 +9,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from src.tandem_agents.config.config_loader import resolve_config
-from src.tandem_agents.api.main import _operator_coordination_state, _project_runtime_env, app
+from src.tandem_agents.api.main import _compact_event_payload, _operator_coordination_state, _project_runtime_env, app
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 
 
@@ -178,6 +178,44 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             detailed = detail_response.json()
             self.assertEqual(detailed["blackboard"]["large"], "should only appear on detail route")
             self.assertIn("engine", detailed["events"][0]["payload"])
+
+    def test_compact_event_payload_keeps_graph_and_partial_diff_diagnostics(self) -> None:
+        payload = _compact_event_payload(
+            {
+                "repo_context": {
+                    "source": "repo.context_bundle",
+                    "fallback_used": False,
+                    "artifact_path": "/runs/run-1/artifacts/repo_context_bundle.json",
+                    "path_scope": "crates/tandem-meta-harness-eval",
+                    "required_files": ["crates/tandem-meta-harness-eval/src/lib.rs"],
+                    "index_status": "refreshed",
+                    "secret_prompt": "omit me",
+                },
+                "partial_diff_artifacts": [
+                    {
+                        "worker_id": "worker-1",
+                        "subtask_id": "subtask-1",
+                        "patch_path": "/runs/run-1/artifacts/worker-1.patch",
+                        "raw_diff": "omit me",
+                    }
+                ],
+                "duration_ms": 123,
+                "filters": {"statuses": "Backlog,Todo", "query": "", "token": "omit"},
+                "engine": {"messages": ["omit"]},
+            }
+        )
+
+        self.assertEqual(payload["repo_context"]["source"], "repo.context_bundle")
+        self.assertFalse(payload["repo_context"]["fallback_used"])
+        self.assertEqual(payload["repo_context"]["index_status"], "refreshed")
+        self.assertEqual(payload["repo_context"]["path_scope"], "crates/tandem-meta-harness-eval")
+        self.assertEqual(payload["repo_context"]["required_files"], ["crates/tandem-meta-harness-eval/src/lib.rs"])
+        self.assertNotIn("secret_prompt", payload["repo_context"])
+        self.assertEqual(payload["partial_diff_artifacts"][0]["worker_id"], "worker-1")
+        self.assertNotIn("raw_diff", payload["partial_diff_artifacts"][0])
+        self.assertEqual(payload["duration_ms"], 123)
+        self.assertEqual(payload["filters"], {"statuses": "Backlog,Todo"})
+        self.assertNotIn("engine", payload)
 
     def test_workspace_projects_and_guide_include_repo_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -129,6 +129,48 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("pr_candidate_context.json", prompt)
         self.assertNotIn("refs/aca/pr-", prompt)
 
+    def test_worker_prompt_bounds_verbose_task_payloads(self) -> None:
+        task = {
+            "title": "TAN-999 Reduce timeout risk",
+            "description": "D" * 20_000,
+            "raw_issue_body": "R" * 20_000,
+            "task_contract": {
+                "local_goal": "Implement the smallest useful timeout reduction.",
+                "target_files": ["src/tandem_agents/core/engine/prompts.py"],
+                "notes_for_agent": "N" * 20_000,
+            },
+        }
+        subtask = self._subtask(
+            goal="G" * 20_000,
+            acceptance_criteria=["A" * 20_000],
+            deliverables=["B" * 20_000],
+            target_files=["src/tandem_agents/core/engine/prompts.py"],
+            pr_candidate_context=[
+                {
+                    "number": 42,
+                    "files": [
+                        {
+                            "filename": "src/tandem_agents/core/engine/prompts.py",
+                            "patch_excerpt": "P" * 20_000,
+                        }
+                    ],
+                }
+            ],
+            pr_candidate_context_artifact="pr_candidate_context.json",
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, task, "/wt")
+
+        self.assertIn("TAN-999 Reduce timeout risk", prompt)
+        self.assertIn("Implement the smallest useful timeout reduction", prompt)
+        self.assertIn("src/tandem_agents/core/engine/prompts.py", prompt)
+        self.assertIn("[truncated for worker prompt budget]", prompt)
+        self.assertLess(len(prompt), 30_000)
+        self.assertNotIn("D" * 5000, prompt)
+        self.assertNotIn("R" * 5000, prompt)
+        self.assertNotIn("N" * 5000, prompt)
+        self.assertNotIn("P" * 5000, prompt)
+
     def test_worker_prompt_warns_about_git_ignored_targets(self) -> None:
         subtask = self._subtask(
             files=[],

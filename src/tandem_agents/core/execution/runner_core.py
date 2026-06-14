@@ -3099,8 +3099,12 @@ def _run_once_internal_impl(
                 completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
                 if partial_diff_artifacts:
                     ctx.blackboard.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
+                    ctx.blackboard.setdefault("repair", {})["partial_diff_state"] = "preserved_not_accepted"
+                    ctx.status.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
+                    ctx.status.setdefault("repair", {})["partial_diff_state"] = "preserved_not_accepted"
                 if completed_subtask_ids:
                     ctx.blackboard.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
+                    ctx.status.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
                 _append_blackboard_note(
                     ctx.blackboard,
                     f"Attempt {attempt + 1} hit retryable worker blocker `{worker_blocker['kind']}`. Retrying.",

@@ -169,3 +169,27 @@ curl -s -X POST "http://127.0.0.1:39735/runs/trigger-batch" \
     "overrides":{"ACA_PROVIDER":"openrouter","ACA_MODEL":"minimax/minimax-m2.7"}
   }'
 ```
+
+Run a one-command Linear dogfood check that triggers one task and fails if
+planning does not use `repo.context_bundle`:
+
+```bash
+./scripts/run.sh dogfood-linear-graph \
+  --project-slug <workspace-project-slug> \
+  --item <linear-issue-identifier-or-url>
+```
+
+The command prints the run id, selected task metadata, repo-context source,
+graph artifact path when available, partial-diff state, and first failure event.
+Use `--allow-fallback` only when you are intentionally testing the heuristic
+`repo_truth` fallback path.
+
+Run the deterministic ACA repo-graph routing eval fixtures:
+
+```bash
+./scripts/run.sh repo-graph-eval
+```
+
+The eval checks Meta-Harness, control-panel, runtime-security, and docs-only
+planning tasks. It fails if task-derived graph hints do not route to the
+expected `path_scope` or omit the expected query terms.

@@ -3113,6 +3113,25 @@ def summarize_worker_notes(
     }
 
 
+def _partial_diff_payload(result: dict[str, Any], worker_id: str, subtask: dict[str, Any]) -> dict[str, Any]:
+    artifact_path = str(result.get("partial_diff_artifact") or "").strip()
+    if not artifact_path and isinstance(result.get("artifacts"), dict):
+        artifact_path = str(result["artifacts"].get("partial_diff") or "").strip()
+    state = "none"
+    if artifact_path:
+        state = "accepted" if result.get("returncode") == 0 else "preserved_not_accepted"
+    return {
+        "worker_id": worker_id,
+        "subtask_id": subtask.get("id"),
+        "partial_diff_state": state,
+        "partial_diff_artifact": artifact_path,
+        "changed_files": list(result.get("changed_files") or []),
+        "failure_reason": result.get("failure_reason"),
+        "blocker_kind": result.get("blocker_kind"),
+        "recovery_action": result.get("recovery_action"),
+    }
+
+
 def sync_worker_artifacts(worktree: Path, run_artifacts_dir: Path, run_id: str, worker_id: str, events_path: Path) -> None:
     """Detects and moves artifacts (like screenshots) from worktree to run artifacts dir."""
     worker_screenshots = worktree / "screenshots"
@@ -3220,6 +3239,7 @@ def run_worker_subtask(
     # Sync artifacts after turn
     sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
+    result_before_terminalize = dict(result)
     result = _terminalize_worker_after_tool_loop(
         cfg,
         result,
@@ -3231,6 +3251,22 @@ def run_worker_subtask(
         model=worker_model,
         require_filesystem_changes=require_filesystem_changes,
     )
+    if result.get("terminalized_after_tool_loop") and not result_before_terminalize.get("terminalized_after_tool_loop"):
+        append_event(
+            layout["events"],
+            "worker.terminalized_after_tool_loop",
+            run_id,
+            {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "changed_files": list(result.get("changed_files") or []),
+                "returncode": result.get("returncode"),
+                "partial_diff_state": "accepted",
+            },
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
 
     result = _coerce_worker_failure(
         result,
@@ -3247,6 +3283,16 @@ def run_worker_subtask(
         require_filesystem_changes=require_filesystem_changes,
         reason=str(result.get("failure_reason") or "late target diff"),
     )
+    if result.get("partial_diff_artifact"):
+        append_event(
+            layout["events"],
+            "worker.partial_diff_preserved",
+            run_id,
+            _partial_diff_payload(result, worker_id, subtask),
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
     
     seeded_diff: dict[str, Any] | None = None
     if (
@@ -3328,6 +3374,7 @@ def run_worker_subtask(
         # Sync artifacts after retry turn
         sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
+        retry_before_terminalize = dict(retry_result)
         retry_result = _terminalize_worker_after_tool_loop(
             cfg,
             retry_result,
@@ -3339,6 +3386,22 @@ def run_worker_subtask(
             model=worker_model,
             require_filesystem_changes=require_filesystem_changes,
         )
+        if retry_result.get("terminalized_after_tool_loop") and not retry_before_terminalize.get("terminalized_after_tool_loop"):
+            append_event(
+                layout["events"],
+                "worker.terminalized_after_tool_loop",
+                run_id,
+                {
+                    "worker_id": worker_id,
+                    "subtask_id": subtask["id"],
+                    "changed_files": list(retry_result.get("changed_files") or []),
+                    "returncode": retry_result.get("returncode"),
+                    "partial_diff_state": "accepted",
+                },
+                task_id=task.get("task_id"),
+                role="worker",
+                repo={"path": str(repo_path)},
+            )
 
         retry_result = _coerce_worker_failure(
             retry_result,
@@ -3356,6 +3419,28 @@ def run_worker_subtask(
                 require_filesystem_changes=require_filesystem_changes,
                 reason=str(retry_result.get("failure_reason") or "retry produced diff"),
             )
+        if retry_result.get("partial_diff_artifact"):
+            append_event(
+                layout["events"],
+                "worker.partial_diff_preserved",
+                run_id,
+                _partial_diff_payload(retry_result, worker_id, subtask),
+                task_id=task.get("task_id"),
+                role="worker",
+                repo={"path": str(repo_path)},
+            )
+        append_event(
+            layout["events"],
+            "worker.retry_completed",
+            run_id,
+            {
+                **_partial_diff_payload(retry_result, worker_id, subtask),
+                "returncode": retry_result.get("returncode"),
+            },
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
         result = retry_result
             
     append_event(
@@ -3366,6 +3451,7 @@ def run_worker_subtask(
             "worker_id": worker_id,
             "subtask_id": subtask["id"],
             "returncode": result["returncode"],
+            **_partial_diff_payload(result, worker_id, subtask),
             "failure_reason": result.get("failure_reason"),
             "blocker_kind": result.get("blocker_kind"),
             "recovery_action": result.get("recovery_action"),

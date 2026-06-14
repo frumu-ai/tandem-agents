@@ -397,11 +397,26 @@ def _compact_event_payload(payload: Any) -> dict[str, Any]:
         "kind",
         "phase",
         "detail",
+        "duration_ms",
         "returncode",
         "worker_id",
         "subtask_id",
+        "source_type",
+        "team",
+        "project",
+        "identifier",
+        "issue_id",
+        "selected_status",
+        "mcp_server",
         "failure_reason",
         "blocker_kind",
+        "previous_failure_reason",
+        "previous_blocker_kind",
+        "will_retry",
+        "write_required",
+        "prompt_sync_first",
+        "partial_diff_state",
+        "partial_diff_artifact",
         "count",
         "started",
         "message",
@@ -415,6 +430,56 @@ def _compact_event_payload(payload: Any) -> dict[str, Any]:
         compact["changed_files"] = [str(path) for path in changed_files[:20]]
         if len(changed_files) > 20:
             compact["changed_files_truncated"] = len(changed_files) - 20
+    for key in ("artifact_path", "patch_path", "events_path", "messages_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            compact[key] = value
+    repo_context = payload.get("repo_context")
+    if isinstance(repo_context, dict):
+        compact["repo_context"] = {
+            key: value
+            for key, value in {
+                "source": repo_context.get("source"),
+                "fallback_used": repo_context.get("fallback_used"),
+                "artifact_path": repo_context.get("artifact_path"),
+                "path_scope": repo_context.get("path_scope"),
+                "required_files": repo_context.get("required_files"),
+                "index_source": repo_context.get("index_source"),
+                "index_status": repo_context.get("index_status"),
+                "index_error": repo_context.get("index_error"),
+                "error": repo_context.get("error"),
+            }.items()
+            if value not in ("", None, [], {})
+        }
+    filters = payload.get("filters")
+    if isinstance(filters, dict):
+        compact["filters"] = {
+            key: value
+            for key, value in {
+                "statuses": filters.get("statuses"),
+                "labels": filters.get("labels"),
+                "query": filters.get("query"),
+                "item": filters.get("item"),
+            }.items()
+            if value not in ("", None, [], {})
+        }
+    partial_diff_artifacts = payload.get("partial_diff_artifacts")
+    if isinstance(partial_diff_artifacts, list):
+        compact["partial_diff_artifacts"] = [
+            {
+                key: str(value)
+                for key, value in {
+                    "worker_id": artifact.get("worker_id") if isinstance(artifact, dict) else "",
+                    "subtask_id": artifact.get("subtask_id") if isinstance(artifact, dict) else "",
+                    "patch_path": artifact.get("patch_path") if isinstance(artifact, dict) else "",
+                }.items()
+                if str(value or "").strip()
+            }
+            for artifact in partial_diff_artifacts[:10]
+            if isinstance(artifact, dict)
+        ]
+        if len(partial_diff_artifacts) > 10:
+            compact["partial_diff_artifacts_truncated"] = len(partial_diff_artifacts) - 10
     return {key: value for key, value in compact.items() if value not in ("", None, [], {})}
 
 
@@ -556,6 +621,8 @@ def _build_run_snapshot(
         "summary_available": _run_summary(run_dir) is not None,
         "events": _run_events(run_dir) if include_details else _run_event_summaries(run_dir),
         "diff": _run_diff_snapshot(run_dir),
+        "repo_context": status_payload.get("repo_context") if isinstance(status_payload.get("repo_context"), dict) else {},
+        "repair": status_payload.get("repair") if isinstance(status_payload.get("repair"), dict) else {},
         "artifacts": {
             "run_dir": str(run_dir),
             "logs_dir": str(run_dir / "logs"),

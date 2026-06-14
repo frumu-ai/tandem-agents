@@ -164,6 +164,8 @@ def run_manager_prompt(ctx: RunContext) -> None:
         "fallback_used": repo_context.fallback_used,
         "error": repo_context.error,
         "artifact_path": repo_context.artifact_path,
+        "path_scope": repo_context.path_scope,
+        "required_files": repo_context.required_files or [],
         "index_source": repo_context.index_source,
         "index_status": repo_context.index_status,
         "index_error": repo_context.index_error,

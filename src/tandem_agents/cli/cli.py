@@ -15,12 +15,14 @@ from src.tandem_agents.core.coordination.coordination_reaper import (
 )
 from src.tandem_agents.core.engine.engine import engine_status_report
 from src.tandem_agents.core.execution.runtime_entrypoints import run_worker
+from src.tandem_agents.core.repository.repo_graph_eval import run_repo_graph_eval
 from src.tandem_agents.core.repository.repository import repository_binding_issues
 from src.tandem_agents.core.scheduling.outbox_dispatcher import dispatch_outbox_tick, run_outbox_dispatcher
 from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot
 from src.tandem_agents.core.scheduling.scheduler_dispatcher import dispatch_scheduled_runs
 from src.tandem_agents.cli.monitor import monitor_run
 from src.tandem_agents.cli.runner import run_once
+from src.tandem_agents.cli.dogfood import run_linear_graph_dogfood
 from src.tandem_agents.runtime.operator_view import build_operator_summary
 from src.tandem_agents.runtime.state import board_summary, ensure_board_template, load_board
 from src.tandem_agents.runtime.workspace_registry import load_workspace, save_workspace, set_active_project, workspace_summary
@@ -82,6 +84,12 @@ def cmd_check_engine(cfg: ResolvedConfig) -> int:
 def cmd_print_config(cfg: ResolvedConfig) -> int:
     _print_json(cfg.config_summary())
     return 0
+
+
+def cmd_repo_graph_eval(_cfg: ResolvedConfig) -> int:
+    result = run_repo_graph_eval()
+    _print_json(result)
+    return 0 if result.get("passed") else 1
 
 
 def cmd_init_board(cfg: ResolvedConfig) -> int:
@@ -391,6 +399,33 @@ def cmd_scheduler_dispatch(cfg: ResolvedConfig, limit: int = 25, wait: bool = Tr
     return 0
 
 
+def cmd_dogfood_linear_graph(
+    cfg: ResolvedConfig,
+    *,
+    api_url: str,
+    project_slug: str,
+    item: str | None,
+    token_file: str | None,
+    wait_seconds: int,
+    allow_fallback: bool,
+) -> int:
+    try:
+        code, summary = run_linear_graph_dogfood(
+            root=cfg.root_dir,
+            api_url=api_url,
+            project_slug=project_slug,
+            item=item,
+            token_file=Path(token_file).expanduser() if token_file else None,
+            wait_seconds=wait_seconds,
+            expect_graph=not allow_fallback,
+        )
+    except Exception as exc:
+        print(f"ACA Linear graph dogfood failed: {exc}", file=sys.stderr)
+        return 1
+    _print_json(summary)
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aca")
     parser.add_argument("--root", default=str(_root_dir()), help="ACA workspace root")
@@ -467,6 +502,24 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler_dispatch.add_argument("--no-wait", action="store_true")
     scheduler_dispatch.set_defaults(command="scheduler-dispatch")
 
+    dogfood_linear_graph = sub.add_parser(
+        "dogfood-linear-graph",
+        help="Trigger one Linear-backed ACA run and assert planning used repo.context_bundle.",
+    )
+    dogfood_linear_graph.add_argument("--api-url", default="http://127.0.0.1:39735")
+    dogfood_linear_graph.add_argument("--project-slug", required=True)
+    dogfood_linear_graph.add_argument("--item", default=None, help="Linear issue identifier/id/url to trigger.")
+    dogfood_linear_graph.add_argument("--token-file", default=None)
+    dogfood_linear_graph.add_argument("--wait-seconds", type=int, default=180)
+    dogfood_linear_graph.add_argument("--allow-fallback", action="store_true")
+    dogfood_linear_graph.set_defaults(command="dogfood-linear-graph")
+
+    repo_graph_eval = sub.add_parser(
+        "repo-graph-eval",
+        help="Run deterministic ACA repo graph routing eval fixtures.",
+    )
+    repo_graph_eval.set_defaults(command="repo-graph-eval")
+
     # `aca lease ...` — operator-side lease inspection / unblock
     lease_parser = sub.add_parser("lease", help="Inspect and manage coordination leases.")
     lease_sub = lease_parser.add_subparsers(dest="lease_command")
@@ -516,6 +569,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check_engine(cfg)
     if command == "print-config":
         return cmd_print_config(cfg)
+    if command == "repo-graph-eval":
+        return cmd_repo_graph_eval(cfg)
     if command == "init-board":
         return cmd_init_board(cfg)
     if command == "next-task":
@@ -542,6 +597,16 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_scheduler_plan(cfg, limit=getattr(args, "limit", 25))
     if command == "scheduler-dispatch":
         return cmd_scheduler_dispatch(cfg, limit=getattr(args, "limit", 25), wait=not getattr(args, "no_wait", False))
+    if command == "dogfood-linear-graph":
+        return cmd_dogfood_linear_graph(
+            cfg,
+            api_url=getattr(args, "api_url", "http://127.0.0.1:39735"),
+            project_slug=getattr(args, "project_slug"),
+            item=getattr(args, "item", None),
+            token_file=getattr(args, "token_file", None),
+            wait_seconds=getattr(args, "wait_seconds", 180),
+            allow_fallback=getattr(args, "allow_fallback", False),
+        )
     if command == "run":
         return cmd_run(cfg, dry_run=getattr(args, "dry_run", False))
     if command == "worker":
