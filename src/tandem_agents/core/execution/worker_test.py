@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import tempfile
 import subprocess
@@ -892,6 +893,21 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(output["blocker_kind"], "engine_prompt_timeout")
             self.assertEqual(output["partial_diff_artifact"], retry_result["partial_diff_artifact"])
             sync_changes.assert_not_called()
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            event_types = [event["type"] for event in events]
+            self.assertIn("worker.retry_started", event_types)
+            self.assertIn("worker.retry_completed", event_types)
+            self.assertIn("worker.partial_diff_preserved", event_types)
+            retry_completed = next(event for event in events if event["type"] == "worker.retry_completed")
+            self.assertEqual(retry_completed["payload"]["partial_diff_state"], "preserved_not_accepted")
+            self.assertEqual(
+                retry_completed["payload"]["partial_diff_artifact"],
+                retry_result["partial_diff_artifact"],
+            )
 
     def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

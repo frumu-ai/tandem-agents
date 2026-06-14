@@ -14,7 +14,7 @@ usage() {
   cat <<'EOF'
 Usage:
   run.sh [--setup] [--validate] [--check-engine] [--print-config] [--init-board] [--dry-run]
-  run.sh [worker|outbox-dispatcher]
+  run.sh [worker|outbox-dispatcher|dogfood-linear-graph|repo-graph-eval]
   run.sh [run]
 
 If no arguments are provided, the portable runner starts a run.
@@ -47,7 +47,7 @@ case "$1" in
   -h|--help)
     usage
     ;;
-  run|worker|outbox-dispatcher|validate|check-engine|print-config|init-board|monitor)
+  run|worker|outbox-dispatcher|validate|check-engine|print-config|init-board|monitor|dogfood-linear-graph|repo-graph-eval)
     exec python3 -m src.tandem_agents.cli "$@"
     ;;
   *)

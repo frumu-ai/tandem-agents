@@ -27,6 +27,11 @@ SOURCE_OR_TEST_TARGET_EXTENSIONS = {
     ".sh",
 }
 SUPPORT_ONLY_TARGET_EXTENSIONS = {".md", ".mdx", ".rst", ".adoc", ".yml", ".yaml", ".toml", ".json"}
+WORKER_PARENT_SCOPE_CHAR_LIMIT = 2_500
+WORKER_SUBTASK_CONTRACT_CHAR_LIMIT = 2_500
+WORKER_SUBTASK_TEXT_CHAR_LIMIT = 1_600
+WORKER_JSON_CHAR_LIMIT = 2_000
+WORKER_PR_SUMMARY_CHAR_LIMIT = 2_500
 
 
 def _chunk_list(values: list[Any], chunks: int) -> list[list[Any]]:
@@ -381,8 +386,20 @@ def _compact_pr_context(pr_context: Any) -> Any:
     return compact
 
 
+def _clip_prompt_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 34)].rstrip()}\n[truncated for worker prompt budget]"
+
+
+def _bounded_prompt_json(value: Any, limit: int) -> str:
+    rendered = json.dumps(value, indent=2, sort_keys=True, default=str)
+    return _clip_prompt_text(rendered, limit)
+
+
 def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], task: dict[str, Any], worktree: str) -> str:
-    deliverables = json.dumps(subtask.get("deliverables") or [])
+    deliverables = _bounded_prompt_json(subtask.get("deliverables") or [], WORKER_JSON_CHAR_LIMIT)
     target_files = [
         str(entry).strip()
         for entry in _as_list(subtask.get("files") or subtask.get("target_files") or [])
@@ -397,9 +414,13 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         if str(entry).strip()
     ]
     write_required = bool(subtask.get("write_required", True))
-    parent_scope = _task_scope_block(task)
-    subtask_contract = _task_contract_block(subtask)
-    scope_note = str(subtask.get("scope_note") or "").strip()
+    parent_scope = _clip_prompt_text(_task_scope_block(task), WORKER_PARENT_SCOPE_CHAR_LIMIT)
+    subtask_contract = _clip_prompt_text(_task_contract_block(subtask), WORKER_SUBTASK_CONTRACT_CHAR_LIMIT)
+    parent_title = _clip_prompt_text(task.get("title"), 500)
+    subtask_title = _clip_prompt_text(subtask.get("title"), 500)
+    subtask_goal = _clip_prompt_text(subtask.get("goal"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
+    acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], WORKER_JSON_CHAR_LIMIT)
+    scope_note = _clip_prompt_text(subtask.get("scope_note"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
     scope_note_block = f"\nACA scope note: {scope_note}\n" if scope_note else ""
     tracked_target_guidance = ""
     write_required_guidance = ""
@@ -493,7 +514,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "A successful worker turn must either leave a filesystem diff or return a structured blocker that names every inspected PR and explains why no safe code change should be applied.\n"
             "Use this context first, then verify against the repository before editing. "
             "If after applying you genuinely have no safe changes, return a structured blocker that lists the inspected PR numbers.\n"
-            f"PR candidate summary:\n{json.dumps(_compact_pr_context(pr_context), indent=2, sort_keys=True, default=str)[:6000]}\n"
+            f"PR candidate summary:\n{_bounded_prompt_json(_compact_pr_context(pr_context), WORKER_PR_SUMMARY_CHAR_LIMIT)}\n"
         )
     return (
         f"You are ACA worker {worker_id} in run {run_id}.\n"
@@ -514,13 +535,13 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         "Return a concise completion note with changed files, validation performed, and any blockers.\n\n"
         "If the target files already exist and satisfy the subtask, you may finish without editing them, but only after proving that with real tool calls.\n"
         "If you do not need to change a file, say that it was already satisfied and describe the verification you performed.\n\n"
-        f"Parent task: {task['title']}\n"
+        f"Parent task: {parent_title}\n"
         f"Parent task scope:\n{parent_scope}\n\n"
-        f"Subtask title: {subtask['title']}\n"
-        f"Subtask goal: {subtask['goal']}\n"
+        f"Subtask title: {subtask_title}\n"
+        f"Subtask goal: {subtask_goal}\n"
         f"{scope_note_block}"
         f"Subtask contract:\n{subtask_contract}\n\n"
-        f"Acceptance criteria: {json.dumps(subtask.get('acceptance_criteria') or [])}\n"
+        f"Acceptance criteria: {acceptance_criteria}\n"
         f"Expected deliverables: {deliverables}\n"
         f"Target files: {files}\n"
         f"Existing readable target files in the base repo before this worker: {existing_files}\n"
