@@ -142,6 +142,33 @@ class RepoContextForTaskTest(unittest.TestCase):
             self.assertIn("Meta-Harness", args["task"])
             self.assertIn("crates/tandem-meta-harness-eval", args["task"])
 
+    def test_free_text_path_scope_preserves_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = {
+                "title": "Fix admin portal route handling",
+                "description": "The broken screen lives under apps/AdminPortal/src/App.tsx.",
+            }
+            tool_result = {
+                "output": "{}",
+                "metadata": {
+                    "index_source": "stored",
+                    "structured": {"suggested_first_reads": [], "likely_files": []},
+                },
+            }
+
+            with patch(
+                "src.tandem_agents.core.repository.repo_context.list_engine_tool_ids",
+                return_value=["repo.context_bundle"],
+            ), patch(
+                "src.tandem_agents.core.repository.repo_context.execute_engine_tool",
+                return_value=tool_result,
+            ) as execute:
+                result = repo_context_for_task(SimpleNamespace(), root, task)
+
+            self.assertEqual(result.path_scope, "apps/AdminPortal")
+            self.assertEqual(execute.call_args.args[2]["path_scope"], "apps/AdminPortal")
+
     def test_falls_back_when_repo_context_bundle_tool_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

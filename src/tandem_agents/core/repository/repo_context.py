@@ -220,8 +220,9 @@ def _task_path_scope(task: dict[str, Any]) -> str:
     target_scope = _scope_from_target_files(_task_target_files(task))
     if target_scope:
         return target_scope
-    text = _task_query_text_without_targets(task).lower()
-    if re.search(r"\bmh-\d+\b|\bmeta[- ]harness\b|tandem-meta-harness-eval", text):
+    text = _task_query_text_without_targets(task)
+    lowered_text = text.lower()
+    if re.search(r"\bmh-\d+\b|\bmeta[- ]harness\b|tandem-meta-harness-eval", lowered_text):
         return "crates/tandem-meta-harness-eval"
     for match in re.finditer(r"(?:^|[\s`'\"])((?:crates|packages|apps|src|scripts|docs|tests)/[A-Za-z0-9_./-]+)", text):
         scope = _scope_from_path(match.group(1))
