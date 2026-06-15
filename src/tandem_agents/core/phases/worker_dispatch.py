@@ -13,6 +13,7 @@ caller continues with ctx.worker_results after this returns.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from pathlib import Path
 import re
@@ -218,6 +219,27 @@ def _diff_is_local_string_oracle_test(diff_text: str) -> bool:
     return bool(local_strings) and meaningful_asserts >= 2
 
 
+def _diff_has_placeholder_noop_test(diff_text: str) -> bool:
+    added = [
+        line.strip().lower()
+        for line in _added_diff_lines(diff_text)
+        if line.strip() and not line.strip().startswith(("+++", "#["))
+    ]
+    if not added:
+        return False
+    placeholder_terms = (
+        "placeholder",
+        "must be replaced",
+        "replace with",
+        "before completion",
+        "before merging",
+        "not implemented",
+    )
+    has_placeholder_language = any(any(term in line for term in placeholder_terms) for line in added)
+    has_noop_assertion = any(re.fullmatch(r"assert!\(\s*true\s*\)\s*;", line) for line in added)
+    return has_noop_assertion and has_placeholder_language
+
+
 def _diff_missing_production_function_calls(worktree: Path, diff_text: str, changed_files: list[str]) -> list[str]:
     if not changed_files or not all(_is_test_path(path) for path in changed_files):
         return []
@@ -405,6 +427,7 @@ def dispatch_workers(ctx: RunContext) -> None:
     active_workers_lock = threading.Lock()
     active_workers: set[str] = set()
     active_worker_started_at: dict[str, float] = {}
+    active_worker_started_at_ms: dict[str, int] = {}
     active_worker_worktrees: dict[str, Path] = {}
     active_worker_subtasks: dict[str, dict[str, Any]] = {}
     active_worker_progress_snapshots: dict[str, dict[str, Any]] = {}
@@ -591,6 +614,8 @@ def dispatch_workers(ctx: RunContext) -> None:
             unproductive_reason = ""
             if _diff_has_unproductive_marker(diff_text):
                 unproductive_reason = "worker diff contains an explicit placeholder/blocker marker"
+            elif _diff_has_placeholder_noop_test(diff_text):
+                unproductive_reason = "worker diff adds an explicit placeholder/no-op test"
             elif (
                 comment_only_abort_seconds > 0
                 and elapsed_seconds >= comment_only_abort_seconds
@@ -769,6 +794,32 @@ def dispatch_workers(ctx: RunContext) -> None:
             repo={"path": ctx.repo.get("path")},
         )
 
+    def _terminal_worker_events_since(started_at_ms: dict[str, int]) -> set[str]:
+        if not started_at_ms:
+            return set()
+        terminal_ids: set[str] = set()
+        try:
+            for raw_line in ctx.layout["events"].read_text(encoding="utf-8").splitlines():
+                if not raw_line.strip():
+                    continue
+                event = json.loads(raw_line)
+                event_type = str(event.get("type") or "")
+                if event_type not in {"worker.completed", "worker.failed"}:
+                    continue
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                worker_id = str(payload.get("worker_id") or "").strip()
+                if not worker_id or worker_id not in started_at_ms:
+                    continue
+                try:
+                    event_at_ms = int(event.get("timestamp_ms") or 0)
+                except (TypeError, ValueError):
+                    event_at_ms = 0
+                if event_at_ms >= int(started_at_ms.get(worker_id) or 0):
+                    terminal_ids.add(worker_id)
+        except Exception:
+            logger.debug("Failed to scan terminal worker events for heartbeat pruning", exc_info=True)
+        return terminal_ids
+
     def _heartbeat_local_workers() -> None:
         sleep_s = max(1.0, float(ctx.cfg.coordination.heartbeat_interval_seconds or 1) / 2.0)
         while not worker_heartbeat_stop.wait(sleep_s):
@@ -784,7 +835,20 @@ def dispatch_workers(ctx: RunContext) -> None:
             with active_workers_lock:
                 ids = list(active_workers)
                 started_at = dict(active_worker_started_at)
+                started_at_ms = dict(active_worker_started_at_ms)
                 worktrees = dict(active_worker_worktrees)
+            terminal_ids = _terminal_worker_events_since(started_at_ms)
+            if terminal_ids:
+                with active_workers_lock:
+                    for wid in terminal_ids:
+                        active_workers.discard(wid)
+                        active_worker_started_at.pop(wid, None)
+                        active_worker_started_at_ms.pop(wid, None)
+                        active_worker_worktrees.pop(wid, None)
+                        active_worker_subtasks.pop(wid, None)
+                    ids = [wid for wid in ids if wid not in terminal_ids]
+                    started_at = {wid: value for wid, value in started_at.items() if wid not in terminal_ids}
+                    worktrees = {wid: value for wid, value in worktrees.items() if wid not in terminal_ids}
             for wid in ids:
                 try:
                     ctx.coordination.heartbeat_worker(
@@ -856,6 +920,7 @@ def dispatch_workers(ctx: RunContext) -> None:
             with active_workers_lock:
                 active_workers.discard(wid)
                 active_worker_started_at.pop(wid, None)
+                active_worker_started_at_ms.pop(wid, None)
                 active_worker_worktrees.pop(wid, None)
                 active_worker_subtasks.pop(wid, None)
                 active_worker_progress_snapshots.pop(wid, None)
@@ -878,6 +943,7 @@ def dispatch_workers(ctx: RunContext) -> None:
         with active_workers_lock:
             active_workers.add(wid)
             active_worker_started_at[wid] = time.monotonic()
+            active_worker_started_at_ms[wid] = int(time.time() * 1000)
             subtask_id = str(subtask.get("id") or "").strip()
             if subtask_id:
                 active_worker_worktrees[wid] = ctx.run_dir / "worktrees" / f"{wid}--{subtask_id}"

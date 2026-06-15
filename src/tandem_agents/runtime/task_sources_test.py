@@ -611,6 +611,43 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertFalse(by_identifier["ENG-1"]["actionable"])
             self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
 
+    def test_linear_board_snapshot_skips_incomplete_parent_for_scheduler_next(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issues = [
+                {
+                    "id": "lin-1",
+                    "identifier": "ENG-1",
+                    "title": "Parent umbrella",
+                    "priority": 1,
+                    "description": "Collect runtime intake follow-up work.",
+                    "state": {"name": "Todo", "type": "unstarted"},
+                },
+                {
+                    "id": "lin-2",
+                    "identifier": "ENG-2",
+                    "title": "Concrete child",
+                    "priority": 2,
+                    "description": "Goal: Add the regression.\n\nAcceptance:\n- Exercise the production path.",
+                    "state": {"name": "Todo", "type": "unstarted"},
+                },
+            ]
+            statuses = [
+                {"id": "st-1", "name": "Todo", "type": "unstarted"},
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=(statuses, [], issues),
+            ):
+                snapshot = linear_board_snapshot(cfg, force_refresh=True)
+
+            by_identifier = {item["identifier"]: item for item in snapshot["items"]}
+            self.assertEqual(by_identifier["ENG-1"]["launch_state"], "waiting_contract")
+            self.assertFalse(by_identifier["ENG-1"]["actionable"])
+            self.assertTrue(by_identifier["ENG-2"]["actionable"])
+            self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
+
     def test_linear_board_snapshot_includes_active_items_outside_runnable_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))

@@ -1228,6 +1228,10 @@ def _linear_status_is_actionable(cfg: ResolvedConfig, status_name: str, state_ty
     return linear_status_key_is_actionable(status_name, state_type)
 
 
+def _linear_task_contract_ok(task: dict[str, Any]) -> bool:
+    return bool((task.get("contract_completeness") or task_contract_completeness(task)).get("ok", True))
+
+
 def _linear_issue_to_task(
     cfg: ResolvedConfig,
     issue: dict[str, Any],
@@ -1413,13 +1417,13 @@ def _linear_scheduler_projection(cfg: ResolvedConfig, board_items: list[dict[str
         elif status_key in LINEAR_ACTIVE_STATUS_KEYS or state_key == "started":
             launch_state = status_key or "in_progress"
         elif _linear_status_is_actionable(cfg, str(item.get("status_name") or ""), str(item.get("state_type") or "")):
-            launch_state = "next"
+            launch_state = "candidate"
             candidates.append(item)
         else:
             launch_state = "waiting"
         item["blocked_by"] = blocked_by
         item["launch_state"] = launch_state
-        item["actionable"] = launch_state == "next"
+        item["actionable"] = False
 
     def sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
         priority = item.get("priority")
@@ -1434,10 +1438,20 @@ def _linear_scheduler_projection(cfg: ResolvedConfig, board_items: list[dict[str
         )
 
     candidates.sort(key=sort_key)
-    next_items = candidates[:1]
+    complete_candidates = [
+        item for item in candidates if (item.get("contract_completeness") or {}).get("ok", True)
+    ]
+    candidate_pool = complete_candidates or candidates
+    next_items = candidate_pool[:1]
     next_ids = {str(item.get("id") or "") for item in next_items}
     for item in candidates:
-        if str(item.get("id") or "") not in next_ids:
+        if str(item.get("id") or "") in next_ids:
+            item["launch_state"] = "next"
+            item["actionable"] = True
+        elif complete_candidates and not (item.get("contract_completeness") or {}).get("ok", True):
+            item["launch_state"] = "waiting_contract"
+            item["actionable"] = False
+        else:
             item["launch_state"] = "queued"
             item["actionable"] = False
     return {
@@ -1466,11 +1480,17 @@ def _select_linear_issue(
             warning = None if eligible else f"Selected Linear issue is not actionable: status is '{status_name}'."
             return issue, eligible, warning
 
-    candidates = [
+    actionable = [
         issue
         for issue in issues
         if _linear_status_is_actionable(cfg, _linear_issue_status(issue), _linear_issue_state_type(issue))
     ]
+    complete_actionable = [
+        issue
+        for issue in actionable
+        if _linear_task_contract_ok(_linear_issue_to_task(cfg, issue, coordination=None))
+    ]
+    candidates = complete_actionable or actionable
     candidates.sort(
         key=lambda issue: (
             _linear_issue_priority(issue) if _linear_issue_priority(issue) is not None else 99,
@@ -1547,6 +1567,7 @@ def linear_board_snapshot(
             columns.append({"id": status_key, "name": status_name, "key": status_key, "type": state_type})
         counts[status_key] = counts.get(status_key, 0) + 1
         task_projection = _linear_issue_to_task(cfg, issue)
+        contract_completeness = task_projection.get("contract_completeness") or task_contract_completeness(task_projection)
         item = {
             "id": identifier or issue_id or str(issue.get("title") or "linear-issue"),
             "project_item_id": issue_id,
@@ -1576,6 +1597,7 @@ def linear_board_snapshot(
             "labels": _linear_issue_labels(issue),
             "execution_kind": task_projection.get("execution_kind"),
             "execution_backend": task_execution_backend(cfg, task_projection),
+            "contract_completeness": contract_completeness,
         }
         board_items.append(item)
     scheduler = _linear_scheduler_projection(cfg, board_items)
