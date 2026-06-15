@@ -354,7 +354,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
     def test_write_required_worker_prompt_sync_timeout_is_capped(self) -> None:
         cfg = SimpleNamespace(env={})
 
-        self.assertEqual(_scaled_prompt_sync_timeout_seconds(cfg, "worker-1", True, 2.85), 300.0)
+        self.assertEqual(_scaled_prompt_sync_timeout_seconds(cfg, "worker-1", True, 2.85), 480.0)
         self.assertEqual(_scaled_async_prompt_timeout_seconds(cfg, "worker-1", True, 2.85), 120.0)
         self.assertEqual(_scaled_async_no_text_timeout_seconds(cfg, "worker-1", True, 2.85), 60.0)
         self.assertEqual(_scaled_prompt_sync_timeout_seconds(cfg, "manager", False, 2.0), 180.0)
@@ -908,6 +908,73 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 retry_completed["payload"]["partial_diff_artifact"],
                 retry_result["partial_diff_artifact"],
             )
+
+    def test_worker_incomplete_diff_defers_retry_to_outer_repair_loop(self) -> None:
+        self.assertFalse(
+            _worker_result_should_retry(
+                {
+                    "returncode": 1,
+                    "blocker_kind": "worker_incomplete_diff",
+                    "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                }
+            )
+        )
+
+    def test_late_worker_result_after_terminal_run_does_not_sync_or_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            repo_path.mkdir()
+            worktree.mkdir()
+            cfg = SimpleNamespace(env={})
+
+            def terminal_stream(*_args: object, **kwargs: object) -> dict[str, object]:
+                (run_dir / "status.json").write_text(
+                    json.dumps({"run": {"status": "blocked", "completed_at_ms": 123}}),
+                    encoding="utf-8",
+                )
+                return {
+                    "returncode": 0,
+                    "stdout": "late success",
+                    "log_path": str(kwargs["log_path"]),
+                }
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt", side_effect=terminal_stream), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts") as sync_artifacts, \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes") as sync_changes, \
+                mock.patch("src.tandem_agents.core.execution.worker.git_diff_stat", return_value=""), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_changed_files", return_value=[]):
+                output = run_worker_subtask(
+                    cfg,
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-216", "source": {"type": "linear"}, "title": "Task"},
+                    {"id": "subtask-1", "title": "Subtask", "goal": "Change files", "files": ["src/lib.rs"]},
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 1)
+            self.assertEqual(output["blocker_kind"], "stale_worker_result")
+            sync_artifacts.assert_not_called()
+            sync_changes.assert_not_called()
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            event_types = [event["type"] for event in events]
+            self.assertEqual(event_types, ["worker.started"])
 
     def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2771,6 +2838,59 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertIn("terminal response", result["stdout"])
             prompt_async.assert_called_once()
             prompt_sync.assert_called_once()
+
+    def test_async_recovery_dispatch_timeout_returns_prompt_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            timeout_error = RuntimeError(
+                "Engine request failed for /session/session-1/prompt_sync: operation timed out"
+            )
+
+            def hang_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+                time.sleep(1.0)
+                return {"run_id": "run-too-late"}
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=hang_dispatch,
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                ) as stream_text, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=timeout_error,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=0.1), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_async_dispatch_timeout_seconds", return_value=0.1):
+                started = time.monotonic()
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+                elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.8)
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_PROMPT_TIMEOUT")
+            self.assertEqual(result["blocker_kind"], "engine_prompt_timeout")
+            self.assertEqual(result["engine"]["stream_reason"], "dispatch_timeout")
+            self.assertIn("async prompt dispatch", result["stdout"])
+            prompt_async.assert_called_once()
+            stream_text.assert_not_called()
 
     def test_prompt_sync_timeout_with_partial_diff_does_not_overlap_async_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

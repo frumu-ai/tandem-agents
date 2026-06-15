@@ -28,6 +28,68 @@ def _nonempty(value: Any) -> str:
 
 class CoordinationTasksMixin:
     """Tasks mixin."""
+    def _clear_task_claim_for_lease_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_key: str,
+        lease_id: str,
+        now: int,
+        state: str,
+        status: str | None = None,
+    ) -> None:
+        next_state = self._normalize_task_state(state)
+        next_status = status or next_state
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = ?,
+                state = ?,
+                claimed_run_id = CASE WHEN claimed_lease_id = ? THEN NULL ELSE claimed_run_id END,
+                claimed_lease_id = CASE WHEN claimed_lease_id = ? THEN NULL ELSE claimed_lease_id END,
+                claimed_by = CASE WHEN claimed_lease_id = ? THEN NULL ELSE claimed_by END,
+                claimed_host_id = CASE WHEN claimed_lease_id = ? THEN NULL ELSE claimed_host_id END,
+                lease_expires_at_ms = CASE WHEN claimed_lease_id = ? THEN NULL ELSE lease_expires_at_ms END,
+                updated_at_ms = ?
+            WHERE task_key = ?
+            """,
+            (
+                next_status,
+                next_state,
+                lease_id,
+                lease_id,
+                lease_id,
+                lease_id,
+                lease_id,
+                now,
+                task_key,
+            ),
+        )
+
+    def _clear_reclaimable_task_claim_locked(self, conn: sqlite3.Connection, *, task_key: str, now: int) -> None:
+        row = conn.execute("SELECT * FROM tasks WHERE task_key = ?", (task_key,)).fetchone()
+        if row is None:
+            return
+        claimed_lease_id = str(row["claimed_lease_id"] or "").strip()
+        if not claimed_lease_id:
+            return
+        lease = conn.execute("SELECT * FROM leases WHERE lease_id = ?", (claimed_lease_id,)).fetchone()
+        if lease is not None and str(lease["status"] or "").strip().lower() == "active":
+            return
+        conn.execute(
+            """
+            UPDATE tasks
+            SET claimed_run_id = NULL,
+                claimed_lease_id = NULL,
+                claimed_by = NULL,
+                claimed_host_id = NULL,
+                lease_expires_at_ms = NULL,
+                updated_at_ms = ?
+            WHERE task_key = ?
+            """,
+            (now, task_key),
+        )
+
     def _task_key(self, task: dict[str, Any]) -> tuple[str, str]:
         source = dict(task.get("source") or {})
         source_type = _nonempty(source.get("type")) or "unknown"
@@ -373,6 +435,7 @@ class CoordinationTasksMixin:
                     payload["metadata_json"],
                 ),
             )
+            self._clear_reclaimable_task_claim_locked(conn, task_key=payload["task_key"], now=now)
         return self.get_task(payload["task_key"]) or {"task_key": payload["task_key"], **payload, "status": task_state, "state": task_state}
     def get_task(self, task_key: str) -> dict[str, Any] | None:
         with self.connection() as conn:

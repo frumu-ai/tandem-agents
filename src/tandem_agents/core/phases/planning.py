@@ -19,6 +19,85 @@ from src.tandem_agents.core.phases.context import RunContext
 
 logger = logging.getLogger("aca.phases.planning")
 
+_MANAGER_PLAN_REQUIRED_KEYS = {"summary", "subtasks", "risks", "tests"}
+
+
+def _normalize_repo_relative_path(value: Any) -> str:
+    rel_path = str(value or "").strip().replace("\\", "/")
+    while rel_path.startswith("./"):
+        rel_path = rel_path[2:]
+    if not rel_path or rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../"):
+        return ""
+    if "/../" in f"/{rel_path}/":
+        return ""
+    return rel_path
+
+
+def _subtask_declared_files(subtask: dict[str, Any]) -> set[str]:
+    files: set[str] = set()
+    for key in ("files", "target_files"):
+        raw_values = subtask.get(key)
+        if not isinstance(raw_values, list):
+            continue
+        for raw_path in raw_values:
+            rel_path = _normalize_repo_relative_path(raw_path)
+            if rel_path:
+                files.add(rel_path)
+    return files
+
+
+def _partial_diff_changed_files(artifact: dict[str, Any]) -> list[str]:
+    raw_files = artifact.get("changed_files")
+    if not isinstance(raw_files, list):
+        return []
+    return list(
+        dict.fromkeys(
+            rel_path
+            for rel_path in (_normalize_repo_relative_path(raw_path) for raw_path in raw_files)
+            if rel_path
+        )
+    )
+
+
+def _select_partial_diff_subtask(
+    artifact: dict[str, Any],
+    subtasks: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not subtasks:
+        return None
+    target_subtask_id = str(artifact.get("subtask_id") or "").strip()
+    if target_subtask_id:
+        for subtask in subtasks:
+            if str(subtask.get("id") or "").strip() == target_subtask_id:
+                return subtask
+    changed_files = set(_partial_diff_changed_files(artifact))
+    if changed_files:
+        best_subtask: dict[str, Any] | None = None
+        best_overlap = 0
+        for subtask in subtasks:
+            overlap = len(changed_files.intersection(_subtask_declared_files(subtask)))
+            if overlap > best_overlap:
+                best_subtask = subtask
+                best_overlap = overlap
+        if best_subtask is not None:
+            return best_subtask
+    return subtasks[0]
+
+
+def _append_unique_repo_paths(subtask: dict[str, Any], paths: list[str]) -> None:
+    if not paths:
+        return
+    for key in ("files", "target_files"):
+        values = [
+            rel_path
+            for rel_path in (_normalize_repo_relative_path(raw_path) for raw_path in (subtask.get(key) or []))
+            if rel_path
+        ]
+        for rel_path in paths:
+            if rel_path not in values:
+                values.append(rel_path)
+        subtask[key] = values
+
 
 def _remote_code_task_requires_worker_execution(task: dict[str, Any]) -> bool:
     """Remote code tasks need an explicit worker verdict, not file-presence proof."""
@@ -33,6 +112,22 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     # Import here to avoid circular imports; runner_core is the owner of this util
     from src.tandem_agents.core.execution import runner_core as _rc  # noqa: PLC0415
     return _rc._extract_json(text)
+
+
+def _manager_plan_from_stdout(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse and validate the manager JSON contract."""
+    payload = _extract_json(stdout)
+    if not isinstance(payload, dict):
+        return None, "Manager planning did not return a valid JSON object."
+    missing = sorted(_MANAGER_PLAN_REQUIRED_KEYS.difference(payload))
+    if missing:
+        return None, "Manager planning JSON is missing required key(s): " + ", ".join(missing)
+    if not isinstance(payload.get("subtasks"), list):
+        return None, "Manager planning JSON field `subtasks` must be a list."
+    for key in ("risks", "tests"):
+        if not isinstance(payload.get(key), list):
+            return None, f"Manager planning JSON field `{key}` must be a list."
+    return payload, None
 
 
 def _prepare_subtasks(ctx: RunContext) -> tuple[list[str], list[dict[str, Any]]]:
@@ -67,19 +162,103 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
         patch_path = str(artifact.get("patch_path") or "").strip()
         if not patch_path:
             continue
-        target_subtask_id = str(artifact.get("subtask_id") or "").strip()
-        for subtask in subtasks:
-            subtask_id = str(subtask.get("id") or "").strip()
-            if target_subtask_id and subtask_id and target_subtask_id != subtask_id and len(subtasks) > 1:
-                continue
-            subtask["carry_forward_patch"] = patch_path
-            existing_scope_note = str(subtask.get("scope_note") or "").strip()
-            carry_note = (
-                "ACA will apply the preserved partial worker diff before this retry so the worker can continue "
-                "from the previous attempt instead of repeating it."
+        subtask = _select_partial_diff_subtask(artifact, subtasks)
+        if subtask is None or subtask.get("carry_forward_patch"):
+            continue
+        changed_files = _partial_diff_changed_files(artifact)
+        worker_output_excerpt = str(artifact.get("worker_output_excerpt") or "").strip()
+        if len(worker_output_excerpt) > 1200:
+            worker_output_excerpt = worker_output_excerpt[:1200].rstrip() + "\n..."
+        _append_unique_repo_paths(subtask, changed_files)
+        subtask["carry_forward_patch"] = patch_path
+        subtask["repair_source_subtask_id"] = str(artifact.get("subtask_id") or "").strip()
+        subtask["repair_source_worker_id"] = str(artifact.get("worker_id") or "").strip()
+        subtask["repair_changed_files"] = changed_files
+        if worker_output_excerpt:
+            subtask["repair_worker_output_excerpt"] = worker_output_excerpt
+            criteria = [str(entry).strip() for entry in (subtask.get("acceptance_criteria") or []) if str(entry).strip()]
+            repair_criterion = (
+                "Resolve the recovered partial-diff blocker before expanding scope: "
+                + worker_output_excerpt.replace("\n", " ")[:500]
             )
-            subtask["scope_note"] = f"{existing_scope_note}\n{carry_note}".strip()
-            break
+            if repair_criterion not in criteria:
+                subtask["acceptance_criteria"] = [repair_criterion, *criteria]
+        existing_scope_note = str(subtask.get("scope_note") or "").strip()
+        changed_file_note = (
+            " The saved diff touched these files; read and finish them before adding new scope: "
+            + ", ".join(changed_files)
+            + "."
+            if changed_files
+            else ""
+        )
+        blocker_note = (
+            "\nRecovered partial-diff blocker/context:\n" + worker_output_excerpt
+            if worker_output_excerpt
+            else ""
+        )
+        carry_note = (
+            "ACA will apply the preserved partial worker diff before this retry so the worker can continue "
+            "from the previous attempt instead of repeating it."
+            f"{changed_file_note}{blocker_note}"
+        )
+        subtask["scope_note"] = f"{existing_scope_note}\n{carry_note}".strip()
+
+
+def _repair_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _constrain_extra_partial_diff_repair_subtasks(
+    ctx: RunContext,
+    subtasks: list[dict[str, Any]],
+) -> None:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    if not isinstance(repair, dict) or not repair.get("partial_diff_artifacts"):
+        return
+    attempt = _repair_int(repair.get("attempt"))
+    base_max_loops = _repair_int(repair.get("base_max_loops"))
+    if not attempt or not base_max_loops or attempt <= base_max_loops:
+        return
+    carried = [subtask for subtask in subtasks if subtask.get("carry_forward_patch")]
+    if not carried:
+        return
+    chosen = carried[0]
+    if len(subtasks) > 1:
+        subtasks[:] = [chosen]
+    changed_files = [
+        rel_path
+        for rel_path in (_normalize_repo_relative_path(raw_path) for raw_path in (chosen.get("repair_changed_files") or []))
+        if rel_path
+    ]
+    if changed_files:
+        previous_files = sorted(_subtask_declared_files(chosen).difference(changed_files))
+        chosen["files"] = list(dict.fromkeys(changed_files))
+        chosen["target_files"] = list(dict.fromkeys(changed_files))
+        if previous_files:
+            chosen["repair_deferred_files"] = previous_files
+    existing_scope_note = str(chosen.get("scope_note") or "").strip()
+    narrow_note = (
+        "ACA narrowed this extra repair attempt to the carried partial-diff subtask so the worker "
+        "finishes the preserved files before the manager can expand into new swarm slices."
+    )
+    if changed_files:
+        narrow_note += " Active repair targets are limited to the changed files from the preserved patch: " + ", ".join(changed_files) + "."
+    if chosen.get("repair_deferred_files"):
+        narrow_note += " Broader manager files are deferred until the preserved patch is terminal: " + ", ".join(chosen["repair_deferred_files"]) + "."
+    if narrow_note not in existing_scope_note:
+        chosen["scope_note"] = f"{existing_scope_note}\n{narrow_note}".strip()
+
+
+def _extra_partial_diff_repair_active(ctx: RunContext) -> bool:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    if not isinstance(repair, dict) or not repair.get("partial_diff_artifacts"):
+        return False
+    attempt = _repair_int(repair.get("attempt"))
+    base_max_loops = _repair_int(repair.get("base_max_loops"))
+    return bool(attempt and base_max_loops and attempt > base_max_loops)
 
 
 def _completed_repair_subtask_ids(ctx: RunContext) -> set[str]:
@@ -148,7 +327,7 @@ def run_manager_prompt(ctx: RunContext) -> None:
     from src.tandem_agents.core.engine.prompts import build_manager_prompt
     from src.tandem_agents.core.execution import runner_core as _rc
     from src.tandem_agents.runtime.runstate import append_event, save_blackboard, write_status
-    from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
+    from src.tandem_agents.runtime.run_output import set_status, write_blackboard_snapshot
 
     manager_model_selection = engine_session_provider_model(ctx.cfg, "manager")
     manager_provider = manager_model_selection["provider"]
@@ -211,13 +390,41 @@ def run_manager_prompt(ctx: RunContext) -> None:
             config_path=None,
         )
 
-    ctx.manager_plan = _extract_json(manager_result["stdout"]) or {
-        "summary": manager_result["stdout"][:1200],
-        "subtasks": [],
-        "risks": [],
-        "tests": [],
-    }
-    ctx.blackboard["manager_plan"] = ctx.manager_plan
+    parsed_plan, invalid_plan_reason = _manager_plan_from_stdout(str(manager_result.get("stdout") or ""))
+    if invalid_plan_reason:
+        excerpt = str(manager_result.get("stdout") or "").strip()[:1000]
+        ctx.manager_plan = {
+            "summary": excerpt,
+            "subtasks": [],
+            "risks": [invalid_plan_reason],
+            "tests": [],
+        }
+        ctx.blackboard["manager_plan"] = ctx.manager_plan
+        ctx.blackboard["manager_invalid_plan"] = {
+            "reason": invalid_plan_reason,
+            "stdout_excerpt": excerpt,
+        }
+        ctx.status = set_status(
+            ctx.status,
+            ctx.layout,
+            phase="planning",
+            phase_detail=invalid_plan_reason,
+            run_status="blocked",
+            blocker=(True, "manager_invalid_plan", invalid_plan_reason, "manager"),
+            run_completed=True,
+        )
+        append_event(
+            ctx.layout["events"],
+            "manager.invalid_plan",
+            ctx.run_id,
+            {"reason": invalid_plan_reason, "stdout_excerpt": excerpt},
+            task_id=ctx.task.get("task_id"),
+            role="manager",
+            repo={"path": ctx.repo.get("path")},
+        )
+    else:
+        ctx.manager_plan = parsed_plan or {}
+        ctx.blackboard["manager_plan"] = ctx.manager_plan
     if manager_result.get("engine") or manager_result.get("blocker_kind"):
         ctx.blackboard["manager_engine"] = {
             "engine": manager_result.get("engine") or {},
@@ -261,6 +468,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     repo_path = ctx.repo_path
     discovered_files, subtasks = _prepare_subtasks(ctx)
     _carry_forward_partial_diff_artifacts(ctx, subtasks)
+    _constrain_extra_partial_diff_repair_subtasks(ctx, subtasks)
 
     ctx.planned_subtasks = subtasks
     ctx.pending_subtasks = []
@@ -269,19 +477,34 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     sticky_missing_from_plan = [path for path in sticky_expected_files if path not in current_expected_files]
     if sticky_missing_from_plan and ctx.planned_subtasks:
         first = ctx.planned_subtasks[0]
-        for key in ("files", "target_files"):
-            values = [str(entry).strip() for entry in (first.get(key) or []) if str(entry).strip()]
-            for path in sticky_missing_from_plan:
-                if path not in values:
-                    values.append(path)
-            first[key] = values
+        extra_partial_repair = _extra_partial_diff_repair_active(ctx) and bool(first.get("carry_forward_patch"))
+        if not extra_partial_repair:
+            for key in ("files", "target_files"):
+                values = [str(entry).strip() for entry in (first.get(key) or []) if str(entry).strip()]
+                for path in sticky_missing_from_plan:
+                    if path not in values:
+                        values.append(path)
+                first[key] = values
         existing_scope_note = str(first.get("scope_note") or "").strip()
-        sticky_note = (
-            "ACA kept these expected files from an earlier retry attempt because later manager plans "
-            "must not narrow the run contract: "
-            + ", ".join(sticky_missing_from_plan)
-            + "."
-        )
+        if extra_partial_repair:
+            sticky_note = (
+                "ACA deferred these expected files from an earlier retry attempt while finishing the "
+                "preserved partial diff: "
+                + ", ".join(sticky_missing_from_plan)
+                + "."
+            )
+            deferred = [str(entry).strip() for entry in (first.get("repair_deferred_files") or []) if str(entry).strip()]
+            for path in sticky_missing_from_plan:
+                if path not in deferred:
+                    deferred.append(path)
+            first["repair_deferred_files"] = deferred
+        else:
+            sticky_note = (
+                "ACA kept these expected files from an earlier retry attempt because later manager plans "
+                "must not narrow the run contract: "
+                + ", ".join(sticky_missing_from_plan)
+                + "."
+            )
         first["scope_note"] = f"{existing_scope_note}\n{sticky_note}".strip()
     plan_validation = task_plan_validation(ctx.task, subtasks)
     ctx.blackboard["task_plan_validation"] = plan_validation

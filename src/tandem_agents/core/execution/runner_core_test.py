@@ -36,8 +36,11 @@ from src.tandem_agents.core.execution.runner_core import (
     _pr_candidate_unexpected_changed_files,
     _normalize_manager_subtasks,
     _task_mentions_external_pr_candidates,
+    _verification_can_retry,
     _worker_failure_blocker,
+    _worker_failure_can_retry,
     _worker_failure_retry_feedback,
+    _worker_incomplete_diff_extra_retries,
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
@@ -90,6 +93,110 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 {"id": "req-2", "status": "allow", "permission": "bash"},
             ],
         )
+
+    def test_execute_local_worker_pool_reports_no_progress_timeout(self) -> None:
+        def stalled_runner(*_args):
+            time.sleep(0.05)
+            return {
+                "status": "completed",
+                "returncode": 0,
+                "output_excerpt": "finished after timeout",
+                "changed_files": ["src/app.py"],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            started = time.monotonic()
+            results = _execute_local_worker_pool(
+                self._config(root),
+                "run-1",
+                root,
+                root / "runs" / "run-1",
+                {"task_id": "TAN-1"},
+                [{"id": "subtask-1", "title": "Do work", "write_required": True}],
+                1,
+                worker_runner=stalled_runner,
+                worker_timeout_seconds=0.01,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(len(results), 1)
+        self.assertGreaterEqual(elapsed, 0.04)
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertEqual(results[0]["blocker_kind"], "worker_no_progress")
+        self.assertIn("no terminal result", results[0]["failure_reason"])
+        self.assertIn("Late worker result after timeout", results[0]["output_excerpt"])
+        self.assertIn("finished after timeout", results[0]["output_excerpt"])
+        self.assertEqual(results[0]["changed_files"], ["src/app.py"])
+
+    def test_execute_local_worker_pool_keeps_result_when_callback_fails(self) -> None:
+        def worker_runner(*_args):
+            return {
+                "worker_id": "worker-1",
+                "subtask_id": "subtask-1",
+                "status": "failed",
+                "returncode": 1,
+                "blocker_kind": "engine_dispatch_failed",
+            }
+
+        def broken_callback(_result):
+            raise RuntimeError("status write failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = _execute_local_worker_pool(
+                self._config(root),
+                "run-1",
+                root,
+                root / "runs" / "run-1",
+                {"task_id": "TAN-1"},
+                [{"id": "subtask-1", "title": "Do work", "write_required": True}],
+                1,
+                worker_runner=worker_runner,
+                on_result=broken_callback,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertEqual(results[0]["blocker_kind"], "engine_dispatch_failed")
+
+    def test_execute_local_worker_pool_calls_start_callback_only_for_started_workers(self) -> None:
+        started: list[tuple[str, str]] = []
+
+        def worker_runner(_cfg, _run_id, _repo_path, _run_dir, _task, subtask, worker_id, index):
+            return {
+                "worker_id": worker_id,
+                "subtask_index": index,
+                "subtask_id": subtask["id"],
+                "title": subtask["title"],
+                "status": "failed",
+                "returncode": 1,
+                "blocker_kind": "worker_corrupt_diff",
+                "write_required": True,
+            }
+
+        def on_start(worker_id: str, subtask: dict[str, object]) -> None:
+            started.append((worker_id, str(subtask.get("id"))))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = _execute_local_worker_pool(
+                self._config(root),
+                "run-1",
+                root,
+                root / "runs" / "run-1",
+                {"task_id": "TAN-1"},
+                [
+                    {"id": "subtask-1", "title": "First", "write_required": True},
+                    {"id": "subtask-2", "title": "Second", "write_required": True},
+                ],
+                1,
+                worker_runner=worker_runner,
+                on_start=on_start,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(started, [("worker-1", "subtask-1")])
 
     def test_manager_subtask_deliverable_fills_acceptance_criteria(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1161,6 +1268,136 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("crates/tandem-tools/tests/registry_resolution.rs", feedback or "")
         self.assertIn("unmet acceptance criteria", feedback or "")
 
+    def test_partial_diff_artifact_keeps_worker_output_excerpt(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": ["crates/eval/src/scoring.rs"],
+                    "stdout": "Remaining implementation blockers: missing passes() method.",
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(
+            artifacts[0]["worker_output_excerpt"],
+            "Remaining implementation blockers: missing passes() method.",
+        )
+
+    def test_worker_no_progress_builds_base_retry_feedback(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "Worker produced no terminal result within 300s.",
+                    "blocker_kind": "worker_no_progress",
+                    "stdout": "Worker produced no terminal result within 300s.",
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("retryable blocker `worker_no_progress`", feedback or "")
+        self.assertTrue(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=0,
+                base_max_loops=2,
+            )
+        )
+        self.assertTrue(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=2,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=3,
+                base_max_loops=2,
+            )
+        )
+
+    def test_incomplete_diff_gets_two_extra_worker_repair_loops_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {"kind": "worker_incomplete_diff"}
+
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_extra_worker_repair_loop_is_limited_to_incomplete_diffs(self) -> None:
+        cfg = SimpleNamespace(env={})
+
+        self.assertFalse(
+            _worker_failure_can_retry(
+                cfg,
+                {"kind": "worker_no_diff"},
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_corrupt_diff_can_use_bounded_extra_repair_budget(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {"kind": "worker_corrupt_diff"}
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_incomplete_diff_extra_retry_budget_can_be_disabled(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES": "0"})
+
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 0)
+        self.assertFalse(
+            _worker_failure_can_retry(
+                cfg,
+                {"kind": "worker_incomplete_diff"},
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_verification_can_use_incomplete_diff_extra_repair_budget(self) -> None:
+        cfg = SimpleNamespace(env={})
+        ctx = SimpleNamespace(
+            status={
+                "repair": {
+                    "extra_retry_source": "worker_incomplete_diff",
+                    "partial_diff_artifacts": [{"patch_path": "/runs/run-1/artifacts/worker.patch"}],
+                    "partial_diff_state": "preserved_not_accepted",
+                }
+            },
+            blackboard={},
+        )
+
+        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
+        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+
+    def test_verification_extra_repair_budget_requires_incomplete_diff_state(self) -> None:
+        cfg = SimpleNamespace(env={})
+        ctx = SimpleNamespace(status={"repair": {}}, blackboard={})
+
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
+
     def test_retryable_worker_failure_collects_partial_diff_artifact(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
             [
@@ -1168,6 +1405,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "worker_id": "worker-1",
                     "subtask_id": "subtask-1",
                     "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.partial-worker-diff.patch",
+                    "changed_files": ["./crates/eval/src/scoring.rs"],
                 },
                 {
                     "worker_id": "worker-2",
@@ -1185,6 +1423,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "subtask_id": "subtask-1",
                     "worker_id": "worker-1",
                     "patch_path": "/runs/run-1/artifacts/worker-1.partial-worker-diff.patch",
+                    "changed_files": ["crates/eval/src/scoring.rs"],
                 },
                 {
                     "subtask_id": "subtask-2",

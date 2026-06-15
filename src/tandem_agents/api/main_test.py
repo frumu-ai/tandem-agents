@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from src.tandem_agents.api import main as api_main
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.api.main import _compact_event_payload, _operator_coordination_state, _project_runtime_env, app
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
@@ -66,6 +68,43 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertEqual(_operator_coordination_state("In Review"), "review")
         self.assertEqual(_operator_coordination_state("Done"), "done")
         self.assertEqual(_operator_coordination_state("Blocked"), "blocked")
+
+    def test_coder_supervisor_reconcile_is_serialized(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        second_done = threading.Event()
+        calls: list[str] = []
+
+        def fake_reconcile(_cfg):
+            calls.append("start")
+            entered.set()
+            release.wait(timeout=1)
+            calls.append("end")
+            return {"count": 0}
+
+        def run_second() -> None:
+            api_main._reconcile_active_coder_runs_serialized(object())
+            second_done.set()
+
+        with patch.object(api_main, "reconcile_active_coder_runs", side_effect=fake_reconcile):
+            first = threading.Thread(
+                target=api_main._reconcile_active_coder_runs_serialized,
+                args=(object(),),
+            )
+            second = threading.Thread(target=run_second)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            self.assertFalse(second_done.wait(timeout=0.02))
+            self.assertEqual(calls, ["start"])
+            release.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_done.is_set())
+        self.assertEqual(calls, ["start", "end", "start", "end"])
 
     def test_approvals_status_query_filters_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

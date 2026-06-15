@@ -157,9 +157,13 @@ class CoordinationWorkersMixin:
                         "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
                         (now, lease_id),
                     )
-                    conn.execute(
-                        "UPDATE tasks SET status = 'stale', state = 'stale', lease_expires_at_ms = NULL, updated_at_ms = ? WHERE task_key = ?",
-                        (now, lease["task_key"]),
+                    self._clear_task_claim_for_lease_locked(
+                        conn,
+                        task_key=str(lease["task_key"]),
+                        lease_id=lease_id,
+                        now=now,
+                        state="stale",
+                        status="stale",
                     )
                 conn.execute(
                     "UPDATE workers SET status = 'idle', current_lease_id = NULL, current_run_id = NULL, updated_at_ms = ? WHERE worker_id = ?",
@@ -185,9 +189,13 @@ class CoordinationWorkersMixin:
                     "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
                     (now, lease_id),
                 )
-                conn.execute(
-                    "UPDATE tasks SET status = 'stale', state = 'stale', lease_expires_at_ms = NULL, updated_at_ms = ? WHERE task_key = ?",
-                    (now, lease["task_key"]),
+                self._clear_task_claim_for_lease_locked(
+                    conn,
+                    task_key=str(lease["task_key"]),
+                    lease_id=lease_id,
+                    now=now,
+                    state="stale",
+                    status="stale",
                 )
             conn.execute(
                 "UPDATE workers SET status = 'idle', current_lease_id = NULL, current_run_id = NULL, updated_at_ms = ? WHERE worker_id = ?",

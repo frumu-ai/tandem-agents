@@ -184,9 +184,13 @@ Optional fields:
 - `coder_wait_timeout_seconds`: how long ACA should poll a Tandem coder run before reporting that ACA's supervisor wait budget expired; default `3600`
 - `coder_poll_interval_seconds`: how often ACA should poll Tandem for coder run status; default `15`
 - `coder_supervisor_enabled`: keep reconciling detached Tandem coder runs after ACA request timeout or process restart; default `true`
+- `ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS`: maximum time the API startup hook waits for the initial coder-supervisor reconciliation before serving requests; default `10`
 - `coder_supervisor_interval_seconds`: background reconciliation interval; default `30`
 - `coder_supervisor_batch_size`: maximum active coder runs checked per supervisor tick; default `100`
 - `coder_cancel_on_source_terminal`: allow ACA to cancel a still-running Tandem coder run when the source task is already terminal; default `true`
+- `ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS`: legacy worker prompt-sync timeout for write-required workers; default `300`
+- `ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS`: maximum scaled legacy worker prompt-sync timeout; default `480`
+- `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS`: outer worker watchdog for no terminal result; default `540`
 
 Behavior:
 
@@ -309,9 +313,13 @@ Behavior:
 - `ACA_CODER_WAIT_TIMEOUT_SECONDS` -> `execution.coder_wait_timeout_seconds`
 - `ACA_CODER_POLL_INTERVAL_SECONDS` -> `execution.coder_poll_interval_seconds`
 - `ACA_CODER_SUPERVISOR_ENABLED` -> `execution.coder_supervisor_enabled`
+- `ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS` -> API startup-only supervisor reconciliation timeout
 - `ACA_CODER_SUPERVISOR_INTERVAL_SECONDS` -> `execution.coder_supervisor_interval_seconds`
 - `ACA_CODER_SUPERVISOR_BATCH_SIZE` -> `execution.coder_supervisor_batch_size`
 - `ACA_CODER_CANCEL_ON_SOURCE_TERMINAL` -> `execution.coder_cancel_on_source_terminal`
+- `ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS` -> legacy worker prompt-sync timeout
+- `ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS` -> legacy worker prompt-sync scaled cap
+- `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS` -> legacy worker no-progress watchdog
 - `ACA_PROVIDER_KEY` -> primary generic provider secret for simple single-provider setups; ACA maps it onto the active provider's expected secret env var for Tandem subprocesses
 - `ACA_FALLBACK_PROVIDER` -> `provider.fallback_provider`
 - `ACA_REVIEW_POLICY` -> `review.policy`

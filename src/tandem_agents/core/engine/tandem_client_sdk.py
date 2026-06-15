@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
@@ -83,16 +84,41 @@ def execute_with_client(cfg: ResolvedConfig, fn: str, *args: Any, **kwargs: Any)
 
 
 def _close_quietly(client: Any) -> None:
-    close = getattr(client, "close", None)
+    close = getattr(client, "close", None) or getattr(client, "aclose", None)
     if callable(close):
         try:
-            close()
+            _run_awaitable_if_needed(close())
         except RuntimeError as exc:
             if "Event loop is closed" not in str(exc):
                 raise
 
 
+def _run_awaitable_if_needed(result: Any) -> Any:
+    if not inspect.isawaitable(result):
+        return result
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(result)
+
+    holder: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            holder["result"] = asyncio.run(result)
+        except BaseException as exc:  # noqa: BLE001
+            holder["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("result")
+
+
 def _jsonify_sdk_result(result: Any) -> Any:
+    result = _run_awaitable_if_needed(result)
     if hasattr(result, "model_dump"):
         return result.model_dump(exclude_none=True)
     return result

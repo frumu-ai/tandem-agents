@@ -22,6 +22,7 @@ def run_linear_graph_dogfood(
     wait_seconds: int = 180,
     poll_seconds: float = 2.0,
     expect_graph: bool = True,
+    trigger_timeout_seconds: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Trigger one ACA run and assert whether planning used repo.context_bundle."""
 
@@ -33,6 +34,7 @@ def run_linear_graph_dogfood(
         project_slug=project_slug,
         item=item,
         overrides=overrides or {},
+        timeout_seconds=_trigger_timeout_seconds(wait_seconds, trigger_timeout_seconds),
     )
     deadline = time.monotonic() + max(1, wait_seconds)
     last_snapshot: dict[str, Any] = {}
@@ -71,7 +73,20 @@ def _resolve_token(*, root: Path, token_file: Path | None, token: str | None) ->
     return value
 
 
-def _request_json(url: str, *, token: str, method: str = "GET", payload: Any | None = None) -> Any:
+def _trigger_timeout_seconds(wait_seconds: int, override: float | None = None) -> float:
+    if override is not None:
+        return max(1.0, float(override))
+    return float(max(30, min(max(1, int(wait_seconds or 1)), 300)))
+
+
+def _request_json(
+    url: str,
+    *,
+    token: str,
+    method: str = "GET",
+    payload: Any | None = None,
+    timeout_seconds: float = 15.0,
+) -> Any:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
         url,
@@ -83,7 +98,7 @@ def _request_json(url: str, *, token: str, method: str = "GET", payload: Any | N
         },
     )
     try:
-        with urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=max(1.0, float(timeout_seconds))) as response:
             raw = response.read().decode("utf-8")
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -105,6 +120,7 @@ def _trigger_run(
     project_slug: str,
     item: str | None,
     overrides: dict[str, str],
+    timeout_seconds: float = 15.0,
 ) -> str:
     query = {"project_slug": project_slug}
     if item:
@@ -114,6 +130,7 @@ def _trigger_run(
         token=token,
         method="POST",
         payload=overrides,
+        timeout_seconds=timeout_seconds,
     )
     run_id = str((payload or {}).get("run_id") or "").strip()
     if not run_id:
