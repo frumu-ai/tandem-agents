@@ -265,14 +265,10 @@ def finalize_completed_run(ctx: RunContext) -> dict[str, Any]:
 def _enqueue_and_dispatch_pr(ctx: RunContext, final_diff_snapshot: str) -> bool:
     """Enqueue a github_pull_request.create outbox event and dispatch it now."""
     from src.tandem_agents.core.execution import runner_core as _rc
+    from src.tandem_agents.core.phases.pr_body import build_pull_request_body
     from src.tandem_agents.runtime.runstate import append_event, write_status
 
-    summary_path = ctx.layout["summary"]
-    pr_body = (
-        summary_path.read_text(encoding="utf-8")
-        if summary_path.exists()
-        else f"ACA automated PR for task: {ctx.task['title']}"
-    )
+    pr_body = build_pull_request_body(ctx, final_diff_snapshot)
     ctx.coordination.enqueue_outbox(
         kind="github_pull_request.create",
         aggregate_type="task",
