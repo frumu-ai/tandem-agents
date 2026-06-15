@@ -165,6 +165,27 @@ class FinalizePhaseTest(unittest.TestCase):
             self.assertIn("`src/tandem_agents/core/phases/finalize.py`", body)
             self.assertNotEqual(body.strip(), "ACA automated PR for task: Create PR")
 
+    def test_build_pull_request_body_keeps_string_risks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            ctx.manager_plan = {
+                "summary": "Preserve manager risk notes.",
+                "risks": [
+                    "Real-engine regression baselines remain blocked by TAN-6.",
+                    {
+                        "risk": "Generated PR bodies can omit reviewer context.",
+                        "mitigation": "Compose from structured run artifacts.",
+                    },
+                ],
+            }
+
+            body = build_pull_request_body(ctx, "")
+
+        self.assertIn("## Known Limitations", body)
+        self.assertIn("Real-engine regression baselines remain blocked by TAN-6.", body)
+        self.assertIn("Generated PR bodies can omit reviewer context.", body)
+        self.assertIn("Mitigation: Compose from structured run artifacts.", body)
+
 
 if __name__ == "__main__":
     unittest.main()

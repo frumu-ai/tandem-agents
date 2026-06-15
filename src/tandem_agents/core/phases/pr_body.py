@@ -261,13 +261,20 @@ def _review_notes(review: dict[str, Any], test: dict[str, Any]) -> list[str]:
 
 def _risk_lines(manager_plan: dict[str, Any], task_contract: dict[str, Any]) -> list[str]:
     risks: list[str] = []
-    for item in _list_of_dicts(manager_plan.get("risks")):
-        risk = _clean_inline(_text(item.get("risk")), 260)
-        mitigation = _clean_inline(_text(item.get("mitigation")), 260)
-        if risk and mitigation:
-            risks.append(f"{risk} Mitigation: {mitigation}")
-        elif risk:
-            risks.append(risk)
+    raw_risks = manager_plan.get("risks")
+    if isinstance(raw_risks, list):
+        for item in raw_risks:
+            if isinstance(item, dict):
+                risk = _clean_inline(_text(item.get("risk")), 260)
+                mitigation = _clean_inline(_text(item.get("mitigation")), 260)
+                if risk and mitigation:
+                    risks.append(f"{risk} Mitigation: {mitigation}")
+                elif risk:
+                    risks.append(risk)
+            else:
+                risk = _clean_inline(_text(item), 260)
+                if risk:
+                    risks.append(risk)
     verification = task_contract.get("verification_commands")
     if isinstance(verification, list):
         for item in verification:
