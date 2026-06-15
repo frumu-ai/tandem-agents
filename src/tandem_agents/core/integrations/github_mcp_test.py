@@ -217,6 +217,43 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             )["lifecycle_state"],
             "merged",
         )
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {
+                    "state": "open",
+                    "number": 1,
+                    "reviewDecision": "REVIEW_REQUIRED",
+                    "statusCheckRollup": [
+                        {
+                            "name": "engine-checks (ubuntu-latest)",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "detailsUrl": "https://github.com/frumu-ai/tandem/actions/runs/1/job/2",
+                        },
+                        {"name": "Lint Frontend", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                head_branch="aca/task",
+                base_repo="frumu-ai/example",
+            )["lifecycle_state"],
+            "needs-repair",
+        )
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {
+                    "state": "open",
+                    "number": 1,
+                    "reviewDecision": "REVIEW_REQUIRED",
+                    "statusCheckRollup": [
+                        {"name": "engine-checks (ubuntu-latest)", "status": "IN_PROGRESS", "conclusion": None},
+                        {"name": "Lint Frontend", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                head_branch="aca/task",
+                base_repo="frumu-ai/example",
+            )["lifecycle_state"],
+            "running",
+        )
 
     def test_collect_pull_request_repair_context_skips_stale_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +342,59 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
 
             self.assertFalse(context["actionable"])
             self.assertEqual(context["reason"], "no_actionable_review_feedback")
+
+    def test_collect_pull_request_repair_context_includes_failed_ci_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            pull_request = {
+                "number": 1600,
+                "url": "https://github.com/frumu-ai/tandem/pull/1600",
+                "head_branch": "aca/tan-106",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/tandem",
+            }
+
+            with (
+                patch(
+                    "src.tandem_agents.core.integrations.github_mcp.get_pull_request",
+                    return_value={
+                        "number": 1600,
+                        "state": "open",
+                        "reviewDecision": "REVIEW_REQUIRED",
+                        "statusCheckRollup": [
+                            {
+                                "name": "engine-checks (ubuntu-latest)",
+                                "workflowName": "Engine CI",
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                                "detailsUrl": "https://github.com/frumu-ai/tandem/actions/runs/27522819773/job/81344132013",
+                            },
+                            {
+                                "name": "Lint Frontend",
+                                "workflowName": "CI",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                            },
+                        ],
+                    },
+                ),
+                patch("src.tandem_agents.core.integrations.github_mcp._list_pull_request_reviews", return_value=[]),
+                patch("src.tandem_agents.core.integrations.github_mcp._list_pull_request_review_comments", return_value=[]),
+            ):
+                context = collect_pull_request_repair_context(cfg, pull_request)
+
+            self.assertTrue(context["actionable"])
+            self.assertEqual(context["pull_request"]["checks_state"], "failure")
+            self.assertEqual(context["pull_request"]["lifecycle_state"], "needs-repair")
+            self.assertEqual(context["feedback_items"][0]["kind"], "check_failure")
+            self.assertEqual(context["feedback_items"][0]["name"], "engine-checks (ubuntu-latest)")
+            self.assertEqual(context["feedback_items"][0]["workflow"], "Engine CI")
+            self.assertIn("81344132013", context["feedback_items"][0]["url"])
+            prompt = build_pull_request_repair_prompt(context)
+            self.assertIn("Check: engine-checks (ubuntu-latest)", prompt)
+            self.assertIn("Workflow: Engine CI", prompt)
+            self.assertIn("State: failure", prompt)
 
     def test_github_project_status_mapping_is_explicit(self) -> None:
         self.assertEqual(github_project_status_name_for_task_state("active"), "In progress")
