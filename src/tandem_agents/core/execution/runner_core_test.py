@@ -97,10 +97,16 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
     def test_execute_local_worker_pool_reports_no_progress_timeout(self) -> None:
         def stalled_runner(*_args):
             time.sleep(0.05)
-            return {"status": "completed", "returncode": 0}
+            return {
+                "status": "completed",
+                "returncode": 0,
+                "output_excerpt": "finished after timeout",
+                "changed_files": ["src/app.py"],
+            }
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            started = time.monotonic()
             results = _execute_local_worker_pool(
                 self._config(root),
                 "run-1",
@@ -112,11 +118,16 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 worker_runner=stalled_runner,
                 worker_timeout_seconds=0.01,
             )
+            elapsed = time.monotonic() - started
 
         self.assertEqual(len(results), 1)
+        self.assertGreaterEqual(elapsed, 0.04)
         self.assertEqual(results[0]["status"], "failed")
         self.assertEqual(results[0]["blocker_kind"], "worker_no_progress")
         self.assertIn("no terminal result", results[0]["failure_reason"])
+        self.assertIn("Late worker result after timeout", results[0]["output_excerpt"])
+        self.assertIn("finished after timeout", results[0]["output_excerpt"])
+        self.assertEqual(results[0]["changed_files"], ["src/app.py"])
 
     def test_execute_local_worker_pool_keeps_result_when_callback_fails(self) -> None:
         def worker_runner(*_args):

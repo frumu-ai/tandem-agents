@@ -1789,8 +1789,13 @@ def _execute_local_worker_pool(
                     result.get("subtask_id"),
                 )
 
-    def _timeout_result(index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
-        return {
+    def _timeout_result(
+        index: int,
+        subtask: dict[str, Any],
+        worker_id: str,
+        finished_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = {
             "worker_id": worker_id,
             "subtask_index": index,
             "subtask_id": subtask["id"],
@@ -1809,6 +1814,38 @@ def _execute_local_worker_pool(
             "write_required": bool(subtask.get("write_required", True)),
             "verified_existing": False,
         }
+        if isinstance(finished_result, dict):
+            for key in (
+                "worktree",
+                "log_path",
+                "partial_diff_artifact",
+                "artifacts",
+                "changed_files",
+                "engine",
+            ):
+                if finished_result.get(key):
+                    result[key] = finished_result[key]
+            excerpt = str(finished_result.get("output_excerpt") or finished_result.get("stdout") or "").strip()
+            if excerpt:
+                result["output_excerpt"] = f"{result['output_excerpt']}\n\nLate worker result after timeout:\n{excerpt[:2000]}"
+        return result
+
+    def _timed_out_worker_result(future, index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        if future.cancel():
+            return _timeout_result(index, subtask, worker_id)
+        logger.warning(
+            "Worker %s/%s exceeded %.0fs timeout; waiting for the in-flight worker to finish before repair continues.",
+            worker_id,
+            subtask.get("id"),
+            timeout,
+        )
+        try:
+            finished_result = future.result()
+        except Exception as exc:
+            finished_result = {
+                "output_excerpt": f"Timed-out worker raised while ACA waited for it to finish: {exc}",
+            }
+        return _timeout_result(index, subtask, worker_id, finished_result if isinstance(finished_result, dict) else None)
 
     if worker_limit <= 1:
         executor = ThreadPoolExecutor(max_workers=1)
@@ -1819,8 +1856,7 @@ def _execute_local_worker_pool(
                 try:
                     result = future.result(timeout=timeout if timeout > 0 else None)
                 except FutureTimeoutError:
-                    future.cancel()
-                    result = _timeout_result(index, subtask, worker_id)
+                    result = _timed_out_worker_result(future, index, subtask, worker_id)
                     _record_result(result)
                     break
                 _record_result(result)
@@ -1878,8 +1914,7 @@ def _execute_local_worker_pool(
             for future, (index, subtask, worker_id) in futures.items():
                 if future in completed:
                     continue
-                future.cancel()
-                _record_result(_timeout_result(index, subtask, worker_id))
+                _record_result(_timed_out_worker_result(future, index, subtask, worker_id))
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
     return results
