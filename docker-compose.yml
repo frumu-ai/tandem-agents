@@ -193,7 +193,7 @@ services:
         required: false
     environment:
       ACA_ROOT: /workspace/tandem-agents
-      TANDEM_BASE_URL: ${TANDEM_BASE_URL:-http://tandem-engine:${TANDEM_PORT:-39733}}
+      TANDEM_BASE_URL: ${TANDEM_BASE_URL:-http://127.0.0.1:${TANDEM_PORT:-39733}}
       TANDEM_ENGINE_PORT: ${TANDEM_PORT:-39733}
       TANDEM_API_TOKEN_FILE: ${TANDEM_API_TOKEN_FILE:-/workspace/tandem-data/tandem_api_token}
       TANDEM_API_TOKEN: ""

@@ -1850,6 +1850,82 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(results[0]["worker_id"], "worker-2")
             self.assertCountEqual(call_order, ["worker-1", "worker-2"])
 
+    def test_parallel_worker_pool_honors_abort_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "runs" / "run-1"
+            repo_path.mkdir(parents=True, exist_ok=True)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            pending_subtasks = [
+                {"id": "subtask-1", "title": "first", "goal": "first", "write_required": True},
+                {"id": "subtask-2", "title": "second", "goal": "second", "write_required": True},
+            ]
+            abort_calls: list[str] = []
+
+            def fake_worker_runner(
+                _cfg,
+                _run_id,
+                _repo_path,
+                _run_dir,
+                _task,
+                subtask,
+                worker_id,
+                index,
+            ):
+                time.sleep(0.2)
+                return {
+                    "worker_id": worker_id,
+                    "subtask_index": index,
+                    "subtask_id": subtask["id"],
+                    "title": subtask["title"],
+                    "status": "completed",
+                    "returncode": 0,
+                    "worktree": str(repo_path),
+                    "log_path": "",
+                    "output_excerpt": worker_id,
+                    "write_required": True,
+                    "verified_existing": False,
+                }
+
+            def abort_result(index: int, subtask: dict[str, object], worker_id: str) -> dict[str, object]:
+                abort_calls.append(worker_id)
+                return {
+                    "worker_id": worker_id,
+                    "subtask_index": index,
+                    "subtask_id": subtask["id"],
+                    "title": subtask["title"],
+                    "status": "failed",
+                    "returncode": 1,
+                    "worktree": "",
+                    "log_path": "",
+                    "output_excerpt": "Worker aborted by heartbeat guard.",
+                    "blocker_kind": "worker_unproductive",
+                    "write_required": True,
+                    "verified_existing": False,
+                }
+
+            started = time.monotonic()
+            results = _execute_local_worker_pool(
+                resolve_config(root),
+                "run-1",
+                repo_path,
+                run_dir,
+                {"title": "Parallel work"},
+                pending_subtasks,
+                2,
+                worker_runner=fake_worker_runner,
+                abort_result=abort_result,
+                worker_timeout_seconds=5,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.15)
+            self.assertEqual(len(results), 2)
+            self.assertCountEqual([result["worker_id"] for result in results], ["worker-1", "worker-2"])
+            self.assertTrue(all(result["blocker_kind"] == "worker_unproductive" for result in results))
+            self.assertCountEqual(abort_calls, ["worker-1", "worker-2"])
+
     def test_serial_worker_pool_stops_after_write_required_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -6,7 +6,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1933,46 +1933,73 @@ def _execute_local_worker_pool(
         )
         for index, subtask in enumerate(pending_subtasks, start=1)
     }
-    try:
-        completed = set()
+    def _record_future_result(future) -> None:
+        index, subtask, worker_id = futures[future]
         try:
-            completed_iter = as_completed(futures, timeout=timeout if timeout > 0 else None)
-            for future in completed_iter:
-                completed.add(future)
-                index, subtask, worker_id = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = {
-                        "worker_id": worker_id,
-                        "subtask_index": index,
-                        "subtask_id": subtask["id"],
-                        "title": subtask["title"],
-                        "status": "failed",
-                        "returncode": 1,
-                        "worktree": "",
-                        "log_path": "",
-                        "output_excerpt": f"Worker execution raised an exception: {exc}",
-                        "write_required": bool(subtask.get("write_required", True)),
-                        "verified_existing": False,
-                    }
-                if not isinstance(result, dict):
-                    result = {}
-                result.setdefault("worker_id", worker_id)
-                result.setdefault("subtask_index", index)
-                result.setdefault("subtask_id", subtask["id"])
-                result.setdefault("title", subtask["title"])
-                result.setdefault("status", "failed" if result.get("returncode", 1) else "completed")
-                result.setdefault("returncode", 0 if _normalized_text(result.get("status")) == "completed" else 1)
-                subtask_write_required = bool(subtask.get("write_required", True))
-                result["write_required"] = subtask_write_required or bool(result.get("write_required"))
-                result.setdefault("verified_existing", False)
-                _record_result(result)
-        except FutureTimeoutError:
-            for future, (index, subtask, worker_id) in futures.items():
-                if future in completed:
-                    continue
-                _record_result(_timed_out_worker_result(future, index, subtask, worker_id))
+            result = future.result()
+        except Exception as exc:
+            result = {
+                "worker_id": worker_id,
+                "subtask_index": index,
+                "subtask_id": subtask["id"],
+                "title": subtask["title"],
+                "status": "failed",
+                "returncode": 1,
+                "worktree": "",
+                "log_path": "",
+                "output_excerpt": f"Worker execution raised an exception: {exc}",
+                "write_required": bool(subtask.get("write_required", True)),
+                "verified_existing": False,
+            }
+        if not isinstance(result, dict):
+            result = {}
+        result.setdefault("worker_id", worker_id)
+        result.setdefault("subtask_index", index)
+        result.setdefault("subtask_id", subtask["id"])
+        result.setdefault("title", subtask["title"])
+        result.setdefault("status", "failed" if result.get("returncode", 1) else "completed")
+        result.setdefault("returncode", 0 if _normalized_text(result.get("status")) == "completed" else 1)
+        subtask_write_required = bool(subtask.get("write_required", True))
+        result["write_required"] = subtask_write_required or bool(result.get("write_required"))
+        result.setdefault("verified_existing", False)
+        _record_result(result)
+
+    try:
+        pending = set(futures)
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        while pending:
+            for future in [candidate for candidate in pending if candidate.done()]:
+                pending.remove(future)
+                _record_future_result(future)
+            if not pending:
+                break
+
+            if abort_result is not None:
+                for future in list(pending):
+                    index, subtask, worker_id = futures[future]
+                    aborted = abort_result(index, subtask, worker_id)
+                    if aborted:
+                        future.cancel()
+                        pending.remove(future)
+                        _record_result(aborted)
+                if not pending:
+                    break
+
+            wait_s = 1.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    for future in list(pending):
+                        index, subtask, worker_id = futures[future]
+                        pending.remove(future)
+                        _record_result(_timed_out_worker_result(future, index, subtask, worker_id))
+                    break
+                wait_s = min(wait_s, max(0.01, remaining))
+
+            done, _not_done = wait(pending, timeout=wait_s, return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.remove(future)
+                _record_future_result(future)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
     return results

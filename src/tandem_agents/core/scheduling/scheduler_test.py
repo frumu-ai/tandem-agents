@@ -285,6 +285,42 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(plan["admitted"][0]["task_key"], snapshot["queued"][0]["task_key"])
             self.assertFalse(plan["blocked"])
 
+    def test_scheduler_project_filter_keeps_global_active_repo_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 4
+            cfg.scheduler.max_active_tasks_per_project = 4
+            cfg.scheduler.max_active_tasks_per_repo = 4
+            store = CoordinationStore.from_config(cfg)
+            active_other_project = {
+                "task_id": "active-other",
+                "title": "Active other project",
+                "source": {"type": "linear", "team": "team-1", "project": "project-other"},
+                "repo": {"slug": "frumu-ai/shared", "path": str(root / "shared")},
+            }
+            target = {
+                "task_id": "target",
+                "title": "Target task",
+                "source": {"type": "linear", "team": "team-1", "project": "project-target"},
+                "repo": {"slug": "frumu-ai/shared", "path": str(root / "shared")},
+            }
+            store.register_task(active_other_project, repo=active_other_project["repo"], status="active")
+            registered_target = store.register_task(target, repo=target["repo"], status="queued")
+
+            plan = plan_task_admissions(
+                cfg,
+                coordination=store,
+                limit=10,
+                project_keys={task_project_key(target)},
+            )
+
+            self.assertFalse(plan["admitted"])
+            self.assertEqual(plan["active_tasks"], 0)
+            self.assertEqual(plan["blocked"][0]["task_key"], registered_target["task_key"])
+            self.assertEqual(plan["blocked"][0]["reason"], "repo_overlap_reached")
+            self.assertEqual(plan["blocked"][0]["repo_key"], "frumu-ai/shared")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -195,14 +195,15 @@ def plan_task_admissions(
     requested_limit = max(1, int(limit or cfg.scheduler.queue_depth_limit))
     fetch_limit = requested_limit if not _project_key_filter(project_keys) else max(requested_limit, int(cfg.scheduler.queue_depth_limit), 1000)
     queued = _filter_project_tasks(store.list_tasks(state="queued", limit=fetch_limit), project_keys)[:requested_limit]
-    active = _filter_project_tasks(store.list_tasks(limit=fetch_limit), project_keys)[:requested_limit]
-    active = [task for task in active if _active_state(task)]
+    all_tasks = store.list_tasks(limit=fetch_limit)
+    active_for_capacity = [task for task in all_tasks if _active_state(task)]
+    active = _filter_project_tasks(active_for_capacity, project_keys)[:requested_limit]
 
     active_by_project: dict[str, int] = defaultdict(int)
     active_by_repo: dict[str, int] = defaultdict(int)
     active_repo_locked: dict[str, bool] = defaultdict(bool)
     active_scopes_by_repo: dict[str, list[tuple[str, ...]]] = defaultdict(list)
-    for task in active:
+    for task in active_for_capacity:
         project_key = task_project_key(task)
         repo_key = task_repo_key(task)
         active_by_project[project_key] += 1
