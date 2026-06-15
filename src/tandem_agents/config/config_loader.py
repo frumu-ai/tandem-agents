@@ -171,12 +171,12 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
     linear_mcp_server = mcp_servers.get("linear", {}) if isinstance(mcp_servers, dict) else {}
 
     def github_pat_present() -> bool:
-        direct_token = _nonempty(merged_env.get("GITHUB_PERSONAL_ACCESS_TOKEN")) or _nonempty(
-            merged_env.get("GITHUB_TOKEN")
+        direct_token = _nonempty(merged_env.get("GITHUB_TOKEN")) or _nonempty(
+            merged_env.get("GITHUB_PERSONAL_ACCESS_TOKEN")
         )
         if direct_token:
             return True
-        for file_env_name in ("GITHUB_PERSONAL_ACCESS_TOKEN_FILE", "GITHUB_TOKEN_FILE"):
+        for file_env_name in ("GITHUB_TOKEN_FILE", "GITHUB_PERSONAL_ACCESS_TOKEN_FILE"):
             file_value = _nonempty(merged_env.get(file_env_name))
             if not file_value:
                 continue
@@ -666,20 +666,30 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             )
         ),
     )
-    if not mcp_servers and github_mcp.enabled:
-        mcp_servers = {
-            "github": {
-                "enabled": github_mcp.enabled,
-                "transport": github_mcp.url,
-                "headers": {"X-MCP-Toolsets": github_mcp.toolsets} if github_mcp.toolsets else {},
-                "auth": {
-                    "token_envs": ["GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"],
-                    "token_file_envs": ["GITHUB_PERSONAL_ACCESS_TOKEN_FILE", "GITHUB_TOKEN_FILE"],
-                },
-                "auto_connect": True,
-                "scope": github_mcp.scope,
-                "remote_sync": github_mcp.remote_sync,
-            }
+    if not mcp_servers:
+        mcp_servers = {}
+    if github_mcp.enabled and "github" not in mcp_servers:
+        mcp_servers["github"] = {
+            "enabled": github_mcp.enabled,
+            "transport": github_mcp.url,
+            "headers": {"X-MCP-Toolsets": github_mcp.toolsets} if github_mcp.toolsets else {},
+            "auth": {
+                "token_envs": ["GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+                "token_file_envs": ["GITHUB_TOKEN_FILE", "GITHUB_PERSONAL_ACCESS_TOKEN_FILE"],
+            },
+            "auto_connect": True,
+            "scope": github_mcp.scope,
+            "remote_sync": github_mcp.remote_sync,
+        }
+    if linear_mcp.enabled and linear_mcp.server not in mcp_servers:
+        mcp_servers[linear_mcp.server] = {
+            "enabled": linear_mcp.enabled,
+            "name": linear_mcp.server,
+            "transport": str(linear_mcp_server.get("transport") or "https://mcp.linear.app/mcp"),
+            "auth_kind": str(linear_mcp_server.get("auth_kind") or "oauth"),
+            "auto_connect": True,
+            "scope": linear_mcp.scope,
+            "remote_sync": linear_mcp.remote_sync,
         }
     return ResolvedConfig(
         root_dir=root_dir,

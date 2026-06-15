@@ -25,6 +25,9 @@ services:
       TANDEM_ENGINE_COMMAND: scripts/tandem-engine-serve.sh
       TANDEM_OUTPUT_ROOT: /workspace/tandem-data
       TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
+      TANDEM_CONTROL_PANEL_PUBLIC_URL: ${TANDEM_CONTROL_PANEL_PUBLIC_URL:-}
+      HOSTED_CONTROL_PANEL_PUBLIC_URL: ${HOSTED_CONTROL_PANEL_PUBLIC_URL:-}
+      HOSTED_PUBLIC_URL: ${HOSTED_PUBLIC_URL:-}
       CODEX_HOME: /workspace/tandem-data/codex
       NPM_CONFIG_PREFIX: /home/node/npm
       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN:-}
@@ -124,13 +127,12 @@ services:
       args:
         HOST_UID: "${ACA_HOST_UID:-1000}"
         HOST_GID: "${ACA_HOST_GID:-1000}"
-    user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
     env_file:
       - path: ./.env
         required: false
     environment:
       KB_PORT: ${KB_PORT:-39736}
-      KB_PUBLIC_BASE_URL: ${KB_PUBLIC_BASE_URL:-http://127.0.0.1:${KB_PORT:-39736}/mcp}
+      KB_PUBLIC_BASE_URL: ${KB_PUBLIC_BASE_URL:-http://tandem-kb-mcp:${KB_PORT:-39736}/mcp}
       KB_DOCS_ROOT: /workspace/kb-data/docs
       KB_INDEX_ROOT: /workspace/kb-data/index
       KB_ADMIN_API_KEY_FILE: /run/secrets/kb_admin_api_key
@@ -185,19 +187,21 @@ services:
         TANDEM_ENGINE_RELEASE_VERSION: "${TANDEM_ENGINE_RELEASE_VERSION:-${TANDEM_RELEASE_VERSION:-latest}}"
         TANDEM_ENGINE_PACKAGE: "${TANDEM_ENGINE_PACKAGE:-@frumu/tandem}"
     user: "${ACA_HOST_UID:-1000}:${ACA_HOST_GID:-1000}"
+    network_mode: host
     env_file:
       - path: ./.env
         required: false
     environment:
       ACA_ROOT: /workspace/tandem-agents
-      TANDEM_BASE_URL: http://tandem-engine:${TANDEM_PORT:-39733}
+      TANDEM_BASE_URL: ${TANDEM_BASE_URL:-http://127.0.0.1:${TANDEM_PORT:-39733}}
       TANDEM_ENGINE_PORT: ${TANDEM_PORT:-39733}
-      TANDEM_API_TOKEN_FILE: /workspace/tandem-data/tandem_api_token
+      TANDEM_API_TOKEN_FILE: ${TANDEM_API_TOKEN_FILE:-/workspace/tandem-data/tandem_api_token}
       TANDEM_API_TOKEN: ""
       TANDEM_TOKEN: ""
       TANDEM_ENGINE_COMMAND: scripts/tandem-engine-serve.sh
       TANDEM_ENGINE_STARTUP_MODE: reuse_only
       TANDEM_OUTPUT_ROOT: ${TANDEM_OUTPUT_ROOT:-/workspace/tandem-data}
+      ACA_WORKSPACE_STATE_DIR: ${ACA_WORKSPACE_STATE_DIR:-/workspace/tandem-agents/.tandem-agents}
       AUTOCODER_WORKTREE_ROOT: ${AUTOCODER_WORKTREE_ROOT:-/workspace/repos}
       AUTOCODER_OUTPUT_ROOT: ${AUTOCODER_OUTPUT_ROOT:-/workspace/tandem-agents/runs}
       AUTOCODER_REPO_PATH: ${AUTOCODER_REPO_PATH:-}
@@ -212,8 +216,6 @@ services:
       TANDEM_CONTROL_PANEL_MODE: ${TANDEM_CONTROL_PANEL_MODE:-auto}
       ACA_COORDINATION_SQLITE_PATH: ${ACA_COORDINATION_SQLITE_PATH:-/workspace/tandem-data/coordination.sqlite3}
       ACA_COORDINATION_POSTGRES_URL: ${ACA_COORDINATION_POSTGRES_URL:-postgresql://${ACA_COORDINATION_POSTGRES_USER:-aca}:${ACA_COORDINATION_POSTGRES_PASSWORD:-aca}@coordination-postgres:${ACA_COORDINATION_POSTGRES_PORT:-5432}/${ACA_COORDINATION_POSTGRES_DB:-aca}}
-    ports:
-      - "${ACA_API_PORT:-39735}:${ACA_API_PORT:-39735}"
     volumes:
       - ./:/workspace/tandem-agents:ro
       - ./.tandem-agents:/workspace/tandem-agents/.tandem-agents
@@ -255,6 +257,7 @@ services:
       TANDEM_ENGINE_COMMAND: scripts/tandem-engine-serve.sh
       TANDEM_ENGINE_STARTUP_MODE: reuse_only
       TANDEM_OUTPUT_ROOT: ${TANDEM_OUTPUT_ROOT:-/workspace/tandem-data}
+      ACA_WORKSPACE_STATE_DIR: ${ACA_WORKSPACE_STATE_DIR:-/workspace/tandem-agents/.tandem-agents}
       AUTOCODER_WORKTREE_ROOT: ${AUTOCODER_WORKTREE_ROOT:-/workspace/repos}
       AUTOCODER_OUTPUT_ROOT: ${AUTOCODER_OUTPUT_ROOT:-/workspace/tandem-agents/runs}
       AUTOCODER_REPO_PATH: ${AUTOCODER_REPO_PATH:-}

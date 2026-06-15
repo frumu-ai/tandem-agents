@@ -41,9 +41,12 @@ def _partial_diff_repair_prompt_mode(previous_feedback: str | None) -> str:
     return (
         "PARTIAL-DIFF REPAIR MODE:\n"
         "- Return exactly one subtask unless the feedback says multiple preserved patches exist.\n"
-        "- The subtask must first finish the preserved partial patch and fix blockers named in the worker output excerpt.\n"
-        "- Keep `files` limited to changed files from the failed attempt when those files are listed.\n"
-        "- Do not plan new scenario slices, broad follow-up work, or additional target files until the preserved patch is terminal and verified.\n"
+        "- If the feedback indicates the preserved patch is reusable, the subtask must first finish that patch and fix blockers named in the worker output excerpt.\n"
+        "- If the feedback says the partial patch was rejected, reset, unverified, incomplete, or not treated as completed, use it only as failure evidence; plan a replacement repair against the parent task target files.\n"
+        "- Keep `files` limited to changed files only when the feedback indicates the preserved patch is reusable.\n"
+        "- If the feedback says the partial patch was rejected, reset, unverified, incomplete, or not treated as completed, "
+        "discard that approach and include the parent task target files needed to satisfy the original acceptance criteria.\n"
+        "- Do not plan unrelated scenario slices or broad follow-up work while repairing the partial-diff blocker.\n"
         "- Put the recovered blocker fixes in canonical `acceptance_criteria`, not only in summary or risks.\n\n"
     )
 
@@ -86,6 +89,34 @@ def _is_source_or_test_target_path(path: str) -> bool:
     return any(lowered.endswith(ext) for ext in SOURCE_OR_TEST_TARGET_EXTENSIONS)
 
 
+def _is_test_target_path(path: str) -> bool:
+    rel_path = str(path or "").strip().replace("\\", "/").rstrip("/")
+    if not rel_path:
+        return False
+    lowered = rel_path.lower()
+    return (
+        lowered.startswith("tests/")
+        or "/tests/" in f"/{lowered}"
+        or lowered.endswith((
+            "_test.rs",
+            "_tests.rs",
+            "_test.py",
+            ".test.ts",
+            ".test.tsx",
+            ".spec.ts",
+            ".spec.tsx",
+        ))
+    )
+
+
+def _subtask_mentions_test_work(subtask: dict[str, Any]) -> bool:
+    parts: list[Any] = [subtask.get("title"), subtask.get("goal"), subtask.get("scope_note")]
+    parts.extend(_as_list(subtask.get("acceptance_criteria")))
+    parts.extend(_as_list(subtask.get("deliverables")))
+    text = "\n".join(str(part or "") for part in parts).lower()
+    return any(word in text for word in ("test", "tests", "coverage", "regression"))
+
+
 def _is_support_only_target_path(path: str) -> bool:
     rel_path = str(path or "").strip().replace("\\", "/").rstrip("/")
     if not rel_path:
@@ -106,6 +137,43 @@ def _split_substantive_and_support_targets(target_files: list[str]) -> tuple[lis
     return (
         [path for path in target_files if not _is_metadata_only_target_path(path)],
         [path for path in target_files if _is_metadata_only_target_path(path)],
+    )
+
+
+def _subtask_contract_for_worker(subtask: dict[str, Any], target_files: list[str]) -> dict[str, Any]:
+    """Render worker contract with the active subtask target set, not the parent task target set."""
+    if not target_files:
+        return subtask
+    contract_subtask = dict(subtask)
+    contract_subtask["target_files"] = list(target_files)
+    nested_contract = dict(contract_subtask.get("task_contract") or {})
+    nested_contract["target_files"] = list(target_files)
+    contract_subtask["task_contract"] = nested_contract
+    return contract_subtask
+
+
+def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) -> str:
+    if not subtask.get("discarded_partial_diff_patch"):
+        return ""
+    summary = _clip_prompt_text(subtask.get("repair_failure_summary"), 300)
+    changed_files = [
+        str(entry).strip()
+        for entry in _as_list(subtask.get("repair_changed_files"))
+        if str(entry).strip()
+    ]
+    target_line = json.dumps(target_files)
+    changed_line = json.dumps(changed_files)
+    summary_line = f"\n- Failure summary: {summary}" if summary else ""
+    return (
+        "\nRepair directive:\n"
+        "- The previous partial diff was rejected; do not apply or copy it as-is.\n"
+        f"- Work from the current clean target files: {target_line}.\n"
+        f"- Rejected diff touched: {changed_line}.\n"
+        "- First actions: read the target files, identify the existing production path, make one focused edit/test, "
+        "then run the narrowest relevant verification.\n"
+        "- Valid coverage must call production code or an existing exported behavior; a helper-only or local-oracle "
+        "test fails this repair."
+        f"{summary_line}\n"
     )
 
 
@@ -360,9 +428,12 @@ def build_manager_prompt(
         f"{contract_block}\n\n"
         "If the repository already contains relevant files, prefer planning only missing or refinement work.\n"
         "Do not recreate files that already exist and appear readable unless the task clearly requires changing them.\n\n"
-        "Repo context may include graph-derived likely files, symbols, tests, and uncertainty. Treat that as discovery "
-        "evidence, not final proof. Exact files named in the task contract still take precedence, and every planned "
-        "edit must require the worker to read concrete files before changing code or making final claims.\n\n"
+        "Repo context may include graph-derived required edit files, likely files, symbols, tests, and uncertainty. "
+        "If Required edit files or target_files are present, plan worker deliverables around those paths first. "
+        "Treat Suggested first reads, Likely files, Relevant symbols, and Graph evidence as discovery/read-only context "
+        "unless a required edit file is missing or proves unrelated after inspection. Exact files named in the task "
+        "contract still take precedence, and every planned edit must require the worker to read concrete files before "
+        "changing code or making final claims.\n\n"
         f"Task title: {task['title']}\n"
         f"Task description:\n{task.get('description') or ''}\n\n"
         f"Acceptance criteria: {json.dumps(task.get('acceptance_criteria') or [])}\n"
@@ -428,15 +499,21 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         for entry in _as_list(subtask.get("ignored_target_files"))
         if str(entry).strip()
     ]
+    required_test_targets = [path for path in substantive_target_files if _is_test_target_path(path)]
     write_required = bool(subtask.get("write_required", True))
     parent_scope = _clip_prompt_text(_task_scope_block(task), WORKER_PARENT_SCOPE_CHAR_LIMIT)
-    subtask_contract = _clip_prompt_text(_task_contract_block(subtask), WORKER_SUBTASK_CONTRACT_CHAR_LIMIT)
+    subtask_contract_payload = _subtask_contract_for_worker(subtask, target_files)
+    subtask_contract = _clip_prompt_text(
+        _task_contract_block(subtask_contract_payload),
+        WORKER_SUBTASK_CONTRACT_CHAR_LIMIT,
+    )
     parent_title = _clip_prompt_text(task.get("title"), 500)
     subtask_title = _clip_prompt_text(subtask.get("title"), 500)
     subtask_goal = _clip_prompt_text(subtask.get("goal"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
     acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], WORKER_JSON_CHAR_LIMIT)
     scope_note = _clip_prompt_text(subtask.get("scope_note"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
     scope_note_block = f"\nACA scope note: {scope_note}\n" if scope_note else ""
+    repair_directive_block = _repair_directive_block(subtask, target_files)
     tracked_target_guidance = ""
     write_required_guidance = ""
     if write_required:
@@ -471,6 +548,12 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "Do not stop with an analysis-only blocker unless editing the tracked target files would be unsafe, "
             "and name that concrete safety reason.\n"
         )
+        if required_test_targets and _subtask_mentions_test_work(subtask):
+            write_required_guidance += (
+                "\nThis is a test/regression coverage subtask. Read and edit at least one required test target first: "
+                f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
+                "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
+            )
     no_target_guidance = ""
     if not target_files:
         pr_numbers = _referenced_pr_numbers(task, subtask)
@@ -496,6 +579,11 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         "Do not satisfy those tasks by inventing a standalone simulation unless the task explicitly asks for one. "
         "Do not define the quality-gate rules inside the test or smoke script and then assert those same local rules; "
         "drive existing product code, existing server/API behavior, or an existing exported implementation instead. "
+        "For regression coverage, each new assertion must exercise existing production functions, structs, API handlers, "
+        "fixtures, or exported behavior. A test-only enum, constant, local helper, or string table that merely restates "
+        "the expected behavior is not valid coverage, even if it uses realistic names. If the behavior is private, place "
+        "the test next to the implementation or make the smallest production helper change needed for the test to call "
+        "real code. "
         "Preserve existing live smoke/API behavior such as dry-run modes and endpoint calls unless the task explicitly "
         "requires replacing it. "
         "If a script must export helpers for tests, make sure importing it does not execute its CLI main routine, "
@@ -555,6 +643,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Subtask title: {subtask_title}\n"
         f"Subtask goal: {subtask_goal}\n"
         f"{scope_note_block}"
+        f"{repair_directive_block}"
         f"Subtask contract:\n{subtask_contract}\n\n"
         f"Acceptance criteria: {acceptance_criteria}\n"
         f"Expected deliverables: {deliverables}\n"

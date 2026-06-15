@@ -8,7 +8,7 @@ from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
 from src.tandem_agents.core.task_contract import classify_task_execution_kind
-from src.tandem_agents.core.scheduling.coder_supervisor import task_has_active_coder_run
+from src.tandem_agents.core.scheduling.coder_supervisor import list_active_coder_task_refs
 
 
 def _nonempty(value: Any) -> str:
@@ -48,6 +48,17 @@ def task_project_key(task: dict[str, Any]) -> str:
         return f"{source_type}:{repo_slug}"
     source_ref = _nonempty(task.get("source_ref")) or _nonempty(source.get("item")) or _nonempty(source.get("url"))
     return f"{source_type}:{source_ref or _nonempty(task.get('task_key')) or 'task'}"
+
+
+def _project_key_filter(project_keys: set[str] | list[str] | tuple[str, ...] | None) -> set[str]:
+    return {_nonempty(key) for key in (project_keys or []) if _nonempty(key)}
+
+
+def _filter_project_tasks(tasks: list[dict[str, Any]], project_keys: set[str] | list[str] | tuple[str, ...] | None) -> list[dict[str, Any]]:
+    keys = _project_key_filter(project_keys)
+    if not keys:
+        return tasks
+    return [task for task in tasks if task_project_key(task) in keys]
 
 
 def task_repo_key(task: dict[str, Any]) -> str:
@@ -131,10 +142,13 @@ def scheduler_snapshot(
     *,
     coordination: CoordinationStore | None = None,
     limit: int = 100,
+    project_keys: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     store = coordination or CoordinationStore.from_config(cfg)
     store.ensure_schema()
-    tasks = store.list_tasks(limit=limit)
+    requested_limit = max(1, int(limit or 1))
+    fetch_limit = requested_limit if not _project_key_filter(project_keys) else max(requested_limit, int(cfg.scheduler.queue_depth_limit), 1000)
+    tasks = _filter_project_tasks(store.list_tasks(limit=fetch_limit), project_keys)[:requested_limit]
     queued = [task for task in tasks if str(task.get("state") or task.get("status") or "").strip().lower() == "queued"]
     active = [task for task in tasks if _active_state(task)]
     blocked = [
@@ -174,18 +188,22 @@ def plan_task_admissions(
     *,
     coordination: CoordinationStore | None = None,
     limit: int | None = None,
+    project_keys: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     store = coordination or CoordinationStore.from_config(cfg)
     store.ensure_schema()
-    queued = store.list_tasks(state="queued", limit=max(1, int(limit or cfg.scheduler.queue_depth_limit)))
-    active = store.list_tasks(limit=max(1, int(limit or cfg.scheduler.queue_depth_limit)))
-    active = [task for task in active if _active_state(task)]
+    requested_limit = max(1, int(limit or cfg.scheduler.queue_depth_limit))
+    fetch_limit = requested_limit if not _project_key_filter(project_keys) else max(requested_limit, int(cfg.scheduler.queue_depth_limit), 1000)
+    queued = _filter_project_tasks(store.list_tasks(state="queued", limit=fetch_limit), project_keys)[:requested_limit]
+    all_tasks = store.list_tasks(limit=fetch_limit)
+    active_for_capacity = [task for task in all_tasks if _active_state(task)]
+    active = _filter_project_tasks(active_for_capacity, project_keys)[:requested_limit]
 
     active_by_project: dict[str, int] = defaultdict(int)
     active_by_repo: dict[str, int] = defaultdict(int)
     active_repo_locked: dict[str, bool] = defaultdict(bool)
     active_scopes_by_repo: dict[str, list[tuple[str, ...]]] = defaultdict(list)
-    for task in active:
+    for task in active_for_capacity:
         project_key = task_project_key(task)
         repo_key = task_repo_key(task)
         active_by_project[project_key] += 1
@@ -198,6 +216,17 @@ def plan_task_admissions(
 
     grouped: dict[str, deque[dict[str, Any]]] = {}
     blocked: list[dict[str, Any]] = []
+    active_coder_runs = list_active_coder_task_refs(cfg)
+    active_coder_task_keys = {
+        _nonempty(item.get("task_key"))
+        for item in active_coder_runs
+        if _nonempty(item.get("task_key"))
+    }
+    active_coder_task_ids = {
+        _nonempty(item.get("task_id"))
+        for item in active_coder_runs
+        if _nonempty(item.get("task_id"))
+    }
     for task in queued:
         blocked_reason = None
         dependency_status = task.get("dependency_status") or {}
@@ -219,7 +248,9 @@ def plan_task_admissions(
                 }
             )
             continue
-        if task_has_active_coder_run(cfg, task):
+        task_key = _nonempty(task.get("task_key"))
+        task_id = _nonempty(task.get("task_id"))
+        if (task_key and task_key in active_coder_task_keys) or (task_id and task_id in active_coder_task_ids):
             blocked.append(
                 {
                     "task_key": task.get("task_key"),

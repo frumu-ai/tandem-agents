@@ -16,6 +16,7 @@ import logging
 from typing import Any
 
 from src.tandem_agents.core.phases.context import RunContext
+from src.tandem_agents.core.task_contract import task_contract_payload
 
 logger = logging.getLogger("aca.phases.planning")
 
@@ -107,6 +108,34 @@ def _remote_code_task_requires_worker_execution(task: dict[str, Any]) -> bool:
     return execution_kind == "code_edit" and source_type in {"linear", "github_project"}
 
 
+def _apply_repo_context_required_files_to_task(task: dict[str, Any], required_files: list[str] | None) -> bool:
+    """Promote graph-required files into the task target contract when absent."""
+    if not isinstance(task, dict):
+        return False
+    existing_contract = task_contract_payload(task)
+    existing_targets = [
+        str(entry).strip()
+        for entry in (existing_contract.get("target_files") or task.get("target_files") or [])
+        if str(entry).strip()
+    ]
+    if existing_targets:
+        return False
+    normalized = list(
+        dict.fromkeys(
+            str(entry).strip().replace("\\", "/")
+            for entry in (required_files or [])
+            if str(entry).strip()
+        )
+    )
+    if not normalized:
+        return False
+    task["target_files"] = normalized
+    task.setdefault("task_contract", {})
+    if isinstance(task["task_contract"], dict):
+        task["task_contract"].setdefault("target_files", normalized)
+    return True
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Best-effort JSON extraction from model output (imported from runner_core)."""
     # Import here to avoid circular imports; runner_core is the owner of this util
@@ -167,20 +196,76 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
             continue
         changed_files = _partial_diff_changed_files(artifact)
         worker_output_excerpt = str(artifact.get("worker_output_excerpt") or "").strip()
-        if len(worker_output_excerpt) > 1200:
-            worker_output_excerpt = worker_output_excerpt[:1200].rstrip() + "\n..."
-        _append_unique_repo_paths(subtask, changed_files)
-        subtask["carry_forward_patch"] = patch_path
+        should_reapply_patch = _partial_diff_patch_is_reusable(worker_output_excerpt)
+        excerpt_limit = 1200 if should_reapply_patch else 360
+        if len(worker_output_excerpt) > excerpt_limit:
+            worker_output_excerpt = worker_output_excerpt[:excerpt_limit].rstrip() + "\n..."
+        rejected_failure_summary = (
+            _partial_diff_rejected_failure_summary(worker_output_excerpt)
+            if not should_reapply_patch
+            else ""
+        )
+        if should_reapply_patch:
+            _append_unique_repo_paths(subtask, changed_files)
+            subtask["carry_forward_patch"] = patch_path
+        else:
+            subtask["discarded_partial_diff_patch"] = patch_path
+            if rejected_failure_summary:
+                subtask["repair_failure_summary"] = rejected_failure_summary
+            task_obj = getattr(ctx, "task", None)
+            parent_contract = task_contract_payload(task_obj) if isinstance(task_obj, dict) else {}
+            parent_target_files = [
+                rel_path
+                for rel_path in (
+                    _normalize_repo_relative_path(raw_path)
+                    for raw_path in (
+                        parent_contract.get("target_files")
+                        or task_obj.get("target_files")
+                        or []
+                    )
+                )
+                if rel_path
+            ] if isinstance(task_obj, dict) else []
+            if parent_target_files:
+                _append_unique_repo_paths(subtask, parent_target_files)
+                subtask["repair_parent_target_files"] = parent_target_files
+                criteria = [
+                    str(entry).strip()
+                    for entry in (subtask.get("acceptance_criteria") or [])
+                    if str(entry).strip()
+                ]
+                rewritten: list[str] = []
+                replacement = (
+                    "Keep repair edits scoped to the parent task target files: "
+                    + ", ".join(parent_target_files)
+                    + "."
+                )
+                for entry in criteria:
+                    lowered = entry.lower()
+                    if "do not expand" in lowered and "beyond" in lowered:
+                        if replacement not in rewritten:
+                            rewritten.append(replacement)
+                        continue
+                    rewritten.append(entry)
+                if replacement not in rewritten:
+                    rewritten.append(replacement)
+                subtask["acceptance_criteria"] = rewritten
         subtask["repair_source_subtask_id"] = str(artifact.get("subtask_id") or "").strip()
         subtask["repair_source_worker_id"] = str(artifact.get("worker_id") or "").strip()
         subtask["repair_changed_files"] = changed_files
         if worker_output_excerpt:
             subtask["repair_worker_output_excerpt"] = worker_output_excerpt
             criteria = [str(entry).strip() for entry in (subtask.get("acceptance_criteria") or []) if str(entry).strip()]
-            repair_criterion = (
-                "Resolve the recovered partial-diff blocker before expanding scope: "
-                + worker_output_excerpt.replace("\n", " ")[:500]
-            )
+            if should_reapply_patch:
+                repair_criterion = (
+                    "Resolve the recovered partial-diff blocker before expanding scope: "
+                    + worker_output_excerpt.replace("\n", " ")[:500]
+                )
+            else:
+                repair_criterion = (
+                    "Replace the rejected or incomplete partial-diff approach before expanding scope; do not carry "
+                    "forward helper-only, unverified, self-referential, or local-oracle coverage."
+                )
             if repair_criterion not in criteria:
                 subtask["acceptance_criteria"] = [repair_criterion, *criteria]
         existing_scope_note = str(subtask.get("scope_note") or "").strip()
@@ -193,15 +278,120 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
         )
         blocker_note = (
             "\nRecovered partial-diff blocker/context:\n" + worker_output_excerpt
-            if worker_output_excerpt
+            if worker_output_excerpt and should_reapply_patch
             else ""
         )
-        carry_note = (
-            "ACA will apply the preserved partial worker diff before this retry so the worker can continue "
-            "from the previous attempt instead of repeating it."
-            f"{changed_file_note}{blocker_note}"
-        )
+        if should_reapply_patch:
+            carry_note = (
+                "ACA will apply the preserved partial worker diff before this retry so the worker can continue "
+                "from the previous attempt instead of repeating it."
+                f"{changed_file_note}{blocker_note}"
+            )
+        else:
+            rejected_changed_file_note = (
+                " The rejected diff touched these files: "
+                + ", ".join(changed_files)
+                + ". Inspect the current target files instead of copying that patch."
+                if changed_files
+                else ""
+            )
+            summary_note = f" Failure summary: {rejected_failure_summary}." if rejected_failure_summary else ""
+            carry_note = (
+                "ACA rejected the preserved partial worker diff for this retry because the recovered notes describe "
+                "incomplete, unverified, helper-only, self-referential, or test-only coverage. Start from the clean "
+                "target files, remove that approach if present, and add coverage that calls existing production code "
+                "instead."
+                f"{rejected_changed_file_note}{summary_note}"
+            )
         subtask["scope_note"] = f"{existing_scope_note}\n{carry_note}".strip()
+
+
+def _partial_diff_rejected_failure_summary(worker_output_excerpt: str) -> str:
+    text = worker_output_excerpt.lower()
+    reasons: list[str] = []
+    if "engine_prompt_timeout" in text:
+        reasons.append("the worker timed out before a terminal response")
+    if "verification not run" in text:
+        reasons.append("verification did not run")
+    if any(marker in text for marker in ("helper-only", "test-only helper", "local oracle", "self-referential")):
+        reasons.append("the diff appeared helper-only or self-referential")
+    if any(marker in text for marker in ("unproductive partial diff", "unproductive diff")):
+        reasons.append("ACA flagged the diff as unproductive")
+    if any(marker in text for marker in ("runaway guard", "diff exceeded aca runaway", "giant patch")):
+        reasons.append("ACA flagged the diff as runaway-sized")
+    if any(marker in text for marker in ("changes only string wording", "comment-only", "tautological")):
+        reasons.append("the diff did not add meaningful regression coverage")
+    if "missing production helper" in text:
+        reasons.append("the test called a missing production helper")
+    if any(marker in text for marker in ("not wired", "does not show", "limited to message formatting")):
+        reasons.append("the diff was not wired into the production path")
+    if "not treated as a completed worker result" in text:
+        reasons.append("ACA did not accept the partial as completed work")
+    if not reasons:
+        first_line = next((line.strip() for line in worker_output_excerpt.splitlines() if line.strip()), "")
+        if first_line:
+            reasons.append(first_line[:160])
+    return "; ".join(dict.fromkeys(reasons))[:260]
+
+
+def _partial_diff_patch_is_reusable(worker_output_excerpt: str) -> bool:
+    text = worker_output_excerpt.lower()
+    rejected_markers = (
+        "self-referential",
+        "test-only constant",
+        "test-only enum",
+        "test-only helper",
+        "does not appear to exercise actual",
+        "does not exercise actual",
+        "only asserts those same",
+        "standalone simulation",
+        "local oracle",
+        "limited to message formatting",
+        "only message formatting",
+        "not wired into",
+        "does not show this readiness error being wired",
+        "not covered by the added test",
+        "verification not run",
+        "not treated as a completed worker result",
+        "unproductive partial diff",
+        "unproductive diff",
+        "runaway guard",
+        "diff exceeded aca runaway",
+        "giant patch",
+        "changes only string wording",
+        "comment-only",
+        "tautological",
+        "missing production helper",
+        "no-op",
+        "redundant",
+    )
+    return not any(marker in text for marker in rejected_markers)
+
+
+def _sanitize_partial_diff_artifact_paths_in_plan(plan: dict[str, Any]) -> None:
+    subtasks = plan.get("subtasks") if isinstance(plan, dict) else None
+    if not isinstance(subtasks, list):
+        return
+    replacement = (
+        "Use ACA's repair directive and failure summary as evidence; do not read absolute "
+        "patch paths or replay rejected partial diffs."
+    )
+    for subtask in subtasks:
+        if not isinstance(subtask, dict):
+            continue
+        criteria = subtask.get("acceptance_criteria")
+        if not isinstance(criteria, list):
+            continue
+        sanitized: list[Any] = []
+        for entry in criteria:
+            text = str(entry)
+            lowered = text.lower()
+            if "/workspace/" in text and "partial" in lowered and "patch" in lowered:
+                if replacement not in sanitized:
+                    sanitized.append(replacement)
+                continue
+            sanitized.append(entry)
+        subtask["acceptance_criteria"] = sanitized
 
 
 def _repair_int(value: Any) -> int:
@@ -223,11 +413,38 @@ def _constrain_extra_partial_diff_repair_subtasks(
     if not attempt or not base_max_loops or attempt <= base_max_loops:
         return
     carried = [subtask for subtask in subtasks if subtask.get("carry_forward_patch")]
-    if not carried:
+    rejected = [
+        subtask
+        for subtask in subtasks
+        if subtask.get("discarded_partial_diff_patch") or subtask.get("repair_parent_target_files")
+    ]
+    candidates = carried or rejected
+    if not candidates:
         return
-    chosen = carried[0]
+    chosen = candidates[0]
     if len(subtasks) > 1:
         subtasks[:] = [chosen]
+    parent_target_files = [
+        rel_path
+        for rel_path in (
+            _normalize_repo_relative_path(raw_path)
+            for raw_path in (chosen.get("repair_parent_target_files") or [])
+        )
+        if rel_path
+    ]
+    if chosen.get("discarded_partial_diff_patch") and parent_target_files:
+        chosen["files"] = list(dict.fromkeys(parent_target_files))
+        chosen["target_files"] = list(dict.fromkeys(parent_target_files))
+        existing_scope_note = str(chosen.get("scope_note") or "").strip()
+        parent_note = (
+            "ACA kept this extra repair attempt on the parent task target files because the preserved "
+            "partial diff was rejected or incomplete. Active repair targets are the parent task targets: "
+            + ", ".join(parent_target_files)
+            + "."
+        )
+        if parent_note not in existing_scope_note:
+            chosen["scope_note"] = f"{existing_scope_note}\n{parent_note}".strip()
+        return
     changed_files = [
         rel_path
         for rel_path in (_normalize_repo_relative_path(raw_path) for raw_path in (chosen.get("repair_changed_files") or []))
@@ -349,6 +566,9 @@ def run_manager_prompt(ctx: RunContext) -> None:
         "index_status": repo_context.index_status,
         "index_error": repo_context.index_error,
     }
+    if _apply_repo_context_required_files_to_task(ctx.task, repo_context.required_files):
+        ctx.blackboard["repo_context"]["required_files_applied_as_target_files"] = True
+        ctx.status["repo_context_required_files_applied_as_target_files"] = True
     ctx.status.setdefault("artifacts", {})
     if repo_context.artifact_path:
         ctx.status["artifacts"]["repo_context_bundle"] = repo_context.artifact_path
@@ -424,6 +644,7 @@ def run_manager_prompt(ctx: RunContext) -> None:
         )
     else:
         ctx.manager_plan = parsed_plan or {}
+        _sanitize_partial_diff_artifact_paths_in_plan(ctx.manager_plan)
         ctx.blackboard["manager_plan"] = ctx.manager_plan
     if manager_result.get("engine") or manager_result.get("blocker_kind"):
         ctx.blackboard["manager_engine"] = {

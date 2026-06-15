@@ -115,6 +115,7 @@ function applySpec(name, spec, existing) {
   const next = {
     ...(existing && typeof existing === "object" ? existing : {}),
   };
+  next.name = firstNonEmpty(spec.name, next.name, name);
 
   const hasExplicitEnabled = Object.prototype.hasOwnProperty.call(spec, "enabled");
   const enabledByConfig = hasExplicitEnabled ? boolValue(spec.enabled, false) : false;
@@ -154,12 +155,24 @@ function applySpec(name, spec, existing) {
   };
 
   const auth = spec.auth && typeof spec.auth === "object" ? spec.auth : {};
+  const authKind = firstNonEmpty(spec.auth_kind, spec.authKind, next.auth_kind);
+  if (authKind) {
+    next.auth_kind = authKind;
+  }
+
   const headerName = firstNonEmpty(auth.header_name, "Authorization");
   const headerPrefix = firstNonEmpty(auth.header_prefix, "Bearer");
   if (secret && next.enabled) {
     headers[headerName] = headerPrefix ? `${headerPrefix} ${secret}` : secret;
   }
   next.headers = headers;
+
+  if (spec.oauth && typeof spec.oauth === "object" && !Array.isArray(spec.oauth)) {
+    next.oauth = {
+      ...(next.oauth && typeof next.oauth === "object" ? next.oauth : {}),
+      ...spec.oauth,
+    };
+  }
 
   delete next.mcp_session_id;
   delete next.tool_cache;

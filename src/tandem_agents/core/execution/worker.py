@@ -1408,6 +1408,55 @@ def _repeat_line_is_common_source_syntax(line: str) -> bool:
     return False
 
 
+def _self_referential_test_only_diff_reason(
+    worktree: Path,
+    subtask: dict[str, Any],
+    changed_files: list[str],
+) -> str | None:
+    targets = _subtask_targets(subtask)
+    declared_test_targets = [
+        path
+        for path in targets
+        if "/tests/" in path or path.endswith(("_test.rs", ".test.ts", ".test.tsx", ".test.js"))
+    ]
+    if not declared_test_targets:
+        return None
+    if any(path in changed_files for path in declared_test_targets):
+        return None
+    task_text = " ".join(
+        str(value or "")
+        for value in (
+            subtask.get("title"),
+            subtask.get("goal"),
+            " ".join(str(item or "") for item in (subtask.get("acceptance_criteria") or [])),
+        )
+    ).lower()
+    if not any(marker in task_text for marker in ("regression", "coverage", "test", "readiness", "schema drift")):
+        return None
+    try:
+        diff_text = git_working_diff(worktree, max_chars=120000, max_file_chars=60000)
+    except TypeError:
+        diff_text = git_working_diff(worktree)
+    except Exception:
+        return None
+    added_lines = [line[1:] for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    added_text = "\n".join(added_lines).lower()
+    if not added_text:
+        return None
+    added_source_local_tests = "#[cfg(test)]" in added_text or "#[test]" in added_text or "mod tests" in added_text
+    helper_or_oracle_terms = any(
+        marker in added_text
+        for marker in ("helper", "readiness", "schema_drift", "schema drift", "degraded", "regression")
+    )
+    if added_source_local_tests and helper_or_oracle_terms:
+        return (
+            "regression diff added source-local helper/test coverage without changing "
+            f"the declared test target ({', '.join(declared_test_targets)}); "
+            f"changed files: {', '.join(changed_files)}"
+        )
+    return None
+
+
 def _fail_corrupt_worker_diff(
     result: dict[str, Any],
     log_path: Path,
@@ -1478,6 +1527,13 @@ def _terminalized_note_reports_blockers(text: str) -> bool:
         "visible diff only",
         "diff only adds",
         "does not implement",
+        "does not appear to add meaningful",
+        "does not appear to add meaningful coverage",
+        "does not appear to add meaningful github projects readiness drift regression coverage",
+        "redundant test change",
+        "no-op/redundant",
+        "no-op diff",
+        "effectively a no-op",
         "missing required",
         "missing coverage",
         "would not compile",
@@ -1532,11 +1588,40 @@ def _terminalized_note_reports_blockers(text: str) -> bool:
     blocker_markers = (
         "remaining blocker",
         "remaining blockers",
+        "remaining implementation blocker",
+        "remaining implementation blockers",
         "blocker:",
         "blockers:",
         "blocked by",
     )
     return any(marker in normalized for marker in blocker_markers)
+
+
+def _terminalized_note_reports_no_visible_verification(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return False
+    no_verification_markers = (
+        "verification not run",
+        "verification: not run",
+        "verification was not run",
+        "verification was not performed",
+        "verification not performed",
+        "no verification visible",
+        "no test run visible",
+        "no actual test run visible",
+        "not verified",
+    )
+    return any(marker in normalized for marker in no_verification_markers)
+
+
+def _changed_files_are_all_tests(changed_files: list[str]) -> bool:
+    paths = [
+        _normalize_target_path(path)
+        for path in changed_files
+        if path and not _is_aca_repo_artifact_path(path)
+    ]
+    return bool(paths) and all(_path_is_test_file(path) for path in paths)
 
 
 def _worker_result_should_retry(result: dict[str, Any]) -> bool:
@@ -2195,6 +2280,28 @@ def _terminalize_worker_after_tool_loop(
         result["changed_files"] = changed_files
         result["engine"] = engine_meta
         return result
+    if _terminalized_note_reports_no_visible_verification(text) and _changed_files_are_all_tests(changed_files):
+        incomplete = _preserve_partial_worker_diff(
+            dict(result),
+            log_path,
+            worktree,
+            reason="TERMINALIZED_UNVERIFIED_TEST_ONLY_DIFF",
+        )
+        rejection_note = (
+            "\nACA rejected the terminalized worker note because the recovered diff only changes tests "
+            "and the note reports that verification was not run. The partial diff remains available "
+            "for a narrower repair attempt.\n"
+        )
+        incomplete["stdout"] = f"{result.get('stdout') or ''}{note}{rejection_note}"
+        incomplete["failure_reason"] = "TERMINALIZED_UNVERIFIED_TEST_ONLY_DIFF"
+        incomplete["blocker_kind"] = "worker_incomplete_diff"
+        incomplete["recovery_action"] = (
+            "Rerun with a narrower prompt that either implements the required production behavior "
+            "or verifies the test-only regression diff before completion."
+        )
+        incomplete["changed_files"] = changed_files
+        incomplete["engine"] = engine_meta
+        return incomplete
     recovered = dict(result)
     recovered["returncode"] = 0
     recovered["stdout"] = note
@@ -2286,6 +2393,15 @@ def _coerce_worker_failure(
     corrupt_reason = _corrupt_repeated_source_diff_reason(worktree) if diff_text and changed_files else None
     if corrupt_reason:
         return _fail_corrupt_worker_diff(result, log_path, corrupt_reason)
+    self_referential_reason = (
+        _self_referential_test_only_diff_reason(worktree, subtask, changed_files)
+        if diff_text and changed_files
+        else None
+    )
+    if self_referential_reason and result.get("returncode", 0) != 0:
+        result = _preserve_partial_worker_diff(result, log_path, worktree, reason="SELF_REFERENTIAL_TEST_ONLY_DIFF")
+    elif self_referential_reason and result.get("returncode", 0) == 0:
+        result["failure_reason"] = "SELF_REFERENTIAL_TEST_ONLY_DIFF"
     if result.get("returncode", 0) != 0 and (not targets_exist or not diff_text):
         recovered, recovered_diff = _wait_for_target_files(worktree, subtask)
         if recovered:
@@ -2400,6 +2516,12 @@ def _coerce_worker_failure(
             "Worker edited only Git-ignored target files, so the run produced no reviewable repository diff. "
             f"Ignored files: {paths}.\n"
         )
+    elif failure_reason == "SELF_REFERENTIAL_TEST_ONLY_DIFF":
+        message = (
+            "Worker produced a self-referential regression diff: it added source-local helper/test coverage "
+            "without updating the declared test target or exercising the existing production path. "
+            f"{self_referential_reason or ''}\n"
+        )
     elif failure_reason not in stdout_text:
         message = f"Worker failed: {failure_reason}\n"
     if message:
@@ -2455,6 +2577,13 @@ def _coerce_worker_failure(
         if not result.get("recovery_action"):
             result["recovery_action"] = (
                 "Move the requested deliverable to tracked repository files, or update the task to name tracked target files, then reset it to Backlog."
+            )
+    elif failure_reason == "SELF_REFERENTIAL_TEST_ONLY_DIFF":
+        result["blocker_kind"] = "worker_incomplete_diff"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Reset this worker diff and retry with coverage that updates the declared test target "
+                "and exercises existing production behavior."
             )
     elif failure_reason == "ENGINE_EXCEPTION":
         result["blocker_kind"] = "engine_exception"

@@ -47,10 +47,271 @@ from src.tandem_agents.core.execution.worker import (
     stream_tandem_prompt,
     summarize_worker_notes,
 )
-from src.tandem_agents.core.phases.worker_dispatch import _apply_tolerated_failures
+from src.tandem_agents.core.phases.worker_dispatch import (
+    _apply_tolerated_failures,
+    _diff_has_unproductive_marker,
+    _diff_has_tautological_boolean_assertion,
+    _diff_is_comment_only,
+    _diff_is_local_string_oracle_test,
+    _diff_is_string_only_change,
+    _diff_missing_production_function_calls,
+    _subtask_requires_test_changes,
+    _subtask_required_test_files,
+    _worker_no_progress_timeout_seconds,
+    _worker_comment_only_diff_abort_seconds,
+    _worker_testless_diff_abort_seconds,
+)
 
 
 class WorkerFailureCoercionTest(unittest.TestCase):
+    def test_worker_no_progress_timeout_derives_from_effective_worker_budget(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS": "120",
+                    "ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS": "240",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "20",
+                }
+            )
+        )
+
+        timeout = _worker_no_progress_timeout_seconds(
+            ctx,
+            [{"id": "subtask-1", "title": "Small task", "files": ["src/app.py"]}],
+        )
+
+        self.assertEqual(timeout, 290.0)
+
+    def test_worker_no_progress_timeout_scales_for_large_subtasks(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS": "120",
+                    "ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS": "240",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "20",
+                }
+            )
+        )
+
+        timeout = _worker_no_progress_timeout_seconds(
+            ctx,
+            [
+                {
+                    "id": "subtask-1",
+                    "title": "Large task",
+                    "files": [
+                        "crates/a/src/lib.rs",
+                        "crates/a/src/http.rs",
+                        "crates/a/src/model.rs",
+                        "crates/a/src/store.rs",
+                        "crates/a/src/test.rs",
+                    ],
+                }
+            ],
+        )
+
+        self.assertGreater(timeout, 290.0)
+
+    def test_worker_no_progress_timeout_env_override_still_wins(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(env={"ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS": "42"})
+        )
+
+        self.assertEqual(_worker_no_progress_timeout_seconds(ctx, []), 42.0)
+
+    def test_testless_diff_guard_detects_regression_subtasks_with_test_targets(self) -> None:
+        subtask = {
+            "title": "Add schema drift regression coverage",
+            "goal": "Cover degraded read readiness",
+            "files": [
+                "crates/tandem-server/src/http/coder_parts/part09.rs",
+                "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+            ],
+            "acceptance_criteria": ["Adds regression tests for schema drift."],
+        }
+
+        self.assertEqual(
+            _subtask_required_test_files(subtask),
+            ["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+        )
+        self.assertTrue(_subtask_requires_test_changes(subtask))
+
+    def test_testless_diff_guard_ignores_plain_implementation_subtasks(self) -> None:
+        subtask = {
+            "title": "Refine readiness payload",
+            "goal": "Update production response",
+            "files": [
+                "crates/tandem-server/src/http/coder_parts/part09.rs",
+                "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+            ],
+            "acceptance_criteria": ["Readiness fields are clear."],
+        }
+
+        self.assertFalse(_subtask_requires_test_changes(subtask))
+
+    def test_testless_diff_guard_timeout_env_override_can_disable(self) -> None:
+        ctx = SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS": "0"}))
+
+        self.assertEqual(_worker_testless_diff_abort_seconds(ctx), 0.0)
+
+    def test_comment_only_diff_guard_timeout_env_override_can_disable(self) -> None:
+        ctx = SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_COMMENT_ONLY_DIFF_ABORT_SECONDS": "0"}))
+
+        self.assertEqual(_worker_comment_only_diff_abort_seconds(ctx), 0.0)
+
+    def test_unproductive_diff_marker_detects_placeholder_blocker_test(self) -> None:
+        diff = """diff --git a/tests/part09.rs b/tests/part09.rs
+--- a/tests/part09.rs
++++ b/tests/part09.rs
+@@ -1,3 +1,8 @@
++#[test]
++fn github_projects_regression_coverage_requires_production_path() {
++    // TODO(worker-blocker): replace with production-path regression coverage before merging.
++    panic!("blocked: production-path regression coverage was not added or verified");
++}
+ """
+
+        self.assertTrue(_diff_has_unproductive_marker(diff))
+        self.assertFalse(_diff_is_comment_only(diff))
+
+    def test_comment_only_diff_detects_only_added_comments(self) -> None:
+        diff = """diff --git a/tests/part09.rs b/tests/part09.rs
+--- a/tests/part09.rs
++++ b/tests/part09.rs
+@@ -1,3 +1,4 @@
++// CRI-02 coverage belongs in this module.
+ #[tokio::test]
+ async fn existing_test() {}
+ """
+
+        self.assertTrue(_diff_is_comment_only(diff))
+        self.assertFalse(_diff_has_unproductive_marker(diff))
+
+    def test_tautological_boolean_assertion_diff_is_unproductive(self) -> None:
+        diff = """diff --git a/tests/part09.rs b/tests/part09.rs
+--- a/tests/part09.rs
++++ b/tests/part09.rs
+@@ -2,6 +2,8 @@
+ async fn coder_memory_events_include_normalized_artifact_fields() {
+     let state = test_state().await;
++    let schema_drift_readiness_regression_exercises_part09 = true;
++    assert!(schema_drift_readiness_regression_exercises_part09);
+     state
+ """
+
+        self.assertTrue(_diff_has_tautological_boolean_assertion(diff))
+        self.assertFalse(_diff_is_string_only_change(diff))
+
+    def test_string_only_test_wording_diff_is_unproductive(self) -> None:
+        diff = """diff --git a/tests/part09.rs b/tests/part09.rs
+--- a/tests/part09.rs
++++ b/tests/part09.rs
+@@ -46,7 +46,7 @@ async fn coder_memory_events_include_normalized_artifact_fields() {
+         .body(Body::from(
+             json!({
+-                "summary": "Capability readiness drift already explained this failure",
++                "summary": "Capability readiness drift already explained degraded read readiness for this failure",
+                 "confidence": "high"
+             })
+ """
+
+        self.assertTrue(_diff_is_string_only_change(diff))
+        self.assertFalse(_diff_has_tautological_boolean_assertion(diff))
+
+    def test_local_string_oracle_test_diff_is_unproductive(self) -> None:
+        diff = """diff --git a/tests/part09.rs b/tests/part09.rs
+--- a/tests/part09.rs
++++ b/tests/part09.rs
+@@ -1,3 +1,19 @@
++#[test]
++fn github_projects_readiness_regression_language_distinguishes_read_and_write_degradation() {
++    let read_degraded = "GitHub Projects read readiness degraded: schema drift or remote divergence";
++    let write_degraded = "GitHub Projects write readiness degraded: mutation capability unavailable";
++
++    assert!(read_degraded.contains("read readiness degraded"));
++    assert!(read_degraded.contains("schema drift"));
++    assert!(read_degraded.contains("remote divergence"));
++    assert!(write_degraded.contains("write readiness degraded"));
++    assert!(write_degraded.contains("mutation capability"));
++    assert_ne!(read_degraded, write_degraded);
++}
+ """
+
+        self.assertTrue(_diff_is_local_string_oracle_test(diff))
+        self.assertFalse(_diff_has_tautological_boolean_assertion(diff))
+
+    def test_test_only_diff_detects_missing_production_helper_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=repo, check=True)
+            source = repo / "crates" / "tandem-server" / "src" / "http" / "coder_parts" / "part09.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("pub fn existing() {}\n", encoding="utf-8")
+            test_file = repo / "crates" / "tandem-server" / "src" / "http" / "tests" / "coder_parts" / "part09.rs"
+            test_file.parent.mkdir(parents=True)
+            test_file.write_text("#[test]\nfn existing_test() {}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            diff = """diff --git a/crates/tandem-server/src/http/tests/coder_parts/part09.rs b/crates/tandem-server/src/http/tests/coder_parts/part09.rs
+--- a/crates/tandem-server/src/http/tests/coder_parts/part09.rs
++++ b/crates/tandem-server/src/http/tests/coder_parts/part09.rs
+@@ -1,2 +1,8 @@
++#[test]
++fn github_projects_regression_exercises_production_path() {
++    let readiness = github_projects_intake_readiness_from_project_v2(&serde_json::json!({}));
++    assert!(format!("{readiness:?}").contains("readiness"));
++}
+ """
+
+            self.assertEqual(
+                _diff_missing_production_function_calls(
+                    repo,
+                    diff,
+                    ["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+                ),
+                ["github_projects_intake_readiness_from_project_v2"],
+            )
+
+    def test_test_only_diff_allows_existing_production_helper_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=repo, check=True)
+            source = repo / "crates" / "tandem-server" / "src" / "http" / "coder_parts" / "part09.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "pub fn github_projects_intake_readiness_from_project_v2() {}\n",
+                encoding="utf-8",
+            )
+            test_file = repo / "crates" / "tandem-server" / "src" / "http" / "tests" / "coder_parts" / "part09.rs"
+            test_file.parent.mkdir(parents=True)
+            test_file.write_text("#[test]\nfn existing_test() {}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            diff = """diff --git a/crates/tandem-server/src/http/tests/coder_parts/part09.rs b/crates/tandem-server/src/http/tests/coder_parts/part09.rs
+--- a/crates/tandem-server/src/http/tests/coder_parts/part09.rs
++++ b/crates/tandem-server/src/http/tests/coder_parts/part09.rs
+@@ -1,2 +1,8 @@
++#[test]
++fn github_projects_regression_exercises_production_path() {
++    github_projects_intake_readiness_from_project_v2();
++}
+ """
+
+            self.assertEqual(
+                _diff_missing_production_function_calls(
+                    repo,
+                    diff,
+                    ["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+                ),
+                [],
+            )
+
     def test_session_reply_extracts_assistant_text_from_engine_messages(self) -> None:
         messages = [
             {"info": {"role": "user"}, "parts": [{"text": "prompt"}]},
@@ -220,6 +481,11 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             "The requested suite is only partially implemented.",
             "Source inspection is still required before expanding the suite.",
             "Remaining implementation blockers: the added test would not compile due to type mismatches.",
+            (
+                "Remaining implementation blockers:\n"
+                "- The diff does not appear to add meaningful GitHub Projects readiness drift regression coverage.\n"
+                "- The added assertion is effectively a no-op/redundant test change."
+            ),
         ]
         for note in bad_notes:
             with self.subTest(note=note):
@@ -1315,6 +1581,106 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["changed_files"], ["crates/tandem-tools/tests/security_suite.rs"])
             self.assertNotIn("failure_reason", result)
 
+    def test_tool_loop_terminalize_rejects_unverified_test_only_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "crates" / "tandem-server" / "src" / "http" / "coder_parts" / "part09.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            test_file = (
+                worktree
+                / "crates"
+                / "tandem-server"
+                / "src"
+                / "http"
+                / "tests"
+                / "coder_parts"
+                / "part09.rs"
+            )
+            test_file.parent.mkdir(parents=True)
+            test_file.write_text("#[tokio::test]\nasync fn existing_test() {}\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "crates/tandem-server/src/http/coder_parts/part09.rs", "crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+                cwd=worktree,
+                check=True,
+            )
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            test_file.write_text(
+                test_file.read_text(encoding="utf-8")
+                + "\n#[test]\nfn github_projects_readiness_diagnostics_cover_drift() {\n"
+                + "    let diagnostic = github_projects_schema_drift_readiness_diagnostic(\"ProjectV2 drift\");\n"
+                + "    assert!(diagnostic.contains(\"read readiness\"));\n"
+                + "}\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                return_value="terminal-session",
+            ), mock.patch(
+                "src.tandem_agents.core.execution.worker._prompt_sync_with_connect_retries",
+                return_value={
+                    "messages": [
+                        {
+                            "info": {"role": "assistant"},
+                            "parts": [
+                                {
+                                    "text": (
+                                        "Changed crate tests.\n"
+                                        "Verification: verification not run.\n"
+                                        "Remaining implementation blockers: none visible from the diff."
+                                    )
+                                }
+                            ],
+                        }
+                    ]
+                },
+            ):
+                result = _terminalize_worker_after_tool_loop(
+                    SimpleNamespace(env={}),
+                    {
+                        "returncode": 1,
+                        "stdout": "ENGINE_PROMPT_TIMEOUT\n",
+                        "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                        "blocker_kind": "engine_prompt_timeout",
+                    },
+                    log_path,
+                    worktree,
+                    {
+                        "title": "Add GitHub Projects schema drift and divergence regression coverage",
+                        "goal": "Harden GitHub Projects intake against schema drift and remote state changes.",
+                        "files": ["crates/tandem-server/src/http/coder_parts/part09.rs"],
+                        "acceptance_criteria": [
+                            "Tests cover schema drift, remote divergence, reopened terminal items, and degraded write capability.",
+                            "Regression output identifies degraded read/write readiness clearly.",
+                        ],
+                    },
+                    role="worker-1",
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    require_filesystem_changes=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "TERMINALIZED_UNVERIFIED_TEST_ONLY_DIFF")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertEqual(
+                result["changed_files"],
+                ["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+            )
+            self.assertIn("rejected the terminalized worker note", result["stdout"])
+            self.assertTrue(Path(result["partial_diff_artifact"]).exists())
+            self.assertNotIn("terminalized_after_tool_loop", result)
+
     def test_private_helper_subtask_does_not_accept_nearby_integration_test_only_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp) / "repo"
@@ -1342,6 +1708,83 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                     },
                 )
             )
+
+    def test_regression_task_rejects_source_local_helper_tests_without_declared_test_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp) / "repo"
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            source = worktree / "crates" / "tandem-server" / "src" / "http" / "coder_parts" / "part09.rs"
+            test_target = worktree / "crates" / "tandem-server" / "src" / "http" / "tests" / "coder_parts" / "part09.rs"
+            source.parent.mkdir(parents=True)
+            test_target.parent.mkdir(parents=True)
+            source.write_text("pub(super) async fn coder_project_run_create() {}\n", encoding="utf-8")
+            test_target.write_text("#[test]\nfn existing_part09_test() {}\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "git",
+                    "add",
+                    "crates/tandem-server/src/http/coder_parts/part09.rs",
+                    "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+                ],
+                cwd=worktree,
+                check=True,
+            )
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            source.write_text(
+                "\n".join(
+                    [
+                        "pub(super) fn github_projects_readiness_schema_drift_message(cause: &str) -> String {",
+                        "    format!(\"GitHub Projects read readiness degraded: {cause}\")",
+                        "}",
+                        "",
+                        "#[cfg(test)]",
+                        "mod github_projects_readiness_tests {",
+                        "    use super::github_projects_readiness_schema_drift_message;",
+                        "",
+                        "    #[test]",
+                        "    fn schema_drift_message_identifies_degraded_readiness() {",
+                        "        let message = github_projects_readiness_schema_drift_message(\"missing field\");",
+                        "        assert!(message.contains(\"read readiness degraded\"));",
+                        "    }",
+                        "}",
+                        "",
+                        "pub(super) async fn coder_project_run_create() {}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            log_path = worktree / "worker.log"
+            log_path.write_text("", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 0,
+                    "stdout": "Changed part09.rs. Verification not run.",
+                },
+                log_path,
+                worktree,
+                {
+                    "title": "Add schema drift readiness regression",
+                    "goal": "Verify GitHub Projects read readiness degrades clearly when schema drift occurs.",
+                    "files": [
+                        "crates/tandem-server/src/http/coder_parts/part09.rs",
+                        "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+                    ],
+                    "acceptance_criteria": [
+                        "A regression test simulates GitHub Projects schema drift using the existing test harness.",
+                    ],
+                },
+                require_filesystem_changes=True,
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "SELF_REFERENTIAL_TEST_ONLY_DIFF")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertIn("declared test target", result["stdout"])
 
     def test_tool_loop_stall_with_repeated_source_diff_blocks_as_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3133,6 +3576,40 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                         "status": "failed",
                         "blocker_kind": "worker_corrupt_diff",
                         "failure_reason": "WORKER_CORRUPT_DIFF",
+                    }
+                ],
+                blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},
+            )
+
+            _apply_tolerated_failures(ctx)
+
+            self.assertEqual(ctx.worker_results[0]["status"], "failed")
+            self.assertNotEqual(ctx.blackboard["subtasks"][0]["status"], "tolerated_failure")
+
+    def test_runaway_worker_diff_is_not_tolerated_when_targets_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            target = repo_path / "src/lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={"source": {"type": "linear"}},
+                repo_path=repo_path,
+                planned_subtasks=[
+                    {
+                        "id": "subtask-1",
+                        "title": "Edit existing source",
+                        "goal": "Make a real source change",
+                        "files": ["src/lib.rs"],
+                    }
+                ],
+                worker_results=[
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "status": "failed",
+                        "blocker_kind": "worker_runaway_diff",
+                        "failure_reason": "WORKER_RUNAWAY_DIFF",
                     }
                 ],
                 blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},

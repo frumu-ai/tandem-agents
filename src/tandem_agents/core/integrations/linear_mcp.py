@@ -97,6 +97,20 @@ def get_mcp_server(cfg: ResolvedConfig, name: str | None = None) -> dict[str, An
     return server if isinstance(server, dict) else None
 
 
+def _server_has_pending_auth(server: dict[str, Any]) -> bool:
+    return bool(
+        server.get("last_auth_challenge")
+        or server.get("lastAuthChallenge")
+        or server.get("pending_auth_by_tool")
+        or server.get("pendingAuthByTool")
+    )
+
+
+def _server_error_requires_auth(server: dict[str, Any]) -> bool:
+    last_error = str(server.get("last_error") or server.get("lastError") or "").strip().lower()
+    return "authorization required" in last_error or "awaiting authorization" in last_error
+
+
 def ensure_linear_mcp_connected(cfg: ResolvedConfig) -> dict[str, Any]:
     server_name = linear_mcp_server_name(cfg)
     server = get_mcp_server(cfg, server_name)
@@ -110,9 +124,14 @@ def ensure_linear_mcp_connected(cfg: ResolvedConfig) -> dict[str, Any]:
         server = get_mcp_server(cfg, server_name) or server
     if not server.get("connected"):
         _connect_mcp_server(cfg, server_name)
+        server = get_mcp_server(cfg, server_name) or server
+    if _server_has_pending_auth(server) or _server_error_requires_auth(server):
+        raise RuntimeError(f"Linear MCP server '{server_name}' is awaiting authorization.")
     deadline = time.time() + 10.0
     while time.time() < deadline:
         server = get_mcp_server(cfg, server_name) or server
+        if _server_has_pending_auth(server) or _server_error_requires_auth(server):
+            raise RuntimeError(f"Linear MCP server '{server_name}' is awaiting authorization.")
         if not server.get("connected"):
             time.sleep(0.25)
             continue
@@ -120,11 +139,10 @@ def ensure_linear_mcp_connected(cfg: ResolvedConfig) -> dict[str, Any]:
             return server
         time.sleep(0.25)
     last_error = str(server.get("last_error") or "").strip()
-    pending_auth = server.get("last_auth_challenge") or server.get("pending_auth_by_tool")
     if not server.get("connected"):
         detail = last_error or "authorization is required"
         raise RuntimeError(f"Linear MCP server '{server_name}' is not connected: {detail}")
-    if pending_auth:
+    if _server_has_pending_auth(server):
         raise RuntimeError(f"Linear MCP server '{server_name}' is awaiting authorization.")
     raise RuntimeError(f"Linear MCP server '{server_name}' is connected but exposed no tools.")
     return server

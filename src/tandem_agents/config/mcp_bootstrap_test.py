@@ -75,6 +75,8 @@ class TandemMcpBootstrapTest(unittest.TestCase):
 
             self.assertIn("github", updated)
             self.assertIn("kb", updated)
+            self.assertEqual(updated["github"]["name"], "github")
+            self.assertEqual(updated["kb"]["name"], "kb")
             self.assertFalse(updated["github"]["enabled"])
             self.assertFalse(updated["github"]["connected"])
             self.assertNotIn("mcp_session_id", updated["github"])
@@ -124,7 +126,50 @@ class TandemMcpBootstrapTest(unittest.TestCase):
             updated = json.loads(registry.read_text(encoding="utf-8"))
 
             self.assertTrue(updated["github"]["enabled"])
+            self.assertEqual(updated["github"]["name"], "github")
             self.assertEqual(updated["github"]["headers"]["Authorization"], "Bearer ghp_test_token")
+
+    def test_bootstrap_preserves_auth_kind_and_oauth_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "control-panel-config.json"
+            registry = root / "mcp_servers.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "mcp_servers": {
+                            "linear": {
+                                "enabled": True,
+                                "transport": "https://mcp.linear.app/mcp",
+                                "auth_kind": "oauth",
+                                "oauth": {
+                                    "provider_id": "linear",
+                                    "token_endpoint": "https://api.linear.app/oauth/token",
+                                    "client_id": "linear-client",
+                                },
+                            }
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "MCP_SOURCE_FILE": str(source),
+                    "MCP_REGISTRY_FILE": str(registry),
+                }
+            )
+
+            subprocess.run(["node", str(SCRIPT)], cwd=ROOT, env=env, check=True, capture_output=True, text=True)
+            updated = json.loads(registry.read_text(encoding="utf-8"))
+
+            self.assertTrue(updated["linear"]["enabled"])
+            self.assertEqual(updated["linear"]["auth_kind"], "oauth")
+            self.assertEqual(updated["linear"]["oauth"]["provider_id"], "linear")
 
 
 if __name__ == "__main__":

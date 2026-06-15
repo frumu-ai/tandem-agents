@@ -11,7 +11,14 @@ from fastapi.testclient import TestClient
 
 from src.tandem_agents.api import main as api_main
 from src.tandem_agents.config.config_loader import resolve_config
-from src.tandem_agents.api.main import _compact_event_payload, _operator_coordination_state, _project_runtime_env, app
+from src.tandem_agents.api.main import (
+    _active_scheduler_project_keys,
+    _compact_event_payload,
+    _linear_auth_redirect_origin,
+    _operator_coordination_state,
+    _project_runtime_env,
+    app,
+)
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 
 
@@ -300,6 +307,84 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                     self.assertEqual(guide_payload["active_project"]["id"], "alpha")
                     self.assertEqual(guide_payload["active_project"]["repo"]["path"], "repos/alpha")
                     self.assertTrue(any("Call this guide first" in line for line in guide_payload["instructions"]))
+
+    def test_workspace_active_project_round_trips_in_workspace_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False):
+                with TestClient(app) as client:
+                    for slug in ("alpha", "beta"):
+                        response = client.post(
+                            "/workspace/projects",
+                            params={
+                                "slug": slug,
+                                "repo_path": f"repos/{slug}",
+                                "name": slug.title(),
+                            },
+                            json={"type": "manual", "prompt": slug},
+                            headers={"Authorization": "Bearer secret-token"},
+                        )
+                        self.assertEqual(response.status_code, 200, response.text)
+
+                    set_active = client.post(
+                        "/workspace/active/beta",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(set_active.status_code, 200, set_active.text)
+
+                    workspace = client.get("/workspace", headers={"Authorization": "Bearer secret-token"})
+                    self.assertEqual(workspace.status_code, 200, workspace.text)
+                    payload = workspace.json()
+                    self.assertEqual(payload["workspace"]["active_project_id"], "beta")
+                    self.assertEqual(payload["active_project_id"], "beta")
+                    self.assertEqual(payload["active_project_slug"], "beta")
+
+    def test_active_scheduler_project_keys_uses_workspace_source_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/workspace/projects",
+                        params={
+                            "slug": "linear-target",
+                            "repo_path": "repos/tandem",
+                            "name": "Linear Target",
+                        },
+                        json={
+                            "type": "linear",
+                            "team": "team-1",
+                            "project": "project-1",
+                        },
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    set_active = client.post(
+                        "/workspace/active/linear-target",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(set_active.status_code, 200, set_active.text)
+
+                cfg = resolve_config(root)
+                self.assertEqual(_active_scheduler_project_keys(root, cfg), {"linear:team-1/project-1"})
+
+    def test_linear_auth_redirect_origin_reads_redirect_uri(self) -> None:
+        url = (
+            "https://mcp.linear.app/authorize?"
+            "redirect_uri=https%3A%2F%2Ftests.frumu.ai%2Fapi%2Fengine%2Fmcp%2Flinear%2Fauth%2Fcallback"
+        )
+
+        self.assertEqual(_linear_auth_redirect_origin(url), "https://tests.frumu.ai")
 
     def test_project_runtime_env_uses_managed_checkout_path_for_remote_project(self) -> None:
         env = _project_runtime_env(

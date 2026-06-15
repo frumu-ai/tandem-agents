@@ -160,7 +160,7 @@ class LinearMcpIntegrationTest(unittest.TestCase):
                 patch("src.tandem_agents.core.integrations.linear_mcp._connect_mcp_server"), \
                 patch("src.tandem_agents.core.integrations.linear_mcp.list_engine_tool_ids", return_value=[]), \
                 patch("src.tandem_agents.core.integrations.linear_mcp.time.time", side_effect=[0.0, 11.0]):
-                with self.assertRaisesRegex(RuntimeError, "not connected: Authorization required"):
+                with self.assertRaisesRegex(RuntimeError, "awaiting authorization"):
                     ensure_linear_mcp_connected(cfg)
 
     def test_execute_linear_tool_skips_missing_alias_and_tries_fallback(self) -> None:
