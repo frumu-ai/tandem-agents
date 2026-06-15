@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
+from urllib.parse import parse_qsl, quote, urlparse
+from urllib.request import Request as UrlRequest, urlopen
 
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
@@ -23,7 +25,7 @@ from src.tandem_agents.config.config import resolve_config, validate_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.coordination.coordination_reaper import coordination_reaper_interval, coordination_reaper_tick
 from src.tandem_agents.core.execution.runtime_entrypoints import run_coordinator
-from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot
+from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot, task_project_key
 from src.tandem_agents.core.scheduling.scheduler_dispatcher import dispatch_scheduled_runs
 from src.tandem_agents.core.scheduling.coder_supervisor import (
     list_active_coder_runs,
@@ -297,6 +299,23 @@ def _workspace_view(root: Path, cfg=None) -> Dict[str, Any]:
 def _all_projects(root: Path) -> Dict[str, Any]:
     workspace = _workspace_view(root)
     return {str(project.get("id")): project for project in workspace.get("projects", []) if str(project.get("id") or "").strip()}
+
+
+def _active_scheduler_project_keys(root: Path, cfg=None) -> set[str]:
+    workspace = _workspace_view(root, cfg)
+    active_project_id = str((workspace.get("workspace") or {}).get("active_project_id") or "").strip()
+    projects = workspace.get("projects") or []
+    active_project = next(
+        (project for project in projects if str(project.get("id") or "").strip() == active_project_id),
+        None,
+    )
+    if not isinstance(active_project, dict):
+        return set()
+    source = active_project.get("source") if isinstance(active_project.get("source"), dict) else active_project.get("task_source")
+    if not isinstance(source, dict) or not str(source.get("type") or "").strip():
+        return set()
+    key = task_project_key({"source": source})
+    return {key} if key else set()
 
 
 def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: str = "") -> Dict[str, str]:
@@ -782,7 +801,13 @@ async def list_projects(token: str = Depends(get_token)):
 @app.get("/workspace")
 async def get_workspace(token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
-    return _workspace_view(root)
+    view = _workspace_view(root)
+    active_project_id = view.get("workspace", {}).get("active_project_id")
+    return {
+        **view,
+        "active_project_id": active_project_id,
+        "active_project_slug": active_project_id,
+    }
 
 
 @app.post("/workspace/projects")
@@ -949,6 +974,47 @@ def _linear_auth_challenge(server: Dict[str, Any] | None) -> Dict[str, Any]:
     return challenge if isinstance(challenge, dict) else {}
 
 
+def _linear_auth_redirect_origin(authorization_url: str) -> str:
+    try:
+        parsed = urlparse(authorization_url)
+        query = dict(parse_qsl(parsed.query))
+        redirect_uri = str(query.get("redirect_uri") or "").strip()
+        redirect = urlparse(redirect_uri)
+    except Exception:
+        return ""
+    if not redirect.scheme or not redirect.netloc:
+        return ""
+    return f"{redirect.scheme}://{redirect.netloc}".rstrip("/")
+
+
+def _control_panel_public_origin(cfg) -> str:
+    for key in ("TANDEM_CONTROL_PANEL_PUBLIC_URL", "HOSTED_CONTROL_PANEL_PUBLIC_URL", "HOSTED_PUBLIC_URL"):
+        value = str((cfg.env or {}).get(key) or os.environ.get(key) or "").strip().rstrip("/")
+        if value:
+            return value
+    return ""
+
+
+def _request_linear_auth_challenge(cfg, server_name: str, public_origin: str) -> dict[str, Any]:
+    token_value = cfg.tandem_token()
+    headers = {
+        "Origin": public_origin,
+        "X-Forwarded-Proto": urlparse(public_origin).scheme or "https",
+        "X-Forwarded-Host": urlparse(public_origin).netloc,
+    }
+    if token_value:
+        headers["Authorization"] = f"Bearer {token_value}"
+        headers["X-Tandem-Token"] = token_value
+    request = UrlRequest(
+        f"{cfg.tandem.base_url.rstrip('/')}/mcp/{quote(server_name)}/auth",
+        headers=headers,
+        method="POST",
+    )
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
 @app.get("/linear/catalog")
 async def linear_catalog(
     team: Optional[str] = None,
@@ -990,6 +1056,25 @@ async def linear_catalog(
                 or challenge.get("authorizationUrl")
                 or server.get("authorizationUrl")
             )
+            public_origin = _control_panel_public_origin(cfg)
+            if public_origin and _linear_auth_redirect_origin(authorization_url) != public_origin:
+                try:
+                    auth_payload = await asyncio.to_thread(
+                        _request_linear_auth_challenge,
+                        cfg,
+                        server_name,
+                        public_origin,
+                    )
+                    authorization_url = _linear_catalog_text(
+                        auth_payload.get("authorizationUrl")
+                        or auth_payload.get("authorization_url")
+                        or authorization_url
+                    )
+                    challenge = auth_payload.get("lastAuthChallenge") or auth_payload.get("last_auth_challenge") or challenge
+                    if not isinstance(challenge, dict):
+                        challenge = {}
+                except Exception:
+                    logger.debug("Failed to refresh Linear MCP auth challenge with hosted origin", exc_info=True)
             return {
                 "ok": True,
                 "server": server_name,
@@ -1952,9 +2037,11 @@ async def get_scheduler_plan(limit: int = 25, token: str = Depends(get_token)):
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
-    snapshot = scheduler_snapshot(cfg, coordination=store, limit=max(1, min(limit, 100)))
-    plan = plan_task_admissions(cfg, coordination=store, limit=max(1, min(limit, 100)))
-    return {"snapshot": snapshot, "plan": plan}
+    project_keys = _active_scheduler_project_keys(root, cfg)
+    bounded_limit = max(1, min(limit, 100))
+    snapshot = scheduler_snapshot(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
+    plan = plan_task_admissions(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
+    return {"snapshot": snapshot, "plan": plan, "project_filter": sorted(project_keys)}
 
 
 @app.post("/scheduler/dispatch")
@@ -1970,7 +2057,15 @@ async def dispatch_scheduler_batch(
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
-    result = dispatch_scheduled_runs(cfg, coordination=store, limit=max(1, min(limit, 100)), wait=wait)
+    project_keys = _active_scheduler_project_keys(root, cfg)
+    result = dispatch_scheduled_runs(
+        cfg,
+        coordination=store,
+        limit=max(1, min(limit, 100)),
+        wait=wait,
+        project_keys=project_keys,
+    )
+    result["project_filter"] = sorted(project_keys)
     return result
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
@@ -229,6 +230,60 @@ class SchedulerTest(unittest.TestCase):
             self.assertFalse(plan["blocked"])
             self.assertTrue(all(item["scope_mode"] == "files" for item in plan["admitted"]))
             self.assertEqual({item["repo_key"] for item in plan["admitted"]}, {task["repo"]["slug"] for task in tasks})
+
+    def test_scheduler_scans_active_coder_runs_once_per_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 4
+            store = CoordinationStore.from_config(cfg)
+            for suffix in ("a", "b", "c"):
+                task = {
+                    "task_id": f"task-{suffix}",
+                    "title": f"Task {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/project-{suffix}", "path": str(root / f"repo-{suffix}")},
+                }
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.list_active_coder_task_refs",
+                return_value=[],
+            ) as active_runs:
+                plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertEqual(len(plan["admitted"]), 3)
+            self.assertEqual(active_runs.call_count, 1)
+
+    def test_scheduler_filters_to_requested_project_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            target = {
+                "task_id": "target",
+                "title": "Target task",
+                "source": {"type": "linear", "team": "team-1", "project": "project-target"},
+                "repo": {"slug": "frumu-ai/target", "path": str(root / "target")},
+            }
+            stale = {
+                "task_id": "stale",
+                "title": "Stale task",
+                "source": {"type": "linear", "team": "team-1", "project": "project-stale"},
+                "repo": {"slug": "frumu-ai/stale", "path": str(root / "stale")},
+            }
+            store.register_task(stale, repo=stale["repo"], status="queued")
+            store.register_task(target, repo=target["repo"], status="queued")
+
+            project_key = task_project_key(target)
+            snapshot = scheduler_snapshot(cfg, coordination=store, limit=10, project_keys={project_key})
+            plan = plan_task_admissions(cfg, coordination=store, limit=10, project_keys={project_key})
+
+            self.assertEqual(snapshot["queued_tasks"], 1)
+            self.assertEqual(snapshot["queued"][0]["task_id"], "target")
+            self.assertEqual(len(plan["admitted"]), 1)
+            self.assertEqual(plan["admitted"][0]["task_key"], snapshot["queued"][0]["task_key"])
+            self.assertFalse(plan["blocked"])
 
 
 if __name__ == "__main__":

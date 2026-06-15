@@ -5,7 +5,7 @@ HOST="${TANDEM_ENGINE_HOST:-0.0.0.0}"
 PORT="${TANDEM_ENGINE_PORT:-${TANDEM_PORT:-39733}}"
 TOKEN_FILE="${TANDEM_API_TOKEN_FILE:-/run/secrets/tandem_api_token}"
 CONTROL_PANEL_CONFIG_FILE="${TANDEM_CONTROL_PANEL_CONFIG_FILE:-/workspace/tandem-data/control-panel-config.json}"
-MCP_REGISTRY_FILE="${TANDEM_STATE_DIR:-/home/node/.local/share/tandem/data}/mcp_servers.json"
+MCP_REGISTRY_FILE="${TANDEM_STATE_DIR:-/home/node/.local/share/tandem/data}/mcp/mcp_servers.json"
 MCP_BOOTSTRAP_SCRIPT="${TANDEM_MCP_BOOTSTRAP_SCRIPT:-/usr/local/lib/tandem-mcp-bootstrap.js}"
 
 read_token_file() {

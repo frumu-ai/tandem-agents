@@ -171,6 +171,39 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertNotIn("N" * 5000, prompt)
         self.assertNotIn("P" * 5000, prompt)
 
+    def test_worker_prompt_subtask_contract_uses_active_subtask_files(self) -> None:
+        task = {
+            "title": "TAN-57 Add regression coverage",
+            "task_contract": {
+                "target_files": [
+                    "crates/tandem-server/src/http/coder_parts/part05.rs",
+                    "crates/tandem-server/src/http/coder_parts/part09.rs",
+                    "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+                ]
+            },
+        }
+        subtask = self._subtask(
+            title="Schema drift regression",
+            files=[
+                "crates/tandem-server/src/http/coder_parts/part09.rs",
+                "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+            ],
+            task_contract={
+                "target_files": [
+                    "crates/tandem-server/src/http/coder_parts/part05.rs",
+                    "crates/tandem-server/src/http/coder_parts/part09.rs",
+                    "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+                ]
+            },
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, task, "/wt")
+        subtask_contract = prompt.split("Subtask contract:\n", 1)[1].split("\n\nAcceptance criteria:", 1)[0]
+
+        self.assertIn("crates/tandem-server/src/http/coder_parts/part09.rs", subtask_contract)
+        self.assertIn("crates/tandem-server/src/http/tests/coder_parts/part09.rs", subtask_contract)
+        self.assertNotIn("crates/tandem-server/src/http/coder_parts/part05.rs", subtask_contract)
+
     def test_worker_prompt_warns_about_git_ignored_targets(self) -> None:
         subtask = self._subtask(
             files=[],
@@ -200,6 +233,20 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("Do not define the quality-gate rules inside the test", prompt)
         self.assertIn("Preserve existing live smoke/API behavior", prompt)
 
+    def test_worker_prompt_rejects_test_only_regression_oracles(self) -> None:
+        subtask = self._subtask(
+            title="Add GitHub Projects regression coverage",
+            goal="Cover schema drift and readiness behavior",
+            files=["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+            target_files=["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("each new assertion must exercise existing production functions", prompt)
+        self.assertIn("test-only enum, constant, local helper, or string table", prompt)
+        self.assertIn("not valid coverage", prompt)
+
     def test_manager_prompt_warns_against_duplicate_quality_gate_implementation(self) -> None:
         prompt = build_manager_prompt(
             "run1",
@@ -217,8 +264,9 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("standalone duplicate implementation", prompt)
         self.assertIn("live smoke/API path", prompt)
         self.assertIn("prefer 1-3 high-signal files", prompt)
-        self.assertIn("graph-derived likely files", prompt)
-        self.assertIn("discovery evidence, not final proof", prompt)
+        self.assertIn("graph-derived required edit files", prompt)
+        self.assertIn("plan worker deliverables around those paths first", prompt)
+        self.assertIn("discovery/read-only context", prompt)
         self.assertIn("read concrete files before changing code", prompt)
 
     def test_manager_prompt_enters_partial_diff_repair_mode(self) -> None:
@@ -242,7 +290,39 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("PARTIAL-DIFF REPAIR MODE", prompt)
         self.assertIn("Return exactly one subtask", prompt)
         self.assertIn("missing passes() method", prompt)
+        self.assertIn("limited to changed files only when", prompt)
         self.assertIn("Put the recovered blocker fixes in canonical `acceptance_criteria`", prompt)
+
+    def test_manager_prompt_expands_rejected_partial_diff_to_parent_targets(self) -> None:
+        prompt = build_manager_prompt(
+            "run1",
+            {
+                "title": "Repair rejected partial diff",
+                "description": "Finish real regression coverage",
+                "task_contract": {
+                    "target_files": [
+                        "crates/tandem-server/src/http/coder_parts/part05.rs",
+                        "crates/tandem-server/src/http/coder_parts/part09.rs",
+                        "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+                    ]
+                },
+            },
+            {"path": "/repo"},
+            _stub_config(),
+            previous_feedback=(
+                "CRITICAL: Worker attempt 3 failed with retryable blocker `worker_incomplete_diff`.\n"
+                "Preserved partial patch: `runs/x/artifacts/worker.patch`\n"
+                "Worker output excerpt:\n"
+                "verification not run\n"
+                "The partial diff is not treated as a completed worker result; retry or block with this evidence."
+            ),
+        )
+
+        self.assertIn("PARTIAL-DIFF REPAIR MODE", prompt)
+        self.assertIn("parent task target files needed", prompt)
+        self.assertIn("use it only as failure evidence", prompt)
+        self.assertIn("crates/tandem-server/src/http/tests/coder_parts/part09.rs", prompt)
+        self.assertNotIn("additional target files until the preserved patch is terminal", prompt)
 
     def test_write_required_prompt_rejects_marker_files(self) -> None:
         subtask = self._subtask(
@@ -313,6 +393,30 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
 
         self.assertIn("ACA scope note", prompt)
         self.assertIn("overbroad one-worker target set", prompt)
+
+    def test_worker_prompt_includes_compact_rejected_partial_repair_directive(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "crates/tandem-server/src/http/coder_parts/part09.rs",
+                "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+            ],
+            target_files=[
+                "crates/tandem-server/src/http/coder_parts/part09.rs",
+                "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+            ],
+            discarded_partial_diff_patch="/runs/run-1/artifacts/worker-1.patch",
+            repair_changed_files=["crates/tandem-server/src/http/coder_parts/part09.rs"],
+            repair_failure_summary="verification did not run; the diff was not wired into the production path",
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Repair directive:", prompt)
+        self.assertIn("previous partial diff was rejected", prompt)
+        self.assertIn("do not apply or copy it as-is", prompt)
+        self.assertIn("First actions: read the target files", prompt)
+        self.assertIn("verification did not run", prompt)
+        self.assertNotIn("/runs/run-1/artifacts/worker-1.patch", prompt)
 
 
 if __name__ == "__main__":

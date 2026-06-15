@@ -121,13 +121,26 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             elapsed = time.monotonic() - started
 
         self.assertEqual(len(results), 1)
-        self.assertGreaterEqual(elapsed, 0.04)
+        self.assertLess(elapsed, 0.04)
         self.assertEqual(results[0]["status"], "failed")
         self.assertEqual(results[0]["blocker_kind"], "worker_no_progress")
+        self.assertTrue(results[0]["worker_abandoned_after_timeout"])
         self.assertIn("no terminal result", results[0]["failure_reason"])
-        self.assertIn("Late worker result after timeout", results[0]["output_excerpt"])
-        self.assertIn("finished after timeout", results[0]["output_excerpt"])
-        self.assertEqual(results[0]["changed_files"], ["src/app.py"])
+        self.assertIn("did not wait for the stuck worker thread", results[0]["recovery_action"])
+
+    def test_abandoned_no_progress_worker_does_not_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(
+                _worker_failure_can_retry(
+                    self._config(Path(tmp)),
+                    {
+                        "kind": "worker_no_progress",
+                        "worker": {"worker_abandoned_after_timeout": True},
+                    },
+                    attempt=0,
+                    base_max_loops=2,
+                )
+            )
 
     def test_execute_local_worker_pool_keeps_result_when_callback_fails(self) -> None:
         def worker_runner(*_args):
@@ -1342,6 +1355,81 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
         self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
 
+    def test_worker_off_track_builds_retry_feedback(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                    "blocker_kind": "worker_off_track",
+                    "changed_files": ["crates/tandem-server/src/http/coder_parts/part09.rs"],
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "stdout": "Required regression test file was not touched.",
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertIsNotNone(feedback)
+        self.assertEqual(blocker["kind"], "worker_off_track")
+        self.assertIn("retryable blocker `worker_off_track`", feedback or "")
+        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+
+    def test_worker_runaway_diff_builds_retry_feedback(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "WORKER_RUNAWAY_DIFF",
+                    "blocker_kind": "worker_runaway_diff",
+                    "changed_files": ["crates/tandem-server/src/http/coder_parts/part09.rs"],
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-2.patch",
+                    "stdout": "Diff exceeded runaway guard.",
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertIsNotNone(feedback)
+        self.assertEqual(blocker["kind"], "worker_runaway_diff")
+        self.assertIn("retryable blocker `worker_runaway_diff`", feedback or "")
+        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+
+    def test_worker_unproductive_diff_builds_retry_feedback(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-3",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "WORKER_UNPRODUCTIVE_DIFF",
+                    "blocker_kind": "worker_unproductive_diff",
+                    "changed_files": ["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-3.patch",
+                    "stdout": "Worker produced a comment-only placeholder diff.",
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertIsNotNone(feedback)
+        self.assertEqual(blocker["kind"], "worker_unproductive_diff")
+        self.assertIn("retryable blocker `worker_unproductive_diff`", feedback or "")
+        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+
     def test_extra_worker_repair_loop_is_limited_to_incomplete_diffs(self) -> None:
         cfg = SimpleNamespace(env={})
 
@@ -1547,6 +1635,40 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertIn("-before", patch_text)
             self.assertIn("+after", patch_text)
             self.assertIn("blocked_worktree_cleanup", ctx.blackboard)
+
+    def test_preserve_and_reset_worktree_supports_retry_artifact_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem.invalid", "commit", "-m", "init"])
+            (repo / "README.md").write_text("rejected\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                repo_path=repo,
+                cfg=SimpleNamespace(env={}),
+                layout={"artifacts": artifacts},
+                blackboard={},
+            )
+
+            patch_path = _preserve_and_reset_blocked_worktree(
+                ctx,
+                reason="verification_retry_review_repair_needed",
+                artifact_name="retry-2-rejected-working-diff.patch",
+            )
+
+            self.assertEqual(patch_path, artifacts / "retry-2-rejected-working-diff.patch")
+            self.assertEqual((repo / "README.md").read_text(encoding="utf-8"), "before\n")
+            patch_text = patch_path.read_text(encoding="utf-8")
+            self.assertIn("-before", patch_text)
+            self.assertIn("+rejected", patch_text)
+            cleanup = ctx.blackboard["blocked_worktree_cleanup"][0]
+            self.assertEqual(cleanup["reason"], "verification_retry_review_repair_needed")
+            self.assertEqual(cleanup["patch_path"], str(patch_path))
 
     def test_manager_prompt_includes_previous_feedback_for_repairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

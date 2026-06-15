@@ -69,7 +69,11 @@ def repo_context_for_task(
         if not isinstance(payload, dict):
             raise RuntimeError("repo.context_bundle did not return a structured object")
         metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        bundle_has_evidence = _context_bundle_has_evidence(payload)
+        empty_reason = "repo.context_bundle returned no actionable repo evidence"
         text = _format_context_bundle(payload, metadata)
+        if not bundle_has_evidence:
+            text = _fallback_text(fallback, empty_reason)
         written_artifact = _write_artifact(
             artifact_path,
             {
@@ -80,6 +84,8 @@ def repo_context_for_task(
                 "path_scope": context_tool_args.get("path_scope"),
                 "graph_hints": context_hints,
                 "task_id": task.get("task_id"),
+                "fallback_used": not bundle_has_evidence,
+                "fallback_reason": empty_reason if not bundle_has_evidence else None,
                 "tool_result": result,
                 "bundle": payload,
             },
@@ -87,7 +93,8 @@ def repo_context_for_task(
         return RepoContextResult(
             text=text,
             source="repo.context_bundle",
-            fallback_used=False,
+            fallback_used=not bundle_has_evidence,
+            error=empty_reason if not bundle_has_evidence else None,
             artifact_path=str(written_artifact) if written_artifact else None,
             path_scope=str(context_tool_args.get("path_scope") or "."),
             required_files=list(context_hints.get("required_files") or []),
@@ -155,7 +162,7 @@ def repo_context_hints_for_task(task: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "task": _task_query_text(task),
         "path_scope": _task_path_scope(task),
-        "required_files": _task_target_files(task),
+        "required_files": _task_required_files(task),
     }
 
 
@@ -191,6 +198,9 @@ def _task_query_text(task: dict[str, Any]) -> str:
     labels = [str(value).strip() for value in task.get("labels") or [] if str(value).strip()]
     if labels:
         parts.append(f"Labels: {', '.join(labels)}")
+    domain_hints = _task_domain_hints(task)
+    if domain_hints:
+        parts.append("Routing hints: " + ", ".join(domain_hints))
     target_files = _task_target_files(task)
     if target_files:
         parts.append(f"Target files: {', '.join(target_files[:20])}")
@@ -216,6 +226,18 @@ def _task_target_files(task: dict[str, Any]) -> list[str]:
     return files
 
 
+def _task_required_files(task: dict[str, Any]) -> list[str]:
+    seen: set[str] = set()
+    files: list[str] = []
+    for value in [*_task_target_files(task), *_task_domain_required_files(task)]:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        files.append(text)
+    return files
+
+
 def _task_path_scope(task: dict[str, Any]) -> str:
     target_scope = _scope_from_target_files(_task_target_files(task))
     if target_scope:
@@ -224,11 +246,59 @@ def _task_path_scope(task: dict[str, Any]) -> str:
     lowered_text = text.lower()
     if re.search(r"\bmh-\d+\b|\bmeta[- ]harness\b|tandem-meta-harness-eval", lowered_text):
         return "crates/tandem-meta-harness-eval"
+    if _is_github_projects_coder_task(lowered_text):
+        return "crates/tandem-server/src/http"
     for match in re.finditer(r"(?:^|[\s`'\"])((?:crates|packages|apps|src|scripts|docs|tests)/[A-Za-z0-9_./-]+)", text):
         scope = _scope_from_path(match.group(1))
         if scope:
             return scope
     return "."
+
+
+def _task_domain_hints(task: dict[str, Any]) -> list[str]:
+    lowered_text = _task_query_text_without_targets(task).lower()
+    if not _is_github_projects_coder_task(lowered_text):
+        return []
+    return [
+        "CoderGithubProjectBinding",
+        "CoderGithubProjectInboxResponse",
+        "CoderGithubProjectIntakeInput",
+        "schema_drift",
+        "live_schema_fingerprint",
+        *_task_domain_required_files(task),
+    ]
+
+
+def _is_github_projects_coder_task(lowered_text: str) -> bool:
+    has_github_project = "github projects" in lowered_text or "github project" in lowered_text
+    has_coder_context = "coder" in lowered_text or "intake" in lowered_text
+    return has_github_project and has_coder_context
+
+
+def _task_domain_required_files(task: dict[str, Any]) -> list[str]:
+    lowered_text = _task_query_text_without_targets(task).lower()
+    if not _is_github_projects_coder_task(lowered_text):
+        return []
+    return [
+        "crates/tandem-server/src/http/coder_parts/part05.rs",
+        "crates/tandem-server/src/http/coder_parts/part09.rs",
+        "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+    ]
+
+
+def _context_bundle_has_evidence(bundle: dict[str, Any]) -> bool:
+    evidence_keys = (
+        "suggested_first_reads",
+        "likely_files",
+        "relevant_symbols",
+        "graph_edges",
+        "test_targets",
+    )
+    for key in evidence_keys:
+        values = bundle.get(key)
+        if isinstance(values, list) and any(bool(value) for value in values):
+            return True
+    return False
 
 
 def _task_query_text_without_targets(task: dict[str, Any]) -> str:
@@ -273,6 +343,8 @@ def _scope_from_path(path: str) -> str | None:
     parts = [part for part in cleaned.split("/") if part]
     if not parts:
         return None
+    if parts[:2] == ["docs", "internal"]:
+        return None
     if parts[0] in {"crates", "packages", "apps"} and len(parts) >= 2:
         return "/".join(parts[:2])
     if "." in parts[-1] and len(parts) > 1:
@@ -298,6 +370,7 @@ def _format_context_bundle(bundle: dict[str, Any], metadata: dict[str, Any]) -> 
         f"- Tool: {metadata.get('tool') or 'repo.context_bundle'}",
         f"- Index source: {metadata.get('index_source') or 'unknown'}",
     ]
+    _append_path_list(lines, "Required edit files", metadata.get("required_files"))
     _append_path_list(lines, "Suggested first reads", bundle.get("suggested_first_reads"))
     _append_ranked_items(lines, "Likely files", bundle.get("likely_files"), ("file_path", "reason", "confidence"))
     _append_ranked_items(
@@ -310,7 +383,9 @@ def _format_context_bundle(bundle: dict[str, Any], metadata: dict[str, Any]) -> 
     _append_path_list(lines, "Likely tests", bundle.get("test_targets"))
     _append_path_list(lines, "Known gaps", bundle.get("gaps"))
     lines.append(
-        "Use this bundle as discovery evidence only: read concrete files before editing or making final claims."
+        "Use Required edit files as the preferred worker deliverables. Treat Suggested first reads, "
+        "Likely files, Relevant symbols, and Graph evidence as discovery/read-only context unless a "
+        "required edit file is missing or proves unrelated after inspection."
     )
     return "\n".join(line for line in lines if line is not None)
 

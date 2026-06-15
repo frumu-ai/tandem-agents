@@ -290,6 +290,38 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
 
             self.assertFalse(cfg.github_mcp.enabled)
 
+    def test_linear_task_source_adds_default_mcp_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: linear
+                      team: Tandem
+                      project: Tandem Coder Runtime & Intake
+                    repository:
+                      slug: frumu-ai/tandem
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(root)
+
+            self.assertTrue(cfg.linear_mcp.enabled)
+            self.assertIn("linear", cfg.mcp_servers)
+            self.assertEqual(cfg.mcp_servers["linear"]["transport"], "https://mcp.linear.app/mcp")
+            self.assertEqual(cfg.mcp_servers["linear"]["auth_kind"], "oauth")
+
     def test_coder_supervision_timing_can_come_from_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -373,6 +405,10 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
 
             self.assertTrue(cfg.github_mcp.enabled)
             self.assertEqual(cfg.repository.credential_file, "")
+            self.assertEqual(
+                cfg.mcp_servers["github"]["auth"]["token_file_envs"],
+                ["GITHUB_TOKEN_FILE", "GITHUB_PERSONAL_ACCESS_TOKEN_FILE"],
+            )
 
 
 if __name__ == "__main__":

@@ -568,8 +568,8 @@ function buildControlPanelConfig(existing, example) {
               }
             : {},
           auth: {
-            token_envs: ["GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"],
-            token_file_envs: ["GITHUB_PERSONAL_ACCESS_TOKEN_FILE", "GITHUB_TOKEN_FILE"],
+            token_envs: ["GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+            token_file_envs: ["GITHUB_TOKEN_FILE", "GITHUB_PERSONAL_ACCESS_TOKEN_FILE"],
           },
           auto_connect: true,
           auto_enable_with_credentials: true,
@@ -601,9 +601,40 @@ function buildControlPanelConfig(existing, example) {
             existing.KB_PUBLIC_BASE_URL,
             existing.TANDEM_KB_MCP_URL,
             rawExistingConfig.mcp_servers?.kb?.transport,
-            { default: "http://127.0.0.1:39736/mcp" }
+            { default: "http://tandem-kb-mcp:39736/mcp" }
           ),
           auto_connect: true,
+        },
+        linear: {
+          ...(linearEnabledRaw ? { enabled: boolValue(linearEnabledRaw, false) } : {}),
+          name: firstNonEmpty(
+            existing.ACA_LINEAR_MCP_SERVER,
+            rawExistingConfig.mcp_servers?.linear?.name,
+            rawExistingConfig.linear_mcp?.server,
+            { default: "linear" }
+          ),
+          transport: firstNonEmpty(
+            existing.ACA_LINEAR_MCP_URL,
+            rawExistingConfig.mcp_servers?.linear?.transport,
+            { default: "https://mcp.linear.app/mcp" }
+          ),
+          auth_kind: firstNonEmpty(
+            rawExistingConfig.mcp_servers?.linear?.auth_kind,
+            { default: "oauth" }
+          ),
+          auto_connect: true,
+          scope: firstNonEmpty(
+            existing.ACA_LINEAR_MCP_SCOPE,
+            rawExistingConfig.mcp_servers?.linear?.scope,
+            rawExistingConfig.linear_mcp?.scope,
+            { default: "intake_finalize" }
+          ),
+          remote_sync: firstNonEmpty(
+            existing.ACA_LINEAR_REMOTE_SYNC,
+            rawExistingConfig.mcp_servers?.linear?.remote_sync,
+            rawExistingConfig.linear_mcp?.remote_sync,
+            { default: "rich" }
+          ),
         },
       },
       linear_mcp: {
@@ -802,6 +833,7 @@ function main() {
     ["ACA_GITHUB_MCP_ENABLED", firstNonEmpty(existingEnv.ACA_GITHUB_MCP_ENABLED, exampleEnv.ACA_GITHUB_MCP_ENABLED)],
     ["ACA_LINEAR_MCP_ENABLED", firstNonEmpty(existingEnv.ACA_LINEAR_MCP_ENABLED, exampleEnv.ACA_LINEAR_MCP_ENABLED)],
     ["ACA_LINEAR_MCP_SERVER", firstNonEmpty(existingEnv.ACA_LINEAR_MCP_SERVER, exampleEnv.ACA_LINEAR_MCP_SERVER)],
+    ["ACA_LINEAR_MCP_URL", firstNonEmpty(existingEnv.ACA_LINEAR_MCP_URL, exampleEnv.ACA_LINEAR_MCP_URL)],
     ["GITHUB_PERSONAL_ACCESS_TOKEN_FILE", firstNonEmpty(existingEnv.GITHUB_PERSONAL_ACCESS_TOKEN_FILE, exampleEnv.GITHUB_PERSONAL_ACCESS_TOKEN_FILE, { default: "./secrets/github_token" })],
     ["GITHUB_TOKEN_FILE", firstNonEmpty(existingEnv.GITHUB_TOKEN_FILE, exampleEnv.GITHUB_TOKEN_FILE, { default: "./secrets/github_token" })],
     ["ACA_KB_MCP_ENABLED", firstNonEmpty(existingEnv.ACA_KB_MCP_ENABLED, exampleEnv.ACA_KB_MCP_ENABLED, { default: "true" })],

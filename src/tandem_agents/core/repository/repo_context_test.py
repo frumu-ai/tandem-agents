@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.tandem_agents.core.repository.repo_context import repo_context_for_task
+from src.tandem_agents.core.repository.repo_context import repo_context_for_task, repo_context_hints_for_task
 
 
 class RepoContextForTaskTest(unittest.TestCase):
@@ -87,6 +87,8 @@ class RepoContextForTaskTest(unittest.TestCase):
             self.assertEqual(result.required_files, ["src/tandem_agents/core/phases/planning.py"])
             self.assertEqual(result.index_source, "stored")
             self.assertIn("Repo intelligence context bundle", result.text)
+            self.assertIn("Required edit files", result.text)
+            self.assertIn("Use Required edit files as the preferred worker deliverables", result.text)
             self.assertIn("run_manager_prompt", result.text)
             execute.assert_called_once()
             self.assertEqual(execute.call_args.args[1], "repo.context_bundle")
@@ -106,6 +108,52 @@ class RepoContextForTaskTest(unittest.TestCase):
             self.assertEqual(saved["path_scope"], "src/tandem_agents/core/phases")
             self.assertEqual(saved["graph_hints"]["path_scope"], "src/tandem_agents/core/phases")
             self.assertEqual(saved["graph_hints"]["required_files"], ["src/tandem_agents/core/phases/planning.py"])
+            self.assertFalse(saved["fallback_used"])
+            self.assertIsNone(saved["fallback_reason"])
+
+    def test_empty_context_bundle_uses_fallback_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifacts" / "repo_context_bundle.json"
+            task = {
+                "task_id": "TAN-57",
+                "title": "CRI-02 Add GitHub Projects schema drift and divergence regression coverage",
+                "description": "Tests cover schema drift and degraded write capability.",
+            }
+            tool_result = {
+                "output": json.dumps(
+                    {
+                        "suggested_first_reads": [],
+                        "likely_files": [],
+                        "relevant_symbols": [],
+                        "graph_edges": [],
+                        "test_targets": [],
+                        "gaps": [],
+                    }
+                ),
+                "metadata": {"tool": "repo.context_bundle", "index_source": "stored"},
+            }
+
+            with patch(
+                "src.tandem_agents.core.repository.repo_context.list_engine_tool_ids",
+                return_value=["repo.context_bundle"],
+            ), patch(
+                "src.tandem_agents.core.repository.repo_context.repo_context_summary",
+                return_value="Likely relevant repo files:\n- crates/tandem-github/src/projects.rs (readable, 123 bytes)",
+            ), patch(
+                "src.tandem_agents.core.repository.repo_context.execute_engine_tool",
+                return_value=tool_result,
+            ):
+                result = repo_context_for_task(SimpleNamespace(), root, task, artifact_path=artifact)
+
+            self.assertEqual(result.source, "repo.context_bundle")
+            self.assertTrue(result.fallback_used)
+            self.assertEqual(result.error, "repo.context_bundle returned no actionable repo evidence")
+            self.assertIn("Repo intelligence context bundle unavailable", result.text)
+            self.assertIn("crates/tandem-github/src/projects.rs", result.text)
+            saved = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertTrue(saved["fallback_used"])
+            self.assertEqual(saved["fallback_reason"], "repo.context_bundle returned no actionable repo evidence")
 
     def test_meta_harness_task_selects_eval_crate_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,6 +216,23 @@ class RepoContextForTaskTest(unittest.TestCase):
 
             self.assertEqual(result.path_scope, "apps/AdminPortal")
             self.assertEqual(execute.call_args.args[2]["path_scope"], "apps/AdminPortal")
+
+    def test_internal_docs_reference_does_not_narrow_code_scope(self) -> None:
+        task = {
+            "task_id": "TAN-57",
+            "title": "CRI-02 Add GitHub Projects schema drift and divergence regression coverage",
+            "description": (
+                "Source: `docs/internal/TANDEM_GITHUB_PROJECTS_KANBAN.md` Phase H.\n"
+                "Harden GitHub Projects intake against schema drift and remote state changes."
+            ),
+        }
+
+        hints = repo_context_hints_for_task(task)
+
+        self.assertEqual(hints["path_scope"], "crates/tandem-server/src/http")
+        self.assertIn("docs/internal/TANDEM_GITHUB_PROJECTS_KANBAN.md", hints["task"])
+        self.assertIn("CoderGithubProjectBinding", hints["task"])
+        self.assertIn("crates/tandem-server/src/http/coder_parts/part09.rs", hints["task"])
 
     def test_falls_back_when_repo_context_bundle_tool_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

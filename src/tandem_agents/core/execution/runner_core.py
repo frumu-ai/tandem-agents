@@ -133,6 +133,9 @@ logger = logging.getLogger("aca.runner_core")
 _RETRYABLE_WORKER_BLOCKER_KINDS = {
     "worker_incomplete_diff",
     "worker_no_progress",
+    "worker_off_track",
+    "worker_runaway_diff",
+    "worker_unproductive_diff",
     "worker_corrupt_diff",
     "worker_no_diff",
     "engine_tool_loop_stalled",
@@ -427,6 +430,27 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
             first.get("recovery_action")
             or "Retry with a narrower repair prompt focused on the unmet acceptance criteria."
         )
+    elif kind == "worker_off_track":
+        message = failure_reason or "Worker drifted away from the required task evidence."
+        phase_detail = f"{worker_id} drifted off the required edit/test path"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Retry with a narrower prompt that edits the required test or evidence file first."
+        )
+    elif kind == "worker_runaway_diff":
+        message = failure_reason or "Worker produced an unexpectedly large diff."
+        phase_detail = f"{worker_id} tripped the runaway diff guard"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Retry with a smaller scoped prompt and inspect diff stats before continuing."
+        )
+    elif kind == "worker_unproductive_diff":
+        message = failure_reason or "Worker produced a placeholder or comment-only diff."
+        phase_detail = f"{worker_id} produced an unproductive diff"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Retry with a smaller prompt that requires a real implementation-backed assertion before comments."
+        )
     elif kind == "ignored_path_changes":
         ignored = first.get("ignored_files") or []
         ignored_text = f" Ignored files: {', '.join(str(path) for path in ignored)}." if ignored else ""
@@ -510,6 +534,11 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
                 "acceptance criteria. Do not repeat only the same partial change, and do not mark the task complete "
                 "until required tests or deterministic verification pass."
             ),
+            (
+                "If the failed attempt added only a test-local oracle, mock enum, constant table, or helper that restates "
+                "the desired behavior without calling existing production code, discard that approach and replace it "
+                "with coverage that exercises the real implementation."
+            ),
         )
         if part
     )
@@ -531,12 +560,22 @@ def _worker_failure_can_retry(
     attempt: int,
     base_max_loops: int,
 ) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if (
+        str(blocker.get("kind") or "").strip() == "worker_no_progress"
+        and isinstance(worker, dict)
+        and worker.get("worker_abandoned_after_timeout")
+    ):
+        return False
     if attempt < base_max_loops - 1:
         return True
     if str(blocker.get("kind") or "").strip() not in {
         "worker_incomplete_diff",
         "worker_corrupt_diff",
         "worker_no_progress",
+        "worker_off_track",
+        "worker_runaway_diff",
+        "worker_unproductive_diff",
     }:
         return False
     extra_retries = _worker_incomplete_diff_extra_retries(cfg)
@@ -1298,10 +1337,13 @@ def _normalize_manager_subtasks(
         if str(entry).strip()
     ]
     task_target_files = list(declared_task_target_files)
+    explicit_task_target_files: list[str] = []
     if not task_target_files:
-        task_target_files = _explicit_task_target_files(Path(repo_path), task)
+        explicit_task_target_files = _explicit_task_target_files(Path(repo_path), task)
+        task_target_files = list(explicit_task_target_files)
     contract_constrained = bool(declared_task_target_files)
-    suppress_discovered_targets = _task_mentions_external_pr_candidates(task) and not contract_constrained
+    task_path_constrained = bool(declared_task_target_files or explicit_task_target_files)
+    suppress_discovered_targets = _task_mentions_external_pr_candidates(task) and not task_path_constrained
 
     def _normalize_repo_file(entry: str) -> str:
         if entry.startswith(repo_prefix):
@@ -1454,11 +1496,11 @@ def _normalize_manager_subtasks(
                 + "."
             )
             scope_note = f"{scope_note}\n{extra}".strip()
-        if contract_constrained:
+        if task_path_constrained:
             allowed = set(normalized_task_target_files)
             if not normalized_files or any(entry not in allowed for entry in normalized_files):
                 normalized_files = list(normalized_task_target_files)
-        if contract_constrained:
+        if task_path_constrained:
             normalized_target_files = list(normalized_task_target_files)
         elif not normalized_target_files and normalized_files:
             normalized_target_files = list(normalized_files)
@@ -1493,7 +1535,7 @@ def _normalize_manager_subtasks(
         return normalized
     fallback = derive_subtasks(task, 1)
     if discovered_files and fallback and not suppress_discovered_targets:
-        if contract_constrained:
+        if task_path_constrained:
             fallback[0]["files"] = list(normalized_task_target_files)
             fallback[0]["target_files"] = list(normalized_task_target_files)
         else:
@@ -1731,6 +1773,7 @@ def _execute_local_worker_pool(
     ] = run_worker_subtask,
     on_start: Callable[[str, dict[str, Any]], None] | None = None,
     on_result: Callable[[dict[str, Any]], None] | None = None,
+    abort_result: Callable[[int, dict[str, Any], str], dict[str, Any] | None] | None = None,
     worker_timeout_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     if not pending_subtasks:
@@ -1834,18 +1877,18 @@ def _execute_local_worker_pool(
         if future.cancel():
             return _timeout_result(index, subtask, worker_id)
         logger.warning(
-            "Worker %s/%s exceeded %.0fs timeout; waiting for the in-flight worker to finish before repair continues.",
+            "Worker %s/%s exceeded %.0fs timeout; recording no-progress result while the in-flight worker is abandoned.",
             worker_id,
             subtask.get("id"),
             timeout,
         )
-        try:
-            finished_result = future.result()
-        except Exception as exc:
-            finished_result = {
-                "output_excerpt": f"Timed-out worker raised while ACA waited for it to finish: {exc}",
-            }
-        return _timeout_result(index, subtask, worker_id, finished_result if isinstance(finished_result, dict) else None)
+        result = _timeout_result(index, subtask, worker_id)
+        result["worker_abandoned_after_timeout"] = True
+        result["recovery_action"] = (
+            "Inspect the worker log and engine run state. ACA did not wait for the stuck worker thread, "
+            "so the repair loop can continue or block cleanly."
+        )
+        return result
 
     if worker_limit <= 1:
         executor = ThreadPoolExecutor(max_workers=1)
@@ -1853,13 +1896,28 @@ def _execute_local_worker_pool(
             for index, subtask in enumerate(pending_subtasks, start=1):
                 worker_id = f"worker-{index}"
                 future = executor.submit(_run_one, index, subtask, worker_id)
-                try:
-                    result = future.result(timeout=timeout if timeout > 0 else None)
-                except FutureTimeoutError:
-                    result = _timed_out_worker_result(future, index, subtask, worker_id)
+                deadline = time.monotonic() + timeout if timeout > 0 else None
+                while True:
+                    if abort_result is not None:
+                        aborted = abort_result(index, subtask, worker_id)
+                        if aborted:
+                            result = aborted
+                            _record_result(result)
+                            break
+                    wait_s = 1.0
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            result = _timed_out_worker_result(future, index, subtask, worker_id)
+                            _record_result(result)
+                            break
+                        wait_s = min(wait_s, max(0.01, remaining))
+                    try:
+                        result = future.result(timeout=wait_s)
+                    except FutureTimeoutError:
+                        continue
                     _record_result(result)
                     break
-                _record_result(result)
                 if _has_unresolved_write_required_worker_failure([result]):
                     break
         finally:
@@ -3467,6 +3525,20 @@ def _run_once_internal_impl(
         if verification.should_retry:
             if _verification_can_retry(cfg, ctx, attempt, base_max_loops):
                 previous_feedback = build_retry_feedback(ctx, attempt, verification)
+                rejected_patch = _preserve_and_reset_blocked_worktree(
+                    ctx,
+                    reason=f"verification_retry_{getattr(verification, 'failure_category', 'failed')}",
+                    artifact_name=f"retry-{attempt + 1}-rejected-working-diff.patch",
+                )
+                if rejected_patch is not None:
+                    previous_feedback = (
+                        f"{previous_feedback}\n\n"
+                        "The rejected working diff was preserved and the shared checkout was reset "
+                        f"before this retry. Inspect or reuse only the useful hunks from `{rejected_patch}`; "
+                        "do not carry forward rejected shallow or incomplete behavior."
+                    )
+                    save_blackboard(layout["blackboard"], ctx.blackboard)
+                    write_blackboard_snapshot(run_dir, ctx.blackboard)
                 continue
             return _block_verification_failed(ctx, verification)
         if getattr(verification, "outcome", "pass") != "pass":
@@ -3670,12 +3742,17 @@ def _integration_retry_feedback(
     return feedback
 
 
-def _preserve_and_reset_blocked_worktree(ctx: "_PhaseRunContext", *, reason: str) -> None:
+def _preserve_and_reset_blocked_worktree(
+    ctx: "_PhaseRunContext",
+    *,
+    reason: str,
+    artifact_name: str = "blocked-working-diff.patch",
+) -> Path | None:
     status = run_command(_git_repo_args(ctx.repo_path, "status", "--short", "--untracked-files=all"), env=ctx.cfg.env)
     if status.returncode != 0 or not status.stdout.strip():
-        return
+        return None
     diff = run_command(_git_repo_args(ctx.repo_path, "diff", "--binary", "HEAD"), env=ctx.cfg.env)
-    patch_path = ctx.layout["artifacts"] / "blocked-working-diff.patch"
+    patch_path = ctx.layout["artifacts"] / artifact_name
     patch_text = diff.stdout if diff.returncode == 0 and diff.stdout.strip() else status.stdout
     patch_path.write_text(patch_text, encoding="utf-8")
     ctx.blackboard.setdefault("artifacts", []).append(str(patch_path))
@@ -3698,6 +3775,7 @@ def _preserve_and_reset_blocked_worktree(ctx: "_PhaseRunContext", *, reason: str
             ctx.blackboard,
             f"Preserved blocked worktree diff at `{patch_path}` and reset shared checkout.",
         )
+    return patch_path
 
 
 def _linear_comment_task_summary(task: dict[str, Any]) -> str:

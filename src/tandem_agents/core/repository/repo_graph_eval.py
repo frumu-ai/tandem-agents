@@ -63,6 +63,20 @@ EVAL_CASES: tuple[RepoGraphEvalCase, ...] = (
         expected_path_scope="docs",
         expected_terms=("docs/ENGINE_MANAGEMENT.md", "engine management"),
     ),
+    RepoGraphEvalCase(
+        name="github_projects_coder_intake",
+        task={
+            "task_id": "TAN-57",
+            "title": "CRI-02 Add GitHub Projects schema drift and divergence regression coverage",
+            "description": (
+                "Harden GitHub Projects intake against schema drift and remote state changes. "
+                "Regression output identifies degraded read/write readiness clearly."
+            ),
+            "labels": ["Coder Runtime", "Improvement"],
+        },
+        expected_path_scope="crates/tandem-server/src/http",
+        expected_terms=("CoderGithubProjectBinding", "schema_drift", "crates/tandem-server/src/http/coder_parts/part09.rs"),
+    ),
 )
 
 

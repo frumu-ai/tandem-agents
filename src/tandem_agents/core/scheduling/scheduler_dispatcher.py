@@ -106,10 +106,11 @@ def dispatch_scheduled_runs(
     coordination: CoordinationStore | None = None,
     limit: int | None = None,
     wait: bool = True,
+    project_keys: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     store = coordination or CoordinationStore.from_config(cfg)
     store.ensure_schema()
-    plan = plan_task_admissions(cfg, coordination=store, limit=limit)
+    plan = plan_task_admissions(cfg, coordination=store, limit=limit, project_keys=project_keys)
     admitted = list(plan.get("admitted") or [])
     launched: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []

@@ -1049,6 +1049,38 @@ def list_active_coder_runs(cfg: ResolvedConfig, *, limit: int | None = None) -> 
     return active
 
 
+def list_active_coder_task_refs(cfg: ResolvedConfig, *, limit: int | None = None) -> list[dict[str, Any]]:
+    output_root = cfg.output_root()
+    batch_size = max(1, int(limit or getattr(cfg.execution, "coder_supervisor_batch_size", 100) or 100))
+    refs: list[dict[str, Any]] = []
+    if not output_root.exists():
+        return refs
+    for run_dir in sorted(output_root.iterdir(), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True):
+        if len(refs) >= batch_size:
+            break
+        if not _is_run_directory(run_dir):
+            continue
+        status_payload = load_status(run_dir / "status.json")
+        run = status_payload.get("run") if isinstance(status_payload, dict) else {}
+        phase = status_payload.get("phase") if isinstance(status_payload, dict) else {}
+        if not (
+            isinstance(run, dict)
+            and _normalize_status(run.get("status")) in NON_TERMINAL_RUN_STATUSES
+            and isinstance(phase, dict)
+            and str(phase.get("name") or "").strip() == "coder_execution"
+        ):
+            continue
+        task = status_payload.get("task") if isinstance(status_payload, dict) else {}
+        refs.append(
+            {
+                "run_id": run_dir.name,
+                "task_id": task.get("task_id") if isinstance(task, dict) else None,
+                "task_key": (status_payload.get("coordination") or {}).get("task_key") if isinstance(status_payload, dict) else None,
+            }
+        )
+    return refs
+
+
 def reconcile_active_coder_runs(
     cfg: ResolvedConfig,
     *,
