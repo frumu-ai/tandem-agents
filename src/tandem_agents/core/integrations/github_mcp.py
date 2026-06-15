@@ -529,6 +529,46 @@ def _pull_request_reviews_state(pr: dict[str, Any]) -> str:
     return "review_required"
 
 
+def _flatten_check_entries(value: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    if isinstance(value, dict):
+        for key in (
+            "checks",
+            "check_runs",
+            "checkRuns",
+            "checkSuites",
+            "statusCheckRollup",
+            "status_check_rollup",
+            "nodes",
+            "items",
+        ):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                entries.extend(entry for entry in nested if isinstance(entry, dict))
+            elif isinstance(nested, dict):
+                entries.extend(_flatten_check_entries(nested))
+    return entries
+
+
+def _pull_request_check_entries(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for key in ("checks", "check_runs", "checkSuites", "statusCheckRollup", "status_check_rollup", "combined_status"):
+        entries.extend(_flatten_check_entries(pr.get(key)))
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        name = str(entry.get("name") or entry.get("context") or entry.get("title") or "").strip()
+        url = str(entry.get("detailsUrl") or entry.get("details_url") or entry.get("url") or "").strip()
+        key = (name, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
 def _pull_request_checks_state(pr: dict[str, Any]) -> str:
     for key in ("checks_status", "check_status", "checksState", "checks_state"):
         value = normalize_status_key(str(pr.get(key) or ""))
@@ -549,10 +589,8 @@ def _pull_request_checks_state(pr: dict[str, Any]) -> str:
             return "failure"
         if value in {"pending", "queued", "in_progress", "running", "waiting", "expected"}:
             return "pending"
-    checks = pr.get("checks") or pr.get("check_runs") or pr.get("checkSuites") or []
-    if isinstance(checks, dict):
-        checks = checks.get("nodes") or checks.get("items") or []
-    if isinstance(checks, list) and checks:
+    checks = _pull_request_check_entries(pr)
+    if checks:
         states = [
             normalize_status_key(str((check or {}).get("conclusion") or (check or {}).get("status") or ""))
             for check in checks
@@ -560,8 +598,10 @@ def _pull_request_checks_state(pr: dict[str, Any]) -> str:
         ]
         if any(state in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"} for state in states):
             return "failure"
+        if any(state in {"pending", "queued", "in_progress", "running", "waiting", "expected", "requested"} for state in states):
+            return "pending"
         known_states = [state for state in states if state]
-        if known_states and all(state in {"success", "successful", "passed", "completed"} for state in known_states):
+        if known_states and all(state in {"success", "successful", "passed", "completed", "neutral", "skipped"} for state in known_states):
             return "success"
         return "pending"
     return "unknown"
@@ -1184,26 +1224,21 @@ def _review_comment_url(comment: dict[str, Any]) -> str:
 
 
 def _failed_checks_from_pr(pr: dict[str, Any]) -> list[dict[str, Any]]:
-    checks = pr.get("checks") or pr.get("check_runs") or pr.get("checkSuites") or []
-    if isinstance(checks, dict):
-        checks = checks.get("nodes") or checks.get("items") or []
     failed: list[dict[str, Any]] = []
-    if isinstance(checks, list):
-        for check in checks:
-            if not isinstance(check, dict):
-                continue
-            conclusion = normalize_status_key(str(check.get("conclusion") or check.get("status") or ""))
-            if conclusion not in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"}:
-                continue
-            failed.append(
-                {
-                    "kind": "check_failure",
-                    "name": str(check.get("name") or check.get("context") or check.get("title") or "check").strip(),
-                    "state": conclusion,
-                    "summary": str(check.get("summary") or check.get("details") or check.get("output") or "").strip(),
-                    "url": str(check.get("details_url") or check.get("url") or "").strip(),
-                }
-            )
+    for check in _pull_request_check_entries(pr):
+        conclusion = normalize_status_key(str(check.get("conclusion") or check.get("status") or ""))
+        if conclusion not in {"failure", "failed", "error", "cancelled", "canceled", "timed_out"}:
+            continue
+        failed.append(
+            {
+                "kind": "check_failure",
+                "name": str(check.get("name") or check.get("context") or check.get("title") or "check").strip(),
+                "state": conclusion,
+                "workflow": str(check.get("workflowName") or check.get("workflow") or "").strip(),
+                "summary": str(check.get("summary") or check.get("details") or check.get("output") or "").strip(),
+                "url": str(check.get("detailsUrl") or check.get("details_url") or check.get("url") or "").strip(),
+            }
+        )
     return failed
 
 
@@ -1332,6 +1367,10 @@ def build_pull_request_repair_prompt(context: dict[str, Any]) -> str:
         lines.append(prefix)
         if item.get("name"):
             lines.append(f"Check: {item.get('name')}")
+        if item.get("workflow"):
+            lines.append(f"Workflow: {item.get('workflow')}")
+        if item.get("state"):
+            lines.append(f"State: {item.get('state')}")
         if item.get("author"):
             lines.append(f"Author: {item.get('author')}")
         body = str(item.get("body") or item.get("summary") or "").strip()
