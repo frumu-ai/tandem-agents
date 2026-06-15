@@ -34,6 +34,20 @@ WORKER_JSON_CHAR_LIMIT = 2_000
 WORKER_PR_SUMMARY_CHAR_LIMIT = 2_500
 
 
+def _partial_diff_repair_prompt_mode(previous_feedback: str | None) -> str:
+    feedback = str(previous_feedback or "")
+    if "Preserved partial patch:" not in feedback and "worker_incomplete_diff" not in feedback:
+        return ""
+    return (
+        "PARTIAL-DIFF REPAIR MODE:\n"
+        "- Return exactly one subtask unless the feedback says multiple preserved patches exist.\n"
+        "- The subtask must first finish the preserved partial patch and fix blockers named in the worker output excerpt.\n"
+        "- Keep `files` limited to changed files from the failed attempt when those files are listed.\n"
+        "- Do not plan new scenario slices, broad follow-up work, or additional target files until the preserved patch is terminal and verified.\n"
+        "- Put the recovered blocker fixes in canonical `acceptance_criteria`, not only in summary or risks.\n\n"
+    )
+
+
 def _chunk_list(values: list[Any], chunks: int) -> list[list[Any]]:
     if not values:
         return []
@@ -323,6 +337,7 @@ def build_manager_prompt(
             "CRITICAL: The previous attempt failed to meet the acceptance criteria and was rejected.\n"
             "Review the following feedback and plan subtasks specifically to fix the missing or incorrect functionality.\n\n"
             f"--- PREVIOUS ATTEMPT FEEDBACK ---\n{previous_feedback}\n----------------------------------\n\n"
+            f"{_partial_diff_repair_prompt_mode(previous_feedback)}"
         )
     return prompt + (
         "Do not edit files in this planning pass.\n"

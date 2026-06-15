@@ -26,8 +26,19 @@ _TERMINAL_WORKER_BLOCKER_KINDS = {
     "github_context_unavailable",
     "unsupported_task",
     "worker_corrupt_diff",
+    "worker_no_progress",
     "worker_no_diff",
 }
+
+
+def _worker_no_progress_timeout_seconds(ctx: RunContext) -> float:
+    raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS=%r", raw)
+    return 540.0
 
 
 def dispatch_workers(ctx: RunContext) -> None:
@@ -153,9 +164,10 @@ def dispatch_workers(ctx: RunContext) -> None:
             with active_workers_lock:
                 active_workers.discard(wid)
 
-    # Register all workers upfront
-    for index, subtask in enumerate(ctx.pending_subtasks, start=1):
-        wid = f"worker-{index}"
+    def _on_start(wid: str, subtask: dict[str, Any]) -> None:
+        wid = str(wid or "").strip()
+        if not wid:
+            return
         ctx.coordination.register_worker(
             worker_id=wid,
             host_id=ctx.claim_identity["host_id"],
@@ -183,7 +195,9 @@ def dispatch_workers(ctx: RunContext) -> None:
             ctx.task,
             ctx.pending_subtasks,
             max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1),
+            on_start=_on_start,
             on_result=_on_result,
+            worker_timeout_seconds=_worker_no_progress_timeout_seconds(ctx),
         )
         # Merge any results that bypassed _on_result
         for r in new_results:

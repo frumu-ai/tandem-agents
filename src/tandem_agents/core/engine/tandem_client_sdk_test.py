@@ -9,6 +9,7 @@ from src.tandem_agents.core.engine.tandem_client_sdk import (
     _extract_event_text_delta,
     _sessions_create_supports_temperature,
     sdk_stream_run_text,
+    with_sync_tandem_client,
 )
 
 
@@ -95,6 +96,51 @@ class SdkCreateSessionPassthroughTest(unittest.TestCase):
         self.assertEqual(self._call(client, 0.0), "session-1")
         self.assertIn("temperature", captured[0])
         self.assertNotIn("temperature", captured[1])
+
+
+class SyncClientAwaitableResultTest(unittest.TestCase):
+    def test_awaits_async_result_and_close_from_sync_wrapper(self) -> None:
+        closed = {"value": False}
+
+        class FakeClient:
+            def call(self):
+                async def _payload():
+                    return {"ok": True}
+
+                return _payload()
+
+            def close(self):
+                async def _close():
+                    closed["value"] = True
+
+                return _close()
+
+        from src.tandem_agents.core.engine import tandem_client_sdk as sdk
+
+        with unittest.mock.patch.object(sdk, "create_sync_tandem_client", return_value=FakeClient()):
+            result = with_sync_tandem_client(SimpleNamespace(), lambda client: client.call())
+
+        self.assertEqual(result, {"ok": True})
+        self.assertTrue(closed["value"])
+
+    def test_awaits_async_result_when_called_inside_running_loop(self) -> None:
+        class FakeClient:
+            def call(self):
+                async def _payload():
+                    return {"ok": True}
+
+                return _payload()
+
+            def close(self):
+                return None
+
+        async def _run():
+            from src.tandem_agents.core.engine import tandem_client_sdk as sdk
+
+            with unittest.mock.patch.object(sdk, "create_sync_tandem_client", return_value=FakeClient()):
+                return with_sync_tandem_client(SimpleNamespace(), lambda client: client.call())
+
+        self.assertEqual(asyncio.run(_run()), {"ok": True})
 
 
 class TandemClientSdkEventTextTest(unittest.TestCase):

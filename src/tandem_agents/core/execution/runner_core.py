@@ -6,7 +6,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -132,6 +132,8 @@ logger = logging.getLogger("aca.runner_core")
 
 _RETRYABLE_WORKER_BLOCKER_KINDS = {
     "worker_incomplete_diff",
+    "worker_no_progress",
+    "worker_corrupt_diff",
     "worker_no_diff",
     "engine_tool_loop_stalled",
     "engine_tool_loop_stalled_no_diff",
@@ -411,6 +413,13 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
             first.get("recovery_action")
             or "Inspect the worker log and PR candidate context, then reset the task to Backlog if another attempt is needed."
         )
+    elif kind == "worker_no_progress":
+        message = failure_reason or "Worker produced no terminal result before the no-progress watchdog fired."
+        phase_detail = f"{worker_id} made no terminal progress"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Inspect the worker log and engine run state, then retry after fixing the stalled worker path."
+        )
     elif kind == "worker_incomplete_diff":
         message = "Worker produced a partial repository diff but reported remaining blockers."
         phase_detail = f"{worker_id} produced an incomplete diff"
@@ -506,21 +515,88 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
     )
 
 
-def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> list[dict[str, str]]:
-    artifacts: list[dict[str, str]] = []
+def _worker_incomplete_diff_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES", "") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES=%r", raw)
+    return 2
+
+
+def _worker_failure_can_retry(
+    cfg: ResolvedConfig,
+    blocker: dict[str, Any],
+    attempt: int,
+    base_max_loops: int,
+) -> bool:
+    if attempt < base_max_loops - 1:
+        return True
+    if str(blocker.get("kind") or "").strip() not in {
+        "worker_incomplete_diff",
+        "worker_corrupt_diff",
+        "worker_no_progress",
+    }:
+        return False
+    extra_retries = _worker_incomplete_diff_extra_retries(cfg)
+    return attempt < base_max_loops + extra_retries - 1
+
+
+def _repair_state_has_worker_incomplete_diff(ctx: "_PhaseRunContext") -> bool:
+    for source in (getattr(ctx, "status", None), getattr(ctx, "blackboard", None)):
+        if not isinstance(source, dict):
+            continue
+        repair = source.get("repair")
+        if not isinstance(repair, dict):
+            continue
+        if str(repair.get("extra_retry_source") or "").strip() == "worker_incomplete_diff":
+            return True
+        sources = repair.get("extra_retry_sources")
+        if isinstance(sources, list) and "worker_incomplete_diff" in sources:
+            return True
+        if repair.get("partial_diff_artifacts") and repair.get("partial_diff_state") == "preserved_not_accepted":
+            return True
+    return False
+
+
+def _verification_can_retry(
+    cfg: ResolvedConfig,
+    ctx: "_PhaseRunContext",
+    attempt: int,
+    base_max_loops: int,
+) -> bool:
+    if attempt < base_max_loops - 1:
+        return True
+    if not _repair_state_has_worker_incomplete_diff(ctx):
+        return False
+    extra_retries = _worker_incomplete_diff_extra_retries(cfg)
+    return attempt < base_max_loops + extra_retries - 1
+
+
+def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
     for result in worker_results:
         patch_path = str(result.get("partial_diff_artifact") or "").strip()
         if not patch_path and isinstance(result.get("artifacts"), dict):
             patch_path = str(result["artifacts"].get("partial_diff") or "").strip()
         if not patch_path:
             continue
+        changed_files = _collect_worker_changed_files([result])
+        output_excerpt = str(result.get("stdout") or result.get("output_excerpt") or "").strip()
+        if len(output_excerpt) > 2000:
+            output_excerpt = output_excerpt[:2000].rstrip() + "\n..."
         subtask_id = str(result.get("subtask_id") or "").strip()
         worker_id = str(result.get("worker_id") or "").strip()
-        entry = {
+        entry: dict[str, Any] = {
             "subtask_id": subtask_id,
             "worker_id": worker_id,
             "patch_path": patch_path,
         }
+        if changed_files:
+            entry["changed_files"] = changed_files
+        if output_excerpt:
+            entry["worker_output_excerpt"] = output_excerpt
         if entry not in artifacts:
             artifacts.append(entry)
     return artifacts
@@ -1653,13 +1729,25 @@ def _execute_local_worker_pool(
         [ResolvedConfig, str, Path, Path, dict[str, Any], dict[str, Any], str, int],
         dict[str, Any],
     ] = run_worker_subtask,
+    on_start: Callable[[str, dict[str, Any]], None] | None = None,
     on_result: Callable[[dict[str, Any]], None] | None = None,
+    worker_timeout_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     if not pending_subtasks:
         return []
     results: list[dict[str, Any]] = []
+    timeout = float(worker_timeout_seconds or 0)
 
     def _run_one(index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        if on_start is not None:
+            try:
+                on_start(worker_id, subtask)
+            except Exception:
+                logger.exception(
+                    "Worker start callback failed for %s/%s; continuing worker execution.",
+                    worker_id,
+                    subtask.get("id"),
+                )
         try:
             result = worker_runner(cfg, run_id, repo_path, run_dir, task, subtask, worker_id, index)
         except Exception as exc:
@@ -1692,55 +1780,108 @@ def _execute_local_worker_pool(
     def _record_result(result: dict[str, Any]) -> None:
         results.append(result)
         if on_result is not None:
-            on_result(result)
+            try:
+                on_result(result)
+            except Exception:
+                logger.exception(
+                    "Worker result callback failed for %s/%s; keeping result in local pool output.",
+                    result.get("worker_id"),
+                    result.get("subtask_id"),
+                )
+
+    def _timeout_result(index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        return {
+            "worker_id": worker_id,
+            "subtask_index": index,
+            "subtask_id": subtask["id"],
+            "title": subtask["title"],
+            "status": "failed",
+            "returncode": 1,
+            "worktree": "",
+            "log_path": str(run_dir / "logs" / f"{worker_id}.log"),
+            "output_excerpt": (
+                f"Worker produced no terminal result within {timeout:.0f}s. "
+                "ACA blocked the run instead of leaving it in worker_execution."
+            ),
+            "failure_reason": f"Worker produced no terminal result within {timeout:.0f}s.",
+            "blocker_kind": "worker_no_progress",
+            "recovery_action": "Inspect the worker log and engine run state, then retry after fixing the stalled worker path.",
+            "write_required": bool(subtask.get("write_required", True)),
+            "verified_existing": False,
+        }
 
     if worker_limit <= 1:
-        for index, subtask in enumerate(pending_subtasks, start=1):
-            result = _run_one(index, subtask, f"worker-{index}")
-            _record_result(result)
-            if _has_unresolved_write_required_worker_failure([result]):
-                break
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            for index, subtask in enumerate(pending_subtasks, start=1):
+                worker_id = f"worker-{index}"
+                future = executor.submit(_run_one, index, subtask, worker_id)
+                try:
+                    result = future.result(timeout=timeout if timeout > 0 else None)
+                except FutureTimeoutError:
+                    future.cancel()
+                    result = _timeout_result(index, subtask, worker_id)
+                    _record_result(result)
+                    break
+                _record_result(result)
+                if _has_unresolved_write_required_worker_failure([result]):
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         return results
 
-    with ThreadPoolExecutor(max_workers=max(1, worker_limit)) as executor:
-        futures = {
-            executor.submit(worker_runner, cfg, run_id, repo_path, run_dir, task, subtask, f"worker-{index}", index): (
-                index,
-                subtask,
-                f"worker-{index}",
-            )
-            for index, subtask in enumerate(pending_subtasks, start=1)
-        }
-        for future in as_completed(futures):
-            index, subtask, worker_id = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = {
-                    "worker_id": worker_id,
-                    "subtask_index": index,
-                    "subtask_id": subtask["id"],
-                    "title": subtask["title"],
-                    "status": "failed",
-                    "returncode": 1,
-                    "worktree": "",
-                    "log_path": "",
-                    "output_excerpt": f"Worker execution raised an exception: {exc}",
-                    "write_required": bool(subtask.get("write_required", True)),
-                    "verified_existing": False,
-                }
-            if not isinstance(result, dict):
-                result = {}
-            result.setdefault("worker_id", worker_id)
-            result.setdefault("subtask_index", index)
-            result.setdefault("subtask_id", subtask["id"])
-            result.setdefault("title", subtask["title"])
-            result.setdefault("status", "failed" if result.get("returncode", 1) else "completed")
-            result.setdefault("returncode", 0 if _normalized_text(result.get("status")) == "completed" else 1)
-            subtask_write_required = bool(subtask.get("write_required", True))
-            result["write_required"] = subtask_write_required or bool(result.get("write_required"))
-            result.setdefault("verified_existing", False)
-            _record_result(result)
+    executor = ThreadPoolExecutor(max_workers=max(1, worker_limit))
+    futures = {
+        executor.submit(_run_one, index, subtask, f"worker-{index}"): (
+            index,
+            subtask,
+            f"worker-{index}",
+        )
+        for index, subtask in enumerate(pending_subtasks, start=1)
+    }
+    try:
+        completed = set()
+        try:
+            completed_iter = as_completed(futures, timeout=timeout if timeout > 0 else None)
+            for future in completed_iter:
+                completed.add(future)
+                index, subtask, worker_id = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "worker_id": worker_id,
+                        "subtask_index": index,
+                        "subtask_id": subtask["id"],
+                        "title": subtask["title"],
+                        "status": "failed",
+                        "returncode": 1,
+                        "worktree": "",
+                        "log_path": "",
+                        "output_excerpt": f"Worker execution raised an exception: {exc}",
+                        "write_required": bool(subtask.get("write_required", True)),
+                        "verified_existing": False,
+                    }
+                if not isinstance(result, dict):
+                    result = {}
+                result.setdefault("worker_id", worker_id)
+                result.setdefault("subtask_index", index)
+                result.setdefault("subtask_id", subtask["id"])
+                result.setdefault("title", subtask["title"])
+                result.setdefault("status", "failed" if result.get("returncode", 1) else "completed")
+                result.setdefault("returncode", 0 if _normalized_text(result.get("status")) == "completed" else 1)
+                subtask_write_required = bool(subtask.get("write_required", True))
+                result["write_required"] = subtask_write_required or bool(result.get("write_required"))
+                result.setdefault("verified_existing", False)
+                _record_result(result)
+        except FutureTimeoutError:
+            for future, (index, subtask, worker_id) in futures.items():
+                if future in completed:
+                    continue
+                future.cancel()
+                _record_result(_timeout_result(index, subtask, worker_id))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return results
 
 
@@ -2925,9 +3066,13 @@ def _run_once_internal_impl(
     # Phase 4: Repair loop
     # ------------------------------------------------------------------
     configured_max_retries = max(0, int(getattr(cfg.swarm, "max_retries", 1) or 0))
-    max_loops = configured_max_retries + 1
+    base_max_loops = configured_max_retries + 1
+    incomplete_diff_extra_retries = _worker_incomplete_diff_extra_retries(cfg)
+    max_loops = base_max_loops + incomplete_diff_extra_retries
     ctx.status["repair"] = {
         "configured_max_retries": configured_max_retries,
+        "worker_incomplete_diff_extra_retries": incomplete_diff_extra_retries,
+        "base_max_loops": base_max_loops,
         "max_loops": max_loops,
         "attempt": 0,
     }
@@ -2979,6 +3124,8 @@ def _run_once_internal_impl(
         manager_result = run_manager_prompt(ctx)
         manager_failed = manager_result["returncode"] != 0
         manager_failure_excerpt = str(manager_result.get("stdout") or "").strip()[:1000]
+        if ctx.status.get("run", {}).get("status") == "blocked":
+            return _block_manager_failed(ctx)
         if manager_failed:
             append_event(
                 layout["events"], "manager.failed", run_id,
@@ -3093,7 +3240,7 @@ def _run_once_internal_impl(
             source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
             worker_blocker = _worker_failure_blocker(ctx.worker_results)
             retry_feedback = _worker_failure_retry_feedback(ctx, worker_blocker, attempt)
-            if retry_feedback and attempt < max_loops - 1:
+            if retry_feedback and _worker_failure_can_retry(cfg, worker_blocker, attempt, base_max_loops):
                 previous_feedback = retry_feedback
                 partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
                 completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
@@ -3105,6 +3252,15 @@ def _run_once_internal_impl(
                 if completed_subtask_ids:
                     ctx.blackboard.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
                     ctx.status.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
+                if worker_blocker["kind"] == "worker_incomplete_diff":
+                    for repair_state in (
+                        ctx.blackboard.setdefault("repair", {}),
+                        ctx.status.setdefault("repair", {}),
+                    ):
+                        repair_state["extra_retry_source"] = "worker_incomplete_diff"
+                        sources = repair_state.setdefault("extra_retry_sources", [])
+                        if isinstance(sources, list) and "worker_incomplete_diff" not in sources:
+                            sources.append("worker_incomplete_diff")
                 _append_blackboard_note(
                     ctx.blackboard,
                     f"Attempt {attempt + 1} hit retryable worker blocker `{worker_blocker['kind']}`. Retrying.",
@@ -3179,7 +3335,7 @@ def _run_once_internal_impl(
                 {
                     "reason": repo_blocker,
                     "missing_files": missing_files,
-                    "will_retry": attempt < max_loops - 1,
+                    "will_retry": attempt < base_max_loops - 1,
                 },
                 task_id=ctx.task.get("task_id"),
                 role="manager",
@@ -3187,7 +3343,7 @@ def _run_once_internal_impl(
             )
             save_blackboard(layout["blackboard"], ctx.blackboard)
             write_blackboard_snapshot(run_dir, ctx.blackboard)
-            if attempt < max_loops - 1:
+            if attempt < base_max_loops - 1:
                 previous_feedback = repo_feedback
                 continue
             return _block_from_decision(
@@ -3247,7 +3403,7 @@ def _run_once_internal_impl(
                     )
                     save_blackboard(layout["blackboard"], ctx.blackboard)
                     write_blackboard_snapshot(run_dir, ctx.blackboard)
-                elif attempt < max_loops - 1:
+                elif attempt < base_max_loops - 1:
                     previous_feedback = _integration_retry_feedback(ctx, attempt, integration_blocker, integration_result)
                     continue
                 return _block_integration_failed(ctx, integration_blocker)
@@ -3255,14 +3411,14 @@ def _run_once_internal_impl(
         # 4f. No-diff / no-proof repair check
         ctx.pending_diff_snapshot = git_diff_stat(ctx.repo_path)
         if not ctx.pending_diff_snapshot.strip() and not ctx.repo_validation.get("ok"):
-            decision = check_no_diff(ctx, attempt, max_loops)
+            decision = check_no_diff(ctx, attempt, base_max_loops)
             if decision.action == "retry":
                 previous_feedback = decision.feedback
                 continue
             return _block_from_decision(ctx, decision)
 
         if not ctx.pending_diff_snapshot.strip() and ctx.repo_validation.get("ok"):
-            decision = check_no_verifiable_proof(ctx, attempt, max_loops)
+            decision = check_no_verifiable_proof(ctx, attempt, base_max_loops)
             if decision.action == "retry":
                 previous_feedback = decision.feedback
                 continue
@@ -3274,7 +3430,7 @@ def _run_once_internal_impl(
         verification = run_review_and_test(ctx)
 
         if verification.should_retry:
-            if attempt < max_loops - 1:
+            if _verification_can_retry(cfg, ctx, attempt, base_max_loops):
                 previous_feedback = build_retry_feedback(ctx, attempt, verification)
                 continue
             return _block_verification_failed(ctx, verification)
@@ -3919,7 +4075,7 @@ def _block_no_targets(ctx: "_PhaseRunContext") -> dict[str, Any]:
 
 def _block_manager_failed(ctx: "_PhaseRunContext") -> dict[str, Any]:
     """Return a blocked-run result when manager planning returned a non-zero exit."""
-    from src.tandem_agents.runtime.run_output import build_blocked_summary, save_run_text
+    from src.tandem_agents.runtime.run_output import build_blocked_summary, save_run_text, set_status
 
     blocker = dict(ctx.status.get("blocker") or {})
     msg = str(
@@ -3929,6 +4085,25 @@ def _block_manager_failed(ctx: "_PhaseRunContext") -> dict[str, Any]:
     ).strip()
     kind = str(blocker.get("kind") or "manager").strip() or "manager"
     phase_detail = str(ctx.status.get("phase", {}).get("detail") or msg).strip()
+    ctx.status = set_status(
+        ctx.status,
+        ctx.layout,
+        phase="planning",
+        phase_detail=phase_detail,
+        run_status="blocked",
+        blocker=(True, kind, msg, "manager"),
+        run_completed=True,
+    )
+    _touch_coordination(
+        ctx.coordination,
+        run_id=ctx.run_id,
+        lease_id=ctx.lease_id,
+        lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+        status="blocked",
+        phase="planning",
+        error=msg,
+        completed=True,
+    )
     save_run_text(ctx.layout["summary"], build_blocked_summary(task_title=ctx.task["title"], message=msg))
     _finalize_github_sync(cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
                           status=ctx.status, blackboard=ctx.blackboard,

@@ -221,6 +221,29 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("discovery evidence, not final proof", prompt)
         self.assertIn("read concrete files before changing code", prompt)
 
+    def test_manager_prompt_enters_partial_diff_repair_mode(self) -> None:
+        prompt = build_manager_prompt(
+            "run1",
+            {
+                "title": "Repair preserved diff",
+                "description": "Finish the partial patch",
+                "task_contract": {},
+            },
+            {"path": "/repo"},
+            _stub_config(),
+            previous_feedback=(
+                "CRITICAL: Worker attempt 3 failed with retryable blocker `worker_incomplete_diff`.\n"
+                "Changed files from the failed attempt:\n- crates/eval/src/scoring.rs\n"
+                "Preserved partial patch: `runs/x/artifacts/worker.patch`\n"
+                "Worker output excerpt:\nRemaining implementation blockers: missing passes() method."
+            ),
+        )
+
+        self.assertIn("PARTIAL-DIFF REPAIR MODE", prompt)
+        self.assertIn("Return exactly one subtask", prompt)
+        self.assertIn("missing passes() method", prompt)
+        self.assertIn("Put the recovered blocker fixes in canonical `acceptance_criteria`", prompt)
+
     def test_write_required_prompt_rejects_marker_files(self) -> None:
         subtask = self._subtask(
             files=["scripts/bug-monitor-external-log-intake-fixture.test.mjs"],

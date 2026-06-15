@@ -102,7 +102,10 @@ class CoordinationStoreTest(unittest.TestCase):
                 conn.execute("UPDATE leases SET expires_at_ms = 0 WHERE lease_id = ?", (lease_id,))
             expired = store.reap_expired_leases()
             self.assertEqual(len(expired), 1)
-            self.assertEqual(store.get_task("manual:manual:do-the-thing:task-1")["state"], "stale")
+            stale_task = store.get_task("manual:manual:do-the-thing:task-1")
+            self.assertEqual(stale_task["state"], "stale")
+            self.assertIsNone(stale_task["claimed_lease_id"])
+            self.assertIsNone(stale_task["claimed_run_id"])
             reclaimable = store.task_ownership(first["task"]["task_key"])
             self.assertIsNotNone(reclaimable)
             self.assertEqual(reclaimable["ownership_state"], "reclaimable")
@@ -259,6 +262,8 @@ class CoordinationStoreTest(unittest.TestCase):
             self.assertEqual(lease["status"], "stale")
             task_row = store.get_task(claim["task"]["task_key"])
             self.assertEqual(task_row["status"], "stale")
+            self.assertIsNone(task_row["claimed_lease_id"])
+            self.assertIsNone(task_row["claimed_run_id"])
             worker = store.snapshot()["workers"][0]
             self.assertEqual(worker["status"], "idle")
 
@@ -291,7 +296,10 @@ class CoordinationStoreTest(unittest.TestCase):
             reaped = coordination_reaper_tick(cfg)
             self.assertEqual(len(reaped), 1)
             self.assertEqual(store.get_lease(lease_id)["status"], "stale")
-            self.assertEqual(store.get_task(claim["task"]["task_key"])["status"], "stale")
+            stale_task = store.get_task(claim["task"]["task_key"])
+            self.assertEqual(stale_task["status"], "stale")
+            self.assertIsNone(stale_task["claimed_lease_id"])
+            self.assertIsNone(stale_task["claimed_run_id"])
             self.assertEqual(store.snapshot()["workers"][0]["status"], "idle")
 
     def test_reaper_tick_reclaims_all_stale_workers_on_dead_host(self) -> None:
@@ -338,8 +346,12 @@ class CoordinationStoreTest(unittest.TestCase):
             self.assertEqual(len(reaped), 2)
             self.assertEqual(store.get_lease(claim_a["lease"]["lease_id"])["status"], "stale")
             self.assertEqual(store.get_lease(claim_b["lease"]["lease_id"])["status"], "stale")
-            self.assertEqual(store.get_task(claim_a["task"]["task_key"])["status"], "stale")
-            self.assertEqual(store.get_task(claim_b["task"]["task_key"])["status"], "stale")
+            task_a_row = store.get_task(claim_a["task"]["task_key"])
+            task_b_row = store.get_task(claim_b["task"]["task_key"])
+            self.assertEqual(task_a_row["status"], "stale")
+            self.assertEqual(task_b_row["status"], "stale")
+            self.assertIsNone(task_a_row["claimed_lease_id"])
+            self.assertIsNone(task_b_row["claimed_lease_id"])
             workers = store.snapshot()["workers"]
             self.assertTrue(all(worker["status"] == "idle" for worker in workers))
 
@@ -481,6 +493,53 @@ class CoordinationStoreTest(unittest.TestCase):
             released_lease = store.get_lease(lease["lease_id"])
             self.assertEqual((released_lease or {}).get("status"), "stale")
             self.assertEqual((released_lease or {}).get("release_reason"), "operator cleared task claim")
+
+    def test_register_task_clears_claim_pointing_to_non_active_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "task-stale-registration",
+                "title": "Task Stale Registration",
+                "source": {"type": "manual", "prompt": "Reset stale registration"},
+                "repo": {"slug": "frumu-ai/example", "path": str(root / "repo")},
+            }
+            claim = store.claim_task(
+                task,
+                run_id="run-stale-registration",
+                worker_id="worker-stale-registration",
+                host_id="host-a",
+                lease_ttl_seconds=60,
+                repo=task["repo"],
+            )
+            task_key = claim["task"]["task_key"]
+            lease_id = claim["lease"]["lease_id"]
+            with store.connection() as conn:
+                conn.execute(
+                    "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
+                    (1, lease_id),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = 'stale', state = 'stale', lease_expires_at_ms = NULL WHERE task_key = ?",
+                    (task_key,),
+                )
+
+            registered = store.register_task(task, repo=task["repo"], status="queued")
+
+            self.assertEqual(registered["state"], "queued")
+            self.assertIsNone(registered["claimed_lease_id"])
+            self.assertIsNone(registered["claimed_run_id"])
+            next_claim = store.claim_task(
+                task,
+                run_id="run-next",
+                worker_id="worker-next",
+                host_id="host-a",
+                lease_ttl_seconds=60,
+                repo=task["repo"],
+            )
+            self.assertTrue(next_claim["claimed"])
+            self.assertNotEqual(next_claim["lease"]["lease_id"], lease_id)
 
     def test_postgres_backend_uses_postgres_connection_and_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

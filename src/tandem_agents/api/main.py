@@ -127,7 +127,18 @@ _coordination_reaper_stop = threading.Event()
 _coder_supervisor_task: Optional[asyncio.Task[None]] = None
 _coder_supervisor_stop = threading.Event()
 DEFAULT_READY_ENGINE_TIMEOUT_SECONDS = 5.0
+DEFAULT_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS = 10.0
 _start_time = time.monotonic()
+
+
+def _coder_supervisor_startup_timeout_seconds() -> float:
+    raw = str(os.environ.get("ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS=%r", raw)
+    return DEFAULT_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS
 
 
 @app.on_event("startup")
@@ -186,7 +197,13 @@ async def _start_coder_supervisor() -> None:
         return
     _coder_supervisor_stop.clear()
     try:
-        await asyncio.to_thread(reconcile_active_coder_runs, cfg)
+        timeout = _coder_supervisor_startup_timeout_seconds()
+        await asyncio.wait_for(asyncio.to_thread(reconcile_active_coder_runs, cfg), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Initial coder supervisor reconciliation did not finish within startup timeout; "
+            "continuing API startup and leaving periodic reconciliation enabled."
+        )
     except Exception:
         logger.debug("Initial coder supervisor reconciliation failed.", exc_info=True)
     _coder_supervisor_task = asyncio.create_task(_coder_supervisor_loop(cfg))

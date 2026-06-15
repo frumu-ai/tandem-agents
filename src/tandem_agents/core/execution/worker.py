@@ -79,7 +79,7 @@ WORKER_FAILURE_MARKERS = (
     "TERMINALIZED_WITH_REMAINING_BLOCKERS",
 )
 
-TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout"}
+TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "dispatch_timeout"}
 NON_RETRYABLE_WORKER_BLOCKERS = {
     "coordination_lost",
     "engine_empty_response",
@@ -87,6 +87,7 @@ NON_RETRYABLE_WORKER_BLOCKERS = {
     "engine_session_run_conflict",
     "engine_tool_loop_stalled_no_diff",
     "engine_provider_auth",
+    "worker_incomplete_diff",
     "worker_corrupt_diff",
     "ignored_path_changes",
 }
@@ -294,7 +295,7 @@ def _worker_prompt_sync_timeout_seconds(cfg: ResolvedConfig) -> float:
             return max(30.0, float(raw))
         except ValueError:
             logger.debug("Invalid ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS=%s", raw)
-    return 180.0
+    return 300.0
 
 
 def _worker_prompt_sync_max_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -304,7 +305,7 @@ def _worker_prompt_sync_max_timeout_seconds(cfg: ResolvedConfig) -> float:
             return max(30.0, float(raw))
         except ValueError:
             logger.debug("Invalid ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS=%s", raw)
-    return 300.0
+    return 480.0
 
 
 def _prompt_sync_timeout_seconds(cfg: ResolvedConfig, role: str, write_required: bool) -> float:
@@ -1123,6 +1124,16 @@ def _worker_async_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
     return 60.0
 
 
+def _engine_async_dispatch_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_ASYNC_DISPATCH_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(2.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_ASYNC_DISPATCH_TIMEOUT_SECONDS=%s", raw)
+    return 20.0
+
+
 def _async_prompt_timeout_seconds(cfg: ResolvedConfig, role: str, write_required: bool) -> float:
     timeout = _engine_prompt_timeout_seconds(cfg)
     if role.startswith("worker") and write_required:
@@ -1533,6 +1544,76 @@ def _worker_result_should_retry(result: dict[str, Any]) -> bool:
         return False
     blocker_kind = str(result.get("blocker_kind") or "").strip()
     return blocker_kind not in NON_RETRYABLE_WORKER_BLOCKERS
+
+
+def _run_has_terminal_status(layout: dict[str, Path]) -> bool:
+    status_path = layout.get("status")
+    if not isinstance(status_path, Path) or not status_path.is_file():
+        return False
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    run = status.get("run") if isinstance(status, dict) else {}
+    if not isinstance(run, dict):
+        return False
+    run_status = str(run.get("status") or "").strip().lower()
+    return run_status in {"blocked", "completed"} or run.get("completed_at_ms") is not None
+
+
+def _append_worker_event_if_run_active(
+    layout: dict[str, Path],
+    log_path: Path,
+    event_type: str,
+    run_id: str,
+    payload: dict[str, Any],
+    *,
+    task_id: str | None = None,
+    role: str | None = None,
+    repo: dict[str, Any] | None = None,
+) -> bool:
+    if _run_has_terminal_status(layout):
+        previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        log_path.write_text(
+            previous
+            + f"\nACA suppressed late worker event `{event_type}` because run {run_id} is already terminal.\n",
+            encoding="utf-8",
+        )
+        return False
+    append_event(
+        layout["events"],
+        event_type,
+        run_id,
+        payload,
+        task_id=task_id,
+        role=role,
+        repo=repo,
+    )
+    return True
+
+
+def _late_terminal_worker_result(
+    result: dict[str, Any],
+    *,
+    log_path: Path,
+    write_required: bool,
+) -> dict[str, Any]:
+    previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    log_path.write_text(
+        previous
+        + "\nACA ignored this worker result because the run was already terminal before the worker returned.\n",
+        encoding="utf-8",
+    )
+    stale = dict(result)
+    stale["returncode"] = 1
+    stale["status"] = "failed"
+    stale["failure_reason"] = "WORKER_RESULT_AFTER_RUN_TERMINAL"
+    stale["blocker_kind"] = "stale_worker_result"
+    stale["recovery_action"] = "Inspect the terminal run blocker; this late worker result was intentionally ignored."
+    stale["log_path"] = str(log_path)
+    stale["write_required"] = write_required
+    stale.setdefault("stdout", "")
+    return stale
 
 
 def _subtask_requires_real_diff(subtask: dict[str, Any]) -> bool:
@@ -2481,12 +2562,17 @@ def stream_tandem_prompt(
                     write_required,
                     timeout_multiplier,
                 )
+                async_dispatch_timeout = min(
+                    _engine_async_dispatch_timeout_seconds(cfg),
+                    async_prompt_timeout,
+                )
                 if timeout_multiplier > 1.0:
                     engine_meta["timeout_multiplier"] = timeout_multiplier
                     engine_meta["timeouts"] = {
                         "prompt_sync_seconds": prompt_sync_timeout,
                         "async_prompt_seconds": async_prompt_timeout,
                         "async_no_text_seconds": async_no_text_timeout,
+                        "async_dispatch_seconds": async_dispatch_timeout,
                     }
 
                 def _writer(delta: str) -> None:
@@ -2743,15 +2829,42 @@ def stream_tandem_prompt(
                         }
 
                 def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str, str]:
-                    async_result = sdk_sessions_prompt_async(
-                        cfg,
-                        session_id=session_id,
-                        prompt=prompt_text,
-                        tool_mode=prompt_tool_mode,
-                        tool_allowlist=session_tool_allowlist,
-                        context_mode=None,
-                        write_required=write_required,
-                    )
+                    try:
+                        async_result = _call_with_timeout(
+                            lambda: sdk_sessions_prompt_async(
+                                cfg,
+                                session_id=session_id,
+                                prompt=prompt_text,
+                                tool_mode=prompt_tool_mode,
+                                tool_allowlist=session_tool_allowlist,
+                                context_mode=None,
+                                write_required=write_required,
+                            ),
+                            timeout_seconds=async_dispatch_timeout,
+                        )
+                    except TimeoutError:
+                        engine_meta["retry_count"] = attempt
+                        engine_meta["stream_reason"] = "dispatch_timeout"
+                        engine_meta.setdefault("recovery", []).append(
+                            {
+                                "attempt": attempt,
+                                "stream_reason": "dispatch_timeout",
+                                "timeout_seconds": async_dispatch_timeout,
+                            }
+                        )
+                        return "", False, "", "dispatch_timeout"
+                    except Exception as exc:
+                        conflict = _engine_session_run_conflict(exc)
+                        if conflict:
+                            conflict_run_id, retry_after_ms = conflict
+                            engine_meta["retry_count"] = attempt
+                            engine_meta["run_id"] = conflict_run_id
+                            engine_meta["sync_conflict"] = {
+                                "run_id": conflict_run_id,
+                                "retry_after_ms": retry_after_ms,
+                            }
+                            return "", False, conflict_run_id, "session_run_conflict"
+                        raise
                     run_id = ""
                     try:
                         run_id = str((async_result or {}).get("run_id"))  # type: ignore[attr-defined]
@@ -2961,14 +3074,21 @@ def stream_tandem_prompt(
                     failure_reason = fallback_failure_reason
                     blocker_kind = fallback_blocker_kind
                     stdout_text = fallback_failure_message
-                elif stream_reason == "timeout":
+                elif stream_reason in {"timeout", "dispatch_timeout"}:
                     failure_reason = "ENGINE_PROMPT_TIMEOUT"
                     blocker_kind = "engine_prompt_timeout"
-                    stdout_text = (
-                        "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt did not produce a terminal response "
-                        f"within {async_prompt_timeout:.0f}s. Last engine run: "
-                        f"{run_id or last_run_id or 'unknown'}.\n"
-                    )
+                    if stream_reason == "dispatch_timeout":
+                        stdout_text = (
+                            "ENGINE_PROMPT_TIMEOUT: Tandem engine async prompt dispatch did not return "
+                            f"a run id within {async_dispatch_timeout:.1f}s. Last engine run: "
+                            f"{run_id or last_run_id or 'unknown'}.\n"
+                        )
+                    else:
+                        stdout_text = (
+                            "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt did not produce a terminal response "
+                            f"within {async_prompt_timeout:.0f}s. Last engine run: "
+                            f"{run_id or last_run_id or 'unknown'}.\n"
+                        )
                 elif stream_reason in {"no_text_timeout", "max_events_without_text"}:
                     failure_reason = "ENGINE_TOOL_LOOP_STALLED"
                     blocker_kind = "engine_tool_loop_stalled"
@@ -3235,9 +3355,14 @@ def run_worker_subtask(
         timeout_multiplier=timeout_multiplier,
     )
     result["write_required"] = write_required
+
+    if _run_has_terminal_status(layout):
+        result = _late_terminal_worker_result(result, log_path=log_path, write_required=write_required)
+        return summarize_worker_notes(result, worker_id, subtask, worktree, index)
     
     # Sync artifacts after turn
-    sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
+    if not _run_has_terminal_status(layout):
+        sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
     result_before_terminalize = dict(result)
     result = _terminalize_worker_after_tool_loop(
@@ -3252,8 +3377,9 @@ def run_worker_subtask(
         require_filesystem_changes=require_filesystem_changes,
     )
     if result.get("terminalized_after_tool_loop") and not result_before_terminalize.get("terminalized_after_tool_loop"):
-        append_event(
-            layout["events"],
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
             "worker.terminalized_after_tool_loop",
             run_id,
             {
@@ -3284,8 +3410,9 @@ def run_worker_subtask(
         reason=str(result.get("failure_reason") or "late target diff"),
     )
     if result.get("partial_diff_artifact"):
-        append_event(
-            layout["events"],
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
             "worker.partial_diff_preserved",
             run_id,
             _partial_diff_payload(result, worker_id, subtask),
@@ -3303,8 +3430,9 @@ def run_worker_subtask(
     ):
         seeded_diff = _seed_pr_candidate_diff(worktree, subtask, log_path)
         if seeded_diff:
-            append_event(
-                layout["events"],
+            _append_worker_event_if_run_active(
+                layout,
+                log_path,
                 "worker.pr_candidate_seeded",
                 run_id,
                 {
@@ -3325,7 +3453,7 @@ def run_worker_subtask(
             )
             result = _recover_seeded_pr_candidate_diff(result, seeded_diff, log_path)
 
-    if _worker_result_should_retry(result):
+    if _worker_result_should_retry(result) and not _run_has_terminal_status(layout):
         retry_prompt = prompt + _worker_prompt_retry_suffix(subtask)
         if seeded_diff:
             retry_prompt += (
@@ -3338,8 +3466,9 @@ def run_worker_subtask(
                 "- Do not spend the retry on a broad applicability matrix before verifying the seeded diff.\n"
             )
         retry_prompt_sync_first = str(result.get("blocker_kind") or "") != "engine_tool_loop_stalled"
-        append_event(
-            layout["events"],
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
             "worker.retry_started",
             run_id,
             {
@@ -3370,9 +3499,18 @@ def run_worker_subtask(
             timeout_multiplier=timeout_multiplier,
         )
         retry_result["write_required"] = write_required
+
+        if _run_has_terminal_status(layout):
+            retry_result = _late_terminal_worker_result(
+                retry_result,
+                log_path=log_path,
+                write_required=write_required,
+            )
+            return summarize_worker_notes(retry_result, worker_id, subtask, worktree, index)
         
         # Sync artifacts after retry turn
-        sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
+        if not _run_has_terminal_status(layout):
+            sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
         retry_before_terminalize = dict(retry_result)
         retry_result = _terminalize_worker_after_tool_loop(
@@ -3387,8 +3525,9 @@ def run_worker_subtask(
             require_filesystem_changes=require_filesystem_changes,
         )
         if retry_result.get("terminalized_after_tool_loop") and not retry_before_terminalize.get("terminalized_after_tool_loop"):
-            append_event(
-                layout["events"],
+            _append_worker_event_if_run_active(
+                layout,
+                log_path,
                 "worker.terminalized_after_tool_loop",
                 run_id,
                 {
@@ -3420,8 +3559,9 @@ def run_worker_subtask(
                 reason=str(retry_result.get("failure_reason") or "retry produced diff"),
             )
         if retry_result.get("partial_diff_artifact"):
-            append_event(
-                layout["events"],
+            _append_worker_event_if_run_active(
+                layout,
+                log_path,
                 "worker.partial_diff_preserved",
                 run_id,
                 _partial_diff_payload(retry_result, worker_id, subtask),
@@ -3429,8 +3569,9 @@ def run_worker_subtask(
                 role="worker",
                 repo={"path": str(repo_path)},
             )
-        append_event(
-            layout["events"],
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
             "worker.retry_completed",
             run_id,
             {
@@ -3442,9 +3583,14 @@ def run_worker_subtask(
             repo={"path": str(repo_path)},
         )
         result = retry_result
+
+    if _run_has_terminal_status(layout):
+        result = _late_terminal_worker_result(result, log_path=log_path, write_required=write_required)
+        return summarize_worker_notes(result, worker_id, subtask, worktree, index)
             
-    append_event(
-        layout["events"],
+    _append_worker_event_if_run_active(
+        layout,
+        log_path,
         "worker.completed" if result["returncode"] == 0 else "worker.failed",
         run_id,
         {

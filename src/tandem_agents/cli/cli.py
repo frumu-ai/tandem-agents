@@ -407,6 +407,7 @@ def cmd_dogfood_linear_graph(
     item: str | None,
     token_file: str | None,
     wait_seconds: int,
+    trigger_timeout_seconds: float | None,
     allow_fallback: bool,
 ) -> int:
     try:
@@ -417,6 +418,7 @@ def cmd_dogfood_linear_graph(
             item=item,
             token_file=Path(token_file).expanduser() if token_file else None,
             wait_seconds=wait_seconds,
+            trigger_timeout_seconds=trigger_timeout_seconds,
             expect_graph=not allow_fallback,
         )
     except Exception as exc:
@@ -511,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     dogfood_linear_graph.add_argument("--item", default=None, help="Linear issue identifier/id/url to trigger.")
     dogfood_linear_graph.add_argument("--token-file", default=None)
     dogfood_linear_graph.add_argument("--wait-seconds", type=int, default=180)
+    dogfood_linear_graph.add_argument("--trigger-timeout-seconds", type=float, default=None)
     dogfood_linear_graph.add_argument("--allow-fallback", action="store_true")
     dogfood_linear_graph.set_defaults(command="dogfood-linear-graph")
 
@@ -605,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
             item=getattr(args, "item", None),
             token_file=getattr(args, "token_file", None),
             wait_seconds=getattr(args, "wait_seconds", 180),
+            trigger_timeout_seconds=getattr(args, "trigger_timeout_seconds", None),
             allow_fallback=getattr(args, "allow_fallback", False),
         )
     if command == "run":
