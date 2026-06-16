@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from src.tandem_agents.api import main as api_main
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.api.main import (
+    _active_run_claim_for_task,
     _active_scheduler_project_keys,
     _compact_event_payload,
     _linear_auth_redirect_origin,
@@ -132,6 +133,32 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             ]
             self.assertEqual(events[-1]["type"], "run.blocked")
             self.assertEqual(events[-1]["payload"]["target_status"], "Backlog")
+
+    def test_active_run_claim_for_task_finds_orphaned_active_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            cfg = resolve_config(root)
+            run_dir = cfg.output_root() / "run-orphan"
+            run_dir.mkdir(parents=True)
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run": {"run_id": "run-orphan", "status": "running"},
+                        "task": {
+                            "task_id": "TAN-170",
+                            "source": {"type": "linear", "identifier": "TAN-170"},
+                        },
+                        "coordination": {"lease_id": "lease-orphan"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _active_run_claim_for_task(cfg, "TAN-170"),
+                {"run_id": "run-orphan", "lease_id": "lease-orphan"},
+            )
 
     def test_coder_supervisor_reconcile_is_serialized(self) -> None:
         entered = threading.Event()

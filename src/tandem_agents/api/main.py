@@ -1311,6 +1311,50 @@ def _operator_terminalize_reset_run(
     return True
 
 
+def _active_run_claim_for_task(cfg, task_id: str) -> dict[str, str]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {}
+    try:
+        run_dirs = sorted(
+            cfg.output_root().glob("run-*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        logger.debug("Could not scan run dirs for task %s", task_id, exc_info=True)
+        return {}
+    for run_dir in run_dirs:
+        status_path = run_dir / "status.json"
+        if not status_path.exists():
+            continue
+        try:
+            status_payload = load_status(status_path)
+        except Exception:
+            logger.debug("Could not load status while searching active task run %s", run_dir, exc_info=True)
+            continue
+        if not _persisted_run_is_active(status_payload):
+            continue
+        task_payload = status_payload.get("task") if isinstance(status_payload.get("task"), dict) else {}
+        source = task_payload.get("source") if isinstance(task_payload.get("source"), dict) else {}
+        candidates = {
+            str(task_payload.get("task_id") or "").strip(),
+            str(source.get("item") or "").strip(),
+            str(source.get("identifier") or "").strip(),
+            str(source.get("issue_id") or "").strip(),
+            str(source.get("card_id") or "").strip(),
+        }
+        if task_id not in candidates:
+            continue
+        run_meta = status_payload.get("run") if isinstance(status_payload.get("run"), dict) else {}
+        coordination = status_payload.get("coordination") if isinstance(status_payload.get("coordination"), dict) else {}
+        return {
+            "run_id": str(run_meta.get("run_id") or run_dir.name).strip(),
+            "lease_id": str(coordination.get("lease_id") or "").strip(),
+        }
+    return {}
+
+
 @app.post("/projects/{slug:path}/tasks/{item}/state")
 async def update_project_task_state(
     slug: str,
@@ -1392,6 +1436,10 @@ async def update_project_task_state(
             previous_task = store.get_task(task_key) or {}
             previous_run_id = str((previous_task or {}).get("claimed_run_id") or "").strip()
             previous_lease_id = str((previous_task or {}).get("claimed_lease_id") or "").strip()
+            if not previous_run_id and coord_state != "active":
+                active_claim = _active_run_claim_for_task(cfg, item)
+                previous_run_id = active_claim.get("run_id") or previous_run_id
+                previous_lease_id = active_claim.get("lease_id") or previous_lease_id
             coordination_task = store.transition_task_state(
                 task_key,
                 coord_state,

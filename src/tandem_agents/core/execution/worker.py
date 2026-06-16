@@ -2170,6 +2170,9 @@ def _terminalize_worker_after_tool_loop(
 ) -> dict[str, Any]:
     if result.get("returncode", 0) == 0 or not _result_is_terminalizable_engine_stall(result):
         return result
+    engine_meta = result.get("engine") if isinstance(result.get("engine"), dict) else {}
+    if engine_meta.get("partial_diff_recovery_deferred"):
+        return result
     changed_files = _worktree_changed_files(worktree)
     if not changed_files:
         return result
