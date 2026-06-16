@@ -49,6 +49,7 @@ from src.tandem_agents.core.execution.worker import (
 )
 from src.tandem_agents.core.phases.worker_dispatch import (
     _apply_tolerated_failures,
+    _changed_files_satisfy_required_test_files,
     _diff_has_unproductive_marker,
     _diff_has_tautological_boolean_assertion,
     _diff_has_placeholder_noop_test,
@@ -136,6 +137,22 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             ["crates/tandem-server/src/http/tests/coder_parts/part09.rs"],
         )
         self.assertTrue(_subtask_requires_test_changes(subtask))
+
+    def test_testless_diff_guard_requires_declared_test_target_when_present(self) -> None:
+        required = ["src/tandem_agents/api/run_isolation_test.py"]
+
+        self.assertFalse(
+            _changed_files_satisfy_required_test_files(
+                ["src/tandem_agents/api/run_isolation.py", "tests/api/test_run_isolation.py"],
+                required,
+            )
+        )
+        self.assertTrue(
+            _changed_files_satisfy_required_test_files(
+                ["src/tandem_agents/api/run_isolation.py", "src/tandem_agents/api/run_isolation_test.py"],
+                required,
+            )
+        )
 
     def test_testless_diff_guard_ignores_plain_implementation_subtasks(self) -> None:
         subtask = {
@@ -1428,6 +1445,54 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(kwargs["tool_allowlist"], [])
             self.assertEqual(kwargs["tool_mode"], "none")
             self.assertFalse(kwargs["write_required"])
+
+    def test_tool_loop_terminalize_skips_deferred_partial_diff_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "existing.py"
+            target.parent.mkdir()
+            target.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/existing.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("after\n", encoding="utf-8")
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session"
+            ) as create_session:
+                result = _terminalize_worker_after_tool_loop(
+                    SimpleNamespace(env={}),
+                    {
+                        "returncode": 1,
+                        "stdout": "ENGINE_PROMPT_TIMEOUT\n",
+                        "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                        "blocker_kind": "engine_prompt_timeout",
+                        "engine": {
+                            "session_id": "stalled-session",
+                            "partial_diff_recovery_deferred": True,
+                        },
+                    },
+                    log_path,
+                    worktree,
+                    {"title": "Update target", "files": ["src/existing.py"]},
+                    role="worker-1",
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    require_filesystem_changes=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["blocker_kind"], "engine_prompt_timeout")
+            self.assertNotIn("terminalized_after_tool_loop", result)
+            create_session.assert_not_called()
 
     def test_tool_loop_terminalize_keeps_remaining_blockers_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -78,6 +78,17 @@ def _subtask_required_test_files(subtask: dict[str, Any]) -> list[str]:
     return [str(path).strip() for path in files if _is_test_path(str(path))]
 
 
+def _changed_files_satisfy_required_test_files(
+    changed_files: list[str],
+    required_test_files: list[str],
+) -> bool:
+    changed = {str(path or "").strip().replace("\\", "/") for path in changed_files}
+    required = {str(path or "").strip().replace("\\", "/") for path in required_test_files}
+    if required:
+        return bool(changed & required)
+    return any(_is_test_path(path) for path in changed)
+
+
 def _subtask_requires_test_changes(subtask: dict[str, Any]) -> bool:
     if not _subtask_required_test_files(subtask):
         return False
@@ -547,7 +558,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                 testless_abort_seconds > 0
                 and elapsed_seconds >= testless_abort_seconds
                 and _subtask_requires_test_changes(subtask)
-                and not any(_is_test_path(path) for path in changed_files)
+                and not _changed_files_satisfy_required_test_files(changed_files, required_test_files)
             ):
                 artifact_path.write_text(
                     "# Partial worker diff captured during worker progress heartbeat\n"
