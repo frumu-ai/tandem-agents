@@ -1005,6 +1005,110 @@ def _run_start_preflight(
 COORDINATION_LOST_THRESHOLD = 3
 
 
+def _sync_status_coordination_from_lease(ctx: "_PhaseRunContext | None", lease: dict[str, Any] | None) -> None:
+    if ctx is None or not isinstance(lease, dict):
+        return
+    status = getattr(ctx, "status", None)
+    layout = getattr(ctx, "layout", None)
+    if not isinstance(status, dict) or not isinstance(layout, dict) or "status" not in layout:
+        return
+    coordination_payload = status.setdefault("coordination", {})
+    if not isinstance(coordination_payload, dict):
+        coordination_payload = {}
+        status["coordination"] = coordination_payload
+    for source_key, status_key in (
+        ("lease_id", "lease_id"),
+        ("worker_id", "worker_id"),
+        ("host_id", "host_id"),
+        ("task_key", "task_key"),
+        ("expires_at_ms", "lease_expires_at_ms"),
+        ("heartbeat_at_ms", "lease_heartbeat_at_ms"),
+        ("status", "lease_status"),
+    ):
+        value = lease.get(source_key)
+        if value is not None:
+            coordination_payload[status_key] = value
+    try:
+        write_status(layout["status"], status)
+    except Exception:
+        logger.debug("Failed to mirror refreshed coordination lease into status.json", exc_info=True)
+
+
+def _lookup_coordination_lease(coordination: CoordinationStore, lease_id: str) -> dict[str, Any] | None:
+    try:
+        get_lease = getattr(coordination, "get_lease", None)
+        if callable(get_lease):
+            lease = get_lease(lease_id)
+            if isinstance(lease, dict):
+                return lease
+    except Exception:
+        logger.debug("Failed to fetch coordination lease after heartbeat miss", exc_info=True)
+    return None
+
+
+def _mark_coordination_heartbeat_miss(
+    ctx: "_PhaseRunContext | None",
+    *,
+    lease_id: str,
+    lease: dict[str, Any] | None,
+) -> str | None:
+    if ctx is None:
+        return None
+    status = getattr(ctx, "status", None)
+    layout = getattr(ctx, "layout", None)
+    if not isinstance(status, dict) or not isinstance(layout, dict) or "status" not in layout:
+        return None
+    coordination_payload = status.setdefault("coordination", {})
+    if not isinstance(coordination_payload, dict):
+        coordination_payload = {}
+        status["coordination"] = coordination_payload
+    if isinstance(lease, dict):
+        for source_key, status_key in (
+            ("lease_id", "lease_id"),
+            ("worker_id", "worker_id"),
+            ("host_id", "host_id"),
+            ("task_key", "task_key"),
+            ("expires_at_ms", "lease_expires_at_ms"),
+            ("heartbeat_at_ms", "lease_heartbeat_at_ms"),
+            ("status", "lease_status"),
+        ):
+            value = lease.get(source_key)
+            if value is not None:
+                coordination_payload[status_key] = value
+    else:
+        coordination_payload["lease_id"] = lease_id
+        coordination_payload["lease_status"] = "missing"
+    coordination_payload["consecutive_heartbeat_misses"] = int(
+        getattr(ctx, "consecutive_heartbeat_misses", 0) or 0
+    )
+    coordination_payload["lease_heartbeat_missed_at_ms"] = int(time.time() * 1000)
+    try:
+        write_status(layout["status"], status)
+    except Exception:
+        logger.debug("Failed to mirror missed coordination heartbeat into status.json", exc_info=True)
+    return str(coordination_payload.get("lease_status") or "").strip() or None
+
+
+def _mark_coordination_lost_status(ctx: "_PhaseRunContext", *, lease_id: str, lease_status: str | None) -> str:
+    lease_label = f" status={lease_status}" if lease_status else ""
+    message = (
+        f"Lost coordination lease {lease_id}{lease_label} after "
+        f"{ctx.consecutive_heartbeat_misses} consecutive heartbeat misses. "
+        "Another worker may have reclaimed the task."
+    )
+    ctx.status = set_status(
+        ctx.status,
+        ctx.layout,
+        phase="coordination",
+        phase_detail="lease heartbeat repeatedly missed",
+        phase_role="system",
+        run_status="blocked",
+        blocker=(True, "coordination_lost", message, "system"),
+        run_completed=True,
+    )
+    return message
+
+
 def _touch_coordination(
     coordination: CoordinationStore,
     *,
@@ -1027,17 +1131,29 @@ def _touch_coordination(
     block the run with a clear blocker.
     """
     heartbeat_ok = True
+    lease: dict[str, Any] | None = None
     if lease_id:
         result = coordination.heartbeat_lease(lease_id, lease_ttl_seconds=lease_ttl_seconds)
         if result is None:
             heartbeat_ok = False
+            current_lease = _lookup_coordination_lease(coordination, lease_id)
             if ctx is not None:
                 ctx.consecutive_heartbeat_misses = int(ctx.consecutive_heartbeat_misses or 0) + 1
+                lease_status = _mark_coordination_heartbeat_miss(
+                    ctx,
+                    lease_id=lease_id,
+                    lease=current_lease,
+                )
                 if (
                     ctx.consecutive_heartbeat_misses >= COORDINATION_LOST_THRESHOLD
                     and not ctx.coordination_lost
                 ):
                     ctx.coordination_lost = True
+                    message = _mark_coordination_lost_status(
+                        ctx,
+                        lease_id=lease_id,
+                        lease_status=lease_status,
+                    )
                     try:
                         from src.tandem_agents.runtime.runstate import append_event
 
@@ -1047,14 +1163,26 @@ def _touch_coordination(
                             ctx.run_id,
                             {
                                 "lease_id": lease_id,
+                                "lease_status": lease_status,
                                 "consecutive_misses": ctx.consecutive_heartbeat_misses,
+                                "message": message,
                             },
                         )
                     except Exception:
                         # Don't let event logging failure mask the real problem.
                         pass
+                    coordination.update_run(
+                        run_id,
+                        status="blocked",
+                        phase="coordination",
+                        error=message,
+                        completed=True,
+                    )
+                    return False
         elif ctx is not None:
+            lease = result
             ctx.consecutive_heartbeat_misses = 0
+            _sync_status_coordination_from_lease(ctx, lease)
     coordination.update_run(
         run_id,
         status=status,

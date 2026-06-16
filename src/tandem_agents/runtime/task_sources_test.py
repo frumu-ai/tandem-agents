@@ -508,8 +508,15 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
 
 
 class LinearTaskSourceTest(unittest.TestCase):
-    def _config(self, root: Path):
+    def _config(self, root: Path, *, require_repo_hint: bool = False):
         (root / "runs").mkdir(parents=True, exist_ok=True)
+        payload_lines = []
+        if require_repo_hint:
+            payload_lines = [
+                "  payload:",
+                "    repo_routing:",
+                "      require_explicit_repo_hint: true",
+            ]
         (root / "agent.yaml").write_text(
             "\n".join(
                 [
@@ -520,6 +527,7 @@ class LinearTaskSourceTest(unittest.TestCase):
                     "  team: ENG",
                     "  project: Runtime",
                     "  statuses: Backlog,Todo,Triage,Ready",
+                    *payload_lines,
                     "repository:",
                     "  slug: frumu-ai/tandem",
                     "  clone_url: https://github.com/frumu-ai/tandem",
@@ -758,6 +766,75 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertEqual(task["source"]["initial_status_key"], "todo")
             self.assertEqual(task["repo"]["slug"], "frumu-ai/tandem")
             self.assertIn("Add tests", task["acceptance_criteria"])
+
+    def test_linear_task_repo_hint_matches_configured_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "Make Linear intake work\n\n## Repo\n`/home/evan/tandem`\n\nAcceptance:\n- Add tests",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=([{"name": "Todo", "type": "unstarted"}], [], [issue]),
+            ):
+                task, _board, _path = _task_from_linear(cfg)
+
+            self.assertEqual(task["source"]["repo_hints"], ["/home/evan/tandem"])
+            self.assertTrue(task["repo_routing"]["matched_configured_repo"])
+            self.assertTrue(task["contract_completeness"]["ok"])
+
+    def test_linear_task_repo_hint_mismatch_blocks_before_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "Make Linear intake work\n\n## Repo\n`/home/evan/tandem-agents`\n\nAcceptance:\n- Add tests",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=([{"name": "Todo", "type": "unstarted"}], [], [issue]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "repo hint does not match"):
+                    _task_from_linear(cfg)
+
+                preview = preview_task(cfg)
+
+            self.assertFalse(preview["eligible"])
+            self.assertEqual(preview["task"]["contract_completeness"]["blocker_kind"], "repo_binding_mismatch")
+            self.assertIn("/home/evan/tandem-agents", preview["task"]["repo_routing"]["repo_hints"])
+
+    def test_linear_task_source_can_require_explicit_repo_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp), require_repo_hint=True)
+            issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "Make Linear intake work\n\nAcceptance:\n- Add tests",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                return_value=([{"name": "Todo", "type": "unstarted"}], [], [issue]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "missing an explicit Repo/Repos section"):
+                    _task_from_linear(cfg)
+
+                preview = preview_task(cfg)
+
+            self.assertFalse(preview["eligible"])
+            self.assertEqual(preview["task"]["contract_completeness"]["blocker_kind"], "repo_hint_required")
+            self.assertTrue(preview["task"]["repo_routing"]["require_explicit_repo_hint"])
 
     def test_linear_task_hydrates_selected_issue_before_planning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

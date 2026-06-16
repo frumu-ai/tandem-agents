@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.tandem_agents.core.repository.repo_context import repo_context_for_task, repo_context_hints_for_task
+from src.tandem_agents.core.repository.repo_context import (
+    _repo_index_path_is_ignored,
+    repo_context_for_task,
+    repo_context_hints_for_task,
+)
 
 
 class RepoContextForTaskTest(unittest.TestCase):
+    def test_repo_index_store_path_is_ignored_by_tandem_dir_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            (root / ".gitignore").write_text(".tandem/\n", encoding="utf-8")
+
+            self.assertTrue(_repo_index_path_is_ignored(root))
+
     def test_uses_repo_context_bundle_and_writes_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

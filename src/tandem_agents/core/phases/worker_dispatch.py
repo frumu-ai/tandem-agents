@@ -13,7 +13,6 @@ caller continues with ctx.worker_results after this returns.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from pathlib import Path
 import re
@@ -794,32 +793,6 @@ def dispatch_workers(ctx: RunContext) -> None:
             repo={"path": ctx.repo.get("path")},
         )
 
-    def _terminal_worker_events_since(started_at_ms: dict[str, int]) -> set[str]:
-        if not started_at_ms:
-            return set()
-        terminal_ids: set[str] = set()
-        try:
-            for raw_line in ctx.layout["events"].read_text(encoding="utf-8").splitlines():
-                if not raw_line.strip():
-                    continue
-                event = json.loads(raw_line)
-                event_type = str(event.get("type") or "")
-                if event_type not in {"worker.completed", "worker.failed"}:
-                    continue
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                worker_id = str(payload.get("worker_id") or "").strip()
-                if not worker_id or worker_id not in started_at_ms:
-                    continue
-                try:
-                    event_at_ms = int(event.get("timestamp_ms") or 0)
-                except (TypeError, ValueError):
-                    event_at_ms = 0
-                if event_at_ms >= int(started_at_ms.get(worker_id) or 0):
-                    terminal_ids.add(worker_id)
-        except Exception:
-            logger.debug("Failed to scan terminal worker events for heartbeat pruning", exc_info=True)
-        return terminal_ids
-
     def _heartbeat_local_workers() -> None:
         sleep_s = max(1.0, float(ctx.cfg.coordination.heartbeat_interval_seconds or 1) / 2.0)
         while not worker_heartbeat_stop.wait(sleep_s):
@@ -835,20 +808,7 @@ def dispatch_workers(ctx: RunContext) -> None:
             with active_workers_lock:
                 ids = list(active_workers)
                 started_at = dict(active_worker_started_at)
-                started_at_ms = dict(active_worker_started_at_ms)
                 worktrees = dict(active_worker_worktrees)
-            terminal_ids = _terminal_worker_events_since(started_at_ms)
-            if terminal_ids:
-                with active_workers_lock:
-                    for wid in terminal_ids:
-                        active_workers.discard(wid)
-                        active_worker_started_at.pop(wid, None)
-                        active_worker_started_at_ms.pop(wid, None)
-                        active_worker_worktrees.pop(wid, None)
-                        active_worker_subtasks.pop(wid, None)
-                    ids = [wid for wid in ids if wid not in terminal_ids]
-                    started_at = {wid: value for wid, value in started_at.items() if wid not in terminal_ids}
-                    worktrees = {wid: value for wid, value in worktrees.items() if wid not in terminal_ids}
             for wid in ids:
                 try:
                     ctx.coordination.heartbeat_worker(

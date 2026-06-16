@@ -13,6 +13,7 @@ The planning phase repeats inside the repair loop (max_loops iterations).
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from src.tandem_agents.core.phases.context import RunContext
@@ -98,6 +99,67 @@ def _append_unique_repo_paths(subtask: dict[str, Any], paths: list[str]) -> None
             if rel_path not in values:
                 values.append(rel_path)
         subtask[key] = values
+
+
+def _repo_uses_sibling_python_tests(repo_path: Path) -> bool:
+    if (repo_path / "tests").is_dir():
+        return False
+    try:
+        return any((repo_path / "src").glob("**/*_test.py"))
+    except Exception:
+        return False
+
+
+def _sibling_python_test_path_for_top_level_test(path: str, declared_files: set[str]) -> str:
+    normalized = _normalize_repo_relative_path(path)
+    if not normalized.startswith("tests/test_") or not normalized.endswith(".py"):
+        return normalized
+    test_stem = Path(normalized).stem
+    if not test_stem.startswith("test_"):
+        return normalized
+    source_stem = test_stem.removeprefix("test_")
+    for declared in sorted(declared_files):
+        source_path = Path(declared)
+        if (
+            declared.startswith("src/")
+            and source_path.suffix == ".py"
+            and source_path.stem == source_stem
+        ):
+            return source_path.with_name(f"{source_path.stem}_test.py").as_posix()
+    return normalized
+
+
+def _align_python_test_targets_to_repo_conventions(repo_path: Path, subtasks: list[dict[str, Any]]) -> None:
+    if not _repo_uses_sibling_python_tests(repo_path):
+        return
+    for subtask in subtasks:
+        declared_files = _subtask_declared_files(subtask)
+        if not declared_files:
+            continue
+        rewrites: dict[str, str] = {}
+        for rel_path in declared_files:
+            rewritten = _sibling_python_test_path_for_top_level_test(rel_path, declared_files)
+            if rewritten and rewritten != rel_path:
+                rewrites[rel_path] = rewritten
+        if not rewrites:
+            continue
+        for key in ("files", "target_files"):
+            values: list[str] = []
+            for raw_path in subtask.get(key) or []:
+                rel_path = _normalize_repo_relative_path(raw_path)
+                if not rel_path:
+                    continue
+                values.append(rewrites.get(rel_path, rel_path))
+            subtask[key] = list(dict.fromkeys(values))
+        existing_scope_note = str(subtask.get("scope_note") or "").strip()
+        rewrite_note = (
+            "ACA aligned generated Python test targets to this repository's sibling "
+            "*_test.py convention: "
+            + ", ".join(f"{old} -> {new}" for old, new in sorted(rewrites.items()))
+            + "."
+        )
+        if rewrite_note not in existing_scope_note:
+            subtask["scope_note"] = f"{existing_scope_note}\n{rewrite_note}".strip()
 
 
 def _remote_code_task_requires_worker_execution(task: dict[str, Any]) -> bool:
@@ -394,6 +456,19 @@ def _sanitize_partial_diff_artifact_paths_in_plan(plan: dict[str, Any]) -> None:
         subtask["acceptance_criteria"] = sanitized
 
 
+def _mark_manager_planning_started(ctx: RunContext) -> None:
+    from src.tandem_agents.runtime.run_output import set_status
+
+    ctx.status = set_status(
+        ctx.status,
+        ctx.layout,
+        phase="planning",
+        phase_detail="manager planning",
+        phase_role="manager",
+        run_status="running",
+    )
+
+
 def _repair_int(value: Any) -> int:
     try:
         return int(value)
@@ -586,6 +661,7 @@ def run_manager_prompt(ctx: RunContext) -> None:
         previous_feedback=getattr(ctx, "_previous_feedback", None),
     )
 
+    _mark_manager_planning_started(ctx)
     append_event(
         ctx.layout["events"],
         "manager.started",
@@ -690,6 +766,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     discovered_files, subtasks = _prepare_subtasks(ctx)
     _carry_forward_partial_diff_artifacts(ctx, subtasks)
     _constrain_extra_partial_diff_repair_subtasks(ctx, subtasks)
+    _align_python_test_targets_to_repo_conventions(repo_path, subtasks)
 
     ctx.planned_subtasks = subtasks
     ctx.pending_subtasks = []
