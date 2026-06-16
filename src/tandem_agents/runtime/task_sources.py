@@ -1228,6 +1228,217 @@ def _linear_status_is_actionable(cfg: ResolvedConfig, status_name: str, state_ty
     return linear_status_key_is_actionable(status_name, state_type)
 
 
+def _linear_task_contract_ok(task: dict[str, Any]) -> bool:
+    return bool((task.get("contract_completeness") or task_contract_completeness(task)).get("ok", True))
+
+
+LINEAR_REPO_ROUTING_BLOCKERS = {"repo_hint_required", "repo_binding_mismatch"}
+
+
+def _truthy_config(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _linear_repo_routing_policy(cfg: ResolvedConfig) -> dict[str, Any]:
+    payload = cfg.task_source.payload if isinstance(cfg.task_source.payload, dict) else {}
+    routing = payload.get("repo_routing") if isinstance(payload.get("repo_routing"), dict) else payload
+    return routing if isinstance(routing, dict) else {}
+
+
+def _linear_requires_explicit_repo_hint(cfg: ResolvedConfig) -> bool:
+    policy = _linear_repo_routing_policy(cfg)
+    return any(
+        _truthy_config(policy.get(key))
+        for key in (
+            "require_explicit_repo_hint",
+            "require_explicit_issue_repo",
+            "require_repo_hint",
+        )
+    )
+
+
+def _split_repo_hint_values(value: str) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    backtick_values = [entry.strip() for entry in re.findall(r"`([^`]+)`", text) if entry.strip()]
+    if backtick_values:
+        return backtick_values
+    text = re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", text).strip()
+    parts = re.split(r"\s*(?:,|;|\band\b)\s*", text)
+    return [part.strip().strip("`").strip() for part in parts if part.strip().strip("`").strip()]
+
+
+def _linear_issue_repo_hints(issue: dict[str, Any]) -> list[str]:
+    body = _linear_issue_body(issue)
+    if not body:
+        return []
+    hints: list[str] = []
+    in_repo_section = False
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        heading_match = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if heading_match:
+            heading_key = re.sub(r"[^a-z0-9]+", "_", heading_match.group(1).strip().lower()).strip("_")
+            in_repo_section = heading_key in {"repo", "repos", "repository", "repositories"}
+            continue
+        inline_match = re.match(r"^(?:repos?|repositories?)\s*:\s*(.+)$", line, re.IGNORECASE)
+        if inline_match:
+            hints.extend(_split_repo_hint_values(inline_match.group(1)))
+            continue
+        if in_repo_section:
+            if re.match(r"^[A-Za-z][A-Za-z0-9 /_-]{1,80}:\s*$", line):
+                in_repo_section = False
+                continue
+            hints.extend(_split_repo_hint_values(line))
+    return list(dict.fromkeys(hints))
+
+
+def _repo_reference_aliases(value: Any) -> set[str]:
+    text = str(value or "").strip().strip("`").replace("\\", "/").lower()
+    if not text:
+        return set()
+    if text.endswith(".git"):
+        text = text[:-4]
+    text = text.rstrip("/")
+    aliases = {text}
+    path = text
+    if "://" in path:
+        try:
+            from urllib.parse import urlparse
+
+            path = urlparse(path).path.strip("/")
+        except Exception:
+            path = path.split("://", 1)[-1]
+    elif ":" in path and "@" in path:
+        path = path.split(":", 1)[1].strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    path = path.rstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if parts:
+        aliases.add(parts[-1])
+    if len(parts) >= 2 and not text.startswith("/"):
+        aliases.add(f"{parts[-2]}/{parts[-1]}")
+    return {alias for alias in aliases if alias}
+
+
+def _configured_repo_aliases(cfg: ResolvedConfig) -> set[str]:
+    aliases: set[str] = set()
+    for value in (
+        cfg.repository.slug,
+        cfg.repository.path,
+        cfg.repository.clone_url,
+        cfg.task_source.repo,
+        cfg.repository_path(),
+    ):
+        aliases.update(_repo_reference_aliases(value))
+    return aliases
+
+
+def _repo_hints_match_config(cfg: ResolvedConfig, hints: list[str]) -> bool:
+    configured = _configured_repo_aliases(cfg)
+    if not configured:
+        return False
+    for hint in hints:
+        if _repo_reference_aliases(hint) & configured:
+            return True
+    return False
+
+
+def _contract_with_blocker(task: dict[str, Any], *, kind: str, message: str) -> dict[str, Any]:
+    contract = dict(task.get("contract_completeness") or task_contract_completeness(task))
+    issues = [str(item).strip() for item in contract.get("issues") or [] if str(item).strip()]
+    if message not in issues:
+        issues.append(message)
+    contract.update(
+        {
+            "ok": False,
+            "issues": issues,
+            "blocker_kind": kind,
+            "blocker_message": message,
+        }
+    )
+    return contract
+
+
+def _merge_contract_completeness(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    if previous.get("ok", True) is not False:
+        return current
+    merged = dict(current)
+    issues = [str(item).strip() for item in (current.get("issues") or []) if str(item).strip()]
+    for item in previous.get("issues") or []:
+        text = str(item).strip()
+        if text and text not in issues:
+            issues.append(text)
+    merged["ok"] = False
+    merged["issues"] = issues
+    merged["blocker_kind"] = previous.get("blocker_kind") or current.get("blocker_kind")
+    merged["blocker_message"] = previous.get("blocker_message") or current.get("blocker_message")
+    return merged
+
+
+def _linear_apply_repo_routing_guard(
+    cfg: ResolvedConfig,
+    task: dict[str, Any],
+    issue: dict[str, Any],
+) -> dict[str, Any]:
+    hints = _linear_issue_repo_hints(issue)
+    require_hint = _linear_requires_explicit_repo_hint(cfg)
+    routing = {
+        "repo_hints": hints,
+        "require_explicit_repo_hint": require_hint,
+    }
+    task["repo_routing"] = routing
+    source = task.setdefault("source", {})
+    if isinstance(source, dict):
+        source["repo_hints"] = hints
+    if hints:
+        repo = task.setdefault("repo", {})
+        if isinstance(repo, dict):
+            repo["hint"] = hints[0] if len(hints) == 1 else hints
+    if not hints and require_hint:
+        message = (
+            "Linear issue is missing an explicit Repo/Repos section, but this task source "
+            "requires repo hints before ACA can safely run a cross-repo project item."
+        )
+        task["contract_completeness"] = _contract_with_blocker(
+            task,
+            kind="repo_hint_required",
+            message=message,
+        )
+        routing["matched_configured_repo"] = False
+        return task
+    if hints and not _repo_hints_match_config(cfg, hints):
+        configured = str(cfg.repository.slug or cfg.repository.path or cfg.repository.clone_url or "<unset>").strip()
+        message = (
+            "Linear issue repo hint does not match the configured ACA repo binding. "
+            f"Configured repo: {configured}. Issue repo hint(s): {', '.join(hints)}."
+        )
+        task["contract_completeness"] = _contract_with_blocker(
+            task,
+            kind="repo_binding_mismatch",
+            message=message,
+        )
+        routing["matched_configured_repo"] = False
+        return task
+    routing["matched_configured_repo"] = bool(hints)
+    return task
+
+
+def _linear_contract_hard_blocker(task: dict[str, Any]) -> str:
+    contract = task.get("contract_completeness") or {}
+    if str(contract.get("blocker_kind") or "") not in LINEAR_REPO_ROUTING_BLOCKERS:
+        return ""
+    return str(contract.get("blocker_message") or "").strip()
+
+
 def _linear_issue_to_task(
     cfg: ResolvedConfig,
     issue: dict[str, Any],
@@ -1291,7 +1502,8 @@ def _linear_issue_to_task(
             "raw_issue_body": body,
         }
     )
-    return _annotate_task_contract(task, coordination=coordination)
+    task = _annotate_task_contract(task, coordination=coordination)
+    return _linear_apply_repo_routing_guard(cfg, task, issue)
 
 
 def _hydrate_linear_issue_for_task(cfg: ResolvedConfig, issue: dict[str, Any]) -> dict[str, Any]:
@@ -1332,10 +1544,14 @@ def _annotate_linear_dependency_status(
     issues: list[dict[str, Any]],
     coordination: CoordinationStore | None = None,
 ) -> dict[str, Any]:
+    previous_contract = dict(task.get("contract_completeness") or {})
     known_tasks = _linear_known_tasks(cfg, issues, coordination=coordination)
     task = apply_task_contract(task)
     task["dependency_status"] = dependency_status_for_task(task, known_tasks)
-    task["contract_completeness"] = task_contract_completeness(task)
+    task["contract_completeness"] = _merge_contract_completeness(
+        task_contract_completeness(task),
+        previous_contract,
+    )
     return task
 
 
@@ -1407,19 +1623,22 @@ def _linear_scheduler_projection(cfg: ResolvedConfig, board_items: list[dict[str
     for item in board_items:
         status_key = str(item.get("status_key") or "").strip()
         state_key = str(item.get("state_type_key") or "").strip()
+        hard_blocker = str((item.get("contract_completeness") or {}).get("blocker_kind") or "") in LINEAR_REPO_ROUTING_BLOCKERS
         blocked_by: list[str] = []
         if status_key in LINEAR_DONE_STATUS_KEYS or state_key in {"completed", "canceled", "cancelled"}:
             launch_state = "done"
         elif status_key in LINEAR_ACTIVE_STATUS_KEYS or state_key == "started":
             launch_state = status_key or "in_progress"
+        elif hard_blocker:
+            launch_state = "waiting_contract"
         elif _linear_status_is_actionable(cfg, str(item.get("status_name") or ""), str(item.get("state_type") or "")):
-            launch_state = "next"
+            launch_state = "candidate"
             candidates.append(item)
         else:
             launch_state = "waiting"
         item["blocked_by"] = blocked_by
         item["launch_state"] = launch_state
-        item["actionable"] = launch_state == "next"
+        item["actionable"] = False
 
     def sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
         priority = item.get("priority")
@@ -1434,10 +1653,25 @@ def _linear_scheduler_projection(cfg: ResolvedConfig, board_items: list[dict[str
         )
 
     candidates.sort(key=sort_key)
-    next_items = candidates[:1]
+    complete_candidates = [
+        item for item in candidates if (item.get("contract_completeness") or {}).get("ok", True)
+    ]
+    soft_candidates = [
+        item
+        for item in candidates
+        if str((item.get("contract_completeness") or {}).get("blocker_kind") or "") not in LINEAR_REPO_ROUTING_BLOCKERS
+    ]
+    candidate_pool = complete_candidates or soft_candidates
+    next_items = candidate_pool[:1]
     next_ids = {str(item.get("id") or "") for item in next_items}
     for item in candidates:
-        if str(item.get("id") or "") not in next_ids:
+        if str(item.get("id") or "") in next_ids:
+            item["launch_state"] = "next"
+            item["actionable"] = True
+        elif complete_candidates and not (item.get("contract_completeness") or {}).get("ok", True):
+            item["launch_state"] = "waiting_contract"
+            item["actionable"] = False
+        else:
             item["launch_state"] = "queued"
             item["actionable"] = False
     return {
@@ -1461,16 +1695,42 @@ def _select_linear_issue(
             status_name = _linear_issue_status(issue)
             state_type = _linear_issue_state_type(issue)
             eligible = _linear_status_is_actionable(cfg, status_name, state_type)
+            task_projection = _linear_issue_to_task(cfg, issue, coordination=None)
+            hard_blocker = _linear_contract_hard_blocker(task_projection)
+            if hard_blocker:
+                if not allow_non_actionable:
+                    raise RuntimeError(hard_blocker)
+                return issue, False, hard_blocker
             if not eligible and not allow_non_actionable:
                 raise RuntimeError(f"Selected Linear issue is not actionable: status is '{status_name}'.")
             warning = None if eligible else f"Selected Linear issue is not actionable: status is '{status_name}'."
             return issue, eligible, warning
 
-    candidates = [
+    actionable = [
         issue
         for issue in issues
         if _linear_status_is_actionable(cfg, _linear_issue_status(issue), _linear_issue_state_type(issue))
     ]
+    projected_actionable = [
+        (issue, _linear_issue_to_task(cfg, issue, coordination=None))
+        for issue in actionable
+    ]
+    hard_blocked = [
+        (issue, task_projection)
+        for issue, task_projection in projected_actionable
+        if _linear_contract_hard_blocker(task_projection)
+    ]
+    soft_actionable = [
+        (issue, task_projection)
+        for issue, task_projection in projected_actionable
+        if not _linear_contract_hard_blocker(task_projection)
+    ]
+    complete_actionable = [
+        issue
+        for issue, task_projection in soft_actionable
+        if _linear_task_contract_ok(task_projection)
+    ]
+    candidates = complete_actionable or [issue for issue, _task_projection in soft_actionable]
     candidates.sort(
         key=lambda issue: (
             _linear_issue_priority(issue) if _linear_issue_priority(issue) is not None else 99,
@@ -1480,6 +1740,11 @@ def _select_linear_issue(
     )
     if candidates:
         return candidates[0], True, None
+    if hard_blocked:
+        message = _linear_contract_hard_blocker(hard_blocked[0][1])
+        if allow_non_actionable:
+            return hard_blocked[0][0], False, message
+        raise RuntimeError(message)
     if allow_non_actionable and issues:
         return issues[0], False, "No actionable Linear issues were found; showing the first returned issue."
     found_statuses = sorted({_linear_issue_status(issue) for issue in issues if _linear_issue_status(issue)})
@@ -1547,6 +1812,7 @@ def linear_board_snapshot(
             columns.append({"id": status_key, "name": status_name, "key": status_key, "type": state_type})
         counts[status_key] = counts.get(status_key, 0) + 1
         task_projection = _linear_issue_to_task(cfg, issue)
+        contract_completeness = task_projection.get("contract_completeness") or task_contract_completeness(task_projection)
         item = {
             "id": identifier or issue_id or str(issue.get("title") or "linear-issue"),
             "project_item_id": issue_id,
@@ -1576,6 +1842,8 @@ def linear_board_snapshot(
             "labels": _linear_issue_labels(issue),
             "execution_kind": task_projection.get("execution_kind"),
             "execution_backend": task_execution_backend(cfg, task_projection),
+            "contract_completeness": contract_completeness,
+            "repo_routing": task_projection.get("repo_routing") or {},
         }
         board_items.append(item)
     scheduler = _linear_scheduler_projection(cfg, board_items)
@@ -2105,6 +2373,9 @@ def _task_from_linear(
     chosen = _hydrate_linear_issue_for_task(cfg, chosen)
     task = _linear_issue_to_task(cfg, chosen, coordination=coordination)
     task = _annotate_linear_dependency_status(cfg, task=task, issues=issues, coordination=coordination)
+    hard_blocker = _linear_contract_hard_blocker(task)
+    if hard_blocker:
+        raise RuntimeError(hard_blocker)
     board = default_board()
     card = task_to_card(task, lane="ready")
     board["cards"].append(card)
@@ -2123,6 +2394,7 @@ def _task_from_linear(
     returned["acceptance_criteria"] = list(task.get("acceptance_criteria") or returned.get("acceptance_criteria") or [])
     returned["notes_for_agent"] = task.get("notes_for_agent") or returned.get("notes_for_agent")
     returned["subtasks"] = list(task.get("subtasks") or returned.get("subtasks") or [])
+    returned["repo_routing"] = task.get("repo_routing") or returned.get("repo_routing") or {}
     return returned, board, None
 
 
@@ -2368,6 +2640,7 @@ def preview_task(cfg: ResolvedConfig, coordination: CoordinationStore | None = N
                 "contract_completeness": selected_task.get("contract_completeness"),
                 "raw_issue_body": selected_task.get("raw_issue_body"),
                 "task_id": selected_task.get("task_id"),
+                "repo_routing": selected_task.get("repo_routing") or {},
             },
             "source_type": source_type,
             "board_path": None,

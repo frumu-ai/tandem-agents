@@ -36,6 +36,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _pr_candidate_unexpected_changed_files,
     _normalize_manager_subtasks,
     _task_mentions_external_pr_candidates,
+    _touch_coordination,
     _verification_can_retry,
     _worker_failure_blocker,
     _worker_failure_can_retry,
@@ -93,6 +94,130 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 {"id": "req-2", "status": "allow", "permission": "bash"},
             ],
         )
+
+    def test_touch_coordination_mirrors_renewed_lease_into_status_file(self) -> None:
+        class FakeCoordination:
+            def __init__(self) -> None:
+                self.updated_run: dict[str, object] | None = None
+
+            def heartbeat_lease(self, lease_id: str, *, lease_ttl_seconds: int) -> dict[str, object]:
+                self.heartbeat_args = {
+                    "lease_id": lease_id,
+                    "lease_ttl_seconds": lease_ttl_seconds,
+                }
+                return {
+                    "lease_id": lease_id,
+                    "task_key": "task-1",
+                    "worker_id": "worker-1",
+                    "host_id": "host-1",
+                    "status": "active",
+                    "heartbeat_at_ms": 111,
+                    "expires_at_ms": 222,
+                }
+
+            def update_run(self, run_id: str, **kwargs: object) -> None:
+                self.updated_run = {"run_id": run_id, **kwargs}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "status.json"
+            ctx = SimpleNamespace(
+                status={
+                    "coordination": {
+                        "lease_id": "lease-1",
+                        "lease_expires_at_ms": 1,
+                    }
+                },
+                layout={"status": status_path},
+                consecutive_heartbeat_misses=0,
+                coordination_lost=False,
+            )
+            coordination = FakeCoordination()
+
+            heartbeat_ok = _touch_coordination(
+                coordination,
+                run_id="run-1",
+                lease_id="lease-1",
+                lease_ttl_seconds=300,
+                status="running",
+                phase="worker_execution",
+                ctx=ctx,
+            )
+
+            self.assertTrue(heartbeat_ok)
+            self.assertEqual(ctx.status["coordination"]["lease_expires_at_ms"], 222)
+            self.assertEqual(ctx.status["coordination"]["lease_heartbeat_at_ms"], 111)
+            self.assertEqual(ctx.status["coordination"]["lease_status"], "active")
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["coordination"]["lease_expires_at_ms"], 222)
+            self.assertEqual(coordination.updated_run["phase"], "worker_execution")
+
+    def test_touch_coordination_blocks_status_after_stale_lease_misses(self) -> None:
+        class FakeCoordination:
+            def __init__(self) -> None:
+                self.updated_runs: list[dict[str, object]] = []
+
+            def heartbeat_lease(self, _lease_id: str, *, lease_ttl_seconds: int) -> None:
+                self.lease_ttl_seconds = lease_ttl_seconds
+                return None
+
+            def get_lease(self, lease_id: str) -> dict[str, object]:
+                return {
+                    "lease_id": lease_id,
+                    "task_key": "task-1",
+                    "worker_id": "worker-1",
+                    "host_id": "host-1",
+                    "status": "stale",
+                    "heartbeat_at_ms": 111,
+                    "expires_at_ms": 222,
+                }
+
+            def update_run(self, run_id: str, **kwargs: object) -> None:
+                self.updated_runs.append({"run_id": run_id, **kwargs})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            status_path = run_dir / "status.json"
+            events_path = run_dir / "events.jsonl"
+            ctx = SimpleNamespace(
+                run_id="run-1",
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "coordination": {
+                        "lease_id": "lease-1",
+                        "lease_status": "active",
+                    },
+                },
+                layout={"status": status_path, "events": events_path},
+                consecutive_heartbeat_misses=0,
+                coordination_lost=False,
+            )
+            coordination = FakeCoordination()
+
+            for _ in range(3):
+                heartbeat_ok = _touch_coordination(
+                    coordination,
+                    run_id="run-1",
+                    lease_id="lease-1",
+                    lease_ttl_seconds=300,
+                    status="running",
+                    phase="worker_execution",
+                    ctx=ctx,
+                )
+
+            self.assertFalse(heartbeat_ok)
+            self.assertTrue(ctx.coordination_lost)
+            self.assertEqual(ctx.status["run"]["status"], "blocked")
+            self.assertEqual(ctx.status["blocker"]["kind"], "coordination_lost")
+            self.assertEqual(ctx.status["coordination"]["lease_status"], "stale")
+            self.assertEqual(ctx.status["coordination"]["consecutive_heartbeat_misses"], 3)
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["run"]["status"], "blocked")
+            self.assertEqual(persisted["coordination"]["lease_status"], "stale")
+            self.assertEqual(coordination.updated_runs[-1]["status"], "blocked")
+            self.assertTrue(coordination.updated_runs[-1]["completed"])
+            event = json.loads(events_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["type"], "coordination_lost")
+            self.assertEqual(event["payload"]["lease_status"], "stale")
 
     def test_execute_local_worker_pool_reports_no_progress_timeout(self) -> None:
         def stalled_runner(*_args):

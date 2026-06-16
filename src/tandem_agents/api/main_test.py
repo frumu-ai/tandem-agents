@@ -16,6 +16,7 @@ from src.tandem_agents.api.main import (
     _compact_event_payload,
     _linear_auth_redirect_origin,
     _operator_coordination_state,
+    _operator_terminalize_reset_run,
     _project_runtime_env,
     app,
 )
@@ -75,6 +76,62 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertEqual(_operator_coordination_state("In Review"), "review")
         self.assertEqual(_operator_coordination_state("Done"), "done")
         self.assertEqual(_operator_coordination_state("Blocked"), "blocked")
+
+    def test_operator_terminalize_reset_run_marks_active_status_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            cfg = resolve_config(root)
+            run_dir = cfg.output_root() / "run-operator-reset"
+            run_dir.mkdir(parents=True)
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run": {
+                            "run_id": "run-operator-reset",
+                            "status": "running",
+                            "updated_at_ms": 1,
+                            "completed_at_ms": None,
+                        },
+                        "phase": {"name": "worker_execution", "detail": "running"},
+                        "coordination": {"lease_id": "lease-1", "lease_status": "active"},
+                        "blocker": {"active": False, "kind": None, "message": None},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = _operator_terminalize_reset_run(
+                cfg,
+                run_id="run-operator-reset",
+                task_id="TAN-170",
+                target_status="Backlog",
+                coordination_state="queued",
+                lease={
+                    "lease_id": "lease-1",
+                    "task_key": "linear:team/project:TAN-170",
+                    "worker_id": "worker-1",
+                    "host_id": "host-a",
+                    "status": "stale",
+                    "heartbeat_at_ms": 11,
+                    "expires_at_ms": 22,
+                },
+            )
+
+            self.assertTrue(updated)
+            status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status_payload["run"]["status"], "blocked")
+            self.assertIsNotNone(status_payload["run"]["completed_at_ms"])
+            self.assertEqual(status_payload["phase"]["role"], "operator")
+            self.assertEqual(status_payload["coordination"]["lease_status"], "stale")
+            self.assertEqual(status_payload["blocker"]["kind"], "operator_requeued")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(events[-1]["type"], "run.blocked")
+            self.assertEqual(events[-1]["payload"]["target_status"], "Backlog")
 
     def test_coder_supervisor_reconcile_is_serialized(self) -> None:
         entered = threading.Event()
@@ -412,6 +469,35 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertEqual(env["ACA_REPO_PATH"], "workspace/repos/tandem")
         self.assertEqual(env["ACA_WORKTREE_ROOT"], "workspace/repos")
         self.assertEqual(env["ACA_TASK_SOURCE_REPO"], "tandem")
+
+    def test_project_runtime_env_serializes_task_source_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _project_runtime_env(
+                root,
+                {
+                    "id": "linear-runtime",
+                    "repo_url": "https://github.com/frumu-ai/tandem-agents",
+                    "repo": {"slug": "frumu-ai/tandem-agents"},
+                    "task_source": {
+                        "type": "linear",
+                        "team": "Tandem",
+                        "project": "Runtime",
+                        "payload": {
+                            "repo_routing": {
+                                "require_explicit_repo_hint": True,
+                            }
+                        },
+                    },
+                },
+            )
+
+            self.assertEqual(
+                json.loads(env["ACA_TASK_SOURCE_PAYLOAD"]),
+                {"repo_routing": {"require_explicit_repo_hint": True}},
+            )
+            cfg = resolve_config(root, env=env)
+            self.assertTrue(cfg.task_source.payload["repo_routing"]["require_explicit_repo_hint"])
 
     def test_project_repo_sync_initializes_local_workspace_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

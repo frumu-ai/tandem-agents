@@ -222,6 +222,15 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             )
         ),
     )
+    payload = task_data.get("payload")
+    env_payload = pick("ACA_TASK_SOURCE_PAYLOAD", yaml_value=None, default="")
+    if env_payload:
+        try:
+            parsed_payload = json.loads(str(env_payload))
+            if isinstance(parsed_payload, dict):
+                payload = parsed_payload
+        except json.JSONDecodeError:
+            payload = payload if isinstance(payload, dict) else {}
     task_source = TaskSourceConfig(
         type=str(pick("ACA_TASK_SOURCE_TYPE", "AUTOCODER_TASK_SOURCE_TYPE", yaml_value=task_data.get("type"), default="")),
         owner=str(pick("ACA_TASK_SOURCE_OWNER", "AUTOCODER_TASK_SOURCE_OWNER", yaml_value=task_data.get("owner"), default="")),
@@ -237,7 +246,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         prompt=str(pick("ACA_TASK_SOURCE_PROMPT", "AUTOCODER_TASK_SOURCE_PROMPT", yaml_value=task_data.get("prompt"), default="")),
         source_name=str(pick("ACA_TASK_SOURCE_SOURCE_NAME", "AUTOCODER_TASK_SOURCE_SOURCE_NAME", yaml_value=task_data.get("source_name"), default="")),
         card_id=str(pick("ACA_TASK_SOURCE_CARD_ID", "AUTOCODER_TASK_SOURCE_CARD_ID", yaml_value=task_data.get("card_id"), default="")),
-        payload=dict(task_data.get("payload") or {}),
+        payload=dict(payload or {}),
     )
     repo_path = pick("ACA_REPO_PATH", "AUTOCODER_REPO_PATH", yaml_value=repo_data.get("path"), default="")
     repo_slug = pick("ACA_REPO_SLUG", "AUTOCODER_REPO_SLUG", yaml_value=repo_data.get("slug"), default="")

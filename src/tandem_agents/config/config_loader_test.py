@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from textwrap import dedent
@@ -9,6 +10,42 @@ from src.tandem_agents.config.config_loader import resolve_config, validate_conf
 
 
 class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
+    def test_task_source_payload_can_come_from_env_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: linear
+                      team: Tandem
+                      project: Runtime
+                    repository:
+                      slug: frumu-ai/tandem-agents
+                    provider:
+                      id: openai
+                      model: gpt-5.5
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(
+                root,
+                env={
+                    "ACA_TASK_SOURCE_PAYLOAD": json.dumps(
+                        {"repo_routing": {"require_explicit_repo_hint": True}}
+                    )
+                },
+            )
+
+            self.assertTrue(cfg.task_source.payload["repo_routing"]["require_explicit_repo_hint"])
+
     def test_control_panel_config_overrides_agent_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

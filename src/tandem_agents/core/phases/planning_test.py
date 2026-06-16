@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from src.tandem_agents.core.phases.planning import (
+    _align_python_test_targets_to_repo_conventions,
     _apply_repo_context_required_files_to_task,
     _carry_forward_partial_diff_artifacts,
     _constrain_extra_partial_diff_repair_subtasks,
     _completed_repair_worker_results,
+    _mark_manager_planning_started,
     _manager_plan_from_stdout,
     _remote_code_task_requires_worker_execution,
     _sanitize_partial_diff_artifact_paths_in_plan,
@@ -494,6 +498,60 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertIn("Keep repair edits scoped to the parent task target files", criteria)
         self.assertNotIn("Do not expand the edit set beyond", criteria)
         self.assertIn("Active repair targets are the parent task targets", subtasks[0]["scope_note"])
+
+    def test_align_python_test_targets_to_sibling_repo_convention(self) -> None:
+        with self.subTest("top-level tests target rewrites only when repo uses sibling tests"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo_path = Path(tmp)
+                (repo_path / "src" / "tandem_agents" / "api").mkdir(parents=True)
+                (repo_path / "src" / "tandem_agents" / "api" / "main_test.py").write_text(
+                    "import unittest\n",
+                    encoding="utf-8",
+                )
+                subtasks = [
+                    {
+                        "id": "subtask-1",
+                        "files": [
+                            "src/tandem_agents/api/worktree_isolation.py",
+                            "tests/test_worktree_isolation.py",
+                        ],
+                        "target_files": [
+                            "src/tandem_agents/api/worktree_isolation.py",
+                            "tests/test_worktree_isolation.py",
+                        ],
+                    }
+                ]
+
+                _align_python_test_targets_to_repo_conventions(repo_path, subtasks)
+
+                expected = [
+                    "src/tandem_agents/api/worktree_isolation.py",
+                    "src/tandem_agents/api/worktree_isolation_test.py",
+                ]
+                self.assertEqual(subtasks[0]["files"], expected)
+                self.assertEqual(subtasks[0]["target_files"], expected)
+                self.assertIn("sibling *_test.py convention", subtasks[0]["scope_note"])
+
+    def test_mark_manager_planning_started_updates_status_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status_path = Path(tmp) / "status.json"
+            ctx = SimpleNamespace(
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "phase": {"name": "task_resolution", "updated_at_ms": 1},
+                    "blocker": {"active": False},
+                    "metrics": {},
+                },
+                layout={"status": status_path},
+            )
+
+            _mark_manager_planning_started(ctx)
+
+            self.assertEqual(ctx.status["phase"]["name"], "planning")
+            self.assertEqual(ctx.status["phase"]["detail"], "manager planning")
+            self.assertEqual(ctx.status["phase"]["role"], "manager")
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["phase"]["name"], "planning")
 
     def test_manager_plan_sanitizes_absolute_partial_patch_paths(self) -> None:
         plan = {

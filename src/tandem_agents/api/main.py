@@ -387,6 +387,9 @@ def _apply_task_source_env(target_env: Dict[str, str], task_source: Optional[Dic
     for key, value in (task_source or {}).items():
         if value is None:
             continue
+        if key == "payload" and isinstance(value, dict):
+            target_env["ACA_TASK_SOURCE_PAYLOAD"] = json.dumps(value, sort_keys=True)
+            continue
         text = str(value).strip()
         if not text:
             continue
@@ -1218,6 +1221,96 @@ def _operator_coordination_state(target_state: str) -> str:
     return "queued"
 
 
+def _operator_terminalize_reset_run(
+    cfg,
+    *,
+    run_id: str,
+    task_id: str,
+    target_status: str,
+    coordination_state: str,
+    lease: dict[str, Any] | None = None,
+) -> bool:
+    run_id = str(run_id or "").strip()
+    if not run_id or coordination_state == "active":
+        return False
+    run_dir = _run_dir(cfg, run_id)
+    status_path = run_dir / "status.json"
+    if not status_path.exists():
+        return False
+    try:
+        status_payload = load_status(status_path)
+    except Exception:
+        logger.debug("Could not load status for operator-reset run %s", run_id, exc_info=True)
+        return False
+    if not _persisted_run_is_active(status_payload):
+        return False
+
+    now = int(time.time() * 1000)
+    message = f"Operator moved task {task_id} to {target_status}; ACA cleared the active run claim."
+    run_meta = status_payload.setdefault("run", {})
+    run_meta["status"] = "blocked" if coordination_state != "done" else "completed"
+    run_meta["updated_at_ms"] = now
+    run_meta["completed_at_ms"] = now
+    run_meta["error"] = message if coordination_state != "done" else None
+    timestamps = status_payload.setdefault("timestamps", {})
+    timestamps["updated_at_ms"] = now
+    timestamps["completed_at_ms"] = now
+    phase = status_payload.setdefault("phase", {})
+    phase["name"] = "coordination"
+    phase["detail"] = message
+    phase["role"] = "operator"
+    phase["updated_at_ms"] = now
+    coordination = status_payload.setdefault("coordination", {})
+    if isinstance(lease, dict):
+        for source_key, status_key in (
+            ("lease_id", "lease_id"),
+            ("worker_id", "worker_id"),
+            ("host_id", "host_id"),
+            ("task_key", "task_key"),
+            ("expires_at_ms", "lease_expires_at_ms"),
+            ("heartbeat_at_ms", "lease_heartbeat_at_ms"),
+            ("status", "lease_status"),
+        ):
+            value = lease.get(source_key)
+            if value is not None:
+                coordination[status_key] = value
+    coordination["operator_reset_at_ms"] = now
+    blocker = status_payload.setdefault("blocker", {})
+    blocker["active"] = coordination_state != "done"
+    blocker["kind"] = None if coordination_state == "done" else "operator_requeued"
+    blocker["message"] = None if coordination_state == "done" else message
+    blocker["owner_role"] = None if coordination_state == "done" else "operator"
+    try:
+        write_status(status_path, status_payload)
+        append_event(
+            run_dir / "events.jsonl",
+            "run.completed" if coordination_state == "done" else "run.blocked",
+            run_id,
+            {
+                "kind": "operator_state_update",
+                "task_id": task_id,
+                "target_status": target_status,
+                "coordination_state": coordination_state,
+                "message": message,
+            },
+        )
+    except Exception:
+        logger.debug("Could not write operator-reset terminal status for run %s", run_id, exc_info=True)
+        return False
+    with run_manager._lock:
+        active_state = run_manager.runs.get(run_id)
+        if active_state is not None:
+            active_state.is_running = False
+            active_state.error = None if coordination_state == "done" else message
+            active_state.result = {
+                "run_id": run_id,
+                "status": run_meta["status"],
+                "operator_state_update": True,
+                "message": message,
+            }
+    return True
+
+
 @app.post("/projects/{slug:path}/tasks/{item}/state")
 async def update_project_task_state(
     slug: str,
@@ -1296,6 +1389,9 @@ async def update_project_task_state(
         registered = store.register_task(task_for_key, repo=repo, status=coord_state)
         task_key = str((registered or {}).get("task_key") or "").strip()
         if task_key:
+            previous_task = store.get_task(task_key) or {}
+            previous_run_id = str((previous_task or {}).get("claimed_run_id") or "").strip()
+            previous_lease_id = str((previous_task or {}).get("claimed_lease_id") or "").strip()
             coordination_task = store.transition_task_state(
                 task_key,
                 coord_state,
@@ -1303,6 +1399,16 @@ async def update_project_task_state(
                 reason=f"operator moved Linear issue to {target_status}",
                 clear_claim=coord_state != "active",
             )
+            if previous_run_id and coord_state != "active":
+                lease = store.get_lease(previous_lease_id) if previous_lease_id else None
+                _operator_terminalize_reset_run(
+                    cfg,
+                    run_id=previous_run_id,
+                    task_id=item,
+                    target_status=target_status,
+                    coordination_state=coord_state,
+                    lease=lease,
+                )
     except Exception as exc:
         logger.warning("Could not update ACA coordination task state for %s: %s", item, exc)
     return {

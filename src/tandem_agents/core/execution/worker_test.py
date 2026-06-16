@@ -51,6 +51,7 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _apply_tolerated_failures,
     _diff_has_unproductive_marker,
     _diff_has_tautological_boolean_assertion,
+    _diff_has_placeholder_noop_test,
     _diff_is_comment_only,
     _diff_is_local_string_oracle_test,
     _diff_is_string_only_change,
@@ -201,6 +202,22 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
         self.assertTrue(_diff_has_tautological_boolean_assertion(diff))
         self.assertFalse(_diff_is_string_only_change(diff))
+
+    def test_placeholder_noop_test_diff_is_unproductive(self) -> None:
+        diff = """diff --git a/tests/part09.rs b/tests/part09.rs
+--- a/tests/part09.rs
++++ b/tests/part09.rs
+@@ -1,3 +1,11 @@
++#[test]
++fn github_projects_readiness_regression_placeholder_exercises_existing_fixture() {
++    // Tooling for this continuation only exposed edit/apply/write and did not
++    // expose read/grep/bash, so this placeholder must be replaced before completion.
++    assert!(true);
++}
+ """
+
+        self.assertTrue(_diff_has_placeholder_noop_test(diff))
+        self.assertFalse(_diff_is_local_string_oracle_test(diff))
 
     def test_string_only_test_wording_diff_is_unproductive(self) -> None:
         diff = """diff --git a/tests/part09.rs b/tests/part09.rs

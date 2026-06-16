@@ -218,6 +218,27 @@ def _diff_is_local_string_oracle_test(diff_text: str) -> bool:
     return bool(local_strings) and meaningful_asserts >= 2
 
 
+def _diff_has_placeholder_noop_test(diff_text: str) -> bool:
+    added = [
+        line.strip().lower()
+        for line in _added_diff_lines(diff_text)
+        if line.strip() and not line.strip().startswith(("+++", "#["))
+    ]
+    if not added:
+        return False
+    placeholder_terms = (
+        "placeholder",
+        "must be replaced",
+        "replace with",
+        "before completion",
+        "before merging",
+        "not implemented",
+    )
+    has_placeholder_language = any(any(term in line for term in placeholder_terms) for line in added)
+    has_noop_assertion = any(re.fullmatch(r"assert!\(\s*true\s*\)\s*;", line) for line in added)
+    return has_noop_assertion and has_placeholder_language
+
+
 def _diff_missing_production_function_calls(worktree: Path, diff_text: str, changed_files: list[str]) -> list[str]:
     if not changed_files or not all(_is_test_path(path) for path in changed_files):
         return []
@@ -405,6 +426,7 @@ def dispatch_workers(ctx: RunContext) -> None:
     active_workers_lock = threading.Lock()
     active_workers: set[str] = set()
     active_worker_started_at: dict[str, float] = {}
+    active_worker_started_at_ms: dict[str, int] = {}
     active_worker_worktrees: dict[str, Path] = {}
     active_worker_subtasks: dict[str, dict[str, Any]] = {}
     active_worker_progress_snapshots: dict[str, dict[str, Any]] = {}
@@ -591,6 +613,8 @@ def dispatch_workers(ctx: RunContext) -> None:
             unproductive_reason = ""
             if _diff_has_unproductive_marker(diff_text):
                 unproductive_reason = "worker diff contains an explicit placeholder/blocker marker"
+            elif _diff_has_placeholder_noop_test(diff_text):
+                unproductive_reason = "worker diff adds an explicit placeholder/no-op test"
             elif (
                 comment_only_abort_seconds > 0
                 and elapsed_seconds >= comment_only_abort_seconds
@@ -856,6 +880,7 @@ def dispatch_workers(ctx: RunContext) -> None:
             with active_workers_lock:
                 active_workers.discard(wid)
                 active_worker_started_at.pop(wid, None)
+                active_worker_started_at_ms.pop(wid, None)
                 active_worker_worktrees.pop(wid, None)
                 active_worker_subtasks.pop(wid, None)
                 active_worker_progress_snapshots.pop(wid, None)
@@ -878,6 +903,7 @@ def dispatch_workers(ctx: RunContext) -> None:
         with active_workers_lock:
             active_workers.add(wid)
             active_worker_started_at[wid] = time.monotonic()
+            active_worker_started_at_ms[wid] = int(time.time() * 1000)
             subtask_id = str(subtask.get("id") or "").strip()
             if subtask_id:
                 active_worker_worktrees[wid] = ctx.run_dir / "worktrees" / f"{wid}--{subtask_id}"
