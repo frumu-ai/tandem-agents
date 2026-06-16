@@ -83,13 +83,14 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             root = Path(tmp)
             self._write_minimal_config(root)
             cfg = resolve_config(root)
-            run_dir = cfg.output_root() / "run-operator-reset"
+            run_id = f"run-operator-reset-{root.name}"
+            run_dir = cfg.output_root() / run_id
             run_dir.mkdir(parents=True)
             (run_dir / "status.json").write_text(
                 json.dumps(
                     {
                         "run": {
-                            "run_id": "run-operator-reset",
+                            "run_id": run_id,
                             "status": "running",
                             "updated_at_ms": 1,
                             "completed_at_ms": None,
@@ -104,7 +105,7 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
 
             updated = _operator_terminalize_reset_run(
                 cfg,
-                run_id="run-operator-reset",
+                run_id=run_id,
                 task_id="TAN-170",
                 target_status="Backlog",
                 coordination_state="queued",
@@ -139,12 +140,13 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             root = Path(tmp)
             self._write_minimal_config(root)
             cfg = resolve_config(root)
-            run_dir = cfg.output_root() / "run-orphan"
+            run_id = f"run-orphan-{root.name}"
+            run_dir = cfg.output_root() / run_id
             run_dir.mkdir(parents=True)
             (run_dir / "status.json").write_text(
                 json.dumps(
                     {
-                        "run": {"run_id": "run-orphan", "status": "running"},
+                        "run": {"run_id": run_id, "status": "running"},
                         "task": {
                             "task_id": "TAN-170",
                             "source": {"type": "linear", "identifier": "TAN-170"},
@@ -157,7 +159,7 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
 
             self.assertEqual(
                 _active_run_claim_for_task(cfg, "TAN-170"),
-                {"run_id": "run-orphan", "lease_id": "lease-orphan"},
+                {"run_id": run_id, "lease_id": "lease-orphan"},
             )
 
     def test_coder_supervisor_reconcile_is_serialized(self) -> None:
