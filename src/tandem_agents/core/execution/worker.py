@@ -1748,6 +1748,31 @@ def _log_path_run_has_terminal_status(log_path: Path) -> bool:
     return run_status in {"blocked", "completed"} or run.get("completed_at_ms") is not None
 
 
+def _execution_id_from_worktree_path(cwd: Path) -> str:
+    name = str(getattr(cwd, "name", "") or "").strip()
+    marker = "--exec-"
+    if marker not in name:
+        return ""
+    return name.split(marker, 1)[1].strip()
+
+
+def _log_path_worker_attempt_is_current(log_path: Path, worker_id: str, cwd: Path) -> bool:
+    execution_id = _execution_id_from_worktree_path(cwd)
+    worker_id = str(worker_id or "").strip()
+    if not execution_id or not worker_id:
+        return True
+    attempts_path = log_path.parent.parent / "active_worker_attempts.json"
+    if not attempts_path.is_file():
+        return True
+    try:
+        attempts = json.loads(attempts_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    if not isinstance(attempts, dict):
+        return True
+    return str(attempts.get(worker_id) or "").strip() == execution_id
+
+
 def _active_worker_attempts_path(layout: dict[str, Path]) -> Path | None:
     run_dir = layout.get("run_dir")
     if not isinstance(run_dir, Path):
@@ -2980,6 +3005,24 @@ def stream_tandem_prompt(
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\n=== {role} @ {now_ms()} ===\n")
             log.write(prompt.strip() + "\n\n")
+            if role.startswith("worker") and not _log_path_worker_attempt_is_current(log_path, role, cwd):
+                message = "ACA_WORKER_ATTEMPT_INACTIVE: worker execution is no longer the active attempt before engine session creation.\n"
+                log.write(message)
+                log.flush()
+                _print_line(role, message)
+                return {
+                    "role": role,
+                    "returncode": 1,
+                    "stdout": message,
+                    "log_path": str(log_path),
+                    "cwd": str(cwd),
+                    "session_id": "",
+                    "engine_run_id": "",
+                    "engine": {"session_id": "", "run_id": "", "retry_count": 0, "fallback_mode": None},
+                    "failure_reason": "WORKER_ATTEMPT_INACTIVE",
+                    "blocker_kind": "worker_attempt_inactive",
+                    "recovery_action": "ACA stopped this abandoned worker because a newer worker attempt is active.",
+                }
             if role.startswith("worker") and _log_path_run_has_terminal_status(log_path):
                 message = "ACA_WORKER_ATTEMPT_INACTIVE: run reached terminal status before engine session creation.\n"
                 log.write(message)
@@ -3075,11 +3118,28 @@ def stream_tandem_prompt(
                         log.flush()
                         _print_line(role, line)
 
-                def _terminal_run_result(reason: str) -> dict[str, Any] | None:
-                    if not role.startswith("worker") or not _log_path_run_has_terminal_status(log_path):
+                def _worker_stop_result(reason: str) -> dict[str, Any] | None:
+                    if not role.startswith("worker"):
+                        return None
+                    failure_reason = ""
+                    blocker_kind = ""
+                    recovery_action = ""
+                    if _log_path_run_has_terminal_status(log_path):
+                        detail = "run reached terminal status"
+                        failure_reason = "RUN_TERMINAL"
+                        blocker_kind = "run_terminal"
+                        recovery_action = "ACA stopped this abandoned worker because the run is already terminal."
+                    elif not _log_path_worker_attempt_is_current(log_path, role, cwd):
+                        detail = "worker execution is no longer the active attempt"
+                        failure_reason = "WORKER_ATTEMPT_INACTIVE"
+                        blocker_kind = "worker_attempt_inactive"
+                        recovery_action = "ACA stopped this abandoned worker because a newer worker attempt is active."
+                    else:
                         return None
                     message = (
-                        "ACA_WORKER_ATTEMPT_INACTIVE: run reached terminal status before "
+                        "ACA_WORKER_ATTEMPT_INACTIVE: "
+                        + detail
+                        + " before "
                         f"{reason}; stopping worker engine recovery.\n"
                     )
                     log.write(message)
@@ -3094,9 +3154,9 @@ def stream_tandem_prompt(
                         "session_id": session_id or "",
                         "engine_run_id": last_run_id,
                         "engine": engine_meta,
-                        "failure_reason": "RUN_TERMINAL",
-                        "blocker_kind": "run_terminal",
-                        "recovery_action": "ACA stopped this abandoned worker because the run is already terminal.",
+                        "failure_reason": failure_reason,
+                        "blocker_kind": blocker_kind,
+                        "recovery_action": recovery_action,
                     }
 
                 if role.startswith("worker") and write_required and _use_prompt_sync_first(cfg, prompt_sync_first):
@@ -3285,9 +3345,9 @@ def stream_tandem_prompt(
                             "tool-capable recovery on the same worktree."
                         )
                     if recover_with_async:
-                        terminal_result = _terminal_run_result("async recovery session creation")
-                        if terminal_result is not None:
-                            return terminal_result
+                        stop_result = _worker_stop_result("async recovery session creation")
+                        if stop_result is not None:
+                            return stop_result
                         previous_session_id = session_id
                         engine_meta["prompt_sync_first_session_id"] = previous_session_id
                         recovery_notice = (
@@ -3357,9 +3417,9 @@ def stream_tandem_prompt(
 
                 def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str, str]:
                     nonlocal last_run_id
-                    terminal_result = _terminal_run_result("async prompt dispatch")
-                    if terminal_result is not None:
-                        return terminal_result["stdout"], False, last_run_id, "run_terminal"
+                    stop_result = _worker_stop_result("async prompt dispatch")
+                    if stop_result is not None:
+                        return stop_result["stdout"], False, last_run_id, str(stop_result.get("blocker_kind") or "worker_stopped")
                     try:
                         async_result = _call_with_timeout(
                             lambda: sdk_sessions_prompt_async(
@@ -3468,9 +3528,9 @@ def stream_tandem_prompt(
 
                 stdout_text, completed, run_id, stream_reason = _run_async_once(prompt, 0)
                 if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
-                    terminal_result = _terminal_run_result("same-session async retry")
-                    if terminal_result is not None:
-                        return terminal_result
+                    stop_result = _worker_stop_result("same-session async retry")
+                    if stop_result is not None:
+                        return stop_result
                     retry_notice = (
                         f"ENGINE_EMPTY_RESPONSE_RETRY: engine run {run_id or 'unknown'} completed "
                         "without transcript text; retrying once in the same session.\n"
@@ -3499,9 +3559,9 @@ def stream_tandem_prompt(
                 fallback_blocker_kind = ""
                 fallback_failure_message = ""
                 if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
-                    terminal_result = _terminal_run_result("prompt_sync fallback")
-                    if terminal_result is not None:
-                        return terminal_result
+                    stop_result = _worker_stop_result("prompt_sync fallback")
+                    if stop_result is not None:
+                        return stop_result
                     engine_meta["fallback_mode"] = "prompt_sync"
                     fallback_notice = (
                         f"ENGINE_EMPTY_RESPONSE_FALLBACK: engine run {run_id or 'unknown'} still had "
