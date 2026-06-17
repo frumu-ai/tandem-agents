@@ -1803,7 +1803,7 @@ def _mark_active_worker_engine_session(
 ) -> None:
     worker_id = str(worker_id or "").strip()
     session_id = str(session_id or "").strip()
-    if not worker_id.startswith("worker-") or not session_id:
+    if (worker_id != "manager" and not worker_id.startswith("worker-")) or not session_id:
         return
     path = _active_worker_engine_sessions_path_for_log(log_path)
     if path is None:
@@ -1828,7 +1828,7 @@ def _mark_active_worker_engine_session(
 def _clear_active_worker_engine_session(log_path: Path, worker_id: str, session_id: str) -> None:
     worker_id = str(worker_id or "").strip()
     session_id = str(session_id or "").strip()
-    if not worker_id.startswith("worker-") or not session_id:
+    if (worker_id != "manager" and not worker_id.startswith("worker-")) or not session_id:
         return
     path = _active_worker_engine_sessions_path_for_log(log_path)
     if path is None:

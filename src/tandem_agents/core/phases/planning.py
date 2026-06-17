@@ -16,9 +16,11 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
+from src.tandem_agents.core.engine.engine import delete_tandem_session
 from src.tandem_agents.core.phases.context import RunContext
 from src.tandem_agents.core.task_contract import task_contract_payload
 
@@ -44,6 +46,99 @@ _PRODUCTION_SOURCE_EXTENSIONS = {
     ".ts",
     ".tsx",
 }
+
+
+def _active_engine_sessions_path(ctx: RunContext) -> Path:
+    return ctx.run_dir / "active_worker_engine_sessions.json"
+
+
+def _pop_active_engine_session(ctx: RunContext, role: str) -> dict[str, Any]:
+    role = str(role or "").strip()
+    if not role:
+        return {}
+    path = _active_engine_sessions_path(ctx)
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    info = dict(loaded.pop(role, {}) or {})
+    if loaded:
+        from src.tandem_agents.utils.utils import atomic_write_json
+
+        atomic_write_json(path, loaded)
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return info
+
+
+def _cancel_active_manager_engine_session(ctx: RunContext, reason: str) -> None:
+    info = _pop_active_engine_session(ctx, "manager")
+    session_id = str(info.get("session_id") or "").strip()
+    if not session_id:
+        return
+    run_id = str(info.get("run_id") or "").strip()
+    reason = str(reason or "manager_cancelled").strip() or "manager_cancelled"
+    from src.tandem_agents.runtime.runstate import append_event
+
+    append_event(
+        ctx.layout["events"],
+        "manager.engine_cancel_requested",
+        ctx.run_id,
+        {
+            "session_id": session_id,
+            "engine_run_id": run_id,
+            "reason": reason,
+        },
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+
+    def _delete() -> None:
+        try:
+            delete_tandem_session(ctx.cfg, session_id)
+            append_event(
+                ctx.layout["events"],
+                "manager.engine_cancelled",
+                ctx.run_id,
+                {
+                    "session_id": session_id,
+                    "engine_run_id": run_id,
+                    "reason": reason,
+                },
+                task_id=ctx.task.get("task_id"),
+                role="manager",
+                repo={"path": ctx.repo.get("path")},
+            )
+        except Exception as exc:
+            append_event(
+                ctx.layout["events"],
+                "manager.engine_cancel_failed",
+                ctx.run_id,
+                {
+                    "session_id": session_id,
+                    "engine_run_id": run_id,
+                    "reason": reason,
+                    "error": str(exc)[:500],
+                },
+                task_id=ctx.task.get("task_id"),
+                role="manager",
+                repo={"path": ctx.repo.get("path")},
+            )
+
+    thread = threading.Thread(
+        target=_delete,
+        name="aca-cancel-engine-session-manager",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _normalize_repo_relative_path(value: Any) -> str:
@@ -1962,6 +2057,7 @@ def run_manager_prompt(ctx: RunContext) -> None:
         try:
             manager_result = future.result(timeout=timeout_seconds)
         except FutureTimeoutError:
+            _cancel_active_manager_engine_session(ctx, "manager_prompt_timeout")
             message = (
                 "ENGINE_PROMPT_TIMEOUT: ACA manager planning prompt exceeded "
                 f"{timeout_seconds:.0f}s without producing a plan. The run will use "

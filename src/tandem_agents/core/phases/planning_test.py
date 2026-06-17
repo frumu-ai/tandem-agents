@@ -4,6 +4,7 @@ import unittest
 import tempfile
 import json
 import contextlib
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -13,6 +14,7 @@ from src.tandem_agents.core.phases.planning import (
     _append_deferred_repair_subtasks,
     _apply_repo_context_required_files_to_task,
     _carry_forward_partial_diff_artifacts,
+    _cancel_active_manager_engine_session,
     _constrain_extra_partial_diff_repair_subtasks,
     _completed_repair_worker_results,
     _deterministic_testless_partial_diff_repair_plan,
@@ -32,6 +34,54 @@ from src.tandem_agents.core.phases.planning import (
 
 
 class PlanningPreScreenTest(unittest.TestCase):
+    def test_cancel_active_manager_engine_session_deletes_marked_session(self) -> None:
+        from src.tandem_agents.runtime.runstate import ensure_layout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            layout = ensure_layout(run_dir)
+            marker = run_dir / "active_worker_engine_sessions.json"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "manager": {
+                            "session_id": "session-1",
+                            "run_id": "run-1",
+                            "log_path": str(run_dir / "logs" / "manager.log"),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={}),
+                run_id="aca-run-1",
+                run_dir=run_dir,
+                layout=layout,
+                task={"task_id": "TAN-173"},
+                repo={"path": "/repo"},
+            )
+
+            with mock.patch("src.tandem_agents.core.phases.planning.delete_tandem_session") as delete_session:
+                _cancel_active_manager_engine_session(ctx, "manager_prompt_timeout")
+                for _ in range(50):
+                    if delete_session.call_count and "manager.engine_cancelled" in layout["events"].read_text(
+                        encoding="utf-8"
+                    ):
+                        break
+                    time.sleep(0.01)
+
+            delete_session.assert_called_once_with(ctx.cfg, "session-1")
+            self.assertFalse(marker.exists())
+            events = [
+                json.loads(line)
+                for line in layout["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [event["type"] for event in events],
+                ["manager.engine_cancel_requested", "manager.engine_cancelled"],
+            )
+
     def test_append_deferred_repair_subtasks_resumes_serial_tail(self) -> None:
         ctx = SimpleNamespace(
             blackboard={
