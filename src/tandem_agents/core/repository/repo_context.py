@@ -248,6 +248,8 @@ def _task_path_scope(task: dict[str, Any]) -> str:
         return "crates/tandem-meta-harness-eval"
     if _is_github_projects_coder_task(lowered_text):
         return "crates/tandem-server/src/http"
+    if _is_aca_worktree_isolation_task(lowered_text):
+        return "src/tandem_agents/core"
     for match in re.finditer(r"(?:^|[\s`'\"])((?:crates|packages|apps|src|scripts|docs|tests)/[A-Za-z0-9_./-]+)", text):
         scope = _scope_from_path(match.group(1))
         if scope:
@@ -257,16 +259,27 @@ def _task_path_scope(task: dict[str, Any]) -> str:
 
 def _task_domain_hints(task: dict[str, Any]) -> list[str]:
     lowered_text = _task_query_text_without_targets(task).lower()
-    if not _is_github_projects_coder_task(lowered_text):
-        return []
-    return [
-        "CoderGithubProjectBinding",
-        "CoderGithubProjectInboxResponse",
-        "CoderGithubProjectIntakeInput",
-        "schema_drift",
-        "live_schema_fingerprint",
-        *_task_domain_required_files(task),
-    ]
+    if _is_github_projects_coder_task(lowered_text):
+        return [
+            "CoderGithubProjectBinding",
+            "CoderGithubProjectInboxResponse",
+            "CoderGithubProjectIntakeInput",
+            "schema_drift",
+            "live_schema_fingerprint",
+            *_task_domain_required_files(task),
+        ]
+    if _is_aca_worktree_isolation_task(lowered_text):
+        return [
+            "run_task_intake",
+            "checkout_run_branch",
+            "task_run_branch_name",
+            "create_worktree",
+            "worker_worktree_name",
+            "CoordinationStore.claim_task",
+            "finalize_completed_run",
+            *_task_domain_required_files(task),
+        ]
+    return []
 
 
 def _is_github_projects_coder_task(lowered_text: str) -> bool:
@@ -275,15 +288,34 @@ def _is_github_projects_coder_task(lowered_text: str) -> bool:
     return has_github_project and has_coder_context
 
 
+def _is_aca_worktree_isolation_task(lowered_text: str) -> bool:
+    has_aca_context = "aca" in lowered_text or "autonomous coding agent" in lowered_text
+    has_issue_context = "linear issue" in lowered_text or "claimed issue" in lowered_text or "per-issue" in lowered_text
+    has_isolation_context = (
+        "worktree" in lowered_text
+        and "branch" in lowered_text
+        and any(term in lowered_text for term in ("isolation", "parallel", "overlap", "conflict"))
+    )
+    return has_aca_context and has_issue_context and has_isolation_context
+
+
 def _task_domain_required_files(task: dict[str, Any]) -> list[str]:
     lowered_text = _task_query_text_without_targets(task).lower()
-    if not _is_github_projects_coder_task(lowered_text):
-        return []
-    return [
-        "crates/tandem-server/src/http/coder_parts/part05.rs",
-        "crates/tandem-server/src/http/coder_parts/part09.rs",
-        "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
-    ]
+    if _is_github_projects_coder_task(lowered_text):
+        return [
+            "crates/tandem-server/src/http/coder_parts/part05.rs",
+            "crates/tandem-server/src/http/coder_parts/part09.rs",
+            "crates/tandem-server/src/http/tests/coder_parts/part09.rs",
+        ]
+    if _is_aca_worktree_isolation_task(lowered_text):
+        return [
+            "src/tandem_agents/core/phases/task_intake.py",
+            "src/tandem_agents/core/repository/repository.py",
+            "src/tandem_agents/core/repository/repository_test.py",
+            "src/tandem_agents/core/phases/finalize.py",
+            "src/tandem_agents/core/phases/pr_body.py",
+        ]
+    return []
 
 
 def _context_bundle_has_evidence(bundle: dict[str, Any]) -> bool:

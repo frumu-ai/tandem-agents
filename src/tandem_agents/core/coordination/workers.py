@@ -152,7 +152,14 @@ class CoordinationWorkersMixin:
             for row in rows:
                 lease_id = str(row["current_lease_id"] or "").strip()
                 lease = conn.execute("SELECT * FROM leases WHERE lease_id = ?", (lease_id,)).fetchone() if lease_id else None
-                if lease and lease["status"] == "active":
+                lease_worker_id = str(lease["worker_id"] or "").strip() if lease else ""
+                row_worker_id = str(row["worker_id"] or "").strip()
+                lease_owned_by_worker = bool(lease and lease_worker_id == row_worker_id)
+                lease_heartbeat_at = int(lease["heartbeat_at_ms"] or 0) if lease else 0
+                lease_heartbeat_stale = lease_heartbeat_at <= now - stale_after_ms
+                if lease and lease["status"] == "active" and lease_owned_by_worker and not lease_heartbeat_stale:
+                    continue
+                if lease and lease["status"] == "active" and lease_owned_by_worker and lease_heartbeat_stale:
                     conn.execute(
                         "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
                         (now, lease_id),
@@ -169,7 +176,21 @@ class CoordinationWorkersMixin:
                     "UPDATE workers SET status = 'idle', current_lease_id = NULL, current_run_id = NULL, updated_at_ms = ? WHERE worker_id = ?",
                     (now, row["worker_id"]),
                 )
-                stale.append(self._row_to_worker(row))
+                stale_worker = self._row_to_worker(row)
+                if lease_owned_by_worker and lease_heartbeat_stale:
+                    stale_worker.update(
+                        {
+                            "lease_id": str(lease["lease_id"] or ""),
+                            "run_id": str(lease["run_id"] or ""),
+                            "task_key": str(lease["task_key"] or ""),
+                            "task_id": str(lease["task_id"] or ""),
+                            "lease_status": "stale",
+                            "release_reason": "worker stale",
+                            "lease_heartbeat_at_ms": lease["heartbeat_at_ms"],
+                            "lease_expires_at_ms": lease["expires_at_ms"],
+                        }
+                    )
+                stale.append(stale_worker)
             conn.commit()
         return stale
     def _reap_stale_workers_locked(self, conn: sqlite3.Connection, now: int, *, stale_after_seconds: int = DEFAULT_WORKER_STALE_AFTER_SECONDS) -> None:
@@ -184,7 +205,13 @@ class CoordinationWorkersMixin:
         for row in rows:
             lease_id = str(row["current_lease_id"] or "").strip()
             lease = conn.execute("SELECT * FROM leases WHERE lease_id = ?", (lease_id,)).fetchone() if lease_id else None
-            if lease and lease["status"] == "active":
+            lease_worker_id = str(lease["worker_id"] or "").strip() if lease else ""
+            row_worker_id = str(row["worker_id"] or "").strip()
+            lease_heartbeat_at = int(lease["heartbeat_at_ms"] or 0) if lease else 0
+            lease_heartbeat_stale = lease_heartbeat_at <= now - stale_after_ms
+            if lease and lease["status"] == "active" and lease_worker_id == row_worker_id and not lease_heartbeat_stale:
+                continue
+            if lease and lease["status"] == "active" and lease_worker_id == row_worker_id and lease_heartbeat_stale:
                 conn.execute(
                     "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
                     (now, lease_id),

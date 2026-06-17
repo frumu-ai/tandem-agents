@@ -49,7 +49,7 @@ from src.tandem_agents.runtime.workspace_registry import (
 )
 from src.tandem_agents.runtime.runstate import load_status, load_blackboard, set_event_broadcast_callback, new_run_id
 from src.tandem_agents.runtime.runstate import append_event, write_status
-from src.tandem_agents.runtime.run_output import save_run_text
+from src.tandem_agents.runtime.run_output import build_blocked_summary, save_run_text
 from src.tandem_agents.core.external_actions.github_pr import execute_approved_actions
 from src.tandem_agents.core.integrations.linear_mcp import (
     linear_status_name_for_task_state,
@@ -223,12 +223,14 @@ async def _coordination_reaper_loop(cfg) -> None:
         try:
             expired = await asyncio.to_thread(coordination_reaper_tick, cfg)
             if expired:
+                terminalized = await asyncio.to_thread(_terminalize_reaped_coordination_runs, cfg, expired)
                 logger.info("Reaped %s expired coordination lease(s).", len(expired))
                 run_manager.broadcast_global(
                     "coordination_leases_reaped",
                     {
                         "count": len(expired),
                         "leases": expired,
+                        "terminalized_runs": terminalized,
                     },
                 )
         except asyncio.CancelledError:
@@ -1221,6 +1223,147 @@ def _operator_coordination_state(target_state: str) -> str:
     return "queued"
 
 
+def _terminalize_expired_coordination_run(cfg, lease: dict[str, Any] | None) -> bool:
+    if not isinstance(lease, dict):
+        return False
+    run_id = str(lease.get("run_id") or lease.get("current_run_id") or "").strip()
+    lease_id = str(lease.get("lease_id") or lease.get("current_lease_id") or "").strip()
+    if not run_id:
+        return False
+    run_dir = _run_dir(cfg, run_id)
+    status_path = run_dir / "status.json"
+    if not status_path.exists():
+        return False
+    try:
+        status_payload = load_status(status_path)
+    except Exception:
+        logger.debug("Could not load status for expired coordination run %s", run_id, exc_info=True)
+        return False
+    if not _persisted_run_is_active(status_payload):
+        return False
+
+    now = int(time.time() * 1000)
+    reason = str(lease.get("release_reason") or "expired").strip()
+    message = (
+        f"Coordination lease {lease_id or '(unknown)'} {reason}; "
+        "ACA marked this run blocked because its worker claim is no longer active."
+    )
+    run_meta = status_payload.setdefault("run", {})
+    run_meta["run_id"] = str(run_meta.get("run_id") or run_id)
+    run_meta["status"] = "blocked"
+    run_meta["updated_at_ms"] = now
+    run_meta["completed_at_ms"] = now
+    run_meta["error"] = message
+    timestamps = status_payload.setdefault("timestamps", {})
+    timestamps["updated_at_ms"] = now
+    timestamps["completed_at_ms"] = now
+    phase = status_payload.setdefault("phase", {})
+    phase["name"] = "coordination"
+    phase["detail"] = message
+    phase["role"] = "coordinator"
+    phase["updated_at_ms"] = now
+    coordination = status_payload.setdefault("coordination", {})
+    for source_key, status_key in (
+        ("lease_id", "lease_id"),
+        ("worker_id", "worker_id"),
+        ("host_id", "host_id"),
+        ("task_key", "task_key"),
+        ("expires_at_ms", "lease_expires_at_ms"),
+        ("heartbeat_at_ms", "lease_heartbeat_at_ms"),
+    ):
+        value = lease.get(source_key)
+        if value is not None:
+            coordination[status_key] = value
+    coordination["lease_status"] = str(lease.get("status") or "stale").strip() or "stale"
+    coordination["lease_release_reason"] = reason
+    coordination["lease_terminalized_at_ms"] = now
+    blocker = status_payload.setdefault("blocker", {})
+    blocker["active"] = True
+    blocker["kind"] = "coordination_lease_expired"
+    blocker["message"] = message
+    blocker["owner_role"] = "coordinator"
+    task_payload = status_payload.get("task") if isinstance(status_payload.get("task"), dict) else {}
+    try:
+        write_status(status_path, status_payload)
+        save_run_text(
+            run_dir / "summary.md",
+            build_blocked_summary(
+                task_title=task_payload.get("title") if isinstance(task_payload, dict) else None,
+                message=message,
+            ),
+        )
+        append_event(
+            run_dir / "events.jsonl",
+            "run.blocked",
+            run_id,
+            {
+                "kind": "coordination_lease_expired",
+                "lease_id": lease_id,
+                "lease_status": coordination["lease_status"],
+                "release_reason": reason,
+                "message": message,
+            },
+        )
+    except Exception:
+        logger.debug("Could not write expired-lease terminal status for run %s", run_id, exc_info=True)
+        return False
+
+    try:
+        store = CoordinationStore.from_config(cfg)
+        store.ensure_schema()
+        store.update_run(
+            run_id,
+            status="blocked",
+            phase="coordination",
+            error=message,
+            completed=True,
+        )
+    except Exception:
+        logger.debug("Could not mirror expired-lease terminal status into coordination for %s", run_id, exc_info=True)
+
+    with run_manager._lock:
+        active_state = run_manager.runs.get(run_id)
+        if active_state is not None:
+            active_state.is_running = False
+            active_state.error = message
+            active_state.result = {
+                "run_id": run_id,
+                "status": "blocked",
+                "coordination_lease_expired": True,
+                "message": message,
+            }
+    return True
+
+
+def _terminalize_reaped_coordination_runs(cfg, reaped: list[dict[str, Any]]) -> list[str]:
+    terminalized: list[str] = []
+    store: CoordinationStore | None = None
+    for item in reaped:
+        if not isinstance(item, dict):
+            continue
+        lease: dict[str, Any] | None = None
+        lease_id = str(item.get("lease_id") or item.get("current_lease_id") or "").strip()
+        if lease_id:
+            try:
+                if store is None:
+                    store = CoordinationStore.from_config(cfg)
+                    store.ensure_schema()
+                fetched = store.get_lease(lease_id)
+                lease = fetched if isinstance(fetched, dict) else None
+            except Exception:
+                logger.debug("Could not reload reaped lease %s", lease_id, exc_info=True)
+        if lease is None:
+            lease = dict(item)
+            if lease_id and not lease.get("lease_id"):
+                lease["lease_id"] = lease_id
+            lease["status"] = str(lease.get("status") or "stale").strip() or "stale"
+            lease["release_reason"] = str(lease.get("release_reason") or "expired").strip() or "expired"
+        run_id = str(lease.get("run_id") or lease.get("current_run_id") or "").strip()
+        if _terminalize_expired_coordination_run(cfg, lease) and run_id:
+            terminalized.append(run_id)
+    return terminalized
+
+
 def _operator_terminalize_reset_run(
     cfg,
     *,
@@ -1370,6 +1513,24 @@ async def update_project_task_state(
     if not target_state:
         raise HTTPException(status_code=400, detail="state is required.")
     target_status = _operator_linear_status_name(cfg, target_state)
+    coord_state = _operator_coordination_state(target_state)
+    force_active_reset = bool(
+        payload.get("force")
+        or payload.get("confirm_active_run_reset")
+        or payload.get("clear_active_run")
+    )
+    if coord_state != "active" and not force_active_reset:
+        active_claim = await asyncio.to_thread(_active_run_claim_for_task, cfg, item)
+        if active_claim:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Refusing to move a task with an active ACA run without force=true.",
+                    "item": item,
+                    "target_status": target_status,
+                    "active_run": active_claim,
+                },
+            )
     task = {
         "task_id": item,
         "source": {
@@ -1397,7 +1558,6 @@ async def update_project_task_state(
     coordination_task = None
     try:
         store = CoordinationStore.from_config(cfg)
-        coord_state = _operator_coordination_state(target_state)
         task_for_key = {
             "task_id": item,
             "title": item,

@@ -1228,6 +1228,12 @@ def _linear_status_is_actionable(cfg: ResolvedConfig, status_name: str, state_ty
     return linear_status_key_is_actionable(status_name, state_type)
 
 
+def _linear_explicit_status_can_resume(status_name: str, state_type: str = "") -> bool:
+    status_key = normalize_linear_key(status_name)
+    state_key = normalize_linear_key(state_type)
+    return state_key == "started" or status_key in {"in_progress", "started"}
+
+
 def _linear_task_contract_ok(task: dict[str, Any]) -> bool:
     return bool((task.get("contract_completeness") or task_contract_completeness(task)).get("ok", True))
 
@@ -1694,7 +1700,11 @@ def _select_linear_issue(
                 continue
             status_name = _linear_issue_status(issue)
             state_type = _linear_issue_state_type(issue)
-            eligible = _linear_status_is_actionable(cfg, status_name, state_type)
+            eligible = _linear_status_is_actionable(
+                cfg,
+                status_name,
+                state_type,
+            ) or _linear_explicit_status_can_resume(status_name, state_type)
             task_projection = _linear_issue_to_task(cfg, issue, coordination=None)
             hard_blocker = _linear_contract_hard_blocker(task_projection)
             if hard_blocker:

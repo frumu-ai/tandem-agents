@@ -15,6 +15,7 @@ from src.tandem_agents.core.execution.worker import (
     _async_no_text_timeout_seconds,
     _async_prompt_timeout_seconds,
     _call_with_timeout,
+    _clear_active_worker_attempt,
     _coerce_worker_failure,
     _diff_touches_nearby_test_files,
     _engine_max_events_without_text,
@@ -41,6 +42,8 @@ from src.tandem_agents.core.execution.worker import (
     _terminalize_worker_after_tool_loop,
     _worktree_changed_files,
     _worker_result_should_retry,
+    _worker_execution_worktree_name,
+    _worker_note_reports_blocked,
     _worker_timeout_multiplier,
     _worker_prompt_retry_suffix,
     run_worker_subtask,
@@ -50,22 +53,104 @@ from src.tandem_agents.core.execution.worker import (
 from src.tandem_agents.core.phases.worker_dispatch import (
     _apply_tolerated_failures,
     _changed_files_satisfy_required_test_files,
+    _changed_python_syntax_errors,
+    _clear_active_worker_attempt_marker,
     _diff_has_unproductive_marker,
     _diff_has_tautological_boolean_assertion,
     _diff_has_placeholder_noop_test,
+    _diff_applies_to_head,
     _diff_is_comment_only,
     _diff_is_local_string_oracle_test,
     _diff_is_string_only_change,
+    _diff_changed_files_missing_substantive_production_followup,
     _diff_missing_production_function_calls,
+    _subtask_has_required_test_only_diff,
+    _subtask_has_verifiable_source_and_test_diff,
+    _sync_verifiable_worker_diff,
     _subtask_requires_test_changes,
     _subtask_required_test_files,
     _worker_no_progress_timeout_seconds,
     _worker_comment_only_diff_abort_seconds,
     _worker_testless_diff_abort_seconds,
+    _worker_verifiable_diff_abort_seconds,
 )
 
 
 class WorkerFailureCoercionTest(unittest.TestCase):
+    def test_dash_blocked_heading_reports_blocker(self) -> None:
+        self.assertTrue(
+            _worker_note_reports_blocked(
+                "Blocked \u2014 I inspected the patch but could not complete fixes before the tool session ended.\n"
+                "\nBlocker:\n- Verification failed.\n"
+            )
+        )
+        self.assertFalse(_worker_note_reports_blocked("Blocked by dependency analysis is not a final blocked status."))
+
+    def test_worker_clear_active_attempt_removes_matching_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            marker = run_dir / "active_worker_attempts.json"
+            marker.write_text(json.dumps({"worker-1": "exec-1", "worker-2": "exec-2"}), encoding="utf-8")
+            layout = {"run_dir": run_dir}
+
+            _clear_active_worker_attempt(layout, "worker-1", "exec-1")
+
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"worker-2": "exec-2"})
+
+    def test_worker_clear_active_attempt_keeps_newer_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            marker = run_dir / "active_worker_attempts.json"
+            marker.write_text(json.dumps({"worker-1": "new-exec"}), encoding="utf-8")
+            layout = {"run_dir": run_dir}
+
+            _clear_active_worker_attempt(layout, "worker-1", "old-exec")
+
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"worker-1": "new-exec"})
+
+    def test_dispatch_abort_clears_active_worker_attempt_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            marker = run_dir / "active_worker_attempts.json"
+            marker.write_text(
+                json.dumps({"worker-1": "old-exec", "worker-2": "other-exec"}),
+                encoding="utf-8",
+            )
+            ctx = SimpleNamespace(run_dir=run_dir)
+
+            _clear_active_worker_attempt_marker(ctx, "worker-1")
+
+            self.assertEqual(
+                json.loads(marker.read_text(encoding="utf-8")),
+                {"worker-2": "other-exec"},
+            )
+
+            _clear_active_worker_attempt_marker(ctx, "worker-2")
+
+            self.assertFalse(marker.exists())
+
+    def test_worker_execution_worktree_name_uses_safe_internal_override(self) -> None:
+        self.assertEqual(
+            _worker_execution_worktree_name(
+                "worker-1",
+                {
+                    "id": "subtask-1",
+                    "_worker_worktree_name": "worker-1--subtask-1--exec-123",
+                },
+            ),
+            "worker-1--subtask-1--exec-123",
+        )
+        self.assertEqual(
+            _worker_execution_worktree_name(
+                "worker-1",
+                {
+                    "id": "subtask-1",
+                    "_worker_worktree_name": "../shared-repo",
+                },
+            ),
+            "worker-1--subtask-1",
+        )
+
     def test_worker_no_progress_timeout_derives_from_effective_worker_budget(self) -> None:
         ctx = SimpleNamespace(
             cfg=SimpleNamespace(
@@ -177,6 +262,172 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
         self.assertEqual(_worker_comment_only_diff_abort_seconds(ctx), 0.0)
 
+    def test_verifiable_diff_guard_timeout_env_override_can_disable(self) -> None:
+        ctx = SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_VERIFIABLE_DIFF_ABORT_SECONDS": "0"}))
+
+        self.assertEqual(_worker_verifiable_diff_abort_seconds(ctx), 0.0)
+
+    def test_changed_python_syntax_errors_reports_invalid_changed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            valid = root / "valid.py"
+            invalid = root / "invalid.py"
+            valid.write_text("value = 1\n", encoding="utf-8")
+            invalid.write_text("def broken(:\n    pass\n", encoding="utf-8")
+
+            self.assertEqual(_changed_python_syntax_errors(root, ["valid.py"]), [])
+            errors = _changed_python_syntax_errors(root, ["valid.py", "invalid.py", "README.md"])
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("invalid.py", errors[0])
+            self.assertIn("invalid syntax", errors[0])
+
+    def test_sync_verifiable_worker_diff_emits_synced_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events.jsonl"
+            ctx = SimpleNamespace(
+                repo_path=root / "repo",
+                layout={"events": events},
+                run_id="run-1",
+                task={"task_id": "TAN-170"},
+                repo={"path": str(root / "repo")},
+            )
+            worktree = root / "worktree"
+            with mock.patch(
+                "src.tandem_agents.core.phases.worker_dispatch.sync_worktree_changes",
+                return_value=["src/app.py", "src/app_test.py"],
+            ):
+                ok, changed, synced, error = _sync_verifiable_worker_diff(
+                    ctx,
+                    worker_id="worker-1",
+                    subtask_id="subtask-1",
+                    worktree=worktree,
+                    changed_files=["src/app.py"],
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(changed, ["src/app.py", "src/app_test.py"])
+            self.assertEqual(synced, ["src/app.py", "src/app_test.py"])
+            self.assertEqual(error, "")
+            event = json.loads(events.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["type"], "worker.verifiable_diff_synced")
+            self.assertEqual(event["payload"]["changed_files"], ["src/app.py", "src/app_test.py"])
+
+    def test_sync_verifiable_worker_diff_reports_sync_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = SimpleNamespace(
+                repo_path=root / "repo",
+                layout={"events": root / "events.jsonl"},
+                run_id="run-1",
+                task={},
+                repo={},
+            )
+            with mock.patch(
+                "src.tandem_agents.core.phases.worker_dispatch.sync_worktree_changes",
+                side_effect=RuntimeError("copy failed"),
+            ):
+                ok, changed, synced, error = _sync_verifiable_worker_diff(
+                    ctx,
+                    worker_id="worker-1",
+                    subtask_id="subtask-1",
+                    worktree=root / "worktree",
+                    changed_files=["src/app.py", "src/app_test.py"],
+                )
+
+            self.assertFalse(ok)
+            self.assertEqual(changed, [])
+            self.assertEqual(synced, [])
+            self.assertIn("copy failed", error)
+
+    def test_required_test_only_diff_detects_incomplete_regression_attempt(self) -> None:
+        subtask = {
+            "title": "Finish repository isolation regression tests",
+            "goal": "Add regression coverage",
+            "files": [
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            "acceptance_criteria": ["Run repository regression tests."],
+        }
+
+        self.assertTrue(
+            _subtask_has_required_test_only_diff(
+                subtask,
+                ["src/tandem_agents/core/repository/repository_test.py"],
+            )
+        )
+        self.assertFalse(
+            _subtask_has_required_test_only_diff(
+                subtask,
+                [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            )
+        )
+        self.assertFalse(
+            _subtask_has_required_test_only_diff(
+                subtask,
+                ["tests/repository_test.py"],
+            )
+        )
+        plain_subtask = {
+            **subtask,
+            "title": "Update repository helper behavior",
+            "goal": "Refine branch naming behavior",
+            "acceptance_criteria": ["Repository helper behavior is updated."],
+        }
+        self.assertFalse(
+            _subtask_has_required_test_only_diff(
+                plain_subtask,
+                ["src/tandem_agents/core/repository/repository_test.py"],
+            )
+        )
+
+    def test_verifiable_diff_guard_requires_source_and_declared_test_target(self) -> None:
+        subtask = {
+            "title": "Finish repository isolation regression tests",
+            "goal": "Add regression coverage",
+            "files": [
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            "acceptance_criteria": ["Run repository regression tests."],
+        }
+
+        self.assertTrue(
+            _subtask_has_verifiable_source_and_test_diff(
+                subtask,
+                [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            )
+        )
+        self.assertFalse(
+            _subtask_has_verifiable_source_and_test_diff(
+                subtask,
+                ["src/tandem_agents/core/repository/repository.py"],
+            )
+        )
+        self.assertFalse(
+            _subtask_has_verifiable_source_and_test_diff(
+                subtask,
+                ["src/tandem_agents/core/repository/repository_test.py"],
+            )
+        )
+        self.assertFalse(
+            _subtask_has_verifiable_source_and_test_diff(
+                subtask,
+                [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "tests/repository_test.py",
+                ],
+            )
+        )
+
     def test_unproductive_diff_marker_detects_placeholder_blocker_test(self) -> None:
         diff = """diff --git a/tests/part09.rs b/tests/part09.rs
 --- a/tests/part09.rs
@@ -204,6 +455,58 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
         self.assertTrue(_diff_is_comment_only(diff))
         self.assertFalse(_diff_has_unproductive_marker(diff))
+
+    def test_test_only_repair_rejects_comment_only_production_followup(self) -> None:
+        diff = """diff --git a/src/repository.py b/src/repository.py
+--- a/src/repository.py
++++ b/src/repository.py
+@@ -1,3 +1,5 @@
+ from __future__ import annotations
++# Keep run isolation helpers together for future callers.
++
+ import os
+diff --git a/src/repository_test.py b/src/repository_test.py
+--- a/src/repository_test.py
++++ b/src/repository_test.py
+@@ -1,2 +1,6 @@
++def test_worker_name_includes_run_id():
++    assert worker_worktree_name("worker-1", "subtask-1")
+ """
+
+        self.assertEqual(
+            _diff_changed_files_missing_substantive_production_followup(
+                diff,
+                ["src/repository.py", "src/repository_test.py"],
+                {"repair_requires_production_followup": ["src/repository.py"]},
+            ),
+            ["src/repository.py"],
+        )
+
+    def test_test_only_repair_accepts_substantive_production_followup(self) -> None:
+        diff = """diff --git a/src/repository.py b/src/repository.py
+--- a/src/repository.py
++++ b/src/repository.py
+@@ -1,3 +1,5 @@
+ from __future__ import annotations
++MAX_WORKTREE_NAME_LENGTH = 96
++
+ import os
+diff --git a/src/repository_test.py b/src/repository_test.py
+--- a/src/repository_test.py
++++ b/src/repository_test.py
+@@ -1,2 +1,6 @@
++def test_worker_name_includes_run_id():
++    assert worker_worktree_name("worker-1", "subtask-1")
+ """
+
+        self.assertEqual(
+            _diff_changed_files_missing_substantive_production_followup(
+                diff,
+                ["src/repository.py", "src/repository_test.py"],
+                {"repair_requires_production_followup": ["src/repository.py"]},
+            ),
+            [],
+        )
 
     def test_tautological_boolean_assertion_diff_is_unproductive(self) -> None:
         diff = """diff --git a/tests/part09.rs b/tests/part09.rs
@@ -372,6 +675,32 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             )
         )
 
+    def test_progress_diff_validator_rejects_truncated_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=repo, check=True)
+            target = repo / "src" / "lib.rs"
+            target.parent.mkdir()
+            target.write_text("pub fn value() -> i32 { 1 }\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/lib.rs"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("pub fn value() -> i32 { 2 }\n", encoding="utf-8")
+            diff = subprocess.run(
+                ["git", "diff", "--binary"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            truncated = "\n".join(diff.splitlines()[:-1]) + "\n"
+
+            self.assertTrue(_diff_applies_to_head(repo, diff))
+            self.assertFalse(_diff_applies_to_head(repo, diff.strip()))
+            self.assertFalse(_diff_applies_to_head(repo, truncated))
+
     def test_carry_forward_patch_applies_saved_partial_diff_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -409,6 +738,62 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "pub fn value() -> i32 { 2 }\n")
             self.assertIn("applied carry-forward", log_path.read_text(encoding="utf-8"))
 
+    def test_run_worker_subtask_fails_closed_when_carry_forward_patch_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "lib.rs"
+            target.parent.mkdir()
+            target.write_text("pub fn value() -> i32 { 1 }\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/lib.rs"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            repo_path.mkdir()
+            patch = root / "corrupt.patch"
+            patch.write_text(
+                "# Partial worker diff captured during worker progress heartbeat\n"
+                "## git diff --binary\n\n"
+                "diff --git a/src/lib.rs b/src/lib.rs\n"
+                "index 1111111..2222222 100644\n"
+                "--- a/src/lib.rs\n"
+                "+++ b/src/lib.rs\n"
+                "@@ -1 +1 @@\n"
+                "-pub fn value() -> i32 { 1 }\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt") as stream_prompt:
+                output = run_worker_subtask(
+                    SimpleNamespace(),
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-170", "source": {"type": "linear"}, "title": "Task"},
+                    {
+                        "id": "subtask-1",
+                        "title": "Retry carried patch",
+                        "goal": "Apply preserved patch and verify.",
+                        "files": ["src/lib.rs"],
+                        "carry_forward_patch": str(patch),
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 1)
+            self.assertEqual(output["failure_reason"], "CARRY_FORWARD_PATCH_APPLY_FAILED")
+            self.assertEqual(output["blocker_kind"], "carry_forward_patch_apply_failed")
+            self.assertEqual(output["carry_forward_patch"], str(patch))
+            stream_prompt.assert_not_called()
+            log_text = (run_dir / "logs" / "worker-1.log").read_text(encoding="utf-8")
+            self.assertIn("carry-forward patch did not apply cleanly", log_text)
+
     def test_preserved_partial_diff_artifact_carries_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -430,6 +815,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             new_test = repo / "tests" / "contract.rs"
             new_test.parent.mkdir()
             new_test.write_text("#[test]\nfn contract() { assert!(true); }\n", encoding="utf-8")
+            (repo / "__aca_temp_probe.txt").write_text("placeholder\n", encoding="utf-8")
             result = _preserve_partial_worker_diff(
                 {"returncode": 1, "stdout": "ENGINE_PROMPT_TIMEOUT\n"},
                 log_path,
@@ -440,6 +826,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             patch_text = _extract_partial_worker_diff_artifact(artifact.read_text(encoding="utf-8"))
             self.assertIn("new file mode", patch_text)
             self.assertIn("+++ b/tests/contract.rs", patch_text)
+            self.assertNotIn("__aca_temp_probe.txt", patch_text)
 
             new_test.unlink()
             self.assertTrue(_apply_carry_forward_patch(repo, artifact, log_path))
@@ -508,6 +895,152 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(summary["partial_diff_artifact"], str(patch_path))
             self.assertEqual(summary["artifacts"]["partial_diff"], str(patch_path))
+
+    def test_blocked_worker_note_with_diff_is_preserved_not_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "worktrees.py"
+            target.parent.mkdir()
+            target.write_text("def branch_name() -> str:\n    return 'old'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/worktrees.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("def branch_name() -> str:\n    return 'new'\n", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 0,
+                    "stdout": (
+                        "Status: blocked\n"
+                        "Changed files: none by this worker.\n\n"
+                        "Blocker:\n"
+                        "- I cannot truthfully claim verification completed.\n"
+                    ),
+                    "log_path": str(log_path),
+                },
+                log_path,
+                worktree,
+                {
+                    "id": "subtask-1",
+                    "title": "Finish worktree helper",
+                    "files": ["src/worktrees.py"],
+                    "target_files": ["src/worktrees.py"],
+                },
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_REPORTED_BLOCKER")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertEqual(result["changed_files"], ["src/worktrees.py"])
+            self.assertTrue(Path(result["partial_diff_artifact"]).exists())
+            self.assertIn("Status: blocked", result["stdout"])
+            self.assertIn("treating the worker as failed", result["stdout"])
+
+    def test_plain_blocked_worker_note_with_diff_is_preserved_not_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "worktrees.py"
+            target.parent.mkdir()
+            target.write_text("def branch_name() -> str:\n    return 'old'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/worktrees.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("def branch_name() -> str:\n    return 'new'\n", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 0,
+                    "stdout": (
+                        "Blocked.\n\n"
+                        "Changed files:\n"
+                        "- None by this worker in this turn.\n\n"
+                        "Blocker:\n"
+                        "- I was instructed not to call tools further in this turn.\n"
+                    ),
+                    "log_path": str(log_path),
+                },
+                log_path,
+                worktree,
+                {
+                    "id": "subtask-1",
+                    "title": "Finish worktree helper",
+                    "files": ["src/worktrees.py"],
+                    "target_files": ["src/worktrees.py"],
+                },
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_REPORTED_BLOCKER")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertEqual(result["changed_files"], ["src/worktrees.py"])
+            self.assertTrue(Path(result["partial_diff_artifact"]).exists())
+            self.assertIn("Blocked.", result["stdout"])
+            self.assertIn("treating the worker as failed", result["stdout"])
+
+    def test_malformed_blocked_status_boundary_is_preserved_not_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "worktrees.py"
+            target.parent.mkdir()
+            target.write_text("def branch_name() -> str:\n    return 'old'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/worktrees.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("def branch_name() -> str:\n    return 'new'\n", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 0,
+                    "stdout": (
+                        "Status: blockedChanged files: none.\n\n"
+                        "Validation performed:\n"
+                        "- Read src/worktrees.py.\n\n"
+                        "Blocker:\n"
+                        "- Verification was not run.\n"
+                    ),
+                    "log_path": str(log_path),
+                },
+                log_path,
+                worktree,
+                {
+                    "id": "subtask-1",
+                    "title": "Finish worktree helper",
+                    "files": ["src/worktrees.py"],
+                    "target_files": ["src/worktrees.py"],
+                },
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_REPORTED_BLOCKER")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertEqual(result["changed_files"], ["src/worktrees.py"])
+            self.assertTrue(Path(result["partial_diff_artifact"]).exists())
+            self.assertIn("Status: blockedChanged", result["stdout"])
+            self.assertIn("treating the worker as failed", result["stdout"])
 
     def test_terminalized_note_reports_placeholder_partial_and_unverified_work(self) -> None:
         bad_notes = [
@@ -719,6 +1252,25 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             )
         )
 
+    def test_verification_first_repair_does_not_require_new_real_diff(self) -> None:
+        self.assertFalse(
+            _subtask_requires_real_diff(
+                {
+                    "title": "Finish repository worktree isolation and conflict detection patch",
+                    "goal": "Verify the preserved source+test partial worker diff and fix only narrow verification failures.",
+                    "files": [
+                        "src/tandem_agents/core/repository/repository.py",
+                        "src/tandem_agents/core/repository/repository_test.py",
+                    ],
+                    "acceptance_criteria": [
+                        "Run the narrow deterministic verification first; if it passes, return a terminal completion note without making another mandatory edit.",
+                        "If verification fails, fix only the failing behavior and rerun verification.",
+                    ],
+                    "repair_verification_first": True,
+                }
+            )
+        )
+
     def test_empty_transcript_retry_prompt_is_role_aware(self) -> None:
         manager_prompt = _empty_transcript_retry_prompt(role="manager", write_required=False)
         worker_prompt = _empty_transcript_retry_prompt(role="worker-1", require_tool_use=True, write_required=True)
@@ -805,6 +1357,9 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
         self.assertIn("Missing test coverage or missing behavior is not a blocker", suffix)
         self.assertIn("Do not create marker files", suffix)
+        self.assertIn("retry a narrower readback if a tool is skipped", suffix)
+        self.assertIn("python3 -m unittest", suffix)
+        self.assertIn("Do not treat missing `pytest` as a blocker", suffix)
         self.assertIn("Do not reply with `changed_files: []`", suffix)
         self.assertIn("Do not claim tool access is disallowed", suffix)
         self.assertNotIn("no-safe-changes blocker naming every inspected target file", suffix)
@@ -1109,6 +1664,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
                 mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes") as sync_changes, \
                 mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", return_value={"returncode": 0}):
+                sync_changes.return_value = ["src/lib.rs"]
                 output = run_worker_subtask(
                     cfg,
                     "run-1",
@@ -1122,6 +1678,14 @@ class WorkerFailureCoercionTest(unittest.TestCase):
 
             self.assertEqual(output["returncode"], 0)
             sync_changes.assert_called_once_with(worktree, repo_path)
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            completed = next(event for event in events if event["type"] == "worker.completed")
+            self.assertEqual(completed["payload"]["changed_files"], ["src/lib.rs"])
+            self.assertEqual(completed["payload"]["synced_files"], ["src/lib.rs"])
 
     def test_run_worker_subtask_reports_failed_retry_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1276,6 +1840,73 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             event_types = [event["type"] for event in events]
             self.assertEqual(event_types, ["worker.started"])
 
+    def test_superseded_worker_attempt_does_not_sync_or_emit_terminal_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            repo_path = root / "repo"
+            worktree = root / "worktree"
+            run_dir.mkdir()
+            repo_path.mkdir()
+            worktree.mkdir()
+            cfg = SimpleNamespace(env={})
+            (run_dir / "status.json").write_text(
+                json.dumps({"run": {"status": "running"}}),
+                encoding="utf-8",
+            )
+
+            def superseded_stream(*_args: object, **kwargs: object) -> dict[str, object]:
+                (run_dir / "active_worker_attempts.json").write_text(
+                    json.dumps({"worker-1": "newer-exec"}),
+                    encoding="utf-8",
+                )
+                return {
+                    "returncode": 0,
+                    "stdout": "late success",
+                    "log_path": str(kwargs["log_path"]),
+                }
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt", side_effect=superseded_stream), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts") as sync_artifacts, \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes") as sync_changes, \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", side_effect=lambda result, *_args: result):
+                output = run_worker_subtask(
+                    cfg,
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-216", "source": {"type": "linear"}, "title": "Task"},
+                    {
+                        "id": "subtask-1",
+                        "_worker_execution_id": "old-exec",
+                        "title": "Subtask",
+                        "goal": "Change files",
+                        "files": ["src/lib.rs"],
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 1)
+            self.assertEqual(output["blocker_kind"], "stale_worker_result")
+            self.assertEqual(output["failure_reason"], "WORKER_RESULT_AFTER_RETRY_SUPERSEDED")
+            sync_artifacts.assert_not_called()
+            sync_changes.assert_not_called()
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([event["type"] for event in events], ["worker.started"])
+            self.assertEqual(events[0]["payload"]["execution_id"], "old-exec")
+
     def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
@@ -1315,10 +1946,12 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["returncode"], 1)
             self.assertEqual(result["blocker_kind"], "engine_provider_auth")
 
-    def test_nonzero_worker_with_engine_error_diff_preserves_partial_artifact(self) -> None:
+    def test_engine_dispatch_failure_with_target_diff_enters_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            worktree = Path(tmp)
-            log_path = worktree / "worker.log"
+            root = Path(tmp)
+            worktree = root / "repo"
+            worktree.mkdir()
+            log_path = root / "worker.log"
             log_path.write_text("", encoding="utf-8")
             (worktree / "src").mkdir()
             target = worktree / "src" / "existing.ts"
@@ -1341,10 +1974,13 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 require_filesystem_changes=True,
             )
 
-            self.assertEqual(result["returncode"], 1)
-            self.assertEqual(result["blocker_kind"], "engine_dispatch_failed")
-            self.assertNotIn("recovered_success", result)
-            self.assertTrue(Path(result["partial_diff_artifact"]).exists())
+            self.assertEqual(result["returncode"], 0)
+            self.assertTrue(result["recovered_success"])
+            self.assertTrue(result["recovered_from_engine_dispatch_partial_diff"])
+            self.assertEqual(result["changed_files"], ["src/existing.ts"])
+            self.assertNotIn("blocker_kind", result)
+            self.assertNotIn("partial_diff_artifact", result)
+            self.assertIn("normal integration review", log_path.read_text(encoding="utf-8"))
 
     def test_tool_loop_stall_with_diff_recovers_into_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1945,6 +2581,111 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertEqual(result["blocker_kind"], "worker_corrupt_diff")
             self.assertIn("mechanically corrupted", result["stdout"])
 
+    def test_tool_loop_stall_with_duplicate_python_top_level_def_blocks_as_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "repository.py"
+            target.parent.mkdir()
+            target.write_text("def existing() -> str:\n    return 'base'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/repository.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text(
+                "\n".join(
+                    [
+                        "def existing() -> str:",
+                        "    return 'base'",
+                        "",
+                        "def issue_worktree_branch(issue_id: str) -> str:",
+                        "    return issue_id.lower()",
+                        "",
+                        "def issue_worktree_branch(issue_id: str) -> str:",
+                        "    return issue_id.strip().lower()",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = _recover_nonzero_result_with_diff(
+                {
+                    "returncode": 1,
+                    "stdout": "ENGINE_TOOL_LOOP_STALLED\n",
+                    "failure_reason": "ENGINE_TOOL_LOOP_STALLED",
+                    "blocker_kind": "engine_tool_loop_stalled",
+                },
+                log_path,
+                worktree,
+                reason="target file diff",
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_CORRUPT_DIFF")
+            self.assertEqual(result["blocker_kind"], "worker_corrupt_diff")
+            self.assertNotIn("partial_diff_preserved_after_engine_stall", result)
+            self.assertIn("duplicate top-level Python definition", result["stdout"])
+
+    def test_tool_loop_stall_with_duplicate_python_methods_is_not_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "repository.py"
+            target.parent.mkdir()
+            target.write_text("def existing() -> str:\n    return 'base'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/repository.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text(
+                "\n".join(
+                    [
+                        "def existing() -> str:",
+                        "    return 'base'",
+                        "",
+                        "class First:",
+                        "    def render(self) -> str:",
+                        "        return 'first'",
+                        "",
+                        "class Second:",
+                        "    def render(self) -> str:",
+                        "        return 'second'",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = _recover_nonzero_result_with_diff(
+                {
+                    "returncode": 1,
+                    "stdout": "ENGINE_TOOL_LOOP_STALLED\n",
+                    "failure_reason": "ENGINE_TOOL_LOOP_STALLED",
+                    "blocker_kind": "engine_tool_loop_stalled",
+                },
+                log_path,
+                worktree,
+                reason="target file diff",
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertTrue(result["partial_diff_preserved_after_engine_stall"])
+            self.assertEqual(result["failure_reason"], "ENGINE_TOOL_LOOP_STALLED")
+            self.assertEqual(result["blocker_kind"], "engine_tool_loop_stalled")
+
     def test_tool_loop_stall_with_repeated_serde_attributes_is_not_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2414,6 +3155,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             (worktree / "aca-subtask-1-blocker.md").write_text("blocked\n", encoding="utf-8")
             (worktree / ".aca").mkdir()
             (worktree / ".aca" / "pr_candidate_context.json").write_text("{}\n", encoding="utf-8")
+            (worktree / "__aca_temp_probe.txt").write_text("placeholder\n", encoding="utf-8")
 
             self.assertEqual(_worktree_changed_files(worktree), [])
 
@@ -3726,6 +4468,74 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                         "status": "failed",
                         "blocker_kind": "worker_no_diff",
                         "failure_reason": "NO_FILESYSTEM_CHANGES",
+                    }
+                ],
+                blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},
+            )
+
+            _apply_tolerated_failures(ctx)
+
+            self.assertEqual(ctx.worker_results[0]["status"], "failed")
+            self.assertNotEqual(ctx.blackboard["subtasks"][0]["status"], "tolerated_failure")
+
+    def test_incomplete_diff_worker_blocker_is_not_tolerated_when_targets_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            target = repo_path / "src/lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={"source": {"type": "linear"}},
+                repo_path=repo_path,
+                planned_subtasks=[
+                    {
+                        "id": "subtask-1",
+                        "title": "Edit existing source",
+                        "goal": "Make a real source change",
+                        "files": ["src/lib.rs"],
+                    }
+                ],
+                worker_results=[
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "status": "failed",
+                        "blocker_kind": "worker_incomplete_diff",
+                        "failure_reason": "WORKER_REPORTED_BLOCKER",
+                    }
+                ],
+                blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},
+            )
+
+            _apply_tolerated_failures(ctx)
+
+            self.assertEqual(ctx.worker_results[0]["status"], "failed")
+            self.assertNotEqual(ctx.blackboard["subtasks"][0]["status"], "tolerated_failure")
+
+    def test_reported_worker_blocker_is_not_tolerated_when_targets_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            target = repo_path / "src/lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={"source": {"type": "linear"}},
+                repo_path=repo_path,
+                planned_subtasks=[
+                    {
+                        "id": "subtask-1",
+                        "title": "Edit existing source",
+                        "goal": "Make a real source change",
+                        "files": ["src/lib.rs"],
+                    }
+                ],
+                worker_results=[
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "status": "failed",
+                        "blocker_kind": "worker_reported_blocker",
+                        "failure_reason": "WORKER_REPORTED_BLOCKER",
                     }
                 ],
                 blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},

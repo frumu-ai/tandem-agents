@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
-from src.tandem_agents.core.scheduling.scheduler_dispatcher import dispatch_scheduled_runs
+from src.tandem_agents.core.scheduling.scheduler_dispatcher import _task_source_overrides, dispatch_scheduled_runs
 from src.tandem_agents.runtime.workspace_registry import load_workspace
 
 
@@ -54,6 +54,38 @@ class SchedulerDispatcherTest(unittest.TestCase):
             encoding="utf-8",
         )
         return resolve_config(root)
+
+    def test_task_source_overrides_include_linear_routing_fields(self) -> None:
+        task = {
+            "task_id": "TAN-170",
+            "source": {
+                "type": "linear",
+                "team": "team-1",
+                "project": "project-1",
+                "statuses": "Backlog,Ready,In Progress",
+                "labels": "Runtime Security",
+                "query": "TAN-170",
+                "item": "TAN-170",
+            },
+            "repo": {
+                "slug": "frumu-ai/tandem-agents",
+                "path": "/workspace/repos/tandem-agents",
+                "clone_url": "https://github.com/frumu-ai/tandem-agents.git",
+            },
+        }
+
+        overrides = _task_source_overrides(task)
+
+        self.assertEqual(overrides["ACA_TASK_SOURCE_TYPE"], "linear")
+        self.assertEqual(overrides["ACA_TASK_SOURCE_TEAM"], "team-1")
+        self.assertEqual(overrides["ACA_TASK_SOURCE_PROJECT"], "project-1")
+        self.assertEqual(overrides["ACA_TASK_SOURCE_STATUSES"], "Backlog,Ready,In Progress")
+        self.assertEqual(overrides["ACA_TASK_SOURCE_LABELS"], "Runtime Security")
+        self.assertEqual(overrides["ACA_TASK_SOURCE_QUERY"], "TAN-170")
+        self.assertEqual(overrides["ACA_TASK_SOURCE_ITEM"], "TAN-170")
+        self.assertEqual(overrides["ACA_REPO_SLUG"], "frumu-ai/tandem-agents")
+        self.assertEqual(overrides["ACA_REPO_PATH"], "/workspace/repos/tandem-agents")
+        self.assertEqual(overrides["ACA_REPO_URL"], "https://github.com/frumu-ai/tandem-agents.git")
 
     def test_dispatcher_launches_multiple_admitted_runs_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

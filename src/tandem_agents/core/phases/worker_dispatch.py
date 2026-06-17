@@ -13,17 +13,46 @@ caller continues with ctx.worker_results after this returns.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
 
 from src.tandem_agents.core.phases.context import RunContext
+from src.tandem_agents.core.repository.repository import sync_worktree_changes, worker_worktree_name
+from src.tandem_agents.runtime.runstate import append_event
+from src.tandem_agents.utils.utils import atomic_write_json
 
 logger = logging.getLogger("aca.phases.worker_dispatch")
+
+
+def _clear_active_worker_attempt_marker(ctx: RunContext, worker_id: str) -> None:
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        return
+    path = ctx.run_dir / "active_worker_attempts.json"
+    if not path.exists():
+        return
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(loaded, dict) or worker_id not in loaded:
+        return
+    loaded.pop(worker_id, None)
+    if loaded:
+        atomic_write_json(path, loaded)
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 _TERMINAL_WORKER_BLOCKER_KINDS = {
@@ -35,6 +64,8 @@ _TERMINAL_WORKER_BLOCKER_KINDS = {
     "worker_runaway_diff",
     "worker_unproductive_diff",
     "worker_no_progress",
+    "worker_incomplete_diff",
+    "worker_reported_blocker",
     "worker_no_diff",
 }
 
@@ -45,6 +76,114 @@ _UNPRODUCTIVE_DIFF_MARKERS = (
     "blocked: production-path regression coverage",
     "production-path regression coverage was not added or verified",
 )
+
+
+def _diff_apply_check(worktree: Path, diff_text: str) -> tuple[bool, str]:
+    if not str(diff_text or "").strip():
+        return False, "empty diff"
+    with tempfile.TemporaryDirectory(prefix="aca-progress-diff-index-") as temp_dir:
+        index_path = str(Path(temp_dir) / "index")
+        env = {**os.environ, "GIT_INDEX_FILE": index_path}
+        read_tree = subprocess.run(
+            ["git", "-C", str(worktree), "read-tree", "HEAD"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if read_tree.returncode != 0:
+            detail = (read_tree.stderr or read_tree.stdout or "").strip()
+            return False, detail or f"git read-tree failed with exit {read_tree.returncode}"
+        check = subprocess.run(
+            ["git", "-C", str(worktree), "apply", "--cached", "--check", "--whitespace=nowarn"],
+            input=diff_text,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check.returncode == 0:
+            return True, ""
+        detail = (check.stderr or check.stdout or "").strip()
+        return False, detail or f"git apply --check failed with exit {check.returncode}"
+
+
+def _diff_applies_to_head(worktree: Path, diff_text: str) -> bool:
+    ok, _detail = _diff_apply_check(worktree, diff_text)
+    return ok
+
+
+def _sync_verifiable_worker_diff(
+    ctx: RunContext,
+    *,
+    worker_id: str,
+    subtask_id: str,
+    worktree: Path,
+    changed_files: list[str],
+) -> tuple[bool, list[str], list[str], str]:
+    """Sync a source+test guard diff into the run checkout before review."""
+    try:
+        synced = sync_worktree_changes(worktree, ctx.repo_path)
+    except Exception as exc:
+        return False, [], [], str(exc)
+    synced_files = [str(path) for path in synced if str(path).strip()]
+    if not synced_files:
+        return False, [], [], "no files were synced from the verifiable worker diff"
+    merged = list(dict.fromkeys([*changed_files, *synced_files]))
+    append_event(
+        ctx.layout["events"],
+        "worker.verifiable_diff_synced",
+        ctx.run_id,
+        {
+            "worker_id": worker_id,
+            "subtask_id": subtask_id,
+            "changed_files": merged,
+            "synced_files": synced_files,
+        },
+        task_id=ctx.task.get("task_id"),
+        role="worker",
+        repo={"path": ctx.repo.get("path")},
+    )
+    return True, merged, synced_files, ""
+
+
+def _changed_python_syntax_errors(worktree: Path, changed_files: list[str]) -> list[str]:
+    python_files = [
+        str(path).replace("\\", "/")
+        for path in changed_files
+        if str(path or "").replace("\\", "/").endswith(".py")
+        and (worktree / str(path).replace("\\", "/")).is_file()
+    ]
+    if not python_files:
+        return []
+    script = (
+        "import ast, pathlib, sys\n"
+        "errors = []\n"
+        "for raw in sys.argv[1:]:\n"
+        "    path = pathlib.Path(raw)\n"
+        "    try:\n"
+        "        ast.parse(path.read_text(encoding='utf-8'), filename=str(path))\n"
+        "    except SyntaxError as exc:\n"
+        "        errors.append(f'{raw}:{exc.lineno}:{exc.offset}: {exc.msg}')\n"
+        "    except Exception as exc:\n"
+        "        errors.append(f'{raw}: {type(exc).__name__}: {exc}')\n"
+        "if errors:\n"
+        "    print('\\n'.join(errors))\n"
+        "    raise SystemExit(1)\n"
+    )
+    result = subprocess.run(
+        ["python3", "-c", script, *python_files],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return []
+    output = (result.stdout or result.stderr or "").strip()
+    return [line.strip() for line in output.splitlines() if line.strip()] or [
+        f"python syntax check failed with exit {result.returncode}"
+    ]
 
 
 def _is_test_path(path: str) -> bool:
@@ -126,6 +265,43 @@ def _worker_comment_only_diff_abort_seconds(ctx: RunContext) -> float:
     return 120.0
 
 
+def _worker_verifiable_diff_abort_seconds(ctx: RunContext) -> float:
+    raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_VERIFIABLE_DIFF_ABORT_SECONDS") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_VERIFIABLE_DIFF_ABORT_SECONDS=%r", raw)
+    return 240.0
+
+
+def _subtask_has_verifiable_source_and_test_diff(
+    subtask: dict[str, Any],
+    changed_files: list[str],
+) -> bool:
+    if not _subtask_requires_test_changes(subtask):
+        return False
+    if not _changed_files_satisfy_required_test_files(changed_files, _subtask_required_test_files(subtask)):
+        return False
+    return any(not _is_test_path(path) for path in changed_files)
+
+
+def _subtask_has_required_test_only_diff(
+    subtask: dict[str, Any],
+    changed_files: list[str],
+) -> bool:
+    if not _subtask_requires_test_changes(subtask):
+        return False
+    if not changed_files:
+        return False
+    if not all(_is_test_path(path) for path in changed_files):
+        return False
+    return _changed_files_satisfy_required_test_files(
+        changed_files,
+        _subtask_required_test_files(subtask),
+    )
+
+
 def _added_diff_lines(diff_text: str) -> list[str]:
     lines: list[str] = []
     for line in str(diff_text or "").splitlines():
@@ -154,6 +330,69 @@ def _diff_is_comment_only(diff_text: str) -> bool:
         return False
     comment_prefixes = ("//", "#", "/*", "*", "*/", "//!", "///")
     return all(line.startswith(comment_prefixes) for line in added)
+
+
+def _normalize_repo_path(path: Any) -> str:
+    return str(path or "").strip().replace("\\", "/").strip("/")
+
+
+def _diff_sections_by_file(diff_text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    current_path = ""
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("diff --git "):
+            current_path = ""
+            parts = line.split()
+            if len(parts) >= 4:
+                current_path = _normalize_repo_path(parts[3][2:] if parts[3].startswith("b/") else parts[3])
+                sections.setdefault(current_path, [])
+            continue
+        if line.startswith("+++ b/"):
+            current_path = _normalize_repo_path(line.removeprefix("+++ b/"))
+            sections.setdefault(current_path, [])
+        if current_path:
+            sections.setdefault(current_path, []).append(line)
+    return {path: "\n".join(lines) for path, lines in sections.items()}
+
+
+def _line_is_comment_or_trivia(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped in {"{", "}", "};", "(", ")", "[", "]", ","}:
+        return True
+    return stripped.startswith(("//", "#", "/*", "*", "*/", "//!", "///"))
+
+
+def _diff_changed_files_missing_substantive_production_followup(
+    diff_text: str,
+    changed_files: list[str],
+    subtask: dict[str, Any],
+) -> list[str]:
+    followups = [
+        _normalize_repo_path(path)
+        for path in subtask.get("repair_requires_production_followup") or []
+        if _normalize_repo_path(path)
+    ]
+    if not followups:
+        return []
+    changed = {_normalize_repo_path(path) for path in changed_files if _normalize_repo_path(path)}
+    sections = _diff_sections_by_file(diff_text)
+    missing: list[str] = []
+    for path in followups:
+        if path not in changed:
+            missing.append(path)
+            continue
+        section = sections.get(path, "")
+        added_or_removed = [
+            line[1:]
+            for line in section.splitlines()
+            if (line.startswith("+") and not line.startswith("+++"))
+            or (line.startswith("-") and not line.startswith("---"))
+        ]
+        if not any(not _line_is_comment_or_trivia(line) for line in added_or_removed):
+            missing.append(path)
+    return missing
 
 
 def _diff_has_tautological_boolean_assertion(diff_text: str) -> bool:
@@ -388,7 +627,7 @@ def dispatch_workers(ctx: RunContext) -> None:
 
     from src.tandem_agents.core.engine.engine import effective_tandem_provider
     from src.tandem_agents.core.execution import runner_core as _rc
-    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+    from src.tandem_agents.runtime.runstate import save_blackboard
     from src.tandem_agents.runtime.run_output import set_status, write_blackboard_snapshot, write_status
 
     worker_provider, worker_model = ctx.cfg.provider_for_role("worker")
@@ -399,7 +638,9 @@ def dispatch_workers(ctx: RunContext) -> None:
         "repository": ctx.repo.get("slug") or ctx.cfg.repository.slug,
         "worktree_mode": "single-host",
     }
-    worker_lease_id = str(ctx.status.get("coordination", {}).get("lease_id") or "")
+    # Local worker rows are observability records for this run. The manager
+    # owns the task lease, so child workers must not be able to stale it.
+    worker_lease_id: str | None = None
 
     # Transition status
     ctx.status = set_status(
@@ -443,6 +684,8 @@ def dispatch_workers(ctx: RunContext) -> None:
     active_worker_progress_snapshots: dict[str, dict[str, Any]] = {}
     active_worker_snapshot_digests: dict[str, str] = {}
     active_worker_abort_results: dict[str, dict[str, Any]] = {}
+    active_worker_snapshot_inflight: set[str] = set()
+    active_worker_snapshot_threads: list[threading.Thread] = []
     last_progress_event_at = 0.0
     worker_heartbeat_stop = threading.Event()
 
@@ -466,19 +709,47 @@ def dispatch_workers(ctx: RunContext) -> None:
             changed_files = _worktree_changed_files(worktree)
             if not changed_files:
                 return None
-            diff_text = _applyable_working_diff(worktree).strip()
-            if not diff_text:
-                diff_text = git_working_diff(worktree).strip()
-            if not diff_text:
+            diff_text = _applyable_working_diff(worktree)
+            if not str(diff_text or "").strip():
+                diff_text = git_working_diff(worktree)
+            if not str(diff_text or "").strip():
                 return None
             diff_bytes = len(diff_text.encode("utf-8", errors="replace"))
             diff_lines = diff_text.count("\n") + 1
             digest = hashlib.sha256(diff_text.encode("utf-8", errors="replace")).hexdigest()
-            if active_worker_snapshot_digests.get(wid) == digest:
-                return active_worker_progress_snapshots.get(wid)
+            previous_snapshot = active_worker_progress_snapshots.get(wid)
+            same_digest = active_worker_snapshot_digests.get(wid) == digest
+            diff_ok = True
+            diff_check_detail = ""
+            if not same_digest:
+                diff_ok, diff_check_detail = _diff_apply_check(worktree, diff_text)
+            if not diff_ok:
+                active_worker_snapshot_digests[wid] = digest
+                snapshot = active_worker_progress_snapshots.get(wid)
+                append_event(
+                    ctx.layout["events"],
+                    "worker.progress_partial_diff_invalid",
+                    ctx.run_id,
+                    {
+                        "worker_id": wid,
+                        "changed_files": list(changed_files),
+                        "diff_bytes": diff_bytes,
+                        "diff_lines": diff_lines,
+                        "previous_partial_diff_artifact": (snapshot or {}).get("partial_diff_artifact", ""),
+                        "reason": "progress-time git diff did not apply cleanly to HEAD",
+                        "detail": diff_check_detail[:1000],
+                    },
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                return snapshot
             artifacts_dir = ctx.run_dir / "artifacts"
             artifacts_dir.mkdir(parents=True, exist_ok=True)
-            artifact_path = artifacts_dir / f"{wid}.progress-partial-worker-diff.patch"
+            subtask = active_worker_subtasks.get(wid) or {}
+            execution_id = str(subtask.get("_worker_execution_id") or "").strip()
+            artifact_stem = f"{wid}-{execution_id}" if execution_id else wid
+            artifact_path = artifacts_dir / f"{artifact_stem}.progress-partial-worker-diff.patch"
             status_rows = "\n".join(f"- {path}" for path in changed_files)
             max_bytes = _runaway_diff_max_bytes()
             if diff_bytes > max_bytes:
@@ -537,6 +808,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         "write_required": True,
                         "verified_existing": False,
                     }
+                _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
                     ctx.layout["events"],
                     "worker.runaway_diff_detected",
@@ -611,9 +883,76 @@ def dispatch_workers(ctx: RunContext) -> None:
                         "write_required": True,
                         "verified_existing": False,
                     }
+                _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
                     ctx.layout["events"],
                     "worker.off_track_detected",
+                    ctx.run_id,
+                    snapshot,
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                return snapshot
+            if (
+                testless_abort_seconds > 0
+                and elapsed_seconds >= testless_abort_seconds
+                and _subtask_has_required_test_only_diff(subtask, changed_files)
+            ):
+                artifact_path.write_text(
+                    "# Partial worker diff captured during worker progress heartbeat\n"
+                    "# Reason: active worker changed only required test files without production implementation\n\n"
+                    f"## changed files\n\n{status_rows}\n\n"
+                    "## test-only guard\n\n"
+                    f"- elapsed_seconds: {elapsed_seconds:.1f}\n"
+                    f"- abort_seconds: {testless_abort_seconds:.1f}\n"
+                    f"- required_test_files: {required_test_files}\n"
+                    "- reason: subtask requires a production-path regression fix but the worker has only changed tests\n\n"
+                    f"## git diff --binary\n\n{diff_text}\n",
+                    encoding="utf-8",
+                )
+                snapshot = {
+                    "worker_id": wid,
+                    "partial_diff_artifact": str(artifact_path),
+                    "changed_files": list(changed_files),
+                    "partial_diff_state": "preserved_not_accepted",
+                    "source": "worker_test_only_guard",
+                    "diff_bytes": diff_bytes,
+                    "diff_lines": diff_lines,
+                    "elapsed_seconds": round(elapsed_seconds, 1),
+                    "abort_seconds": testless_abort_seconds,
+                    "required_test_files": required_test_files,
+                }
+                active_worker_snapshot_digests[wid] = digest
+                active_worker_progress_snapshots[wid] = snapshot
+                subtask_id = str(subtask.get("id") or "").strip()
+                with active_workers_lock:
+                    active_worker_abort_results[wid] = {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "status": "failed",
+                        "returncode": 1,
+                        "partial_diff_state": "preserved_not_accepted",
+                        "partial_diff_artifact": str(artifact_path),
+                        "artifacts": {"partial_diff": str(artifact_path)},
+                        "changed_files": list(changed_files),
+                        "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                        "blocker_kind": "worker_incomplete_diff",
+                        "output_excerpt": (
+                            "Worker changed only required test files for a regression subtask: "
+                            f"after {elapsed_seconds:.0f}s it had not made the required production change."
+                        ),
+                        "recovery_action": (
+                            "Retry from a clean checkout. Preserve the useful test intent, but require the "
+                            "worker to implement the production path in the same attempt before returning."
+                        ),
+                        "write_required": True,
+                        "verified_existing": False,
+                    }
+                _clear_active_worker_attempt_marker(ctx, wid)
+                append_event(
+                    ctx.layout["events"],
+                    "worker.test_only_diff_detected",
                     ctx.run_id,
                     snapshot,
                     task_id=ctx.task.get("task_id"),
@@ -626,6 +965,19 @@ def dispatch_workers(ctx: RunContext) -> None:
                 unproductive_reason = "worker diff contains an explicit placeholder/blocker marker"
             elif _diff_has_placeholder_noop_test(diff_text):
                 unproductive_reason = "worker diff adds an explicit placeholder/no-op test"
+            elif (
+                comment_only_abort_seconds > 0
+                and elapsed_seconds >= comment_only_abort_seconds
+                and (missing_followups := _diff_changed_files_missing_substantive_production_followup(
+                    diff_text,
+                    changed_files,
+                    subtask,
+                ))
+            ):
+                unproductive_reason = (
+                    "worker carried a test-only partial diff but did not make a substantive production "
+                    "follow-up change in: " + ", ".join(missing_followups)
+                )
             elif (
                 comment_only_abort_seconds > 0
                 and elapsed_seconds >= comment_only_abort_seconds
@@ -722,6 +1074,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         "write_required": True,
                         "verified_existing": False,
                     }
+                _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
                     ctx.layout["events"],
                     "worker.unproductive_diff_detected",
@@ -732,6 +1085,196 @@ def dispatch_workers(ctx: RunContext) -> None:
                     repo={"path": ctx.repo.get("path")},
                 )
                 return snapshot
+            verifiable_abort_seconds = _worker_verifiable_diff_abort_seconds(ctx)
+            syntax_errors = _changed_python_syntax_errors(worktree, changed_files)
+            if (
+                verifiable_abort_seconds > 0
+                and elapsed_seconds >= verifiable_abort_seconds
+                and syntax_errors
+                and _subtask_has_verifiable_source_and_test_diff(subtask, changed_files)
+            ):
+                artifact_path.write_text(
+                    "# Partial worker diff captured during worker progress heartbeat\n"
+                    "# Reason: active worker produced source and required-test changes with Python syntax errors before terminal result\n\n"
+                    f"## changed files\n\n{status_rows}\n\n"
+                    "## syntax errors\n\n"
+                    + "\n".join(f"- {error}" for error in syntax_errors[:20])
+                    + "\n\n## verifiable diff guard\n\n"
+                    f"- elapsed_seconds: {elapsed_seconds:.1f}\n"
+                    f"- abort_seconds: {verifiable_abort_seconds:.1f}\n"
+                    f"- required_test_files: {required_test_files}\n"
+                    "- reason: subtask has production and required-test changes but changed Python files do not parse; retry should fix syntax before verification\n\n"
+                    f"## git diff --binary\n\n{diff_text}\n",
+                    encoding="utf-8",
+                )
+                snapshot = {
+                    "worker_id": wid,
+                    "partial_diff_artifact": str(artifact_path),
+                    "changed_files": list(changed_files),
+                    "partial_diff_state": "preserved_not_accepted",
+                    "source": "worker_syntax_invalid_diff_guard",
+                    "diff_bytes": diff_bytes,
+                    "diff_lines": diff_lines,
+                    "elapsed_seconds": round(elapsed_seconds, 1),
+                    "abort_seconds": verifiable_abort_seconds,
+                    "required_test_files": required_test_files,
+                    "syntax_errors": syntax_errors[:20],
+                }
+                active_worker_snapshot_digests[wid] = digest
+                active_worker_progress_snapshots[wid] = snapshot
+                subtask_id = str(subtask.get("id") or "").strip()
+                with active_workers_lock:
+                    active_worker_abort_results[wid] = {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "status": "failed",
+                        "returncode": 1,
+                        "partial_diff_state": "preserved_not_accepted",
+                        "partial_diff_artifact": str(artifact_path),
+                        "artifacts": {"partial_diff": str(artifact_path)},
+                        "changed_files": list(changed_files),
+                        "failure_reason": "WORKER_SYNTAX_INVALID_DIFF",
+                        "blocker_kind": "worker_incomplete_diff",
+                        "output_excerpt": (
+                            "Worker produced a source plus required-test partial diff, but changed Python files "
+                            f"did not parse after {elapsed_seconds:.0f}s: " + "; ".join(syntax_errors[:5])
+                        ),
+                        "recovery_action": (
+                            "Retry with the preserved patch already applied. Fix the reported Python syntax errors first, "
+                            "then run the narrow verification before returning a terminal result."
+                        ),
+                        "write_required": True,
+                        "verified_existing": False,
+                    }
+                _clear_active_worker_attempt_marker(ctx, wid)
+                append_event(
+                    ctx.layout["events"],
+                    "worker.syntax_invalid_diff_detected",
+                    ctx.run_id,
+                    snapshot,
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                return snapshot
+            if (
+                verifiable_abort_seconds > 0
+                and elapsed_seconds >= verifiable_abort_seconds
+                and _subtask_has_verifiable_source_and_test_diff(subtask, changed_files)
+            ):
+                artifact_path.write_text(
+                    "# Partial worker diff captured during worker progress heartbeat\n"
+                    "# Reason: active worker produced source and required-test changes before terminal result\n\n"
+                    f"## changed files\n\n{status_rows}\n\n"
+                    "## verifiable diff guard\n\n"
+                    f"- elapsed_seconds: {elapsed_seconds:.1f}\n"
+                    f"- abort_seconds: {verifiable_abort_seconds:.1f}\n"
+                    f"- required_test_files: {required_test_files}\n"
+                    "- reason: subtask now has production and required-test changes; retry should verify/fix the preserved patch instead of waiting for another engine timeout\n\n"
+                    f"## git diff --binary\n\n{diff_text}\n",
+                    encoding="utf-8",
+                )
+                snapshot = {
+                    "worker_id": wid,
+                    "partial_diff_artifact": str(artifact_path),
+                    "changed_files": list(changed_files),
+                    "partial_diff_state": "preserved_not_accepted",
+                    "source": "worker_verifiable_diff_guard",
+                    "diff_bytes": diff_bytes,
+                    "diff_lines": diff_lines,
+                    "elapsed_seconds": round(elapsed_seconds, 1),
+                    "abort_seconds": verifiable_abort_seconds,
+                    "required_test_files": required_test_files,
+                }
+                subtask_id = str(subtask.get("id") or "").strip()
+                sync_ok, merged_changed_files, synced_files, sync_error = _sync_verifiable_worker_diff(
+                    ctx,
+                    worker_id=wid,
+                    subtask_id=subtask_id,
+                    worktree=worktree,
+                    changed_files=list(changed_files),
+                )
+                if sync_ok:
+                    snapshot["partial_diff_state"] = "reviewable_terminalized"
+                    snapshot["changed_files"] = merged_changed_files
+                    result = {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "status": "completed",
+                        "returncode": 0,
+                        "partial_diff_state": "reviewable_terminalized",
+                        "partial_diff_artifact": str(artifact_path),
+                        "artifacts": {"partial_diff": str(artifact_path)},
+                        "changed_files": merged_changed_files,
+                        "synced_files": synced_files,
+                        "output_excerpt": (
+                            "Worker produced a source plus required-test diff but did not return a terminal result "
+                            f"after {elapsed_seconds:.0f}s. ACA synced the verifiable diff for manager review and tests."
+                        ),
+                        "write_required": True,
+                        "verified_existing": False,
+                    }
+                    event_type = "worker.completed"
+                else:
+                    result = {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "status": "failed",
+                        "returncode": 1,
+                        "partial_diff_state": "preserved_not_accepted",
+                        "partial_diff_artifact": str(artifact_path),
+                        "artifacts": {"partial_diff": str(artifact_path)},
+                        "changed_files": list(changed_files),
+                        "failure_reason": "WORKER_VERIFIABLE_DIFF_SYNC_FAILED",
+                        "blocker_kind": "worker_incomplete_diff",
+                        "output_excerpt": (
+                            "Worker produced a source plus required-test partial diff, but ACA could not sync it "
+                            f"for review: {sync_error}"
+                        ),
+                        "recovery_action": (
+                            "Retry with the preserved source+test patch already applied, then sync and verify the changed files."
+                        ),
+                        "write_required": True,
+                        "verified_existing": False,
+                    }
+                    event_type = "worker.failed"
+                active_worker_snapshot_digests[wid] = digest
+                active_worker_progress_snapshots[wid] = snapshot
+                with active_workers_lock:
+                    active_worker_abort_results[wid] = result
+                _clear_active_worker_attempt_marker(ctx, wid)
+                append_event(
+                    ctx.layout["events"],
+                    "worker.verifiable_diff_detected",
+                    ctx.run_id,
+                    snapshot,
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                append_event(
+                    ctx.layout["events"],
+                    event_type,
+                    ctx.run_id,
+                    {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "returncode": result["returncode"],
+                        "partial_diff_state": result.get("partial_diff_state"),
+                        "partial_diff_artifact": result.get("partial_diff_artifact"),
+                        "changed_files": result.get("changed_files"),
+                        "synced_files": result.get("synced_files"),
+                        "failure_reason": result.get("failure_reason"),
+                        "blocker_kind": result.get("blocker_kind"),
+                        "recovery_action": result.get("recovery_action"),
+                    },
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                return snapshot
+            if same_digest and previous_snapshot:
+                return previous_snapshot
             artifact_path.write_text(
                 "# Partial worker diff captured during worker progress heartbeat\n"
                 "# Reason: active worker had filesystem changes before terminal result\n\n"
@@ -763,6 +1306,29 @@ def dispatch_workers(ctx: RunContext) -> None:
         except Exception:
             logger.debug("Failed to snapshot worker progress diff for %s", wid, exc_info=True)
             return None
+
+    def _schedule_worker_progress_snapshot(wid: str, worktree: Path) -> None:
+        """Run expensive progress diff capture away from the lease heartbeat."""
+
+        with active_workers_lock:
+            if wid in active_worker_snapshot_inflight:
+                return
+            active_worker_snapshot_inflight.add(wid)
+
+        def _run_snapshot() -> None:
+            try:
+                _snapshot_worker_progress_diff(wid, worktree)
+            finally:
+                with active_workers_lock:
+                    active_worker_snapshot_inflight.discard(wid)
+
+        thread = threading.Thread(
+            target=_run_snapshot,
+            name=f"aca-worker-progress-snapshot-{wid}",
+            daemon=True,
+        )
+        active_worker_snapshot_threads.append(thread)
+        thread.start()
 
     def _attach_progress_snapshot_to_failed_result(result: dict[str, Any]) -> None:
         if result.get("returncode") == 0 or result.get("partial_diff_artifact"):
@@ -835,7 +1401,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                     logger.debug("Heartbeat failed for worker %s", wid, exc_info=True)
                 worktree = worktrees.get(wid)
                 if worktree:
-                    _snapshot_worker_progress_diff(wid, worktree)
+                    _schedule_worker_progress_snapshot(wid, worktree)
             now = time.monotonic()
             progress_interval = max(30.0, float(ctx.cfg.coordination.heartbeat_interval_seconds or 1) * 2.0)
             nonlocal last_progress_event_at
@@ -917,7 +1483,10 @@ def dispatch_workers(ctx: RunContext) -> None:
             active_worker_started_at_ms[wid] = int(time.time() * 1000)
             subtask_id = str(subtask.get("id") or "").strip()
             if subtask_id:
-                active_worker_worktrees[wid] = ctx.run_dir / "worktrees" / f"{wid}--{subtask_id}"
+                worktree_name = str(subtask.get("_worker_worktree_name") or "").strip()
+                if not worktree_name or "/" in worktree_name or "\\" in worktree_name or ".." in worktree_name:
+                    worktree_name = worker_worktree_name(wid, subtask_id)
+                active_worker_worktrees[wid] = ctx.run_dir / "worktrees" / worktree_name
                 active_worker_subtasks[wid] = dict(subtask)
 
     def _abort_result(index: int, subtask: dict[str, Any], wid: str) -> dict[str, Any] | None:
@@ -978,6 +1547,9 @@ def dispatch_workers(ctx: RunContext) -> None:
                 )
             except Exception:
                 logger.debug("Failed to unregister lingering worker %s", wid, exc_info=True)
+        for thread in list(active_worker_snapshot_threads):
+            if thread.is_alive():
+                thread.join(timeout=0.1)
 
     _apply_tolerated_failures(ctx)
     ctx.status["metrics"].update(_rc._worker_result_metrics(ctx.worker_results))

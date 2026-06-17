@@ -322,7 +322,7 @@ def cmd_lease_list(cfg: ResolvedConfig, status: str | None, task_key: str | None
     return 0
 
 
-def cmd_lease_release(cfg: ResolvedConfig, lease_id: str, reason: str | None) -> int:
+def cmd_lease_release(cfg: ResolvedConfig, lease_id: str, reason: str | None, status: str = "stale") -> int:
     if not lease_id.strip():
         print("lease_id is required.")
         return 2
@@ -334,7 +334,7 @@ def cmd_lease_release(cfg: ResolvedConfig, lease_id: str, reason: str | None) ->
     store.ensure_schema()
     released = store.release_lease(
         lease_id.strip(),
-        status="completed",
+        status=status,
         reason=(reason or "manual release via CLI"),
     )
     if released is None:
@@ -541,6 +541,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lease_release.add_argument("lease_id")
     lease_release.add_argument("--reason", default=None)
+    lease_release.add_argument(
+        "--status",
+        choices=["stale", "blocked", "failed", "completed"],
+        default="stale",
+        help="Terminal lease status to record. Defaults to stale so manual unblocks do not mark unfinished tasks done.",
+    )
     lease_release.set_defaults(lease_command="release")
     lease_reap = lease_sub.add_parser(
         "reap-stale",
@@ -625,7 +631,12 @@ def main(argv: list[str] | None = None) -> int:
                 limit=getattr(args, "limit", 50),
             )
         if lease_command == "release":
-            return cmd_lease_release(cfg, lease_id=getattr(args, "lease_id"), reason=getattr(args, "reason", None))
+            return cmd_lease_release(
+                cfg,
+                lease_id=getattr(args, "lease_id"),
+                reason=getattr(args, "reason", None),
+                status=getattr(args, "status", "stale"),
+            )
         if lease_command == "reap-stale":
             return cmd_lease_reap(cfg)
         parser.error(f"Unknown lease command: {lease_command}")

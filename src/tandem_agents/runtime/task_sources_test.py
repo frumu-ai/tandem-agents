@@ -204,7 +204,7 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
 
             self.assertEqual(task["repo"]["slug"], "frumu-ai/tandem")
             self.assertEqual(task["repo"]["clone_url"], "https://github.com/frumu-ai/tandem")
-            self.assertEqual(task["repo"]["path"], "/workspace/repos/tandem")
+            self.assertEqual(task["repo"]["path"], str(Path("/workspace/repos/tandem").resolve()))
 
     def test_todos_status_items_are_actionable_in_board_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -593,6 +593,31 @@ class LinearTaskSourceTest(unittest.TestCase):
             ]
 
             with self.assertRaisesRegex(RuntimeError, "No actionable Linear issues.*(Done.*In Progress|In Progress.*Done)"):
+                _select_linear_issue(cfg, issues=issues)
+
+    def test_linear_explicit_selector_can_resume_started_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.item = "ENG-1"
+            issues = [
+                {"id": "lin-1", "identifier": "ENG-1", "title": "Started", "state": {"name": "In Progress", "type": "started"}},
+            ]
+
+            chosen, eligible, warning = _select_linear_issue(cfg, issues=issues)
+
+            self.assertTrue(eligible)
+            self.assertIsNone(warning)
+            self.assertEqual(chosen["identifier"], "ENG-1")
+
+    def test_linear_explicit_selector_rejects_completed_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.item = "ENG-2"
+            issues = [
+                {"id": "lin-2", "identifier": "ENG-2", "title": "Done", "state": {"name": "Done", "type": "completed"}},
+            ]
+
+            with self.assertRaisesRegex(RuntimeError, "not actionable: status is .Done."):
                 _select_linear_issue(cfg, issues=issues)
 
     def test_linear_board_snapshot_marks_only_scheduler_next_actionable(self) -> None:

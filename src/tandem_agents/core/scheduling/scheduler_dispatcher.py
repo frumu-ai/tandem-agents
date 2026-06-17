@@ -31,7 +31,11 @@ def _task_source_overrides(task: dict[str, Any]) -> dict[str, str]:
     for key, env_name in [
         ("owner", "ACA_TASK_SOURCE_OWNER"),
         ("repo", "ACA_TASK_SOURCE_REPO"),
+        ("team", "ACA_TASK_SOURCE_TEAM"),
         ("project", "ACA_TASK_SOURCE_PROJECT"),
+        ("statuses", "ACA_TASK_SOURCE_STATUSES"),
+        ("labels", "ACA_TASK_SOURCE_LABELS"),
+        ("query", "ACA_TASK_SOURCE_QUERY"),
         ("item", "ACA_TASK_SOURCE_ITEM"),
         ("url", "ACA_TASK_SOURCE_URL"),
         ("path", "ACA_TASK_SOURCE_PATH"),

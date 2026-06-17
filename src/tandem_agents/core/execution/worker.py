@@ -41,7 +41,7 @@ from src.tandem_agents.core.repository.repo_truth import file_is_readable, shell
 from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.runtime.artifact_store import mirror_run_tree
 from src.tandem_agents.runtime.runstate import append_event, ensure_layout
-from src.tandem_agents.utils.utils import now_ms
+from src.tandem_agents.utils.utils import atomic_write_json, now_ms
 from src.tandem_agents.core.engine.tandem_client_sdk import (
     sdk_session_messages,
     sdk_sessions_prompt_async,
@@ -50,6 +50,7 @@ from src.tandem_agents.core.engine.tandem_client_sdk import (
 )
 
 PRINT_LOCK = threading.Lock()
+WORKER_STATUS_LOCK = threading.Lock()
 SESSION_TOOL_ALLOWLIST = [
     "read",
     "glob",
@@ -68,6 +69,13 @@ SESSION_PERMISSION_RULES = [
     {"permission": tool, "pattern": "*", "action": "allow"}
     for tool in SESSION_TOOL_ALLOWLIST
 ]
+
+
+def _worker_execution_worktree_name(worker_id: str, subtask: dict[str, Any]) -> str:
+    override = str(subtask.get("_worker_worktree_name") or "").strip()
+    if override and "/" not in override and "\\" not in override and ".." not in override:
+        return override
+    return worker_worktree_name(worker_id, subtask.get("id"))
 WORKER_FAILURE_MARKERS = (
     "ENGINE_ERROR:",
     "TOOL_MODE_REQUIRED_NOT_SATISFIED",
@@ -77,6 +85,9 @@ WORKER_FAILURE_MARKERS = (
     "ENGINE_TOOL_LOOP_STALLED",
     "ENGINE_SESSION_RUN_CONFLICT",
     "TERMINALIZED_WITH_REMAINING_BLOCKERS",
+)
+WORKER_BLOCKED_STATUS_RE = re.compile(
+    r"(?im)^\s*(?:status\s*:\s*blocked.*|blocked(?:\s*(?:[^\w\s].*)?)?)\s*$"
 )
 
 TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "dispatch_timeout"}
@@ -988,6 +999,8 @@ def _is_aca_repo_artifact_path(path: str) -> bool:
         return True
     if rel_path.startswith(".aca/"):
         return True
+    if name == "__aca_temp_probe.txt":
+        return True
     if name == ".aca_worker_blocker_note.txt":
         return True
     if name.startswith("aca-") and name.endswith(".md"):
@@ -1334,6 +1347,36 @@ def _apply_carry_forward_patch(worktree: Path, patch_path: Path, log_path: Path)
     return True
 
 
+def _carry_forward_patch_failure_result(
+    patch_path: Path,
+    worker_id: str,
+    subtask: dict[str, Any],
+    log_path: Path,
+) -> dict[str, Any]:
+    message = (
+        "ACA could not apply the preserved partial worker diff before retry. "
+        "The patch artifact is missing, unreadable, mechanically invalid, or no longer applies cleanly."
+    )
+    return {
+        "worker_id": worker_id,
+        "subtask_id": str(subtask.get("id") or "").strip(),
+        "status": "failed",
+        "returncode": 1,
+        "stdout": f"{message}\nPatch: {patch_path}",
+        "failure_reason": "CARRY_FORWARD_PATCH_APPLY_FAILED",
+        "blocker_kind": "carry_forward_patch_apply_failed",
+        "recovery_action": (
+            "Discard this preserved patch for the next repair attempt and plan a fresh narrow repair "
+            "against the parent task target files."
+        ),
+        "log_path": str(log_path),
+        "changed_files": [],
+        "write_required": bool(subtask.get("write_required")),
+        "verified_existing": False,
+        "carry_forward_patch": str(patch_path),
+    }
+
+
 def _recover_tool_stall_with_diff(
     result: dict[str, Any],
     log_path: Path,
@@ -1374,15 +1417,26 @@ def _corrupt_repeated_source_diff_reason(worktree: Path) -> str | None:
         return None
     source_exts = (".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py")
     current_source_file = False
+    current_target = ""
     counts: dict[str, int] = {}
+    python_top_level_defs: dict[tuple[str, str], int] = {}
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("diff --git "):
             parts = raw_line.split()
             target = parts[-1][2:] if len(parts) >= 4 and parts[-1].startswith("b/") else ""
+            current_target = target
             current_source_file = target.endswith(source_exts)
             continue
         if not current_source_file or raw_line.startswith("+++") or not raw_line.startswith("+"):
             continue
+        if current_target.endswith(".py"):
+            definition_match = re.match(r"^(async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", raw_line[1:])
+            if definition_match:
+                definition = f"{definition_match.group(1)} {definition_match.group(2)}"
+                key = (current_target, definition)
+                python_top_level_defs[key] = python_top_level_defs.get(key, 0) + 1
+                if python_top_level_defs[key] >= 2:
+                    return f"duplicate top-level Python definition added in {current_target}: {definition}"
         line = raw_line[1:].strip()
         if len(line) < 24:
             continue
@@ -1508,6 +1562,19 @@ def _engine_failure_should_not_recover(result: dict[str, Any], stdout_text: str)
     )
 
 
+def _engine_dispatch_failure_allows_diff_salvage(result: dict[str, Any], stdout_text: str) -> bool:
+    reason = str(result.get("failure_reason") or "").upper()
+    blocker = str(result.get("blocker_kind") or "").lower()
+    text = f"{reason}\n{stdout_text}".upper()
+    if any(marker in text for marker in ("API KEY", "AUTHORIZATION", "AUTHENTICATION")):
+        return False
+    return (
+        blocker == "engine_dispatch_failed"
+        or "ENGINE_DISPATCH_FAILED" in text
+        or "ITERATION BUDGET" in text
+    )
+
+
 def _terminalized_note_reports_blockers(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
     if not normalized:
@@ -1597,6 +1664,10 @@ def _terminalized_note_reports_blockers(text: str) -> bool:
     return any(marker in normalized for marker in blocker_markers)
 
 
+def _worker_note_reports_blocked(text: str) -> bool:
+    return bool(WORKER_BLOCKED_STATUS_RE.search(str(text or "")))
+
+
 def _terminalized_note_reports_no_visible_verification(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
     if not normalized:
@@ -1646,6 +1717,72 @@ def _run_has_terminal_status(layout: dict[str, Path]) -> bool:
     return run_status in {"blocked", "completed"} or run.get("completed_at_ms") is not None
 
 
+def _active_worker_attempts_path(layout: dict[str, Path]) -> Path | None:
+    run_dir = layout.get("run_dir")
+    if not isinstance(run_dir, Path):
+        return None
+    return run_dir / "active_worker_attempts.json"
+
+
+def _load_active_worker_attempts(layout: dict[str, Path]) -> dict[str, str]:
+    path = _active_worker_attempts_path(layout)
+    if not isinstance(path, Path) or not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(key): str(value) for key, value in loaded.items() if str(key).strip() and str(value).strip()}
+
+
+def _write_active_worker_attempts(layout: dict[str, Path], attempts: dict[str, str]) -> None:
+    path = _active_worker_attempts_path(layout)
+    if not isinstance(path, Path):
+        return
+    if attempts:
+        atomic_write_json(path, attempts)
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _mark_active_worker_attempt(layout: dict[str, Path], worker_id: str, execution_id: str) -> None:
+    worker_id = str(worker_id or "").strip()
+    execution_id = str(execution_id or "").strip()
+    if not worker_id or not execution_id:
+        return
+    with WORKER_STATUS_LOCK:
+        attempts = _load_active_worker_attempts(layout)
+        attempts[worker_id] = execution_id
+        _write_active_worker_attempts(layout, attempts)
+
+
+def _clear_active_worker_attempt(layout: dict[str, Path], worker_id: str, execution_id: str) -> None:
+    worker_id = str(worker_id or "").strip()
+    execution_id = str(execution_id or "").strip()
+    if not worker_id or not execution_id:
+        return
+    with WORKER_STATUS_LOCK:
+        attempts = _load_active_worker_attempts(layout)
+        if attempts.get(worker_id) != execution_id:
+            return
+        attempts.pop(worker_id, None)
+        _write_active_worker_attempts(layout, attempts)
+
+
+def _worker_event_attempt_is_current(layout: dict[str, Path], payload: dict[str, Any]) -> bool:
+    execution_id = str(payload.get("execution_id") or "").strip()
+    worker_id = str(payload.get("worker_id") or "").strip()
+    if not execution_id or not worker_id:
+        return True
+    attempts = _load_active_worker_attempts(layout)
+    return str(attempts.get(worker_id) or "").strip() == execution_id
+
+
 def _append_worker_event_if_run_active(
     layout: dict[str, Path],
     log_path: Path,
@@ -1662,6 +1799,15 @@ def _append_worker_event_if_run_active(
         log_path.write_text(
             previous
             + f"\nACA suppressed late worker event `{event_type}` because run {run_id} is already terminal.\n",
+            encoding="utf-8",
+        )
+        return False
+    if not _worker_event_attempt_is_current(layout, payload):
+        previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        log_path.write_text(
+            previous
+            + f"\nACA suppressed stale worker event `{event_type}` from inactive execution "
+            + f"{payload.get('execution_id')}.\n",
             encoding="utf-8",
         )
         return False
@@ -1701,9 +1847,37 @@ def _late_terminal_worker_result(
     return stale
 
 
+def _inactive_worker_attempt_result(
+    result: dict[str, Any],
+    *,
+    log_path: Path,
+    write_required: bool,
+    execution_id: str,
+) -> dict[str, Any]:
+    previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    log_path.write_text(
+        previous
+        + "\nACA ignored this worker result because a newer retry execution superseded it before sync.\n",
+        encoding="utf-8",
+    )
+    stale = dict(result)
+    stale["returncode"] = 1
+    stale["status"] = "failed"
+    stale["failure_reason"] = "WORKER_RESULT_AFTER_RETRY_SUPERSEDED"
+    stale["blocker_kind"] = "stale_worker_result"
+    stale["recovery_action"] = "Inspect the active retry result; this abandoned worker result was intentionally ignored."
+    stale["log_path"] = str(log_path)
+    stale["write_required"] = write_required
+    stale["execution_id"] = str(execution_id or "").strip()
+    stale.setdefault("stdout", "")
+    return stale
+
+
 def _subtask_requires_real_diff(subtask: dict[str, Any]) -> bool:
     if subtask.get("pr_candidate_context") or subtask.get("pr_candidate_refs"):
         return True
+    if subtask.get("repair_verification_first"):
+        return False
     if not _subtask_targets(subtask):
         return False
     text = _subtask_search_text(subtask)
@@ -2066,6 +2240,24 @@ def _recover_nonzero_result_with_diff(
         or "ENGINE_PROMPT_TIMEOUT" in stdout_text.upper()
     ):
         return _recover_tool_stall_with_diff(result, log_path, worktree, reason=reason)
+    if _engine_dispatch_failure_allows_diff_salvage(result, stdout_text):
+        message = (
+            "Worker engine dispatch failed before a terminal response, but ACA found a substantive "
+            "target-file diff. Accepting the worker diff for normal integration review and verification.\n"
+        )
+        log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
+        result["stdout"] = f"{stdout_text}{message}"
+        result["returncode"] = 0
+        result["recovered_success"] = True
+        result["recovered_from_engine_dispatch_partial_diff"] = True
+        result["recovered_failure_reason"] = result.get("failure_reason") or reason
+        result.setdefault("warnings", []).append("engine_dispatch_failed_partial_diff_salvaged")
+        result.pop("failure_reason", None)
+        result.pop("blocker_kind", None)
+        result.pop("recovery_action", None)
+        result["changed_files"] = changed_files
+        result["diff_stat"] = diff_text
+        return result
     if _engine_failure_should_not_recover(result, str(result.get("stdout") or "")):
         return _preserve_partial_worker_diff(result, log_path, worktree, reason=reason)
     message = (
@@ -2358,7 +2550,9 @@ def _worker_prompt_retry_suffix(subtask: dict[str, Any]) -> str:
             "For private helper coverage, add real tests inside the source module that defines the helper; do not add placeholder integration or contract test files.",
             "When adding tests, prefer additive test modules or additive cases; do not rewrite existing tests unless the task explicitly requires changing them.",
             "Missing test coverage or missing behavior is not a blocker; implement the smallest safe improvement in one of the target files.",
-            "Once a substantive diff exists, stop expanding scope: run one lightweight verification or file readback, then return the final completion note.",
+            "Once a substantive diff exists, stop expanding scope; run one lightweight verification or file readback, retry a narrower readback if a tool is skipped, then return the final completion note.",
+            "For Python sibling test files under `src/`, prefer `python3 -m unittest <module.path>`; use `python3 -m py_compile <changed files>` as a fallback if dependencies needed by the test command are unavailable.",
+            "Do not treat missing `pytest` as a blocker when an equivalent `python3 -m unittest ...` command can exercise the changed Python test module.",
             "Finish by verifying the changed files with `ls -la`, `read`, `grep`, or the narrowest relevant test command.",
         ]
     )
@@ -2441,6 +2635,8 @@ def _coerce_worker_failure(
         result["verified_existing"] = True
         return result
     failure_reason = str(result.get("failure_reason") or "").strip()
+    if result.get("returncode", 0) == 0 and _worker_note_reports_blocked(stdout_text):
+        failure_reason = failure_reason or "WORKER_REPORTED_BLOCKER"
     for marker in WORKER_FAILURE_MARKERS:
         if not failure_reason and marker in stdout_text:
             if marker == "ENGINE_ERROR:":
@@ -2527,6 +2723,8 @@ def _coerce_worker_failure(
         )
     elif failure_reason not in stdout_text:
         message = f"Worker failed: {failure_reason}\n"
+    if failure_reason == "WORKER_REPORTED_BLOCKER":
+        message = "Worker final note reported a blocker, so ACA is treating the worker as failed.\n"
     if message:
         log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
         result["stdout"] = f"{stdout_text}{message}"
@@ -2588,6 +2786,12 @@ def _coerce_worker_failure(
                 "Reset this worker diff and retry with coverage that updates the declared test target "
                 "and exercises existing production behavior."
             )
+    elif failure_reason == "WORKER_REPORTED_BLOCKER":
+        result["blocker_kind"] = "worker_incomplete_diff" if diff_text else "worker_reported_blocker"
+        if not result.get("recovery_action"):
+            result["recovery_action"] = (
+                "Inspect the worker note and preserved diff, then retry with enough tool budget to verify the changed files."
+            )
     elif failure_reason == "ENGINE_EXCEPTION":
         result["blocker_kind"] = "engine_exception"
     elif failure_reason.startswith("ENGINE_ERROR:"):
@@ -2606,6 +2810,8 @@ def _coerce_worker_failure(
                 )
     if diff_text and failure_reason in {"ENGINE_TOOL_LOOP_STALLED", "ENGINE_PROMPT_TIMEOUT"} and diff_satisfies_subtask:
         return _recover_tool_stall_with_diff(result, log_path, worktree, reason=failure_reason)
+    if diff_text and failure_reason == "WORKER_REPORTED_BLOCKER":
+        return _preserve_partial_worker_diff(result, log_path, worktree, reason=failure_reason)
     if diff_text and _engine_failure_should_not_recover(result, str(result.get("stdout") or stdout_text)):
         return _preserve_partial_worker_diff(result, log_path, worktree, reason=failure_reason)
     return result
@@ -3375,9 +3581,11 @@ def _partial_diff_payload(result: dict[str, Any], worker_id: str, subtask: dict[
     return {
         "worker_id": worker_id,
         "subtask_id": subtask.get("id"),
+        "execution_id": str(subtask.get("_worker_execution_id") or "").strip(),
         "partial_diff_state": state,
         "partial_diff_artifact": artifact_path,
         "changed_files": list(result.get("changed_files") or []),
+        "synced_files": list(result.get("synced_files") or []),
         "failure_reason": result.get("failure_reason"),
         "blocker_kind": result.get("blocker_kind"),
         "recovery_action": result.get("recovery_action"),
@@ -3425,13 +3633,17 @@ def run_worker_subtask(
 ) -> dict[str, Any]:
     layout = ensure_layout(run_dir)
     
+    execution_id = str(subtask.get("_worker_execution_id") or "").strip()
+
     # Create an isolated worktree for this worker/subtask ownership pair.
-    worktree_path = layout["worktrees"] / worker_worktree_name(worker_id, subtask.get("id"))
+    worktree_path = layout["worktrees"] / _worker_execution_worktree_name(worker_id, subtask)
     worktree = create_worktree(repo_path, worktree_path)
     log_path = layout["logs"] / f"{worker_id}.log"
     carry_forward_patch = str(subtask.get("carry_forward_patch") or "").strip()
     if carry_forward_patch:
-        _apply_carry_forward_patch(worktree, Path(carry_forward_patch), log_path)
+        patch_path = Path(carry_forward_patch)
+        if not _apply_carry_forward_patch(worktree, patch_path, log_path):
+            return _carry_forward_patch_failure_result(patch_path, worker_id, subtask, log_path)
     subtask = _materialize_worker_context(worktree, subtask)
     subtask = _annotate_ignored_target_files(worktree, subtask)
     
@@ -3470,8 +3682,27 @@ def run_worker_subtask(
             "- Re-check the current directory with tools before doing any work.\n"
         )
     
-    append_event(layout["events"], "worker.started", run_id, {"worker_id": worker_id, "subtask_id": subtask["id"], "worktree": str(worktree)}, task_id=task.get("task_id"), role="worker", repo={"path": str(repo_path)})
+    if execution_id:
+        _mark_active_worker_attempt(layout, worker_id, execution_id)
+    append_event(
+        layout["events"],
+        "worker.started",
+        run_id,
+        {
+            "worker_id": worker_id,
+            "subtask_id": subtask["id"],
+            "worktree": str(worktree),
+            "execution_id": execution_id,
+        },
+        task_id=task.get("task_id"),
+        role="worker",
+        repo={"path": str(repo_path)},
+    )
     
+    def _summarize_and_clear_current_attempt(worker_result: dict[str, Any]) -> dict[str, Any]:
+        _clear_active_worker_attempt(layout, worker_id, execution_id)
+        return summarize_worker_notes(worker_result, worker_id, subtask, worktree, index)
+
     result = stream_tandem_prompt(
         cfg,
         role=worker_id,
@@ -3490,7 +3721,18 @@ def run_worker_subtask(
 
     if _run_has_terminal_status(layout):
         result = _late_terminal_worker_result(result, log_path=log_path, write_required=write_required)
-        return summarize_worker_notes(result, worker_id, subtask, worktree, index)
+        return _summarize_and_clear_current_attempt(result)
+    if not _worker_event_attempt_is_current(
+        layout,
+        {"worker_id": worker_id, "execution_id": execution_id},
+    ):
+        result = _inactive_worker_attempt_result(
+            result,
+            log_path=log_path,
+            write_required=write_required,
+            execution_id=execution_id,
+        )
+        return _summarize_and_clear_current_attempt(result)
     
     # Sync artifacts after turn
     if not _run_has_terminal_status(layout):
@@ -3517,6 +3759,7 @@ def run_worker_subtask(
             {
                 "worker_id": worker_id,
                 "subtask_id": subtask["id"],
+                "execution_id": execution_id,
                 "changed_files": list(result.get("changed_files") or []),
                 "returncode": result.get("returncode"),
                 "partial_diff_state": "accepted",
@@ -3570,6 +3813,7 @@ def run_worker_subtask(
                 {
                     "worker_id": worker_id,
                     "subtask_id": subtask["id"],
+                    "execution_id": execution_id,
                     "pr_number": seeded_diff.get("number"),
                     "pr_numbers": seeded_diff.get("numbers") or [],
                     "ref": seeded_diff.get("ref"),
@@ -3606,6 +3850,7 @@ def run_worker_subtask(
             {
                 "worker_id": worker_id,
                 "subtask_id": subtask["id"],
+                "execution_id": execution_id,
                 "previous_failure_reason": result.get("failure_reason"),
                 "previous_blocker_kind": result.get("blocker_kind"),
                 "write_required": write_required,
@@ -3638,7 +3883,7 @@ def run_worker_subtask(
                 log_path=log_path,
                 write_required=write_required,
             )
-            return summarize_worker_notes(retry_result, worker_id, subtask, worktree, index)
+            return _summarize_and_clear_current_attempt(retry_result)
         
         # Sync artifacts after retry turn
         if not _run_has_terminal_status(layout):
@@ -3665,6 +3910,7 @@ def run_worker_subtask(
                 {
                     "worker_id": worker_id,
                     "subtask_id": subtask["id"],
+                    "execution_id": execution_id,
                     "changed_files": list(retry_result.get("changed_files") or []),
                     "returncode": retry_result.get("returncode"),
                     "partial_diff_state": "accepted",
@@ -3718,8 +3964,29 @@ def run_worker_subtask(
 
     if _run_has_terminal_status(layout):
         result = _late_terminal_worker_result(result, log_path=log_path, write_required=write_required)
-        return summarize_worker_notes(result, worker_id, subtask, worktree, index)
-            
+        return _summarize_and_clear_current_attempt(result)
+
+    if not _worker_event_attempt_is_current(
+        layout,
+        {"worker_id": worker_id, "execution_id": execution_id},
+    ):
+        result = _inactive_worker_attempt_result(
+            result,
+            log_path=log_path,
+            write_required=write_required,
+            execution_id=execution_id,
+        )
+        return _summarize_and_clear_current_attempt(result)
+
+    if result["returncode"] == 0:
+        synced = sync_worktree_changes(worktree, repo_path)
+        if isinstance(synced, list):
+            synced_files = [str(path) for path in synced if str(path).strip()]
+            if synced_files:
+                result["synced_files"] = synced_files
+                existing_changed = [str(path) for path in (result.get("changed_files") or []) if str(path).strip()]
+                result["changed_files"] = list(dict.fromkeys([*existing_changed, *synced_files]))
+
     _append_worker_event_if_run_active(
         layout,
         log_path,
@@ -3728,6 +3995,7 @@ def run_worker_subtask(
         {
             "worker_id": worker_id,
             "subtask_id": subtask["id"],
+            "execution_id": execution_id,
             "returncode": result["returncode"],
             **_partial_diff_payload(result, worker_id, subtask),
             "failure_reason": result.get("failure_reason"),
@@ -3739,9 +4007,5 @@ def run_worker_subtask(
         role="worker",
         repo={"path": str(repo_path)},
     )
-    
-    # Finalize by syncing worktree changes back to the main repo path if successful
-    if result["returncode"] == 0:
-        sync_worktree_changes(worktree, repo_path)
-        
-    return summarize_worker_notes(result, worker_id, subtask, worktree, index)
+
+    return _summarize_and_clear_current_attempt(result)
