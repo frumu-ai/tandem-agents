@@ -10,6 +10,8 @@ from unittest import mock
 
 from src.tandem_agents.core.phases.worker_dispatch import (
     _cancel_active_worker_engine_session,
+    _changed_python_test_modules,
+    _changed_python_tests_result,
     _diff_add_delete_counts,
     _diff_is_destructive_rewrite,
     _failed_result_has_reviewable_source_and_test_diff,
@@ -132,6 +134,54 @@ class WorkerDispatchTest(unittest.TestCase):
                 {"write_required": True, "deterministic_partial_diff_repair": True}
             )
         )
+
+    def test_changed_python_test_modules_targets_changed_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test_path = root / "src" / "tandem_agents" / "config" / "config_loader_test.py"
+            test_path.parent.mkdir(parents=True)
+            test_path.write_text("import unittest\n", encoding="utf-8")
+            (test_path.parent / "config_loader.py").write_text("# source\n", encoding="utf-8")
+
+            self.assertEqual(
+                _changed_python_test_modules(
+                    root,
+                    [
+                        "src/tandem_agents/config/config_loader.py",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                ),
+                ["src.tandem_agents.config.config_loader_test"],
+            )
+
+    def test_changed_python_tests_result_reports_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            for init_path in [
+                root / "src" / "__init__.py",
+                root / "src" / "tandem_agents" / "__init__.py",
+                package / "__init__.py",
+            ]:
+                init_path.write_text("", encoding="utf-8")
+            test_path = package / "config_loader_test.py"
+            test_path.write_text(
+                "import unittest\n\n"
+                "class ConfigLoaderTest(unittest.TestCase):\n"
+                "    def test_fails(self):\n"
+                "        self.assertEqual(1, 2)\n",
+                encoding="utf-8",
+            )
+
+            result = _changed_python_tests_result(root, ["src/tandem_agents/config/config_loader_test.py"])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertIn("src.tandem_agents.config.config_loader_test", " ".join(result["command"]))
+        self.assertIn("FAILED", result["output"])
 
     def test_cancel_active_worker_engine_session_deletes_marked_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

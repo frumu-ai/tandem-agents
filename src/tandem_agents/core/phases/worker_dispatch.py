@@ -335,6 +335,57 @@ def _changed_python_syntax_errors(worktree: Path, changed_files: list[str]) -> l
     ]
 
 
+def _changed_python_test_modules(worktree: Path, changed_files: list[str]) -> list[str]:
+    modules: list[str] = []
+    seen: set[str] = set()
+    for raw_path in changed_files:
+        rel_path = str(raw_path or "").strip().replace("\\", "/")
+        if not rel_path.endswith(".py") or not _is_test_path(rel_path):
+            continue
+        if rel_path.endswith("/__init__.py") or rel_path == "__init__.py":
+            continue
+        if not (worktree / rel_path).is_file():
+            continue
+        module = rel_path[:-3].replace("/", ".")
+        if module and module not in seen:
+            seen.add(module)
+            modules.append(module)
+    return modules
+
+
+def _changed_python_tests_result(worktree: Path, changed_files: list[str]) -> dict[str, Any] | None:
+    modules = _changed_python_test_modules(worktree, changed_files)
+    if not modules:
+        return None
+    command = ["python3", "-m", "unittest", *modules]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = "\n".join(part for part in (exc.stdout, exc.stderr) if isinstance(part, str)).strip()
+        return {
+            "ok": False,
+            "command": command,
+            "returncode": None,
+            "output": output or "changed Python tests timed out after 90s",
+            "timed_out": True,
+        }
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    return {
+        "ok": result.returncode == 0,
+        "command": command,
+        "returncode": result.returncode,
+        "output": output,
+        "timed_out": False,
+    }
+
+
 def _is_test_path(path: str) -> bool:
     lowered = str(path or "").strip().replace("\\", "/").lower()
     if not lowered:
@@ -1578,6 +1629,86 @@ def dispatch_workers(ctx: RunContext) -> None:
                     repo={"path": ctx.repo.get("path")},
                 )
                 return snapshot
+            if (
+                verifiable_abort_seconds > 0
+                and elapsed_seconds >= verifiable_abort_seconds
+                and _subtask_has_verifiable_source_and_test_diff(subtask, changed_files)
+            ):
+                test_result = _changed_python_tests_result(worktree, changed_files)
+                if test_result is not None and not bool(test_result.get("ok")):
+                    command = [str(part) for part in test_result.get("command") or []]
+                    output = str(test_result.get("output") or "").strip()
+                    artifact_path.write_text(
+                        "# Partial worker diff captured during worker progress heartbeat\n"
+                        "# Reason: active worker produced source and required-test changes that failed focused tests before terminal result\n\n"
+                        f"## changed files\n\n{status_rows}\n\n"
+                        "## focused verification\n\n"
+                        f"- command: {' '.join(command)}\n"
+                        f"- returncode: {test_result.get('returncode')}\n"
+                        f"- timed_out: {bool(test_result.get('timed_out'))}\n\n"
+                        "## test output\n\n"
+                        f"{output[:8000] or '(no output)'}\n\n"
+                        "## verifiable diff guard\n\n"
+                        f"- elapsed_seconds: {elapsed_seconds:.1f}\n"
+                        f"- abort_seconds: {verifiable_abort_seconds:.1f}\n"
+                        f"- required_test_files: {required_test_files}\n"
+                        "- reason: subtask has production and required-test changes but focused tests failed; retry should fix the preserved patch before sync\n\n"
+                        f"## git diff --binary\n\n{diff_text}\n",
+                        encoding="utf-8",
+                    )
+                    snapshot = {
+                        "worker_id": wid,
+                        "partial_diff_artifact": str(artifact_path),
+                        "changed_files": list(changed_files),
+                        "partial_diff_state": "preserved_not_accepted",
+                        "source": "worker_verifiable_diff_test_failed_guard",
+                        "diff_bytes": diff_bytes,
+                        "diff_lines": diff_lines,
+                        "elapsed_seconds": round(elapsed_seconds, 1),
+                        "abort_seconds": verifiable_abort_seconds,
+                        "required_test_files": required_test_files,
+                        "verification_command": command,
+                        "verification_returncode": test_result.get("returncode"),
+                        "verification_timed_out": bool(test_result.get("timed_out")),
+                    }
+                    active_worker_snapshot_digests[wid] = digest
+                    active_worker_progress_snapshots[wid] = snapshot
+                    subtask_id = str(subtask.get("id") or "").strip()
+                    with active_workers_lock:
+                        active_worker_abort_results[wid] = {
+                            "worker_id": wid,
+                            "subtask_id": subtask_id,
+                            "status": "failed",
+                            "returncode": 1,
+                            "partial_diff_state": "preserved_not_accepted",
+                            "partial_diff_artifact": str(artifact_path),
+                            "artifacts": {"partial_diff": str(artifact_path)},
+                            "changed_files": list(changed_files),
+                            "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                            "blocker_kind": "worker_incomplete_diff",
+                            "output_excerpt": (
+                                "Worker produced a source plus required-test partial diff, but focused tests failed "
+                                f"after {elapsed_seconds:.0f}s: {output[:500]}"
+                            ),
+                            "recovery_action": (
+                                "Retry with the preserved source+test patch already applied. Fix the focused test failure, "
+                                "then rerun the reported verification command before returning a terminal result."
+                            ),
+                            "write_required": True,
+                            "verified_existing": False,
+                            **_subtask_retry_metadata(subtask),
+                        }
+                    _clear_active_worker_attempt_marker(ctx, wid)
+                    append_event(
+                        ctx.layout["events"],
+                        "worker.verifiable_diff_tests_failed",
+                        ctx.run_id,
+                        snapshot,
+                        task_id=ctx.task.get("task_id"),
+                        role="worker",
+                        repo={"path": ctx.repo.get("path")},
+                    )
+                    return snapshot
             if (
                 verifiable_abort_seconds > 0
                 and elapsed_seconds >= verifiable_abort_seconds
