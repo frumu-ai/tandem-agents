@@ -584,6 +584,25 @@ class WorkerDispatchTest(unittest.TestCase):
 
         self.assertIn("config_loader.py", filtered)
         self.assertNotIn("config_types.py", filtered)
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            package = worktree / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            (package / "config_loader.py").write_text(
+                "return SchedulerConfig(queue_depth_limit=50)\n",
+                encoding="utf-8",
+            )
+            patch_path = worktree / "filtered.patch"
+            patch_path.write_text(filtered, encoding="utf-8")
+            result = subprocess.run(
+                ["git", "apply", "--check", str(patch_path)],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_worktree_has_subtask_changes_ignores_inherited_dirty_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

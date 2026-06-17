@@ -316,7 +316,7 @@ def _filter_diff_text_to_files(diff_text: str, changed_files: list[str]) -> str:
         if include_current:
             current_lines.append(line)
     flush()
-    return "".join(sections).strip()
+    return "".join(sections)
 
 
 def _sync_verifiable_worker_diff(
