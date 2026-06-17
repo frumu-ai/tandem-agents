@@ -26,6 +26,7 @@ from typing import Any
 
 from src.tandem_agents.core.phases.context import RunContext
 from src.tandem_agents.core.engine.engine import delete_tandem_session
+from src.tandem_agents.core.engine.tandem_client_sdk import sdk_session_messages
 from src.tandem_agents.core.repository.repository import sync_worktree_changes, worker_worktree_name
 from src.tandem_agents.runtime.runstate import append_event
 from src.tandem_agents.utils.utils import atomic_write_json
@@ -440,7 +441,105 @@ def _worker_no_change_abort_seconds(ctx: RunContext) -> float:
             return max(0.0, float(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_NO_CHANGE_ABORT_SECONDS=%r", raw)
-    return 240.0
+    return 120.0
+
+
+def _worker_no_diff_tool_loop_abort_seconds(ctx: RunContext) -> float:
+    raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_NO_DIFF_TOOL_LOOP_ABORT_SECONDS") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_NO_DIFF_TOOL_LOOP_ABORT_SECONDS=%r", raw)
+    return 90.0
+
+
+def _session_messages_with_timeout(ctx: RunContext, session_id: str, *, timeout_seconds: float = 2.0) -> Any:
+    result: dict[str, Any] = {}
+
+    def _load() -> None:
+        try:
+            result["messages"] = sdk_session_messages(ctx.cfg, session_id)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_load, name="aca-worker-session-messages", daemon=True)
+    thread.start()
+    thread.join(max(0.1, timeout_seconds))
+    if thread.is_alive():
+        return None
+    if result.get("error"):
+        logger.debug("Failed to inspect worker session messages for tool-loop guard: %s", result["error"])
+        return None
+    return result.get("messages")
+
+
+def _tool_loop_summary_from_messages(messages: Any) -> dict[str, Any] | None:
+    if not isinstance(messages, list):
+        return None
+    tool_parts: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts") or message.get("content") or []
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "tool":
+                tool_parts.append(part)
+    if not tool_parts:
+        return None
+    invalid_patch_count = 0
+    noop_edit_count = 0
+    edit_paths: set[str] = set()
+    patch_paths: set[str] = set()
+    for part in tool_parts:
+        args = part.get("args") if isinstance(part.get("args"), dict) else {}
+        tool = str(part.get("tool") or "").strip()
+        result = str(part.get("result") or "")
+        if tool == "apply_patch":
+            patch_text = str(args.get("patchText") or "")
+            match = re.search(r"\*\*\* Update File:\s*([^\n\r]+)", patch_text)
+            if match:
+                patch_paths.add(match.group(1).strip())
+            if "No valid patches in input" in result:
+                invalid_patch_count += 1
+        elif tool == "edit":
+            path = str(args.get("path") or "").strip()
+            if path:
+                edit_paths.add(path)
+            if str(args.get("old") or "") == str(args.get("new") or ""):
+                noop_edit_count += 1
+    if invalid_patch_count >= 3:
+        return {
+            "tool_parts": len(tool_parts),
+            "invalid_patch_count": invalid_patch_count,
+            "noop_edit_count": noop_edit_count,
+            "paths": sorted(edit_paths | patch_paths),
+            "reason": "worker repeatedly submitted invalid apply_patch calls without leaving a filesystem diff",
+        }
+    if noop_edit_count >= 3 and len(tool_parts) >= 5:
+        return {
+            "tool_parts": len(tool_parts),
+            "invalid_patch_count": invalid_patch_count,
+            "noop_edit_count": noop_edit_count,
+            "paths": sorted(edit_paths | patch_paths),
+            "reason": "worker repeatedly made no-op edit calls without leaving a filesystem diff",
+        }
+    return None
+
+
+def _active_worker_no_diff_tool_loop(ctx: RunContext, worker_id: str) -> dict[str, Any] | None:
+    session = _load_active_worker_engine_sessions(ctx).get(worker_id) or {}
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        return None
+    messages = _session_messages_with_timeout(ctx, session_id)
+    summary = _tool_loop_summary_from_messages(messages)
+    if not summary:
+        return None
+    summary["session_id"] = session_id
+    return summary
 
 
 def _subtask_is_repair_no_change_guard_candidate(subtask: dict[str, Any]) -> bool:
@@ -1691,11 +1790,29 @@ def dispatch_workers(ctx: RunContext) -> None:
         if abort_seconds <= 0:
             return
         elapsed_seconds = max(0.0, time.monotonic() - started_at)
-        if elapsed_seconds < abort_seconds:
+        tool_loop_abort_seconds = _worker_no_diff_tool_loop_abort_seconds(ctx)
+        tool_loop_summary: dict[str, Any] | None = None
+        if tool_loop_abort_seconds > 0 and elapsed_seconds >= tool_loop_abort_seconds:
+            if not _worktree_has_any_changes(worktree):
+                tool_loop_summary = _active_worker_no_diff_tool_loop(ctx, wid)
+        if not tool_loop_summary and elapsed_seconds < abort_seconds:
             return
         if _worktree_has_any_changes(worktree):
             return
         subtask_id = str(subtask.get("id") or "").strip()
+        if tool_loop_summary:
+            event_type = "worker.no_diff_tool_loop_detected"
+            failure_reason = "WORKER_NO_DIFF_TOOL_LOOP"
+            reason = str(tool_loop_summary.get("reason") or "worker tool loop produced no filesystem changes")
+            excerpt = (
+                "Write-required worker produced no filesystem changes while tool calls were already failing "
+                "unproductively: {reason}. invalid_patch_count={invalid_patch_count}; "
+                "noop_edit_count={noop_edit_count}; tool_parts={tool_parts}; paths={paths}."
+            )
+            recovery_action = (
+                "Retry with a smaller worker prompt and a narrower target-file contract. If the same pattern repeats, "
+                "route away from the current engine/tool path before spending another full prompt budget."
+            )
         result = {
             "worker_id": wid,
             "subtask_id": subtask_id,
@@ -1703,10 +1820,18 @@ def dispatch_workers(ctx: RunContext) -> None:
             "returncode": 1,
             "failure_reason": failure_reason,
             "blocker_kind": "worker_no_progress",
-            "output_excerpt": excerpt.format(elapsed=elapsed_seconds),
+            "output_excerpt": excerpt.format(
+                elapsed=elapsed_seconds,
+                reason=reason,
+                invalid_patch_count=(tool_loop_summary or {}).get("invalid_patch_count", 0),
+                noop_edit_count=(tool_loop_summary or {}).get("noop_edit_count", 0),
+                tool_parts=(tool_loop_summary or {}).get("tool_parts", 0),
+                paths=", ".join((tool_loop_summary or {}).get("paths") or []),
+            ),
             "recovery_action": recovery_action,
             "write_required": True,
             "verified_existing": False,
+            **({"tool_loop_summary": tool_loop_summary} if tool_loop_summary else {}),
         }
         with active_workers_lock:
             active_worker_abort_results[wid] = result

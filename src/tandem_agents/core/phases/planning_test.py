@@ -2090,6 +2090,9 @@ class PlanningPreScreenTest(unittest.TestCase):
             self.assertEqual(result["returncode"], 0)
             self.assertEqual(result["engine"], {"skipped": True, "reason": "repo_context_required_files"})
             subtask_ids = [subtask["id"] for subtask in ctx.manager_plan["subtasks"]]
+            self.assertEqual(subtask_ids[0], "fallback-throughput-config-controls")
+            self.assertIn("config_types.py", " ".join(ctx.manager_plan["subtasks"][0]["files"]))
+            self.assertIn("defaults", " ".join(ctx.manager_plan["subtasks"][0]["acceptance_criteria"]).lower())
             self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
             self.assertIn("fallback-throughput-worker-metrics", subtask_ids)
             self.assertIn("fallback-throughput-operator-cockpit", subtask_ids)

@@ -892,14 +892,36 @@ def _deterministic_invalid_manager_subtasks(
             }
         )
 
+    throughput_config_files = [
+        path
+        for path in (
+            by_name.get("config_types.py"),
+            by_name.get("config_loader.py"),
+            by_name.get("config_loader_test.py"),
+        )
+        if path
+    ]
+    if throughput_config_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-config-controls",
+                "title": f"{title} - scheduler budget config controls",
+                "goal": "Add explicit scheduler budget, concurrency, rate-limit, CI, and merge queue backpressure config fields.",
+                "files": throughput_config_files,
+                "target_files": throughput_config_files,
+                "acceptance_criteria": [
+                    "Add typed scheduler config fields for global/per-repo budget and concurrency controls plus rate-limit, CI, and merge-queue saturation toggles.",
+                    "Load the new fields from config/env using existing config-loader patterns.",
+                    "Add config-loader tests for defaults and at least one non-default env override.",
+                ],
+            }
+        )
+
     throughput_scheduler_files = [
         path
         for path in (
             by_name.get("scheduler.py"),
             by_name.get("scheduler_test.py"),
-            by_name.get("config_types.py"),
-            by_name.get("config_loader.py"),
-            by_name.get("config_loader_test.py"),
         )
         if path
     ]
@@ -908,14 +930,14 @@ def _deterministic_invalid_manager_subtasks(
             {
                 "id": "fallback-throughput-scheduler-controls",
                 "title": f"{title} - scheduler backpressure and caps",
-                "goal": "Add scheduler/runtime controls for budget, concurrency, rate-limit, CI, and queue backpressure.",
+                "goal": "Apply scheduler admission caps and backpressure decisions to queued task planning.",
                 "files": throughput_scheduler_files,
                 "target_files": throughput_scheduler_files,
-                "acceptance_criteria": _criteria_matching(
-                    acceptance_criteria,
-                    ("budget", "concurrency", "backpressure", "rate", "ci", "merge queue", "saturated", "pause"),
-                )
-                or acceptance_criteria,
+                "acceptance_criteria": [
+                    "Make plan_task_admissions or scheduler_snapshot expose deterministic backpressure/cap decisions for budget, rate-limit, CI, or merge-queue saturation.",
+                    "Add scheduler tests that prove a saturated control blocks or defers otherwise-admissible work with a specific reason.",
+                    "Keep the change limited to scheduler behavior and its direct tests; config parsing is handled by the config-control slice.",
+                ],
             }
         )
 

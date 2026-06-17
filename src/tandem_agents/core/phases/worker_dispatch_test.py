@@ -15,6 +15,7 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _failed_result_has_reviewable_source_and_test_diff,
     _subtask_is_no_change_guard_candidate,
     _subtask_is_repair_no_change_guard_candidate,
+    _tool_loop_summary_from_messages,
     _worker_no_change_abort_seconds,
     _worker_repair_no_change_abort_seconds,
     dispatch_workers,
@@ -38,7 +39,7 @@ class _FakeCoordination:
 
 class WorkerDispatchTest(unittest.TestCase):
     def test_no_change_timeout_defaults_and_ignores_invalid_env(self) -> None:
-        self.assertEqual(_worker_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 240.0)
+        self.assertEqual(_worker_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 120.0)
         self.assertEqual(
             _worker_no_change_abort_seconds(
                 SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "90"}))
@@ -49,8 +50,47 @@ class WorkerDispatchTest(unittest.TestCase):
             _worker_no_change_abort_seconds(
                 SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "bad"}))
             ),
-            240.0,
+            120.0,
         )
+
+    def test_tool_loop_summary_detects_invalid_patch_churn(self) -> None:
+        messages = [
+            {
+                "parts": [
+                    {
+                        "type": "tool",
+                        "tool": "apply_patch",
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-noop\n+noop\n*** End Patch"
+                        },
+                        "result": "error: No valid patches in input (allow with \"--allow-empty\")",
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "apply_patch",
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-noop\n+noop\n*** End Patch"
+                        },
+                        "result": "error: No valid patches in input (allow with \"--allow-empty\")",
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "apply_patch",
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Update File: src/app_test.py\n@@\n-noop\n+noop\n*** End Patch"
+                        },
+                        "result": "error: No valid patches in input (allow with \"--allow-empty\")",
+                    },
+                ]
+            }
+        ]
+
+        summary = _tool_loop_summary_from_messages(messages)
+
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["invalid_patch_count"], 3)
+        self.assertEqual(summary["paths"], ["src/app.py", "src/app_test.py"])
 
     def test_repair_no_change_timeout_defaults_and_ignores_invalid_env(self) -> None:
         self.assertEqual(_worker_repair_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 180.0)
