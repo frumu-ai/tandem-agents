@@ -387,6 +387,29 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("temporary files", prompt)
         self.assertIn("will fail review", prompt)
 
+    def test_worker_prompt_front_loads_mechanical_slice_edits(self) -> None:
+        subtask = self._subtask(
+            title="scheduler budget config loader",
+            goal="Wire exact scheduler budget and backpressure config fields.",
+            files=["src/tandem_agents/config/config_loader.py"],
+            target_files=["src/tandem_agents/config/config_loader.py"],
+            write_required=True,
+            scope_note=(
+                "Mechanical slice 2 of 3 for throughput config controls. "
+                "Edit only config_loader.py. Assume SchedulerConfig already has the exact fields."
+            ),
+            acceptance_criteria=[
+                "Load ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS env var.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Mechanical deterministic slice fast path", prompt)
+        self.assertIn('First read only the smallest relevant part of ["src/tandem_agents/config/config_loader.py"]', prompt)
+        self.assertIn("make the first semantic edit in that target before inspecting unrelated files", prompt)
+        self.assertIn("do not explore the parent task surface until after a real diff exists", prompt)
+
     def test_implementation_subtask_with_test_acceptance_does_not_force_test_first(self) -> None:
         subtask = self._subtask(
             title="Add repository worktree and branch lifecycle primitives",

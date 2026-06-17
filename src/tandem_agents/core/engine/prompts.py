@@ -572,6 +572,15 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], WORKER_JSON_CHAR_LIMIT)
     scope_note = _clip_prompt_text(subtask.get("scope_note"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
     scope_note_block = f"\nACA scope note: {scope_note}\n" if scope_note else ""
+    deterministic_fast_path_block = ""
+    if "mechanical slice" in scope_note.lower() and substantive_target_files:
+        deterministic_fast_path_block = (
+            "\nMechanical deterministic slice fast path:\n"
+            f"- First read only the smallest relevant part of {json.dumps(substantive_target_files[:1])}.\n"
+            "- Then make the first semantic edit in that target before inspecting unrelated files.\n"
+            "- Stay inside the listed target files and acceptance criteria; do not explore the parent task surface until after a real diff exists.\n"
+            "- Once the diff exists, run one lightweight readback or syntax check and return the completion note.\n"
+        )
     repair_directive_block = _repair_directive_block(subtask, target_files)
     tracked_target_guidance = ""
     write_required_guidance = ""
@@ -735,6 +744,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Subtask title: {subtask_title}\n"
         f"Subtask goal: {subtask_goal}\n"
         f"{scope_note_block}"
+        f"{deterministic_fast_path_block}"
         f"{repair_directive_block}"
         f"Subtask contract:\n{subtask_contract}\n\n"
         f"Acceptance criteria: {acceptance_criteria}\n"
