@@ -193,7 +193,7 @@ Optional fields:
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS`: outer worker watchdog for no terminal result; default `540`
 - `ACA_WORKER_NO_CHANGE_ABORT_SECONDS`: write-required worker no-change watchdog; default `240`
 - `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS`: repair-worker no-change watchdog; default `180`
-- `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS`: outer manager planning watchdog; default `300`
+- `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS`: outer manager planning watchdog; default `90`
 - `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS`: outer integration watchdog; default `300`
 - `ACA_SERIAL_SUBTASK_LIMIT`: maximum planned worker slices for disabled-swarm serial runs; default `4`
 

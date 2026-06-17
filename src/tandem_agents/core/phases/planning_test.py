@@ -169,7 +169,7 @@ class PlanningPreScreenTest(unittest.TestCase):
         )
 
     def test_manager_prompt_timeout_defaults_and_ignores_invalid_env(self) -> None:
-        self.assertEqual(_manager_prompt_timeout_seconds(SimpleNamespace(env={})), 300.0)
+        self.assertEqual(_manager_prompt_timeout_seconds(SimpleNamespace(env={})), 90.0)
         self.assertEqual(
             _manager_prompt_timeout_seconds(
                 SimpleNamespace(env={"ACA_MANAGER_PROMPT_TIMEOUT_SECONDS": "12.5"})
@@ -180,7 +180,7 @@ class PlanningPreScreenTest(unittest.TestCase):
             _manager_prompt_timeout_seconds(
                 SimpleNamespace(env={"ACA_MANAGER_PROMPT_TIMEOUT_SECONDS": "not-a-number"})
             ),
-            300.0,
+            90.0,
         )
 
     def test_serial_subtask_limit_defaults_and_ignores_invalid_env(self) -> None:

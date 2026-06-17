@@ -1492,7 +1492,7 @@ def _manager_prompt_timeout_seconds(cfg: Any) -> float:
             return max(1.0, float(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_MANAGER_PROMPT_TIMEOUT_SECONDS=%r", raw)
-    return 300.0
+    return 90.0
 
 
 def _deterministic_testless_repair_active(subtasks: list[dict[str, Any]]) -> bool:

@@ -250,6 +250,8 @@ def _task_path_scope(task: dict[str, Any]) -> str:
         return "crates/tandem-server/src/http"
     if _is_aca_worktree_isolation_task(lowered_text):
         return "src/tandem_agents/core"
+    if _is_aca_throughput_controls_task(lowered_text):
+        return "src/tandem_agents"
     for match in re.finditer(r"(?:^|[\s`'\"])((?:crates|packages|apps|src|scripts|docs|tests)/[A-Za-z0-9_./-]+)", text):
         scope = _scope_from_path(match.group(1))
         if scope:
@@ -279,6 +281,17 @@ def _task_domain_hints(task: dict[str, Any]) -> list[str]:
             "finalize_completed_run",
             *_task_domain_required_files(task),
         ]
+    if _is_aca_throughput_controls_task(lowered_text):
+        return [
+            "scheduler_snapshot",
+            "plan_task_admissions",
+            "dispatch_workers",
+            "_worker_result_metrics",
+            "operator_dashboard",
+            "operator_view",
+            "SchedulerConfig",
+            *_task_domain_required_files(task),
+        ]
     return []
 
 
@@ -299,6 +312,32 @@ def _is_aca_worktree_isolation_task(lowered_text: str) -> bool:
     return has_aca_context and has_issue_context and has_isolation_context
 
 
+def _is_aca_throughput_controls_task(lowered_text: str) -> bool:
+    has_aca_context = (
+        "aca" in lowered_text
+        or "coder runtime" in lowered_text
+        or "autonomous coding agent" in lowered_text
+    )
+    has_runtime_control_context = any(
+        term in lowered_text
+        for term in (
+            "throughput",
+            "backpressure",
+            "budget",
+            "cost",
+            "token",
+            "worker pool",
+            "active workers",
+            "queued issues",
+            "concurrency",
+            "rate limit",
+            "rate limits",
+            "cockpit",
+        )
+    )
+    return has_aca_context and has_runtime_control_context
+
+
 def _task_domain_required_files(task: dict[str, Any]) -> list[str]:
     lowered_text = _task_query_text_without_targets(task).lower()
     if _is_github_projects_coder_task(lowered_text):
@@ -314,6 +353,19 @@ def _task_domain_required_files(task: dict[str, Any]) -> list[str]:
             "src/tandem_agents/core/repository/repository_test.py",
             "src/tandem_agents/core/phases/finalize.py",
             "src/tandem_agents/core/phases/pr_body.py",
+        ]
+    if _is_aca_throughput_controls_task(lowered_text):
+        return [
+            "src/tandem_agents/core/scheduling/scheduler.py",
+            "src/tandem_agents/core/scheduling/scheduler_test.py",
+            "src/tandem_agents/core/phases/worker_dispatch.py",
+            "src/tandem_agents/core/execution/runner_core.py",
+            "src/tandem_agents/runtime/operator_view.py",
+            "src/tandem_agents/runtime/operator_dashboard.py",
+            "src/tandem_agents/runtime/operator_dashboard_test.py",
+            "src/tandem_agents/config/config_types.py",
+            "src/tandem_agents/config/config_loader.py",
+            "src/tandem_agents/config/config_loader_test.py",
         ]
     return []
 
