@@ -4193,6 +4193,54 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(result["session_id"], "session-2")
             self.assertEqual(result["engine"].get("prompt_sync_first_session_id"), "session-1")
 
+    def test_prompt_sync_timeout_skips_async_recovery_after_run_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            log_path = run_dir / "logs" / "worker-1.log"
+            log_path.parent.mkdir(parents=True)
+            status_path = run_dir / "status.json"
+            status_path.write_text(json.dumps({"run": {"status": "running"}}), encoding="utf-8")
+            timeout_error = RuntimeError(
+                "Engine request failed for /session/session-1/prompt_sync: operation timed out"
+            )
+
+            def timeout_after_run_blocks(*_args: object, **_kwargs: object) -> dict[str, object]:
+                status_path.write_text(
+                    json.dumps({"run": {"status": "blocked", "completed_at_ms": 123}}),
+                    encoding="utf-8",
+                )
+                raise timeout_error
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=timeout_after_run_blocks,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=5.0):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "RUN_TERMINAL")
+            self.assertEqual(result["blocker_kind"], "run_terminal")
+            self.assertEqual(create_session.call_count, 1)
+            prompt_async.assert_not_called()
+
     def test_prompt_sync_first_hard_timeout_blocks_if_engine_call_hangs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
