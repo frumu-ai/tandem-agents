@@ -1141,6 +1141,8 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
         changed_files = _partial_diff_changed_files(artifact)
         worker_output_excerpt = str(artifact.get("worker_output_excerpt") or "").strip()
         should_reapply_patch = _partial_diff_patch_is_reusable(worker_output_excerpt)
+        if artifact.get("patch_reusable") is False:
+            should_reapply_patch = False
         excerpt_limit = 1200 if should_reapply_patch else 360
         if len(worker_output_excerpt) > excerpt_limit:
             worker_output_excerpt = worker_output_excerpt[:excerpt_limit].rstrip() + "\n..."
@@ -1273,6 +1275,10 @@ def _partial_diff_rejected_failure_summary(worker_output_excerpt: str) -> str:
         reasons.append("the worker drifted off the required test-first path")
     if "verification not run" in text:
         reasons.append("verification did not run")
+    if "focused tests failed" in text or "focused verification" in text:
+        reasons.append("focused verification failed")
+    if "config.aca" in text:
+        reasons.append("the diff used the wrong config namespace")
     if any(marker in text for marker in ("helper-only", "test-only helper", "local oracle", "self-referential")):
         reasons.append("the diff appeared helper-only or self-referential")
     if any(marker in text for marker in ("unproductive partial diff", "unproductive diff")):
@@ -1310,6 +1316,8 @@ def _partial_diff_patch_is_reusable(worker_output_excerpt: str) -> bool:
         "does not show this readiness error being wired",
         "not covered by the added test",
         "verification not run",
+        "focused tests failed",
+        "focused verification",
         "unproductive partial diff",
         "unproductive diff",
         "runaway guard",
@@ -1326,6 +1334,12 @@ def _partial_diff_patch_is_reusable(worker_output_excerpt: str) -> bool:
         "changed only required test files",
         "required test files",
         "worker drifted off the required regression/test coverage path",
+        "config.aca",
+        "aca.throughput",
+        "metrics_window_seconds",
+        "backpressure_queue_limit",
+        "max_concurrent_workers",
+        "max_active_cost_usd",
     )
     return not any(marker in text for marker in rejected_markers)
 

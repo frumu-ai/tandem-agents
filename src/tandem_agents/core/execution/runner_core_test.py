@@ -1817,6 +1817,30 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(artifacts[0]["changed_files"], ["crates/eval/src/scoring.rs"])
 
+    def test_failed_verifiable_diff_artifact_is_not_marked_reusable(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/config/config_types.py",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                    "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": "Worker produced source plus required-test changes, but focused tests failed.",
+                    "recovery_action": "Retry from clean target files.",
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertFalse(artifacts[0]["patch_reusable"])
+        self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_TEST_FAILED")
+        self.assertIn("focused tests failed", artifacts[0]["worker_output_excerpt"])
+
     def test_partial_diff_artifact_preserves_failed_subtask_targets(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
             [

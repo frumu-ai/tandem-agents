@@ -465,6 +465,56 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertIn("Start from the clean target files", subtasks[0]["scope_note"])
         self.assertIn("repository_test.py", subtasks[0]["scope_note"])
 
+    def test_failed_focused_verifiable_partial_diff_is_not_carried_forward(self) -> None:
+        parent_targets = [
+            "src/tandem_agents/config/config_types.py",
+            "src/tandem_agents/config/config_loader.py",
+            "src/tandem_agents/config/config_loader_test.py",
+        ]
+        ctx = SimpleNamespace(
+            task={"target_files": parent_targets},
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/worker-1.patch",
+                            "patch_reusable": False,
+                            "changed_files": [
+                                "src/tandem_agents/config/config_types.py",
+                                "src/tandem_agents/config/config_loader_test.py",
+                            ],
+                            "worker_output_excerpt": (
+                                "Worker produced a source plus required-test partial diff, "
+                                "but focused tests failed: AttributeError: config.aca.throughput"
+                            ),
+                        }
+                    ],
+                }
+            },
+        )
+        subtasks = [
+            {
+                "id": "subtask-1",
+                "files": ["src/tandem_agents/config/config_types.py"],
+                "target_files": ["src/tandem_agents/config/config_types.py"],
+                "acceptance_criteria": [
+                    "Assert exact config.scheduler fields.",
+                ],
+            }
+        ]
+
+        _carry_forward_partial_diff_artifacts(ctx, subtasks)
+
+        self.assertNotIn("carry_forward_patch", subtasks[0])
+        self.assertEqual(subtasks[0]["discarded_partial_diff_patch"], "/runs/run-1/artifacts/worker-1.patch")
+        self.assertEqual(subtasks[0]["files"], parent_targets)
+        self.assertEqual(subtasks[0]["target_files"], parent_targets)
+        self.assertIn("focused verification failed", subtasks[0]["repair_failure_summary"])
+        self.assertIn("wrong config namespace", subtasks[0]["repair_failure_summary"])
+        self.assertIn("Start from the clean target files", subtasks[0]["scope_note"])
+
     def test_testless_partial_diff_gets_deterministic_repair_plan(self) -> None:
         ctx = SimpleNamespace(
             task={

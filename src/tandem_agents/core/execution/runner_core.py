@@ -739,6 +739,20 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
             "worker_id": worker_id,
             "patch_path": patch_path,
         }
+        failure_reason = str(result.get("failure_reason") or "").strip()
+        blocker_kind = str(result.get("blocker_kind") or "").strip()
+        recovery_action = str(result.get("recovery_action") or "").strip()
+        if failure_reason:
+            entry["failure_reason"] = failure_reason
+        if blocker_kind:
+            entry["blocker_kind"] = blocker_kind
+        if recovery_action:
+            entry["recovery_action"] = recovery_action
+        if failure_reason in {
+            "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+            "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+        }:
+            entry["patch_reusable"] = False
         if changed_files:
             entry["changed_files"] = changed_files
         if output_excerpt:
