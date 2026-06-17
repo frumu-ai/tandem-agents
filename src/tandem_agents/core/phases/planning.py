@@ -1379,6 +1379,83 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
             if rel_path
         ]
         if (
+            changed_files
+            and all(_repo_path_looks_like_production_source_file(path) for path in changed_files)
+            and any(
+                marker in lowered
+                for marker in (
+                    "unproductive partial diff",
+                    "worker_unproductive_diff",
+                    "comment-only",
+                    "tautological",
+                    "changes only string wording",
+                )
+            )
+        ):
+            source_files = list(dict.fromkeys(changed_files))
+            parent_target_set = set(artifact_targets)
+            if parent_target_set:
+                source_files = [path for path in source_files if path in parent_target_set] or source_files
+            required_test_files = [
+                path
+                for path in artifact_targets
+                if _repo_path_looks_like_test_file(path)
+            ]
+            active_files = list(dict.fromkeys([*source_files, *required_test_files]))
+            if source_files and required_test_files:
+                source_text = ", ".join(source_files)
+                test_text = ", ".join(required_test_files)
+                subtask = {
+                    "id": str(artifact.get("subtask_id") or "unproductive-diff-repair").strip()
+                    or "unproductive-diff-repair",
+                    "title": "Repair unproductive partial diff",
+                    "goal": (
+                        "Replace the rejected comment-only partial diff with a production-backed repair for "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                    "files": active_files,
+                    "target_files": active_files,
+                    "acceptance_criteria": [
+                        "Do not apply or copy the rejected comment-only partial patch.",
+                        "Make the first new repair edit in the required test file(s): " + test_text + ".",
+                        "Then make only the minimal semantic production change needed in: " + source_text + ".",
+                        "Do not mark this repair complete until the diff includes real coverage in "
+                        + test_text
+                        + " plus a non-comment production behavior change.",
+                    ],
+                    "discarded_partial_diff_patch": patch_path,
+                    "repair_source_subtask_id": str(artifact.get("subtask_id") or "").strip(),
+                    "repair_source_worker_id": str(artifact.get("worker_id") or "").strip(),
+                    "repair_changed_files": changed_files,
+                    "repair_requires_test_followup": required_test_files,
+                    "repair_worker_output_excerpt": excerpt[:1200],
+                    "repair_failure_summary": failure_summary,
+                    "repair_parent_target_files": artifact_targets,
+                    "deterministic_partial_diff_repair": True,
+                    "write_required": True,
+                    "scope_note": (
+                        "ACA generated this repair plan deterministically after rejecting a comment-only or "
+                        "unproductive partial diff. Active repair targets are the changed source file(s) plus "
+                        "required test file(s): "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                }
+                return {
+                    "summary": (
+                        "Deterministic repair for an unproductive source-only partial diff; ACA discarded the "
+                        "patch and narrowed the retry to the source files plus required tests."
+                    ),
+                    "subtasks": [subtask],
+                    "risks": [
+                        "The rejected comment-only patch is intentionally not replayed."
+                    ],
+                    "tests": [
+                        "Run the narrowest deterministic verification for " + test_text + "."
+                    ],
+                }
+        if (
             "engine_prompt_timeout" in lowered
             and changed_files
             and all(_repo_path_looks_like_production_source_file(path) for path in changed_files)

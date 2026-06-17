@@ -602,6 +602,54 @@ class PlanningPreScreenTest(unittest.TestCase):
             "\n".join(subtask["acceptance_criteria"]),
         )
 
+    def test_unproductive_source_partial_gets_deterministic_repair_plan(self) -> None:
+        ctx = SimpleNamespace(
+            task={
+                "target_files": [
+                    "src/tandem_agents/core/scheduling/scheduler.py",
+                    "src/tandem_agents/core/scheduling/scheduler_test.py",
+                ]
+            },
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "fallback-throughput-scheduler-controls-part-2",
+                            "worker_id": "worker-2",
+                            "patch_path": "/runs/run-1/artifacts/comment-only.patch",
+                            "changed_files": ["src/tandem_agents/core/scheduling/scheduler.py"],
+                            "worker_output_excerpt": (
+                                "Worker produced an unproductive partial diff: worker diff is comment-only "
+                                "after the comment-only guard budget."
+                            ),
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(subtask["id"], "fallback-throughput-scheduler-controls-part-2")
+        self.assertEqual(subtask["discarded_partial_diff_patch"], "/runs/run-1/artifacts/comment-only.patch")
+        self.assertNotIn("carry_forward_patch", subtask)
+        self.assertEqual(
+            subtask["files"],
+            [
+                "src/tandem_agents/core/scheduling/scheduler.py",
+                "src/tandem_agents/core/scheduling/scheduler_test.py",
+            ],
+        )
+        criteria = "\n".join(subtask["acceptance_criteria"])
+        self.assertIn("Do not apply or copy the rejected comment-only partial patch", criteria)
+        self.assertIn("non-comment production behavior change", criteria)
+
     def test_testless_deterministic_repair_defers_out_of_contract_required_tests(self) -> None:
         parent_targets = [
             "src/tandem_agents/core/phases/task_intake.py",
