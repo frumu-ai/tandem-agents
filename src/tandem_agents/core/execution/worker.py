@@ -374,7 +374,7 @@ def _worker_prompt_sync_first_enabled(cfg: ResolvedConfig) -> bool:
     raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_PROMPT_SYNC_FIRST", "") or "").strip().lower()
     if raw:
         return raw not in {"0", "false", "no", "off"}
-    return True
+    return False
 
 
 def _use_prompt_sync_first(cfg: ResolvedConfig, override: bool | None) -> bool:
@@ -4139,7 +4139,11 @@ def run_worker_subtask(
                 "- Inspect this diff first. Keep and refine it if it is safe; revert only if it is demonstrably wrong.\n"
                 "- Do not spend the retry on a broad applicability matrix before verifying the seeded diff.\n"
             )
-        retry_prompt_sync_first = str(result.get("blocker_kind") or "") != "engine_tool_loop_stalled"
+        retry_prompt_sync_first = str(result.get("blocker_kind") or "") not in {
+            "engine_tool_loop_stalled",
+            "engine_tool_loop_stalled_no_diff",
+            "worker_no_diff",
+        }
         _append_worker_event_if_run_active(
             layout,
             log_path,

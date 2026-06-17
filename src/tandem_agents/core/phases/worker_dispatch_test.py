@@ -98,6 +98,61 @@ class WorkerDispatchTest(unittest.TestCase):
         self.assertEqual(summary["invalid_patch_count"], 3)
         self.assertEqual(summary["paths"], ["src/app.py", "src/app_test.py"])
 
+    def test_tool_loop_summary_detects_failed_patch_and_noop_edit_churn(self) -> None:
+        messages = [
+            {
+                "parts": [
+                    {
+                        "type": "tool",
+                        "tool": "apply_patch",
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-old\n+new\n*** End Patch"
+                        },
+                        "result": "error: No valid patches in input (allow with \"--allow-empty\")",
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "apply_patch",
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-old\n+new\n*** End Patch"
+                        },
+                        "result": "error: No valid patches in input (allow with \"--allow-empty\")",
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "edit",
+                        "args": {"path": "src/app.py", "old": "alpha", "new": "bravo"},
+                        "result": "ok",
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "edit",
+                        "args": {"path": "src/app.py", "old": "bravo", "new": "alpha"},
+                        "result": "ok",
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "edit",
+                        "args": {"path": "src/app.py", "old": "alpha", "new": "alpha"},
+                        "result": "ok",
+                    },
+                    {"type": "tool", "tool": "read", "args": {"path": "src/app.py"}, "result": "alpha"},
+                    {"type": "tool", "tool": "read", "args": {"path": "src/app.py"}, "result": "alpha"},
+                    {"type": "tool", "tool": "read", "args": {"path": "src/app.py"}, "result": "alpha"},
+                ]
+            }
+        ]
+
+        summary = _tool_loop_summary_from_messages(messages)
+
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["invalid_patch_count"], 2)
+        self.assertEqual(summary["edit_count"], 3)
+        self.assertEqual(summary["noop_edit_count"], 1)
+        self.assertEqual(summary["paths"], ["src/app.py"])
+        self.assertIn("failed patch and no-op edit", summary["reason"])
+
     def test_repair_no_change_timeout_defaults_and_ignores_invalid_env(self) -> None:
         self.assertEqual(_worker_repair_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 180.0)
         self.assertEqual(

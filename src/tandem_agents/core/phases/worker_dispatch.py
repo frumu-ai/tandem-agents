@@ -609,6 +609,7 @@ def _tool_loop_summary_from_messages(messages: Any) -> dict[str, Any] | None:
     if not tool_parts:
         return None
     invalid_patch_count = 0
+    edit_count = 0
     noop_edit_count = 0
     edit_paths: set[str] = set()
     patch_paths: set[str] = set()
@@ -624,6 +625,7 @@ def _tool_loop_summary_from_messages(messages: Any) -> dict[str, Any] | None:
             if "No valid patches in input" in result:
                 invalid_patch_count += 1
         elif tool == "edit":
+            edit_count += 1
             path = str(args.get("path") or "").strip()
             if path:
                 edit_paths.add(path)
@@ -633,6 +635,7 @@ def _tool_loop_summary_from_messages(messages: Any) -> dict[str, Any] | None:
         return {
             "tool_parts": len(tool_parts),
             "invalid_patch_count": invalid_patch_count,
+            "edit_count": edit_count,
             "noop_edit_count": noop_edit_count,
             "paths": sorted(edit_paths | patch_paths),
             "reason": "worker repeatedly submitted invalid apply_patch calls without leaving a filesystem diff",
@@ -641,9 +644,19 @@ def _tool_loop_summary_from_messages(messages: Any) -> dict[str, Any] | None:
         return {
             "tool_parts": len(tool_parts),
             "invalid_patch_count": invalid_patch_count,
+            "edit_count": edit_count,
             "noop_edit_count": noop_edit_count,
             "paths": sorted(edit_paths | patch_paths),
             "reason": "worker repeatedly made no-op edit calls without leaving a filesystem diff",
+        }
+    if invalid_patch_count + noop_edit_count >= 3 and edit_count >= 3 and len(tool_parts) >= 8:
+        return {
+            "tool_parts": len(tool_parts),
+            "invalid_patch_count": invalid_patch_count,
+            "edit_count": edit_count,
+            "noop_edit_count": noop_edit_count,
+            "paths": sorted(edit_paths | patch_paths),
+            "reason": "worker churned through failed patch and no-op edit calls without leaving a filesystem diff",
         }
     return None
 

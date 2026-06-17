@@ -3714,7 +3714,43 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             prompt_async.assert_called_once()
             prompt_sync.assert_not_called()
 
-    def test_write_required_worker_uses_prompt_sync_first_by_default(self) -> None:
+    def test_write_required_worker_uses_async_first_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    return_value={"run_id": "run-1"},
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={"text": "async worker done", "completed": True},
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    return_value={"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync worker done"}]}]},
+                ) as prompt_sync:
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("async worker done", result["stdout"])
+            self.assertIsNone(result["engine"]["fallback_mode"])
+            prompt_async.assert_called_once()
+            prompt_sync.assert_not_called()
+
+    def test_write_required_worker_can_opt_into_prompt_sync_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
             with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
@@ -3725,7 +3761,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                     return_value={"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync worker done"}]}]},
                 ) as prompt_sync:
                 result = stream_tandem_prompt(
-                    SimpleNamespace(env={}),
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
                     role="worker-1",
                     prompt="do work",
                     cwd=Path(tmp),
@@ -4175,7 +4211,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 ), \
                 mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=5.0):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(),
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
                     role="worker-1",
                     prompt="do work",
                     cwd=Path(tmp),
@@ -4223,7 +4259,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 ), \
                 mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=5.0):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(),
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
                     role="worker-1",
                     prompt="do work",
                     cwd=Path(tmp),
@@ -4301,7 +4337,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 ), \
                 mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=5.0):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(),
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
                     role="worker-1",
                     prompt="do work",
                     cwd=worktree,
@@ -4346,7 +4382,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 ) as prompt_sync, \
                 mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=0.1):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(env={}),
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
                     role="worker-1",
                     prompt="do work",
                     cwd=Path(tmp),
@@ -4451,7 +4487,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 ), \
                 mock.patch("src.tandem_agents.core.execution.worker._worker_prompt_sync_timeout_seconds", return_value=0.1):
                 result = stream_tandem_prompt(
-                    SimpleNamespace(env={}),
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
                     role="worker-1",
                     prompt="do work",
                     cwd=worktree,
