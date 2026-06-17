@@ -910,7 +910,7 @@ def _deterministic_invalid_manager_subtasks(
                 "files": throughput_config_files,
                 "target_files": throughput_config_files,
                 "acceptance_criteria": [
-                    "In src/tandem_agents/config/config_types.py, extend SchedulerConfig with max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
+                    "In src/tandem_agents/config/config_types.py, extend SchedulerConfig with max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure. Use max_concurrent_worker_runs=4, max_daily_model_spend_cents=0, and True for each backpressure toggle as defaults.",
                     "In src/tandem_agents/config/config_loader.py, load those fields from scheduler YAML keys and ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS, ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS, ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE, ACA_SCHEDULER_CI_BACKPRESSURE, and ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE env vars.",
                     "In src/tandem_agents/config/config_loader_test.py, add one focused test covering defaults plus env overrides for the new SchedulerConfig fields.",
                 ],
@@ -939,10 +939,18 @@ def _deterministic_invalid_manager_subtasks(
                 "files": throughput_scheduler_files,
                 "target_files": throughput_scheduler_files,
                 "acceptance_criteria": [
-                    "Make plan_task_admissions or scheduler_snapshot expose deterministic backpressure/cap decisions for budget, rate-limit, CI, or merge-queue saturation.",
-                    "Add scheduler tests that prove a saturated control blocks or defers otherwise-admissible work with a specific reason.",
+                    "In src/tandem_agents/core/scheduling/scheduler.py, make plan_task_admissions enforce cfg.scheduler.max_concurrent_worker_runs by setting max_total to the lower of max_active_tasks and max_concurrent_worker_runs when the worker cap is positive.",
+                    "Include max_concurrent_worker_runs in the plan_task_admissions limits payload so the operator can see which worker cap was applied.",
+                    "When queued work remains because len(admitted) reaches max_concurrent_worker_runs, append blocked entries for those remaining candidates with reason worker_concurrency_reached, preserving task_key, project_key, repo_key, scope_mode, and scope_paths.",
+                    "In src/tandem_agents/core/scheduling/scheduler_test.py, add a focused test with max_active_tasks above max_concurrent_worker_runs that proves otherwise-admissible work is blocked with worker_concurrency_reached.",
+                    "Update any existing scheduler test that intentionally admits six tasks so it sets max_concurrent_worker_runs high enough for that scenario.",
                     "Keep the change limited to scheduler behavior and its direct tests; config parsing is handled by the config-control slice.",
                 ],
+                "scope_note": (
+                    "Suggested edit order: read only plan_task_admissions in scheduler.py, then add the max_concurrent_worker_runs cap and remaining-queue blocked entries; "
+                    "next read the existing scheduler concurrency tests and add one focused worker-cap regression. "
+                    "Do not add unrelated spend, CI, or merge queue plumbing in this slice."
+                ),
             }
         )
 

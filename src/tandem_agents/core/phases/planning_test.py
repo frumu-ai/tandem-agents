@@ -2094,6 +2094,15 @@ class PlanningPreScreenTest(unittest.TestCase):
             self.assertIn("config_types.py", " ".join(ctx.manager_plan["subtasks"][0]["files"]))
             self.assertIn("defaults", " ".join(ctx.manager_plan["subtasks"][0]["acceptance_criteria"]).lower())
             self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
+            scheduler_subtask = next(
+                subtask
+                for subtask in ctx.manager_plan["subtasks"]
+                if subtask["id"] == "fallback-throughput-scheduler-controls"
+            )
+            scheduler_criteria = " ".join(scheduler_subtask["acceptance_criteria"])
+            self.assertIn("max_concurrent_worker_runs", scheduler_criteria)
+            self.assertIn("worker_concurrency_reached", scheduler_criteria)
+            self.assertIn("plan_task_admissions", scheduler_subtask["scope_note"])
             self.assertIn("fallback-throughput-worker-metrics", subtask_ids)
             self.assertIn("fallback-throughput-operator-cockpit", subtask_ids)
             events = [
