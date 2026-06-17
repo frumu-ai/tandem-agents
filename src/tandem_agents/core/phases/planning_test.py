@@ -10,6 +10,7 @@ from unittest import mock
 
 from src.tandem_agents.core.phases.planning import (
     _align_python_test_targets_to_repo_conventions,
+    _append_deferred_repair_subtasks,
     _apply_repo_context_required_files_to_task,
     _carry_forward_partial_diff_artifacts,
     _constrain_extra_partial_diff_repair_subtasks,
@@ -31,6 +32,26 @@ from src.tandem_agents.core.phases.planning import (
 
 
 class PlanningPreScreenTest(unittest.TestCase):
+    def test_append_deferred_repair_subtasks_resumes_serial_tail(self) -> None:
+        ctx = SimpleNamespace(
+            blackboard={
+                "repair": {
+                    "deferred_subtasks": [
+                        {"id": "subtask-2", "title": "Two", "files": ["src/two.py"]},
+                        {"id": "subtask-3", "title": "Three", "files": ["src/three.py"]},
+                    ]
+                }
+            },
+            status={},
+        )
+        subtasks = [{"id": "subtask-1", "title": "Repair", "files": ["src/one.py"]}]
+
+        _append_deferred_repair_subtasks(ctx, subtasks)
+
+        self.assertEqual([subtask["id"] for subtask in subtasks], ["subtask-1", "subtask-2", "subtask-3"])
+        self.assertIn("deferred this serial subtask", subtasks[1]["scope_note"])
+        self.assertEqual(ctx.blackboard["repair"]["deferred_subtasks_appended"], 2)
+
     def test_repo_context_required_files_become_task_targets_when_absent(self) -> None:
         task = {
             "execution_kind": "code_edit",

@@ -795,6 +795,26 @@ def _completed_subtask_ids_for_retry(worker_results: list[dict[str, Any]]) -> li
     return completed
 
 
+def _deferred_subtasks_for_retry(
+    pending_subtasks: list[dict[str, Any]],
+    worker_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failed_subtask_id = ""
+    for result in worker_results:
+        if int(result.get("returncode") or 0) == 0:
+            continue
+        failed_subtask_id = str(result.get("subtask_id") or "").strip()
+        if failed_subtask_id:
+            break
+    if not failed_subtask_id:
+        return []
+    for index, subtask in enumerate(pending_subtasks):
+        if str(subtask.get("id") or "").strip() != failed_subtask_id:
+            continue
+        return [dict(item) for item in pending_subtasks[index + 1 :]]
+    return []
+
+
 def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | None:
     if not _task_mentions_external_pr_candidates(ctx.task):
         return None
@@ -3828,6 +3848,7 @@ def _run_once_internal_impl(
                 previous_feedback = retry_feedback
                 partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
                 completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
+                deferred_subtasks = _deferred_subtasks_for_retry(ctx.pending_subtasks, ctx.worker_results)
                 if partial_diff_artifacts:
                     existing_artifacts = (ctx.blackboard.setdefault("repair", {})).get("partial_diff_artifacts")
                     partial_diff_artifacts = _merge_partial_diff_artifacts_for_retry(
@@ -3841,6 +3862,12 @@ def _run_once_internal_impl(
                 if completed_subtask_ids:
                     ctx.blackboard.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
                     ctx.status.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
+                if deferred_subtasks:
+                    for repair_state in (
+                        ctx.blackboard.setdefault("repair", {}),
+                        ctx.status.setdefault("repair", {}),
+                    ):
+                        repair_state["deferred_subtasks"] = deferred_subtasks
                 if partial_diff_artifacts:
                     for repair_state in (
                         ctx.blackboard.setdefault("repair", {}),
@@ -3866,6 +3893,7 @@ def _run_once_internal_impl(
                         "detail": worker_blocker.get("detail"),
                         "partial_diff_artifacts": partial_diff_artifacts,
                         "completed_subtask_ids": completed_subtask_ids,
+                        "deferred_subtask_count": len(deferred_subtasks),
                     },
                     task_id=ctx.task.get("task_id"),
                     role="worker",

@@ -18,6 +18,7 @@ from src.tandem_agents.core.engine.prompts import build_manager_prompt
 from src.tandem_agents.core.execution.run_lifecycle import block_run
 from src.tandem_agents.core.execution.runner_core import (
     _completed_subtask_ids_for_retry,
+    _deferred_subtasks_for_retry,
     _all_subtasks_verified_existing,
     _annotate_pr_candidate_current_layout,
     _auto_approve_loop,
@@ -1920,6 +1921,19 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     base_max_loops=2,
                 )
             )
+
+    def test_deferred_subtasks_for_retry_keeps_unstarted_serial_tail(self) -> None:
+        pending = [
+            {"id": "subtask-1", "title": "One"},
+            {"id": "subtask-2", "title": "Two"},
+            {"id": "subtask-3", "title": "Three"},
+        ]
+        results = [{"subtask_id": "subtask-1", "returncode": 1}]
+
+        deferred = _deferred_subtasks_for_retry(pending, results)
+
+        self.assertEqual([item["id"] for item in deferred], ["subtask-2", "subtask-3"])
+        self.assertIsNot(deferred[0], pending[1])
 
     def test_carry_forward_patch_apply_failure_is_retryable_with_discard_feedback(self) -> None:
         ctx = SimpleNamespace(

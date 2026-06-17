@@ -616,6 +616,38 @@ def _prepare_subtasks(ctx: RunContext) -> tuple[list[str], list[dict[str, Any]]]
     return _constrain_invalid_manager_fallback(ctx, discovered_files, subtasks)
 
 
+def _append_deferred_repair_subtasks(ctx: RunContext, subtasks: list[dict[str, Any]]) -> None:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else None
+    if not isinstance(repair, dict):
+        repair = ctx.status.get("repair") if isinstance(ctx.status, dict) else None
+    if not isinstance(repair, dict):
+        return
+    raw_deferred = repair.get("deferred_subtasks")
+    if not isinstance(raw_deferred, list) or not raw_deferred:
+        return
+    existing_ids = {str(subtask.get("id") or "").strip() for subtask in subtasks}
+    appended = 0
+    for item in raw_deferred:
+        if not isinstance(item, dict):
+            continue
+        subtask = dict(item)
+        subtask_id = str(subtask.get("id") or "").strip()
+        if not subtask_id or subtask_id in existing_ids:
+            continue
+        scope_note = str(subtask.get("scope_note") or "").strip()
+        continuation_note = (
+            "ACA deferred this serial subtask while repairing an earlier failed slice; "
+            "resume it after the repair slice completes."
+        )
+        if continuation_note not in scope_note:
+            subtask["scope_note"] = f"{scope_note}\n{continuation_note}".strip()
+        subtasks.append(subtask)
+        existing_ids.add(subtask_id)
+        appended += 1
+    if appended:
+        repair["deferred_subtasks_appended"] = appended
+
+
 def _serial_subtask_limit(cfg: Any) -> int:
     raw = str(getattr(cfg, "env", {}).get("ACA_SERIAL_SUBTASK_LIMIT", "") or "").strip()
     if raw:
@@ -2033,6 +2065,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     discovered_files, subtasks = _prepare_subtasks(ctx)
     _carry_forward_partial_diff_artifacts(ctx, subtasks)
     _constrain_extra_partial_diff_repair_subtasks(ctx, subtasks)
+    _append_deferred_repair_subtasks(ctx, subtasks)
     _namespace_repair_retry_subtask_ids(ctx, subtasks)
     _align_python_test_targets_to_repo_conventions(repo_path, subtasks)
     _split_dense_serial_subtasks(ctx, subtasks)
