@@ -25,6 +25,7 @@ import time
 from typing import Any
 
 from src.tandem_agents.core.phases.context import RunContext
+from src.tandem_agents.core.engine.engine import delete_tandem_session
 from src.tandem_agents.core.repository.repository import sync_worktree_changes, worker_worktree_name
 from src.tandem_agents.runtime.runstate import append_event
 from src.tandem_agents.utils.utils import atomic_write_json
@@ -53,6 +54,116 @@ def _clear_active_worker_attempt_marker(ctx: RunContext, worker_id: str) -> None
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _active_worker_engine_sessions_path(ctx: RunContext) -> Path:
+    return ctx.run_dir / "active_worker_engine_sessions.json"
+
+
+def _load_active_worker_engine_sessions(ctx: RunContext) -> dict[str, dict[str, Any]]:
+    path = _active_worker_engine_sessions_path(ctx)
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    sessions: dict[str, dict[str, Any]] = {}
+    for raw_worker_id, raw_info in loaded.items():
+        worker_id = str(raw_worker_id or "").strip()
+        if not worker_id or not isinstance(raw_info, dict):
+            continue
+        session_id = str(raw_info.get("session_id") or "").strip()
+        if not session_id:
+            continue
+        sessions[worker_id] = dict(raw_info)
+        sessions[worker_id]["session_id"] = session_id
+    return sessions
+
+
+def _pop_active_worker_engine_session(ctx: RunContext, worker_id: str) -> dict[str, Any]:
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        return {}
+    path = _active_worker_engine_sessions_path(ctx)
+    if not path.exists():
+        return {}
+    sessions = _load_active_worker_engine_sessions(ctx)
+    info = dict(sessions.pop(worker_id, {}) or {})
+    if sessions:
+        atomic_write_json(path, sessions)
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return info
+
+
+def _cancel_active_worker_engine_session(ctx: RunContext, worker_id: str, reason: str) -> None:
+    info = _pop_active_worker_engine_session(ctx, worker_id)
+    session_id = str(info.get("session_id") or "").strip()
+    if not session_id:
+        return
+    run_id = str(info.get("run_id") or "").strip()
+    reason = str(reason or "worker_cancelled").strip() or "worker_cancelled"
+    append_event(
+        ctx.layout["events"],
+        "worker.engine_cancel_requested",
+        ctx.run_id,
+        {
+            "worker_id": worker_id,
+            "session_id": session_id,
+            "engine_run_id": run_id,
+            "reason": reason,
+        },
+        task_id=ctx.task.get("task_id"),
+        role="worker",
+        repo={"path": ctx.repo.get("path")},
+    )
+
+    def _delete() -> None:
+        try:
+            delete_tandem_session(ctx.cfg, session_id)
+            append_event(
+                ctx.layout["events"],
+                "worker.engine_cancelled",
+                ctx.run_id,
+                {
+                    "worker_id": worker_id,
+                    "session_id": session_id,
+                    "engine_run_id": run_id,
+                    "reason": reason,
+                },
+                task_id=ctx.task.get("task_id"),
+                role="worker",
+                repo={"path": ctx.repo.get("path")},
+            )
+        except Exception as exc:
+            append_event(
+                ctx.layout["events"],
+                "worker.engine_cancel_failed",
+                ctx.run_id,
+                {
+                    "worker_id": worker_id,
+                    "session_id": session_id,
+                    "engine_run_id": run_id,
+                    "reason": reason,
+                    "error": str(exc)[:500],
+                },
+                task_id=ctx.task.get("task_id"),
+                role="worker",
+                repo={"path": ctx.repo.get("path")},
+            )
+
+    thread = threading.Thread(
+        target=_delete,
+        name=f"aca-cancel-engine-session-{worker_id}",
+        daemon=True,
+    )
+    thread.start()
 
 
 _TERMINAL_WORKER_BLOCKER_KINDS = {
@@ -1849,6 +1960,7 @@ def dispatch_workers(ctx: RunContext) -> None:
             on_start=_on_start,
             on_result=_on_result,
             abort_result=_abort_result,
+            cancel_worker=lambda wid, reason: _cancel_active_worker_engine_session(ctx, wid, reason),
             worker_timeout_seconds=_worker_no_progress_timeout_seconds(ctx, ctx.pending_subtasks),
         )
         # Merge any results that bypassed _on_result

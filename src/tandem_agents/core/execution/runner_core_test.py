@@ -2680,6 +2680,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 {"id": "subtask-2", "title": "second", "goal": "second", "write_required": True},
             ]
             abort_calls: list[str] = []
+            cancel_calls: list[tuple[str, str]] = []
 
             def fake_worker_runner(
                 _cfg,
@@ -2734,6 +2735,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 2,
                 worker_runner=fake_worker_runner,
                 abort_result=abort_result,
+                cancel_worker=lambda worker_id, reason: cancel_calls.append((worker_id, reason)),
                 worker_timeout_seconds=5,
             )
             elapsed = time.monotonic() - started
@@ -2743,6 +2745,10 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertCountEqual([result["worker_id"] for result in results], ["worker-1", "worker-2"])
             self.assertTrue(all(result["blocker_kind"] == "worker_unproductive" for result in results))
             self.assertCountEqual(abort_calls, ["worker-1", "worker-2"])
+            self.assertCountEqual(
+                cancel_calls,
+                [("worker-1", "worker_unproductive"), ("worker-2", "worker_unproductive")],
+            )
 
     def test_serial_worker_pool_stops_after_write_required_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2113,6 +2113,7 @@ def _execute_local_worker_pool(
     on_start: Callable[[str, dict[str, Any]], None] | None = None,
     on_result: Callable[[dict[str, Any]], None] | None = None,
     abort_result: Callable[[int, dict[str, Any], str], dict[str, Any] | None] | None = None,
+    cancel_worker: Callable[[str, str], None] | None = None,
     worker_timeout_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     if not pending_subtasks:
@@ -2296,6 +2297,11 @@ def _execute_local_worker_pool(
         terminal_event_result = _terminal_worker_event_result(index, subtask, worker_id)
         if terminal_event_result is not None:
             return terminal_event_result
+        if cancel_worker is not None:
+            try:
+                cancel_worker(worker_id, "worker_pool_timeout")
+            except Exception:
+                logger.exception("Worker cancellation callback failed for %s after pool timeout.", worker_id)
         if future.cancel():
             return _timeout_result(index, subtask, worker_id)
         logger.warning(
@@ -2323,6 +2329,11 @@ def _execute_local_worker_pool(
                     if abort_result is not None:
                         aborted = abort_result(index, subtask, worker_id)
                         if aborted:
+                            if cancel_worker is not None:
+                                try:
+                                    cancel_worker(worker_id, str(aborted.get("blocker_kind") or "worker_aborted"))
+                                except Exception:
+                                    logger.exception("Worker cancellation callback failed for %s after abort.", worker_id)
                             result = aborted
                             _record_result(result)
                             break
@@ -2401,6 +2412,11 @@ def _execute_local_worker_pool(
                     index, subtask, worker_id = futures[future]
                     aborted = abort_result(index, subtask, worker_id)
                     if aborted:
+                        if cancel_worker is not None:
+                            try:
+                                cancel_worker(worker_id, str(aborted.get("blocker_kind") or "worker_aborted"))
+                            except Exception:
+                                logger.exception("Worker cancellation callback failed for %s after abort.", worker_id)
                         future.cancel()
                         pending.remove(future)
                         _record_result(aborted)

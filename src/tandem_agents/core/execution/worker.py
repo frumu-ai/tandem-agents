@@ -1740,6 +1740,107 @@ def _active_worker_attempts_path(layout: dict[str, Path]) -> Path | None:
     return run_dir / "active_worker_attempts.json"
 
 
+def _active_worker_engine_sessions_path(run_dir: Path) -> Path:
+    return run_dir / "active_worker_engine_sessions.json"
+
+
+def _active_worker_engine_sessions_path_for_log(log_path: Path) -> Path | None:
+    try:
+        log_parent = log_path.parent
+    except Exception:
+        return None
+    if log_parent.name == "logs":
+        return _active_worker_engine_sessions_path(log_parent.parent)
+    return _active_worker_engine_sessions_path(log_parent)
+
+
+def _load_active_worker_engine_sessions(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    sessions: dict[str, dict[str, Any]] = {}
+    for raw_worker_id, raw_info in loaded.items():
+        worker_id = str(raw_worker_id or "").strip()
+        if not worker_id or not isinstance(raw_info, dict):
+            continue
+        session_id = str(raw_info.get("session_id") or "").strip()
+        if not session_id:
+            continue
+        sessions[worker_id] = dict(raw_info)
+        sessions[worker_id]["session_id"] = session_id
+    return sessions
+
+
+def _write_active_worker_engine_sessions(path: Path, sessions: dict[str, dict[str, Any]]) -> None:
+    cleaned: dict[str, dict[str, Any]] = {}
+    for raw_worker_id, raw_info in sessions.items():
+        worker_id = str(raw_worker_id or "").strip()
+        session_id = str((raw_info or {}).get("session_id") or "").strip()
+        if worker_id and session_id:
+            cleaned[worker_id] = dict(raw_info)
+            cleaned[worker_id]["session_id"] = session_id
+    if cleaned:
+        atomic_write_json(path, cleaned)
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _mark_active_worker_engine_session(
+    log_path: Path,
+    *,
+    worker_id: str,
+    session_id: str,
+    run_id: str = "",
+    cwd: Path | None = None,
+) -> None:
+    worker_id = str(worker_id or "").strip()
+    session_id = str(session_id or "").strip()
+    if not worker_id.startswith("worker-") or not session_id:
+        return
+    path = _active_worker_engine_sessions_path_for_log(log_path)
+    if path is None:
+        return
+    with WORKER_STATUS_LOCK:
+        sessions = _load_active_worker_engine_sessions(path)
+        current = dict(sessions.get(worker_id) or {})
+        current.update(
+            {
+                "session_id": session_id,
+                "run_id": str(run_id or current.get("run_id") or "").strip(),
+                "log_path": str(log_path),
+                "updated_at_ms": now_ms(),
+            }
+        )
+        if cwd is not None:
+            current["cwd"] = str(cwd)
+        sessions[worker_id] = current
+        _write_active_worker_engine_sessions(path, sessions)
+
+
+def _clear_active_worker_engine_session(log_path: Path, worker_id: str, session_id: str) -> None:
+    worker_id = str(worker_id or "").strip()
+    session_id = str(session_id or "").strip()
+    if not worker_id.startswith("worker-") or not session_id:
+        return
+    path = _active_worker_engine_sessions_path_for_log(log_path)
+    if path is None:
+        return
+    with WORKER_STATUS_LOCK:
+        sessions = _load_active_worker_engine_sessions(path)
+        if str((sessions.get(worker_id) or {}).get("session_id") or "").strip() != session_id:
+            return
+        sessions.pop(worker_id, None)
+        _write_active_worker_engine_sessions(path, sessions)
+
+
 def _load_active_worker_attempts(layout: dict[str, Path]) -> dict[str, str]:
     path = _active_worker_attempts_path(layout)
     if not isinstance(path, Path) or not path.is_file():
@@ -2897,6 +2998,12 @@ def stream_tandem_prompt(
                     "fallback_mode": None,
                     "recovery": [],
                 }
+                _mark_active_worker_engine_session(
+                    log_path,
+                    worker_id=role,
+                    session_id=session_id,
+                    cwd=cwd,
+                )
                 timeout_multiplier = max(1.0, float(timeout_multiplier or 1.0))
                 prompt_sync_timeout = _scaled_prompt_sync_timeout_seconds(
                     cfg,
@@ -3154,6 +3261,12 @@ def stream_tandem_prompt(
                         engine_meta["fallback_mode"] = "prompt_sync_first_async_recovery"
                         engine_meta["run_id"] = ""
                         last_run_id = ""
+                        _mark_active_worker_engine_session(
+                            log_path,
+                            worker_id=role,
+                            session_id=session_id,
+                            cwd=cwd,
+                        )
                     elif blocker_kind == "engine_session_run_conflict":
                         recovery_action = (
                             "Wait for the active Tandem engine session run to finish or clear it, then reset the task to Backlog."
@@ -3238,6 +3351,13 @@ def stream_tandem_prompt(
                     engine_meta["retry_count"] = attempt
                     nonlocal last_run_id
                     last_run_id = run_id
+                    _mark_active_worker_engine_session(
+                        log_path,
+                        worker_id=role,
+                        session_id=session_id,
+                        run_id=run_id,
+                        cwd=cwd,
+                    )
                     stream_result = (
                         sdk_stream_run_text(
                             cfg,
@@ -3542,6 +3662,7 @@ def stream_tandem_prompt(
                 }
             finally:
                 if session_id:
+                    _clear_active_worker_engine_session(log_path, role, session_id)
                     try:
                         _call_with_timeout(lambda: delete_tandem_session(cfg, session_id), timeout_seconds=5.0)
                     except TimeoutError:

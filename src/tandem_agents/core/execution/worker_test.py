@@ -14,6 +14,7 @@ from src.tandem_agents.core.execution.worker import (
     _apply_carry_forward_patch,
     _async_no_text_timeout_seconds,
     _async_prompt_timeout_seconds,
+    _active_worker_engine_sessions_path_for_log,
     _call_with_timeout,
     _clear_active_worker_attempt,
     _coerce_worker_failure,
@@ -123,6 +124,48 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             _clear_active_worker_attempt(layout, "worker-1", "old-exec")
 
             self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), {"worker-1": "new-exec"})
+
+    def test_stream_marks_active_worker_engine_session_until_prompt_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            log_dir = run_dir / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / "worker-1.log"
+            marker = _active_worker_engine_sessions_path_for_log(log_path)
+            self.assertIsNotNone(marker)
+
+            def prompt_async(*_args, **_kwargs):
+                active = json.loads(marker.read_text(encoding="utf-8"))
+                self.assertEqual(active["worker-1"]["session_id"], "session-1")
+                self.assertEqual(active["worker-1"]["run_id"], "")
+                return {"run_id": "run-1"}
+
+            def stream_text(*_args, **_kwargs):
+                active = json.loads(marker.read_text(encoding="utf-8"))
+                self.assertEqual(active["worker-1"]["session_id"], "session-1")
+                self.assertEqual(active["worker-1"]["run_id"], "run-1")
+                return {"text": "done", "completed": True}
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session") as delete_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async", side_effect=prompt_async), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_stream_run_text", side_effect=stream_text):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "false"}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=run_dir,
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertFalse(marker.exists())
+            delete_session.assert_called_once()
 
     def test_dispatch_abort_clears_active_worker_attempt_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
