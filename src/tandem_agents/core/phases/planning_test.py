@@ -1874,6 +1874,105 @@ class PlanningPreScreenTest(unittest.TestCase):
             invalid_events = [event for event in events if event["type"] == "manager.invalid_plan"]
             self.assertEqual(invalid_events[-1]["payload"]["recoverable"], True)
 
+    def test_run_manager_prompt_uses_deterministic_repo_context_plan_without_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            repo_path = Path(tmp) / "repo"
+            for child in ("artifacts", "logs"):
+                (run_dir / child).mkdir(parents=True, exist_ok=True)
+            repo_path.mkdir()
+            required_files = [
+                "src/tandem_agents/core/scheduling/scheduler.py",
+                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                "src/tandem_agents/core/phases/worker_dispatch.py",
+                "src/tandem_agents/core/execution/runner_core.py",
+                "src/tandem_agents/runtime/operator_view.py",
+                "src/tandem_agents/runtime/operator_dashboard.py",
+                "src/tandem_agents/runtime/operator_dashboard_test.py",
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ]
+            for rel_path in required_files:
+                path = repo_path / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# test\n", encoding="utf-8")
+            artifact_path = run_dir / "artifacts" / "repo_context_bundle.json"
+            artifact_path.write_text(json.dumps({"bundle": {}, "graph_hints": {"required_files": required_files}}))
+            status_path = run_dir / "status.json"
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={}, swarm=SimpleNamespace(max_workers=4, enabled=False)),
+                repo_path=repo_path,
+                task={
+                    "task_id": "TAN-173",
+                    "title": "LACA-15 Add ACA throughput metrics, backpressure, and cost controls",
+                    "description": "Add backpressure, cost controls, metrics, and cockpit visibility.",
+                    "acceptance_criteria": [
+                        "Add global and per-repo budget/concurrency caps.",
+                        "Track issue cycle time, queue wait, active time, PR time, repair loops, merge time, token cost, tool calls, test time, and failure rate.",
+                        "Operator can see active workers, queued issues, blocked issues, costs, and failures.",
+                    ],
+                    "execution_kind": "code_edit",
+                    "source": {"type": "linear"},
+                },
+                repo={"path": str(repo_path)},
+                layout={
+                    "run_dir": run_dir,
+                    "artifacts": run_dir / "artifacts",
+                    "logs": run_dir / "logs",
+                    "events": run_dir / "events.jsonl",
+                    "blackboard": run_dir / "blackboard.yaml",
+                    "status": status_path,
+                },
+                run_dir=run_dir,
+                run_id="run-1",
+                blackboard={},
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "phase": {"name": "task_resolution", "detail": "task resolved"},
+                    "blocker": {"active": False, "kind": None, "message": None, "owner_role": None},
+                    "metrics": {},
+                },
+            )
+            repo_context = SimpleNamespace(
+                source="repo.context_bundle",
+                fallback_used=False,
+                error=None,
+                artifact_path=str(artifact_path),
+                path_scope="src/tandem_agents",
+                required_files=required_files,
+                index_source="stored",
+                index_status="refreshed",
+                index_error=None,
+                text="Required edit files:\n" + "\n".join(f"- {path}" for path in required_files),
+            )
+
+            with (
+                mock.patch(
+                    "src.tandem_agents.core.repository.repo_context.repo_context_for_task",
+                    return_value=repo_context,
+                ),
+                mock.patch(
+                    "src.tandem_agents.core.engine.engine.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5"},
+                ),
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt") as stream_prompt,
+            ):
+                result = run_manager_prompt(ctx)
+
+            stream_prompt.assert_not_called()
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["engine"], {"skipped": True, "reason": "repo_context_required_files"})
+            subtask_ids = [subtask["id"] for subtask in ctx.manager_plan["subtasks"]]
+            self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
+            self.assertIn("fallback-throughput-worker-metrics", subtask_ids)
+            self.assertIn("fallback-throughput-operator-cockpit", subtask_ids)
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "manager.deterministic_repo_context_plan")
+
     def test_invalid_manager_fallback_builds_deterministic_repo_context_subtasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

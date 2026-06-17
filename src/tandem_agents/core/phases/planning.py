@@ -887,6 +887,90 @@ def _deterministic_invalid_manager_subtasks(
             }
         )
 
+    throughput_scheduler_files = [
+        path
+        for path in (
+            by_name.get("scheduler.py"),
+            by_name.get("scheduler_test.py"),
+            by_name.get("config_types.py"),
+            by_name.get("config_loader.py"),
+            by_name.get("config_loader_test.py"),
+        )
+        if path
+    ]
+    if throughput_scheduler_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-scheduler-controls",
+                "title": f"{title} - scheduler backpressure and caps",
+                "goal": "Add scheduler/runtime controls for budget, concurrency, rate-limit, CI, and queue backpressure.",
+                "files": throughput_scheduler_files,
+                "target_files": throughput_scheduler_files,
+                "acceptance_criteria": _criteria_matching(
+                    acceptance_criteria,
+                    ("budget", "concurrency", "backpressure", "rate", "ci", "merge queue", "saturated", "pause"),
+                )
+                or acceptance_criteria,
+            }
+        )
+
+    throughput_worker_files = [
+        path
+        for path in (by_name.get("worker_dispatch.py"), by_name.get("runner_core.py"))
+        if path
+    ]
+    if throughput_worker_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-worker-metrics",
+                "title": f"{title} - worker and run metrics",
+                "goal": "Track worker/run timing, retry, token/cost, tool-call, test, and failure metrics in ACA run state.",
+                "files": throughput_worker_files,
+                "target_files": throughput_worker_files,
+                "acceptance_criteria": _criteria_matching(
+                    acceptance_criteria,
+                    (
+                        "cycle time",
+                        "queue wait",
+                        "active time",
+                        "pr time",
+                        "repair",
+                        "merge time",
+                        "token",
+                        "tool calls",
+                        "test time",
+                        "failure rate",
+                    ),
+                )
+                or acceptance_criteria,
+            }
+        )
+
+    throughput_operator_files = [
+        path
+        for path in (
+            by_name.get("operator_view.py"),
+            by_name.get("operator_dashboard.py"),
+            by_name.get("operator_dashboard_test.py"),
+        )
+        if path
+    ]
+    if throughput_operator_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-operator-cockpit",
+                "title": f"{title} - operator cockpit visibility",
+                "goal": "Expose active workers, queued issues, blocked issues, costs, failures, and scheduler state in the operator cockpit.",
+                "files": throughput_operator_files,
+                "target_files": throughput_operator_files,
+                "acceptance_criteria": _criteria_matching(
+                    acceptance_criteria,
+                    ("operator", "active workers", "queued issues", "blocked issues", "costs", "failures", "cockpit"),
+                )
+                or acceptance_criteria,
+            }
+        )
+
     covered = {path for subtask in planned for path in subtask.get("files", [])}
     remaining = [path for path in fallback_files if path not in covered]
     if remaining:
@@ -940,6 +1024,60 @@ def _constrain_invalid_manager_fallback(
         return [], []
     fallback_subtasks = _deterministic_invalid_manager_subtasks(ctx, fallback_files, subtasks)
     return fallback_files, fallback_subtasks
+
+
+def _should_use_deterministic_repo_context_plan(ctx: RunContext) -> bool:
+    repo_context = ctx.blackboard.get("repo_context") if isinstance(ctx.blackboard, dict) else {}
+    if not isinstance(repo_context, dict) or not bool(repo_context.get("required_files_applied_as_target_files")):
+        return False
+    source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+    source_type = str(source.get("type") or "").strip() if isinstance(source, dict) else ""
+    execution_kind = str(ctx.task.get("execution_kind") or "").strip()
+    return execution_kind == "code_edit" and source_type in {"linear", "github_project", "manual"}
+
+
+def _deterministic_repo_context_manager_result(ctx: RunContext) -> dict[str, Any] | None:
+    if not _should_use_deterministic_repo_context_plan(ctx):
+        return None
+    fallback_files = _repo_context_fallback_files(ctx)
+    subtasks = _deterministic_invalid_manager_subtasks(ctx, fallback_files, [])
+    if not fallback_files or not subtasks:
+        return None
+    ctx.manager_plan = {
+        "summary": "ACA used graph-required repo-context files to build a deterministic worker plan.",
+        "subtasks": subtasks,
+        "risks": [
+            "Manager engine planning was skipped because the repo graph supplied concrete required files."
+        ],
+        "tests": [],
+    }
+    ctx.blackboard["manager_plan"] = ctx.manager_plan
+    ctx.blackboard["manager_deterministic_repo_context_plan"] = {
+        "reason": "repo_context_required_files",
+        "planned_workers": len(subtasks),
+        "required_files": fallback_files,
+    }
+    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+    from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
+
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    append_event(
+        ctx.layout["events"],
+        "manager.deterministic_repo_context_plan",
+        ctx.run_id,
+        ctx.blackboard["manager_deterministic_repo_context_plan"],
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    return {
+        "role": "manager",
+        "returncode": 0,
+        "stdout": json.dumps(ctx.manager_plan),
+        "stderr": "",
+        "engine": {"skipped": True, "reason": "repo_context_required_files"},
+    }
 
 
 def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[str, Any]]) -> None:
@@ -1987,6 +2125,10 @@ def run_manager_prompt(ctx: RunContext) -> None:
     save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
     write_blackboard_snapshot(ctx.layout["run_dir"], ctx.blackboard)
     write_status(ctx.layout["status"], ctx.status)
+
+    deterministic_repo_context_result = _deterministic_repo_context_manager_result(ctx)
+    if deterministic_repo_context_result is not None:
+        return deterministic_repo_context_result
 
     manager_prompt = build_manager_prompt(
         ctx.run_id,
