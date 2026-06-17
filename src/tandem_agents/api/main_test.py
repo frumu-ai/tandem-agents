@@ -407,6 +407,40 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             self.assertEqual(detailed["blackboard"]["large"], "should only appear on detail route")
             self.assertIn("engine", detailed["events"][0]["payload"])
 
+    def test_trigger_batch_caps_started_runs_to_scheduler_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False), \
+                patch(
+                    "src.tandem_agents.api.main._scheduler_filtered_source_items",
+                    return_value=["TAN-1", "TAN-2", "TAN-3"],
+                ) as scheduler_filter, \
+                patch(
+                    "src.tandem_agents.api.main._start_run",
+                    return_value={"run_id": "run-1", "status": "started"},
+                ) as start_run:
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/runs/trigger-batch",
+                        json={"items": ["TAN-1", "TAN-2", "TAN-3"]},
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["max_started"], 1)
+            self.assertEqual(payload["deferred_count"], 2)
+            self.assertEqual(payload["deferred_items"], ["TAN-2", "TAN-3"])
+            scheduler_filter.assert_called_once()
+            start_run.assert_called_once()
+
     def test_compact_event_payload_keeps_graph_and_partial_diff_diagnostics(self) -> None:
         payload = _compact_event_payload(
             {

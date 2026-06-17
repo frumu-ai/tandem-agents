@@ -10,6 +10,37 @@ from src.tandem_agents.config.config_loader import resolve_config, validate_conf
 
 
 class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
+    def test_default_concurrency_is_spend_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: manual
+                      prompt: Do the thing
+                    repository:
+                      slug: frumu-ai/tandem-agents
+                    provider:
+                      id: openai
+                      model: gpt-5.5
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(root)
+
+            self.assertEqual(cfg.swarm.max_workers, 1)
+            self.assertEqual(cfg.scheduler.max_active_tasks, 1)
+            self.assertEqual(cfg.scheduler.max_active_tasks_per_project, 1)
+            self.assertEqual(cfg.scheduler.max_active_tasks_per_repo, 1)
+
     def test_task_source_payload_can_come_from_env_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

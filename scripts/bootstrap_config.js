@@ -148,7 +148,7 @@ const DEFAULT_CONTROL_PANEL_CONFIG = {
   swarm: {
     enabled: false,
     shared_model: false,
-    max_workers: 3,
+    max_workers: 1,
     max_retries: 1,
     manager: { provider: "", model: "" },
     worker: { provider: "", model: "" },
@@ -513,7 +513,7 @@ function buildControlPanelConfig(existing, example) {
       swarm: {
         enabled: boolValue(existing.ACA_ENABLE_SWARM, false),
         shared_model: boolValue(existing.ACA_SHARED_MODEL, false),
-        max_workers: intValue(firstNonEmpty(existing.ACA_MAX_WORKERS, { default: "3" }), 3),
+        max_workers: intValue(firstNonEmpty(existing.ACA_MAX_WORKERS, { default: "1" }), 1),
         max_retries: intValue(existingConfig.swarm?.max_retries, 1),
         manager: {
           provider: firstNonEmpty(existing.ACA_MANAGER_PROVIDER),

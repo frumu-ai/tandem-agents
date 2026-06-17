@@ -1774,6 +1774,13 @@ async def trigger_runs_batch(
             raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not apply ACA scheduler policy: {exc}") from exc
+        _, cfg = _project_config(root, project_slug) if project_slug else (None, resolve_config(root))
+        max_started = max(1, int(cfg.scheduler.max_active_tasks or 1))
+        deferred_items = items[max_started:]
+        items = items[:max_started]
+    else:
+        max_started = len(items)
+        deferred_items = []
 
     started = [
         _start_run(
@@ -1785,7 +1792,15 @@ async def trigger_runs_batch(
         )
         for item in items
     ]
-    return {"status": "started", "count": len(started), "runs": started}
+    return {
+        "status": "started",
+        "count": len(started),
+        "runs": started,
+        "max_started": max_started,
+        "deferred_count": len(deferred_items),
+        "deferred_items": deferred_items,
+        "respect_scheduler": respect_scheduler,
+    }
 
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, token: str = Depends(get_token)):

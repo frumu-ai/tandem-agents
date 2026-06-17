@@ -165,7 +165,7 @@ Behavior:
 Optional fields:
 
 - `policy`: scheduler policy, currently `fair_round_robin`
-- `max_active_tasks`: maximum total admitted tasks across the workspace
+- `max_active_tasks`: maximum total admitted tasks across the workspace; defaults to `1`
 - `max_active_tasks_per_project`: maximum admitted tasks per project binding
 - `max_active_tasks_per_repo`: maximum admitted tasks per repo/worktree scope
 - `queue_depth_limit`: maximum queued tasks the scheduler will inspect in one pass
@@ -460,7 +460,7 @@ provider:
 swarm:
   enabled: true
   shared_model: false
-  max_workers: 3
+  max_workers: 1
 
 output:
   root: runs
@@ -483,7 +483,7 @@ ACA_TASK_SOURCE_CARD_ID=
 ACA_REPO_PATH=/home/user/projects/my-app
 ACA_OUTPUT_ROOT=runs
 ACA_ENABLE_SWARM=true
-ACA_MAX_WORKERS=3
+ACA_MAX_WORKERS=1
 ```
 
 ## Current Status

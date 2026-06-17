@@ -367,7 +367,7 @@ For the canonical board and task objects used in the workspace schema, see `WORK
   "swarm": {
     "enabled": true,
     "shared_model": false,
-    "max_workers": 3
+    "max_workers": 1
   },
   "phase": {
     "name": "worker_execution",

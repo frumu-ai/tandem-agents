@@ -157,7 +157,9 @@ curl -s -X POST "http://127.0.0.1:39735/runs/trigger?project_slug=<slug>&item=<p
   -d '{"ACA_PROVIDER":"openrouter","ACA_MODEL":"minimax/minimax-m2.7"}'
 ```
 
-Trigger several tasks at once. This creates one ACA run per item and starts them immediately:
+Trigger several tasks at once. When `respect_scheduler` is omitted or true, the
+API starts at most `ACA_SCHEDULER_MAX_ACTIVE_TASKS` runs and returns the rest as
+`deferred_items`:
 
 ```bash
 curl -s -X POST "http://127.0.0.1:39735/runs/trigger-batch" \

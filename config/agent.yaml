@@ -48,7 +48,7 @@ storage:
 swarm:
   enabled: false
   shared_model: false
-  max_workers: 3
+  max_workers: 1
   manager:
     provider: ""
     model: ""
