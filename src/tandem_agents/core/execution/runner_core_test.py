@@ -1841,6 +1841,32 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_TEST_FAILED")
         self.assertIn("focused tests failed", artifacts[0]["worker_output_excerpt"])
 
+    def test_guard_rejected_source_and_test_only_artifacts_are_not_marked_reusable(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/source.patch",
+                    "changed_files": ["src/tandem_agents/config/config_types.py"],
+                    "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                    "blocker_kind": "worker_off_track",
+                    "output_excerpt": "Worker changed only non-test files.",
+                },
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/test.patch",
+                    "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                    "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": "Worker changed only required test files.",
+                },
+            ]
+        )
+
+        self.assertEqual([artifact["patch_reusable"] for artifact in artifacts], [False, False])
+
     def test_partial_diff_artifact_preserves_failed_subtask_targets(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
             [

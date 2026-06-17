@@ -1010,6 +1010,54 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertIn("ACA applied the preserved production patch and test patch", criteria)
         self.assertIn("Run the narrowest deterministic verification", criteria)
 
+    def test_guard_rejected_partials_do_not_get_complementary_carry_forward_plan(self) -> None:
+        ctx = SimpleNamespace(
+            task={
+                "target_files": [
+                    "src/tandem_agents/config/config_types.py",
+                    "src/tandem_agents/config/config_loader.py",
+                    "src/tandem_agents/config/config_loader_test.py",
+                ]
+            },
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/test.patch",
+                            "patch_reusable": False,
+                            "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                            "worker_output_excerpt": (
+                                "Worker changed only required test files for a regression subtask: "
+                                "after 184s it had not made the required production change."
+                            ),
+                        },
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/source.patch",
+                            "patch_reusable": False,
+                            "changed_files": ["src/tandem_agents/config/config_types.py"],
+                            "worker_output_excerpt": (
+                                "Worker drifted off the required regression/test coverage path: after 185s "
+                                "it had changed only non-test files while required test files were "
+                                "src/tandem_agents/config/config_loader_test.py."
+                            ),
+                        },
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertNotEqual(subtask["title"], "Verify complementary source and test partial diffs")
+        self.assertNotIn("carry_forward_patches", subtask)
+        self.assertIn("Do not copy or replay the rejected partial patch", "\n".join(subtask["acceptance_criteria"]))
+
     def test_sticky_production_target_becomes_active_for_test_only_timeout_partial(self) -> None:
         ctx = SimpleNamespace(
             blackboard={

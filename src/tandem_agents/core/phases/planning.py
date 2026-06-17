@@ -1753,6 +1753,8 @@ def _deterministic_complementary_partial_diff_repair_plan(
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
+        if artifact.get("patch_reusable") is False:
+            continue
         changed_files = _partial_diff_changed_files(artifact)
         excerpt = str(artifact.get("worker_output_excerpt") or "").lower()
         if _all_changed_files_are_tests(changed_files) and (

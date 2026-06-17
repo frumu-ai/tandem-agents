@@ -749,6 +749,8 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
         if recovery_action:
             entry["recovery_action"] = recovery_action
         if failure_reason in {
+            "WORKER_OFF_TRACK_TESTLESS_DIFF",
+            "WORKER_TEST_ONLY_DIFF",
             "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
             "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
         }:
