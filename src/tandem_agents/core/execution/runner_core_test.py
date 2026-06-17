@@ -1817,6 +1817,34 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(artifacts[0]["changed_files"], ["crates/eval/src/scoring.rs"])
 
+    def test_partial_diff_artifact_preserves_failed_subtask_targets(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-2.patch",
+                    "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                    "subtask_files": [
+                        "scripts/bootstrap_config.js",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                    "subtask_target_files": [
+                        "scripts/bootstrap_config.js",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            artifacts[0]["subtask_target_files"],
+            [
+                "scripts/bootstrap_config.js",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        )
+
     def test_partial_diff_retry_artifacts_accumulate_across_attempts(self) -> None:
         existing = [
             {

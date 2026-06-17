@@ -677,6 +677,59 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertIn("Make the first new repair edit in the required production file", criteria)
         self.assertIn("Do not mark this repair complete with a test-only diff", criteria)
 
+    def test_test_only_partial_diff_prefers_failed_subtask_targets_over_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            config_dir = repo_path / "src" / "tandem_agents" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config_loader.py").write_text("def load():\n    return None\n", encoding="utf-8")
+            (config_dir / "config_loader_test.py").write_text("import unittest\n", encoding="utf-8")
+            (repo_path / "scripts").mkdir()
+            (repo_path / "scripts" / "bootstrap_config.js").write_text("module.exports = {}\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={},
+                repo_path=repo_path,
+                blackboard={
+                    "repair": {
+                        "partial_diff_artifacts": [
+                            {
+                                "subtask_id": "subtask-2",
+                                "worker_id": "worker-2",
+                                "patch_path": "/runs/run-1/artifacts/worker-2.patch",
+                                "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                                "subtask_target_files": [
+                                    "scripts/bootstrap_config.js",
+                                    "src/tandem_agents/config/config_loader_test.py",
+                                ],
+                                "worker_output_excerpt": (
+                                    "Worker changed only required test files for a regression subtask: "
+                                    "after 182s it had not made the required production change."
+                                ),
+                            }
+                        ],
+                    }
+                },
+            )
+
+            plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(
+            subtask["files"],
+            [
+                "scripts/bootstrap_config.js",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        )
+        self.assertEqual(
+            subtask["repair_requires_production_followup"],
+            ["scripts/bootstrap_config.js"],
+        )
+        criteria = "\n".join(subtask["acceptance_criteria"])
+        self.assertIn("scripts/bootstrap_config.js", criteria)
+        self.assertNotIn("config_loader.py", criteria)
+
     def test_complementary_source_and_test_partials_get_combined_verify_plan(self) -> None:
         ctx = SimpleNamespace(
             task={},

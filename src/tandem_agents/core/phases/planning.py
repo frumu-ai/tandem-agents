@@ -1109,8 +1109,20 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         changed_files = _partial_diff_changed_files(artifact)
         patch_path = str(artifact.get("patch_path") or "").strip()
         failure_summary = _partial_diff_rejected_failure_summary(excerpt)
+        artifact_targets = [
+            rel_path
+            for rel_path in (
+                _normalize_repo_relative_path(raw_path)
+                for raw_path in (
+                    artifact.get("subtask_target_files")
+                    or artifact.get("subtask_files")
+                    or parent_targets
+                )
+            )
+            if rel_path
+        ]
         if "changed only non-test files" in lowered and "required test files" in lowered:
-            parent_target_set = set(parent_targets)
+            parent_target_set = set(artifact_targets)
             source_files = [path for path in changed_files if _repo_path_looks_like_production_source_file(path)]
             if parent_target_set:
                 source_files = [path for path in source_files if path in parent_target_set]
@@ -1121,11 +1133,11 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
             if not required_test_files:
                 required_test_files = [
                     path
-                    for path in parent_targets
+                    for path in artifact_targets
                     if _repo_path_looks_like_test_file(path)
                 ]
-            if parent_targets:
-                active_files = list(dict.fromkeys([*required_test_files, *parent_targets]))
+            if artifact_targets:
+                active_files = list(dict.fromkeys([*required_test_files, *artifact_targets]))
                 source_files = [
                     path
                     for path in active_files
@@ -1167,7 +1179,7 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
                 "repair_requires_test_followup": required_test_files,
                 "repair_worker_output_excerpt": excerpt[:1200],
                 "repair_failure_summary": failure_summary,
-                "repair_parent_target_files": parent_targets,
+                "repair_parent_target_files": artifact_targets,
                 "deterministic_testless_repair": True,
                 "deterministic_partial_diff_repair": True,
                 "write_required": True,
@@ -1205,10 +1217,10 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         production_followup_files = _test_only_partial_production_followup_files(
             {
                 "repair_changed_files": changed_files,
-                "files": parent_targets,
-                "target_files": parent_targets,
+                "files": artifact_targets,
+                "target_files": artifact_targets,
             },
-            parent_targets,
+            artifact_targets,
         )
         if not production_followup_files:
             production_followup_files = _test_only_partial_existing_sibling_production_files(ctx, test_files)

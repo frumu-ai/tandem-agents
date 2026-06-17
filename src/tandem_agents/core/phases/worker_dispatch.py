@@ -126,6 +126,30 @@ def _abort_result_subtask_id(subtask: dict[str, Any] | None, worktree: Path | No
     return subtask_id.strip()
 
 
+def _subtask_retry_metadata(subtask: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(subtask, dict):
+        return {}
+
+    def _paths(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        paths: list[str] = []
+        for raw_path in value:
+            rel_path = str(raw_path or "").strip()
+            if rel_path and rel_path not in paths:
+                paths.append(rel_path)
+        return paths
+
+    metadata: dict[str, Any] = {}
+    files = _paths(subtask.get("files"))
+    target_files = _paths(subtask.get("target_files"))
+    if files:
+        metadata["subtask_files"] = files
+    if target_files:
+        metadata["subtask_target_files"] = target_files
+    return metadata
+
+
 def _sync_verifiable_worker_diff(
     ctx: RunContext,
     *,
@@ -849,8 +873,9 @@ def dispatch_workers(ctx: RunContext) -> None:
                 active_worker_snapshot_digests[wid] = digest
                 active_worker_progress_snapshots[wid] = snapshot
                 with active_workers_lock:
+                    subtask = active_worker_subtasks.get(wid)
                     subtask_id = _abort_result_subtask_id(
-                        active_worker_subtasks.get(wid),
+                        subtask,
                         active_worker_worktrees.get(wid),
                     )
                     active_worker_abort_results[wid] = {
@@ -875,6 +900,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                 _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
@@ -950,6 +976,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                 _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
@@ -1016,6 +1043,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                 _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
@@ -1141,6 +1169,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                 _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
@@ -1213,6 +1242,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                 _clear_active_worker_attempt_marker(ctx, wid)
                 append_event(
@@ -1281,6 +1311,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                     event_type = "worker.completed"
                 else:
@@ -1304,6 +1335,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                         ),
                         "write_required": True,
                         "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
                     }
                     event_type = "worker.failed"
                 active_worker_snapshot_digests[wid] = digest

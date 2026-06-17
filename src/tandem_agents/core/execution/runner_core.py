@@ -743,6 +743,12 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
             entry["changed_files"] = changed_files
         if output_excerpt:
             entry["worker_output_excerpt"] = output_excerpt
+        for metadata_key in ("subtask_files", "subtask_target_files"):
+            metadata_value = result.get(metadata_key)
+            if isinstance(metadata_value, list):
+                paths = [str(path or "").strip() for path in metadata_value if str(path or "").strip()]
+                if paths:
+                    entry[metadata_key] = list(dict.fromkeys(paths))
         if entry not in artifacts:
             artifacts.append(entry)
     return artifacts
