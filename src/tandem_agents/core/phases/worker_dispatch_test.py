@@ -436,6 +436,7 @@ class WorkerDispatchTest(unittest.TestCase):
                 "target_files": ["src/tandem_agents/config/config_types.py"],
                 "acceptance_criteria": [
                     "Add max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
+                    "Add those exact scheduler fields to ResolvedConfig.as_dict() under the scheduler payload if the scheduler payload enumerates fields explicitly.",
                     "Do not add max_parallel_workers or other aliases.",
                 ],
             }

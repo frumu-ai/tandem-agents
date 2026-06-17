@@ -805,6 +805,29 @@ def _failed_result_has_reviewable_source_and_test_diff(
 
 
 def _positive_contract_identifier_tokens(subtask: dict[str, Any]) -> list[str]:
+    ignored_tokens = {
+        "as_dict",
+        "task_key",
+        "project_key",
+        "repo_key",
+        "scope_mode",
+        "scope_paths",
+    }
+
+    def _is_contract_field_token(token: str) -> bool:
+        if token in ignored_tokens:
+            return False
+        return (
+            token.startswith("max_")
+            or token.startswith("min_")
+            or token.startswith("aca_")
+            or token.endswith("_backpressure")
+            or token.endswith("_reached")
+            or token.endswith("_cents")
+            or token.endswith("_seconds")
+            or token.endswith("_limit")
+        )
+
     values: list[str] = []
     for field in ("acceptance_criteria", "deliverables"):
         value = subtask.get(field)
@@ -819,6 +842,9 @@ def _positive_contract_identifier_tokens(subtask: dict[str, Any]) -> list[str]:
         if "do not add" in lowered or "out of scope" in lowered:
             continue
         for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", value):
+            token = token.lower()
+            if not _is_contract_field_token(token):
+                continue
             if token not in seen:
                 seen.add(token)
                 tokens.append(token)
