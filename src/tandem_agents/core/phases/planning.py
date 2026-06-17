@@ -912,12 +912,15 @@ def _deterministic_invalid_manager_subtasks(
                 "acceptance_criteria": [
                     "In src/tandem_agents/config/config_types.py, extend SchedulerConfig with max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure. Use max_concurrent_worker_runs=4, max_daily_model_spend_cents=0, and True for each backpressure toggle as defaults.",
                     "In src/tandem_agents/config/config_loader.py, load those fields from scheduler YAML keys and ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS, ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS, ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE, ACA_SCHEDULER_CI_BACKPRESSURE, and ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE env vars.",
-                    "In src/tandem_agents/config/config_loader_test.py, add one focused test covering defaults plus env overrides for the new SchedulerConfig fields.",
+                    "In src/tandem_agents/config/config_loader_test.py, add one focused test covering defaults plus env overrides for those exact config.scheduler fields: max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
+                    "Do not add alias helpers, legacy scheduler key translation, or new scheduler field names such as max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
                 ],
                 "scope_note": (
                     "Suggested edit order: first read the SchedulerConfig class, then add the typed fields there; "
                     "next read the scheduler construction in config_loader.py and wire the env/YAML loaders; "
-                    "finally add one config_loader_test case. Avoid broad reads of the whole test file."
+                    "finally add one config_loader_test case asserting cfg.scheduler.<exact field>. "
+                    "This slice is not about aliases or helper normalization; edit only SchedulerConfig, the SchedulerConfig(...) construction, and one focused config_loader test. "
+                    "Avoid broad reads of the whole test file."
                 ),
             }
         )

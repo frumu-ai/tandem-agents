@@ -2092,7 +2092,11 @@ class PlanningPreScreenTest(unittest.TestCase):
             subtask_ids = [subtask["id"] for subtask in ctx.manager_plan["subtasks"]]
             self.assertEqual(subtask_ids[0], "fallback-throughput-config-controls")
             self.assertIn("config_types.py", " ".join(ctx.manager_plan["subtasks"][0]["files"]))
-            self.assertIn("defaults", " ".join(ctx.manager_plan["subtasks"][0]["acceptance_criteria"]).lower())
+            config_criteria = " ".join(ctx.manager_plan["subtasks"][0]["acceptance_criteria"])
+            self.assertIn("defaults", config_criteria.lower())
+            self.assertIn("max_concurrent_worker_runs", config_criteria)
+            self.assertIn("Do not add alias helpers", config_criteria)
+            self.assertIn("cfg.scheduler.<exact field>", ctx.manager_plan["subtasks"][0]["scope_note"])
             self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
             scheduler_subtask = next(
                 subtask
