@@ -377,6 +377,21 @@ def _subtask_has_verifiable_source_and_test_diff(
     return any(not _is_test_path(path) for path in changed_files)
 
 
+def _failed_result_has_reviewable_source_and_test_diff(
+    result: dict[str, Any],
+    subtask: dict[str, Any],
+) -> bool:
+    if int(result.get("returncode") or 0) == 0:
+        return False
+    patch_path = str(result.get("partial_diff_artifact") or "").strip()
+    if not patch_path and isinstance(result.get("artifacts"), dict):
+        patch_path = str(result["artifacts"].get("partial_diff") or "").strip()
+    if not patch_path:
+        return False
+    changed_files = [str(path or "").strip() for path in result.get("changed_files") or [] if str(path or "").strip()]
+    return _subtask_has_verifiable_source_and_test_diff(subtask, changed_files)
+
+
 def _subtask_has_required_test_only_diff(
     subtask: dict[str, Any],
     changed_files: list[str],
@@ -1609,6 +1624,50 @@ def dispatch_workers(ctx: RunContext) -> None:
         wid = str(result.get("worker_id") or "").strip()
         subtask_id = str(result.get("subtask_id") or "").strip()
         _attach_progress_snapshot_to_failed_result(result)
+        with active_workers_lock:
+            result_worktree = active_worker_worktrees.get(wid)
+            result_subtask = dict(active_worker_subtasks.get(wid) or {})
+        if result_worktree and _failed_result_has_reviewable_source_and_test_diff(result, result_subtask):
+            changed_files = [str(path or "").strip() for path in result.get("changed_files") or [] if str(path or "").strip()]
+            sync_ok, merged_changed_files, synced_files, sync_error = _sync_verifiable_worker_diff(
+                ctx,
+                worker_id=wid,
+                subtask_id=subtask_id,
+                worktree=result_worktree,
+                changed_files=changed_files,
+            )
+            if sync_ok:
+                result["status"] = "completed"
+                result["returncode"] = 0
+                result["partial_diff_state"] = "reviewable_terminalized"
+                result["changed_files"] = merged_changed_files
+                result["synced_files"] = synced_files
+                result["failure_reason"] = None
+                result["blocker_kind"] = None
+                result["recovery_action"] = None
+                result["output_excerpt"] = (
+                    "Worker returned a blocker after producing a source plus required-test diff. "
+                    "ACA synced the reviewable diff for manager review and tests instead of retrying it."
+                )
+                append_event(
+                    ctx.layout["events"],
+                    "worker.verifiable_failed_diff_synced",
+                    ctx.run_id,
+                    {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "changed_files": merged_changed_files,
+                        "synced_files": synced_files,
+                    },
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+            else:
+                result["recovery_action"] = (
+                    "ACA found a source plus required-test partial diff but could not sync it for review: "
+                    + str(sync_error or "unknown sync error")
+                )
         _rc._record_worker_result(ctx.blackboard, ctx.worker_results, result)
         for item in ctx.blackboard["subtasks"]:
             if item.get("id") == subtask_id:

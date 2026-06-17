@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.tandem_agents.core.phases.worker_dispatch import (
+    _failed_result_has_reviewable_source_and_test_diff,
     _subtask_is_no_change_guard_candidate,
     _subtask_is_repair_no_change_guard_candidate,
     _worker_no_change_abort_seconds,
@@ -85,6 +86,35 @@ class WorkerDispatchTest(unittest.TestCase):
         self.assertFalse(
             _subtask_is_no_change_guard_candidate(
                 {"write_required": True, "deterministic_partial_diff_repair": True}
+            )
+        )
+
+    def test_failed_result_with_source_and_required_test_diff_is_reviewable(self) -> None:
+        subtask = {
+            "files": [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            "target_files": [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            "acceptance_criteria": ["Tests cover the config loader regression."],
+        }
+        result = {
+            "returncode": 1,
+            "partial_diff_artifact": "/runs/run-1/artifacts/worker.patch",
+            "changed_files": [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        }
+
+        self.assertTrue(_failed_result_has_reviewable_source_and_test_diff(result, subtask))
+        self.assertFalse(
+            _failed_result_has_reviewable_source_and_test_diff(
+                {**result, "changed_files": ["src/tandem_agents/config/config_loader_test.py"]},
+                subtask,
             )
         )
 
