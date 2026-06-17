@@ -386,6 +386,39 @@ def _changed_python_tests_result(worktree: Path, changed_files: list[str]) -> di
     }
 
 
+def _worktree_changed_files_diff(worktree: Path, changed_files: list[str]) -> str:
+    paths = [str(path or "").strip() for path in changed_files if str(path or "").strip()]
+    command = ["git", "-C", str(worktree), "diff", "--binary"]
+    if paths:
+        command.extend(["--", *paths])
+    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _reviewable_failed_diff_rejection(
+    worktree: Path,
+    subtask: dict[str, Any],
+    changed_files: list[str],
+) -> dict[str, Any] | None:
+    required_test_files = _subtask_required_test_files(subtask)
+    diff_text = _worktree_changed_files_diff(worktree, changed_files)
+    if diff_text and not _diff_has_substantive_required_test_addition(diff_text, required_test_files):
+        return {
+            "reason": "weak_test_diff",
+            "message": "changed test files did not add a test method or assertion",
+        }
+    test_result = _changed_python_tests_result(worktree, changed_files)
+    if test_result is not None and not bool(test_result.get("ok")):
+        return {
+            "reason": "focused_tests_failed",
+            "message": str(test_result.get("output") or "").strip()[:1000],
+            "command": test_result.get("command"),
+            "returncode": test_result.get("returncode"),
+            "timed_out": bool(test_result.get("timed_out")),
+        }
+    return None
+
+
 def _is_test_path(path: str) -> bool:
     lowered = str(path or "").strip().replace("\\", "/").lower()
     if not lowered:
@@ -2199,6 +2232,27 @@ def dispatch_workers(ctx: RunContext) -> None:
             result_subtask = dict(active_worker_subtasks.get(wid) or {})
         if result_worktree and _failed_result_has_reviewable_source_and_test_diff(result, result_subtask):
             changed_files = [str(path or "").strip() for path in result.get("changed_files") or [] if str(path or "").strip()]
+            rejection = _reviewable_failed_diff_rejection(result_worktree, result_subtask, changed_files)
+            if rejection is not None:
+                append_event(
+                    ctx.layout["events"],
+                    "worker.verifiable_failed_diff_rejected",
+                    ctx.run_id,
+                    {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "changed_files": changed_files,
+                        "reason": rejection.get("reason"),
+                        "message": rejection.get("message"),
+                        "command": rejection.get("command"),
+                        "returncode": rejection.get("returncode"),
+                        "timed_out": rejection.get("timed_out"),
+                    },
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                return
             sync_ok, merged_changed_files, synced_files, sync_error = _sync_verifiable_worker_diff(
                 ctx,
                 worker_id=wid,

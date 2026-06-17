@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -16,6 +17,7 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _diff_has_substantive_required_test_addition,
     _diff_is_destructive_rewrite,
     _failed_result_has_reviewable_source_and_test_diff,
+    _reviewable_failed_diff_rejection,
     _subtask_is_no_change_guard_candidate,
     _subtask_is_repair_no_change_guard_candidate,
     _tool_loop_summary_from_messages,
@@ -207,6 +209,54 @@ class WorkerDispatchTest(unittest.TestCase):
 
         self.assertFalse(_diff_has_substantive_required_test_addition(import_only, required))
         self.assertTrue(_diff_has_substantive_required_test_addition(assertion_diff, required))
+
+    def test_reviewable_failed_diff_rejection_runs_changed_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            for init_path in [
+                root / "src" / "__init__.py",
+                root / "src" / "tandem_agents" / "__init__.py",
+                package / "__init__.py",
+            ]:
+                init_path.write_text("", encoding="utf-8")
+            (package / "config_loader.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (package / "config_loader_test.py").write_text("import unittest\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "aca@example.test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            (package / "config_loader.py").write_text("VALUE = 2\n", encoding="utf-8")
+            (package / "config_loader_test.py").write_text(
+                "import unittest\n\n"
+                "class ConfigLoaderTest(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual(1, 2)\n",
+                encoding="utf-8",
+            )
+            subtask = {
+                "files": [
+                    "src/tandem_agents/config/config_loader.py",
+                    "src/tandem_agents/config/config_loader_test.py",
+                ],
+                "acceptance_criteria": ["Tests cover the config loader regression."],
+            }
+
+            rejection = _reviewable_failed_diff_rejection(
+                root,
+                subtask,
+                [
+                    "src/tandem_agents/config/config_loader.py",
+                    "src/tandem_agents/config/config_loader_test.py",
+                ],
+            )
+
+        self.assertIsNotNone(rejection)
+        assert rejection is not None
+        self.assertEqual(rejection["reason"], "focused_tests_failed")
+        self.assertIn("FAILED", rejection["message"])
 
     def test_cancel_active_worker_engine_session_deletes_marked_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
