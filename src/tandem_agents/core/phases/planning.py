@@ -821,7 +821,12 @@ def _deterministic_invalid_manager_subtasks(
     if not fallback_files:
         return []
 
-    max_workers = max(1, int(getattr(getattr(ctx.cfg, "swarm", None), "max_workers", 1) or 1))
+    swarm_cfg = getattr(ctx.cfg, "swarm", None)
+    max_workers = (
+        max(1, int(getattr(swarm_cfg, "max_workers", 1) or 1))
+        if bool(getattr(swarm_cfg, "enabled", False))
+        else _serial_subtask_limit(ctx.cfg)
+    )
     title = str(ctx.task.get("title") or ctx.task.get("local_goal") or "ACA fallback plan").strip()
     acceptance_criteria = _all_task_acceptance_criteria(ctx)
     by_name = {Path(path).name: path for path in fallback_files}
