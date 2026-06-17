@@ -1935,6 +1935,18 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in deferred], ["subtask-2", "subtask-3"])
         self.assertIsNot(deferred[0], pending[1])
 
+    def test_unproductive_diff_does_not_get_extra_partial_diff_retries(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_unproductive_diff",
+            "worker": {
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+
     def test_carry_forward_patch_apply_failure_is_retryable_with_discard_feedback(self) -> None:
         ctx = SimpleNamespace(
             worker_results=[

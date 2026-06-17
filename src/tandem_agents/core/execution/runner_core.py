@@ -151,7 +151,6 @@ _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS = {
     "worker_no_progress",
     "worker_off_track",
     "worker_runaway_diff",
-    "worker_unproductive_diff",
     "carry_forward_patch_apply_failed",
     "engine_tool_loop_stalled",
     "engine_prompt_timeout",
