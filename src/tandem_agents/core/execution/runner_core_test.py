@@ -487,6 +487,52 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertNotEqual(results[0].get("blocker_kind"), "worker_no_progress")
         self.assertIn("terminal event", results[0].get("output_excerpt", ""))
 
+    def test_serial_worker_pool_continues_after_abandoned_completed_result(self) -> None:
+        def slow_runner(_cfg, _run_id, _repo_path, _run_dir, _task, subtask, worker_id, _index):
+            if worker_id == "worker-1":
+                time.sleep(0.2)
+            return {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "status": "completed",
+                "returncode": 0,
+                "changed_files": [f"src/{worker_id}.py"],
+            }
+
+        def abort_first(index, subtask, worker_id):
+            if index != 1:
+                return None
+            return {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "status": "completed",
+                "returncode": 0,
+                "changed_files": ["src/worker-1.py"],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            started = time.monotonic()
+            results = _execute_local_worker_pool(
+                self._config(root),
+                "run-1",
+                root,
+                root / "runs" / "run-1",
+                {"task_id": "TAN-1"},
+                [
+                    {"id": "subtask-1", "title": "One", "write_required": True},
+                    {"id": "subtask-2", "title": "Two", "write_required": True},
+                ],
+                1,
+                worker_runner=slow_runner,
+                abort_result=abort_first,
+                worker_timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual([result["subtask_id"] for result in results], ["subtask-1", "subtask-2"])
+        self.assertLess(elapsed, 0.15)
+
     def test_abandoned_no_progress_worker_does_not_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertFalse(

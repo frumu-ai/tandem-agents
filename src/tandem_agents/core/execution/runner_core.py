@@ -2288,10 +2288,10 @@ def _execute_local_worker_pool(
         return result
 
     if worker_limit <= 1:
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            for index, subtask in enumerate(pending_subtasks, start=1):
-                worker_id = f"worker-{index}"
+        for index, subtask in enumerate(pending_subtasks, start=1):
+            worker_id = f"worker-{index}"
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
                 future = executor.submit(_run_one, index, subtask, worker_id)
                 deadline = time.monotonic() + timeout if timeout > 0 else None
                 while True:
@@ -2315,10 +2315,10 @@ def _execute_local_worker_pool(
                         continue
                     _record_result(result)
                     break
-                if _has_unresolved_write_required_worker_failure([result]):
-                    break
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            if _has_unresolved_write_required_worker_failure([result]):
+                break
         return results
 
     executor = ThreadPoolExecutor(max_workers=max(1, worker_limit))
