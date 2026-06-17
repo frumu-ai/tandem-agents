@@ -1320,11 +1320,30 @@ def _sanitize_partial_diff_artifact_paths_in_plan(plan: dict[str, Any]) -> None:
         subtask["acceptance_criteria"] = sanitized
 
 
+def _active_partial_diff_artifacts_for_repair(ctx: RunContext, artifacts: list[Any]) -> list[Any]:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    completed_ids = {
+        str(subtask_id or "").strip()
+        for subtask_id in ((repair or {}).get("completed_subtask_ids") or [])
+        if str(subtask_id or "").strip()
+    } if isinstance(repair, dict) else set()
+    if not completed_ids:
+        return artifacts
+    active = [
+        artifact
+        for artifact in artifacts
+        if not isinstance(artifact, dict)
+        or str(artifact.get("subtask_id") or "").strip() not in completed_ids
+    ]
+    return active or artifacts
+
+
 def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[str, Any] | None:
     repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
     artifacts = repair.get("partial_diff_artifacts") if isinstance(repair, dict) else []
     if not isinstance(artifacts, list) or not artifacts:
         return None
+    artifacts = _active_partial_diff_artifacts_for_repair(ctx, artifacts)
     parent_contract = task_contract_payload(ctx.task) if isinstance(ctx.task, dict) else {}
     parent_targets = [
         rel_path
@@ -1359,6 +1378,83 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
             )
             if rel_path
         ]
+        if (
+            "engine_prompt_timeout" in lowered
+            and changed_files
+            and all(_repo_path_looks_like_production_source_file(path) for path in changed_files)
+        ):
+            source_files = list(dict.fromkeys(changed_files))
+            declared_tests = [
+                path
+                for path in artifact_targets
+                if _repo_path_looks_like_test_file(path)
+            ]
+            required_test_files = _source_partial_declared_test_followup_files(
+                {
+                    "repair_changed_files": changed_files,
+                    "files": artifact_targets,
+                    "target_files": artifact_targets,
+                    "acceptance_criteria": [
+                        "Retry the engine timeout with required regression coverage."
+                    ],
+                }
+            ) or declared_tests
+            active_files = list(dict.fromkeys([*source_files, *required_test_files]))
+            if source_files and required_test_files:
+                source_text = ", ".join(source_files)
+                test_text = ", ".join(required_test_files)
+                subtask = {
+                    "id": str(artifact.get("subtask_id") or "source-timeout-diff-repair").strip()
+                    or "source-timeout-diff-repair",
+                    "title": "Repair source-only engine timeout partial diff",
+                    "goal": (
+                        "Finish the timed-out source partial diff with required test coverage for "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                    "files": active_files,
+                    "target_files": active_files,
+                    "acceptance_criteria": [
+                        "Read the timed-out source change in: " + source_text + ".",
+                        "Make the first new repair edit in the required test file(s): " + test_text + ".",
+                        "Do not mark this repair complete until the diff includes both the source behavior and real coverage in "
+                        + test_text
+                        + ".",
+                        "Run the narrowest deterministic verification for "
+                        + test_text
+                        + ", or record the exact unavailable command/blocker.",
+                    ],
+                    "carry_forward_patch": patch_path,
+                    "repair_source_subtask_id": str(artifact.get("subtask_id") or "").strip(),
+                    "repair_source_worker_id": str(artifact.get("worker_id") or "").strip(),
+                    "repair_changed_files": changed_files,
+                    "repair_requires_test_followup": required_test_files,
+                    "repair_worker_output_excerpt": excerpt[:1200],
+                    "repair_failure_summary": failure_summary,
+                    "repair_parent_target_files": artifact_targets,
+                    "deterministic_partial_diff_repair": True,
+                    "write_required": True,
+                    "scope_note": (
+                        "ACA generated this repair plan deterministically after an engine prompt timeout left a "
+                        "source-only partial diff. The preserved source patch is applied before this worker starts; "
+                        "active repair targets are the source file(s) plus required test file(s): "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                }
+                return {
+                    "summary": (
+                        "Deterministic repair for a source-only engine timeout partial diff; ACA narrowed the retry "
+                        "to the timed-out source files plus required tests."
+                    ),
+                    "subtasks": [subtask],
+                    "risks": [
+                        "The preserved patch may need adjustment after required coverage is added."
+                    ],
+                    "tests": [
+                        "Run the narrowest deterministic verification for " + test_text + "."
+                    ],
+                }
         if "changed only non-test files" in lowered and "required test files" in lowered:
             parent_target_set = set(artifact_targets)
             source_files = [path for path in changed_files if _repo_path_looks_like_production_source_file(path)]

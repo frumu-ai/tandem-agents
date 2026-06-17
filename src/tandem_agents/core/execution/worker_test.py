@@ -963,13 +963,20 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 summary = summarize_worker_notes(
                     result,
                     "worker-1",
-                    {"id": "subtask-1", "title": "Subtask"},
+                    {
+                        "id": "subtask-1",
+                        "title": "Subtask",
+                        "files": ["src/lib.rs", "tests/lib_test.rs"],
+                        "target_files": ["src/lib.rs", "tests/lib_test.rs"],
+                    },
                     root / "worktree",
                     0,
                 )
 
             self.assertEqual(summary["partial_diff_artifact"], str(patch_path))
             self.assertEqual(summary["artifacts"]["partial_diff"], str(patch_path))
+            self.assertEqual(summary["subtask_files"], ["src/lib.rs", "tests/lib_test.rs"])
+            self.assertEqual(summary["subtask_target_files"], ["src/lib.rs", "tests/lib_test.rs"])
 
     def test_blocked_worker_note_with_diff_is_preserved_not_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3672,6 +3672,30 @@ def stream_tandem_prompt(
     return {"role": role, "returncode": 1, "stdout": "Internal Error: session-less stream requested"}
 
 
+def _subtask_retry_metadata(subtask: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(subtask, dict):
+        return {}
+
+    def _paths(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        paths: list[str] = []
+        for raw_path in value:
+            rel_path = str(raw_path or "").strip()
+            if rel_path and rel_path not in paths:
+                paths.append(rel_path)
+        return paths
+
+    metadata: dict[str, Any] = {}
+    files = _paths(subtask.get("files"))
+    target_files = _paths(subtask.get("target_files"))
+    if files:
+        metadata["subtask_files"] = files
+    if target_files:
+        metadata["subtask_target_files"] = target_files
+    return metadata
+
+
 def summarize_worker_notes(
     result: dict[str, Any],
     worker_id: str,
@@ -3705,6 +3729,7 @@ def summarize_worker_notes(
         "verified_existing": bool(result.get("verified_existing")),
         "changed_files": [path for path in changed_files if path],
         "diff_stat": diff_stat,
+        **_subtask_retry_metadata(subtask),
     }
 
 

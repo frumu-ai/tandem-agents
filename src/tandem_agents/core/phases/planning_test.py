@@ -524,6 +524,84 @@ class PlanningPreScreenTest(unittest.TestCase):
             ],
         )
 
+    def test_deterministic_repair_ignores_completed_stale_partial_artifacts(self) -> None:
+        ctx = SimpleNamespace(
+            task={
+                "target_files": [
+                    "src/tandem_agents/core/scheduling/scheduler.py",
+                    "src/tandem_agents/core/scheduling/scheduler_test.py",
+                    "src/tandem_agents/core/phases/worker_dispatch.py",
+                    "src/tandem_agents/core/phases/worker_dispatch_test.py",
+                ]
+            },
+            blackboard={
+                "repair": {
+                    "completed_subtask_ids": [
+                        "fallback-throughput-scheduler-controls-part-1",
+                        "fallback-throughput-scheduler-controls-part-2",
+                    ],
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "fallback-throughput-scheduler-controls-part-2",
+                            "worker_id": "worker-2",
+                            "patch_path": "/runs/run-1/artifacts/stale-test.patch",
+                            "changed_files": ["src/tandem_agents/core/scheduling/scheduler_test.py"],
+                            "worker_output_excerpt": "Worker changed only required test files for a regression subtask.",
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                        },
+                        {
+                            "subtask_id": "fallback-throughput-scheduler-controls-part-2",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/stale-source.patch",
+                            "changed_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                            "worker_output_excerpt": "Worker produced a source plus required-test diff.",
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                        },
+                        {
+                            "subtask_id": "fallback-throughput-worker-metrics",
+                            "worker_id": "worker-2",
+                            "patch_path": "/runs/run-1/artifacts/current-timeout.patch",
+                            "changed_files": ["src/tandem_agents/core/phases/worker_dispatch.py"],
+                            "worker_output_excerpt": (
+                                "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync worker prompt did not finish within 300s."
+                            ),
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/phases/worker_dispatch.py",
+                                "src/tandem_agents/core/phases/worker_dispatch_test.py",
+                            ],
+                        },
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(subtask["id"], "fallback-throughput-worker-metrics")
+        self.assertEqual(subtask["carry_forward_patch"], "/runs/run-1/artifacts/current-timeout.patch")
+        self.assertEqual(
+            subtask["files"],
+            [
+                "src/tandem_agents/core/phases/worker_dispatch.py",
+                "src/tandem_agents/core/phases/worker_dispatch_test.py",
+            ],
+        )
+        self.assertIn(
+            "src/tandem_agents/core/phases/worker_dispatch_test.py",
+            "\n".join(subtask["acceptance_criteria"]),
+        )
+
     def test_testless_deterministic_repair_defers_out_of_contract_required_tests(self) -> None:
         parent_targets = [
             "src/tandem_agents/core/phases/task_intake.py",
