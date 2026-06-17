@@ -13,7 +13,9 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _cancel_active_worker_engine_session,
     _changed_python_test_modules,
     _changed_python_tests_result,
+    _changed_files_scoped_to_subtask,
     _diff_add_delete_counts,
+    _filter_diff_text_to_files,
     _diff_has_substantive_required_test_addition,
     _diff_is_destructive_rewrite,
     _failed_result_has_reviewable_production_diff,
@@ -23,6 +25,7 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _subtask_is_no_change_guard_candidate,
     _subtask_is_repair_no_change_guard_candidate,
     _tool_loop_summary_from_messages,
+    _worktree_has_subtask_changes,
     _worker_no_change_abort_seconds,
     _worker_repair_no_change_abort_seconds,
     dispatch_workers,
@@ -448,6 +451,62 @@ class WorkerDispatchTest(unittest.TestCase):
 
             self.assertTrue(_failed_result_has_reviewable_production_diff(result, subtask, worktree))
 
+    def test_failed_result_matches_uppercase_env_contract_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            package = worktree / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            config_loader = package / "config_loader.py"
+            config_loader.write_text(
+                "def resolve_scheduler_config(env):\n"
+                "    return SchedulerConfig(queue_depth_limit=50)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "aca@example.test"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA Test"], cwd=worktree, check=True)
+            subprocess.run(["git", "add", "."], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True)
+            config_loader.write_text(
+                "def resolve_scheduler_config(env):\n"
+                "    scheduler = {}\n"
+                "    return SchedulerConfig(\n"
+                "        queue_depth_limit=50,\n"
+                "        max_concurrent_worker_runs=_config_int(\n"
+                "            scheduler, env, 'max_concurrent_worker_runs', 'ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS', 4\n"
+                "        ),\n"
+                "        max_daily_model_spend_cents=_config_int(\n"
+                "            scheduler, env, 'max_daily_model_spend_cents', 'ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS', 0\n"
+                "        ),\n"
+                "        rate_limit_backpressure=_config_bool(\n"
+                "            scheduler, env, 'rate_limit_backpressure', 'ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE', True\n"
+                "        ),\n"
+                "        ci_backpressure=_config_bool(\n"
+                "            scheduler, env, 'ci_backpressure', 'ACA_SCHEDULER_CI_BACKPRESSURE', True\n"
+                "        ),\n"
+                "        merge_queue_backpressure=_config_bool(\n"
+                "            scheduler, env, 'merge_queue_backpressure', 'ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE', True\n"
+                "        ),\n"
+                "    )\n",
+                encoding="utf-8",
+            )
+            subtask = {
+                "files": ["src/tandem_agents/config/config_loader.py"],
+                "target_files": ["src/tandem_agents/config/config_loader.py"],
+                "acceptance_criteria": [
+                    "Load ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS, ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS, "
+                    "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE, ACA_SCHEDULER_CI_BACKPRESSURE, and "
+                    "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE env vars.",
+                ],
+            }
+            result = {
+                "returncode": 1,
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker.patch",
+                "changed_files": ["src/tandem_agents/config/config_loader.py"],
+            }
+
+            self.assertTrue(_failed_result_has_reviewable_production_diff(result, subtask, worktree))
+
     def test_failed_result_with_docstring_only_production_diff_is_not_reviewable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
@@ -484,6 +543,71 @@ class WorkerDispatchTest(unittest.TestCase):
             }
 
             self.assertFalse(_failed_result_has_reviewable_production_diff(result, subtask, worktree))
+
+    def test_changed_files_scoped_to_subtask_ignores_carried_forward_partials(self) -> None:
+        subtask = {
+            "files": ["src/tandem_agents/config/config_loader.py"],
+            "target_files": ["src/tandem_agents/config/config_loader.py"],
+        }
+
+        self.assertEqual(
+            _changed_files_scoped_to_subtask(
+                [
+                    "src/tandem_agents/config/config_types.py",
+                    "src/tandem_agents/config/config_loader.py",
+                ],
+                subtask,
+            ),
+            ["src/tandem_agents/config/config_loader.py"],
+        )
+
+    def test_filter_diff_text_to_files_ignores_carried_forward_sections(self) -> None:
+        diff_text = (
+            "diff --git a/src/tandem_agents/config/config_types.py b/src/tandem_agents/config/config_types.py\n"
+            "--- a/src/tandem_agents/config/config_types.py\n"
+            "+++ b/src/tandem_agents/config/config_types.py\n"
+            "@@ -1 +1 @@\n"
+            "-queue_depth_limit = 50\n"
+            "+max_concurrent_worker_runs = 4\n"
+            "diff --git a/src/tandem_agents/config/config_loader.py b/src/tandem_agents/config/config_loader.py\n"
+            "--- a/src/tandem_agents/config/config_loader.py\n"
+            "+++ b/src/tandem_agents/config/config_loader.py\n"
+            "@@ -1 +1 @@\n"
+            "-return SchedulerConfig(queue_depth_limit=50)\n"
+            "+return SchedulerConfig(max_concurrent_worker_runs=4)\n"
+        )
+
+        filtered = _filter_diff_text_to_files(
+            diff_text,
+            ["src/tandem_agents/config/config_loader.py"],
+        )
+
+        self.assertIn("config_loader.py", filtered)
+        self.assertNotIn("config_types.py", filtered)
+
+    def test_worktree_has_subtask_changes_ignores_inherited_dirty_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            package = worktree / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            (package / "config_types.py").write_text("queue_depth_limit = 50\n", encoding="utf-8")
+            (package / "config_loader.py").write_text("def load():\n    return 50\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "aca@example.test"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA Test"], cwd=worktree, check=True)
+            subprocess.run(["git", "add", "."], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True)
+            (package / "config_types.py").write_text("max_concurrent_worker_runs = 4\n", encoding="utf-8")
+            subtask = {
+                "files": ["src/tandem_agents/config/config_loader.py"],
+                "target_files": ["src/tandem_agents/config/config_loader.py"],
+            }
+
+            self.assertFalse(_worktree_has_subtask_changes(worktree, subtask))
+
+            (package / "config_loader.py").write_text("def load():\n    return 4\n", encoding="utf-8")
+
+            self.assertTrue(_worktree_has_subtask_changes(worktree, subtask))
 
     def test_test_only_diff_guard_allows_pure_test_slice(self) -> None:
         subtask = {

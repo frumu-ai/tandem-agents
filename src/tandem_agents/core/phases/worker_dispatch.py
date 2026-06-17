@@ -262,6 +262,63 @@ def _subtask_retry_metadata(subtask: dict[str, Any] | None) -> dict[str, Any]:
     return metadata
 
 
+def _subtask_declared_change_files(subtask: dict[str, Any] | None) -> list[str]:
+    if not isinstance(subtask, dict):
+        return []
+    paths: list[str] = []
+    for field in ("target_files", "files"):
+        value = subtask.get(field) or []
+        if not isinstance(value, list):
+            value = [value]
+        for raw_path in value:
+            path = _normalize_repo_path(raw_path)
+            if path and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _changed_files_scoped_to_subtask(
+    changed_files: list[str],
+    subtask: dict[str, Any] | None,
+) -> list[str]:
+    normalized = [_normalize_repo_path(path) for path in changed_files]
+    normalized = [path for path in normalized if path]
+    declared = set(_subtask_declared_change_files(subtask))
+    if not declared:
+        return normalized
+    return [path for path in normalized if path in declared]
+
+
+def _filter_diff_text_to_files(diff_text: str, changed_files: list[str]) -> str:
+    allowed = {_normalize_repo_path(path) for path in changed_files if _normalize_repo_path(path)}
+    if not allowed:
+        return ""
+    sections: list[str] = []
+    current_lines: list[str] = []
+    include_current = False
+
+    def flush() -> None:
+        nonlocal current_lines
+        if include_current and current_lines:
+            sections.append("".join(current_lines))
+        current_lines = []
+
+    for line in str(diff_text or "").splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            flush()
+            parts = line.split()
+            path = ""
+            if len(parts) >= 4:
+                path = _normalize_repo_path(parts[3][2:] if parts[3].startswith("b/") else parts[3])
+            include_current = path in allowed
+            current_lines = [line] if include_current else []
+            continue
+        if include_current:
+            current_lines.append(line)
+    flush()
+    return "".join(sections).strip()
+
+
 def _sync_verifiable_worker_diff(
     ctx: RunContext,
     *,
@@ -708,6 +765,27 @@ def _worktree_has_any_changes(worktree: Path) -> bool:
     return bool((result.stdout or "").strip())
 
 
+def _worktree_has_subtask_changes(worktree: Path, subtask: dict[str, Any] | None) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        logger.debug("Failed to inspect worker worktree status for no-change guard: %s", result.stderr)
+        return True
+    changed_files: list[str] = []
+    for raw_line in (result.stdout or "").splitlines():
+        path = raw_line[3:].strip() if len(raw_line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path:
+            changed_files.append(path)
+    return bool(_changed_files_scoped_to_subtask(changed_files, subtask))
+
+
 def _diff_add_delete_counts(diff_text: str) -> tuple[int, int]:
     additions = 0
     deletions = 0
@@ -886,7 +964,8 @@ def _failed_result_has_reviewable_production_diff(
     tokens = _positive_contract_identifier_tokens(subtask)
     if not tokens:
         return False
-    return all(token in diff_text for token in tokens)
+    diff_text_lower = diff_text.lower()
+    return all(token in diff_text_lower for token in tokens)
 
 
 def _subtask_has_required_test_only_diff(
@@ -1324,12 +1403,18 @@ def dispatch_workers(ctx: RunContext) -> None:
                 git_working_diff,
             )
 
-            changed_files = _worktree_changed_files(worktree)
+            with active_workers_lock:
+                subtask = dict(active_worker_subtasks.get(wid) or {})
+                started_at = float(active_worker_started_at.get(wid) or time.monotonic())
+            changed_files = _changed_files_scoped_to_subtask(_worktree_changed_files(worktree), subtask)
             if not changed_files:
                 return None
-            diff_text = _applyable_working_diff(worktree)
+            raw_diff_text = _applyable_working_diff(worktree)
+            diff_text = _filter_diff_text_to_files(raw_diff_text, changed_files)
             if not str(diff_text or "").strip():
-                diff_text = git_working_diff(worktree)
+                diff_text = _worktree_changed_files_diff(worktree, changed_files)
+            if not str(diff_text or "").strip():
+                diff_text = _filter_diff_text_to_files(git_working_diff(worktree), changed_files)
             if not str(diff_text or "").strip():
                 return None
             diff_bytes = len(diff_text.encode("utf-8", errors="replace"))
@@ -1507,9 +1592,6 @@ def dispatch_workers(ctx: RunContext) -> None:
                     repo={"path": ctx.repo.get("path")},
                 )
                 return snapshot
-            with active_workers_lock:
-                subtask = dict(active_worker_subtasks.get(wid) or {})
-                started_at = float(active_worker_started_at.get(wid) or time.monotonic())
             elapsed_seconds = max(0.0, time.monotonic() - started_at)
             testless_abort_seconds = _worker_testless_diff_abort_seconds(ctx)
             comment_only_abort_seconds = _worker_comment_only_diff_abort_seconds(ctx)
@@ -2207,11 +2289,11 @@ def dispatch_workers(ctx: RunContext) -> None:
         tool_loop_abort_seconds = _worker_no_diff_tool_loop_abort_seconds(ctx)
         tool_loop_summary: dict[str, Any] | None = None
         if tool_loop_abort_seconds > 0 and elapsed_seconds >= tool_loop_abort_seconds:
-            if not _worktree_has_any_changes(worktree):
+            if not _worktree_has_subtask_changes(worktree, subtask):
                 tool_loop_summary = _active_worker_no_diff_tool_loop(ctx, wid)
         if not tool_loop_summary and elapsed_seconds < abort_seconds:
             return
-        if _worktree_has_any_changes(worktree):
+        if _worktree_has_subtask_changes(worktree, subtask):
             return
         subtask_id = str(subtask.get("id") or "").strip()
         if tool_loop_summary:
