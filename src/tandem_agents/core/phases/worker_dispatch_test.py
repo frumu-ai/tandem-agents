@@ -39,7 +39,7 @@ class _FakeCoordination:
 
 class WorkerDispatchTest(unittest.TestCase):
     def test_no_change_timeout_defaults_and_ignores_invalid_env(self) -> None:
-        self.assertEqual(_worker_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 120.0)
+        self.assertEqual(_worker_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 180.0)
         self.assertEqual(
             _worker_no_change_abort_seconds(
                 SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "90"}))
@@ -50,7 +50,7 @@ class WorkerDispatchTest(unittest.TestCase):
             _worker_no_change_abort_seconds(
                 SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "bad"}))
             ),
-            120.0,
+            180.0,
         )
 
     def test_tool_loop_summary_detects_invalid_patch_churn(self) -> None:

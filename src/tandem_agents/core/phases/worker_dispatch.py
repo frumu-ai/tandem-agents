@@ -401,7 +401,7 @@ def _worker_testless_diff_abort_seconds(ctx: RunContext) -> float:
             return max(0.0, float(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS=%r", raw)
-    return 180.0
+    return 120.0
 
 
 def _worker_comment_only_diff_abort_seconds(ctx: RunContext) -> float:
@@ -411,7 +411,7 @@ def _worker_comment_only_diff_abort_seconds(ctx: RunContext) -> float:
             return max(0.0, float(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_COMMENT_ONLY_DIFF_ABORT_SECONDS=%r", raw)
-    return 120.0
+    return 180.0
 
 
 def _worker_verifiable_diff_abort_seconds(ctx: RunContext) -> float:
@@ -441,7 +441,7 @@ def _worker_no_change_abort_seconds(ctx: RunContext) -> float:
             return max(0.0, float(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_NO_CHANGE_ABORT_SECONDS=%r", raw)
-    return 120.0
+    return 180.0
 
 
 def _worker_no_diff_tool_loop_abort_seconds(ctx: RunContext) -> float:
