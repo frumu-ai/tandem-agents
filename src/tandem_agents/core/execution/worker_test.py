@@ -52,6 +52,7 @@ from src.tandem_agents.core.execution.worker import (
 )
 from src.tandem_agents.core.phases.worker_dispatch import (
     _apply_tolerated_failures,
+    _abort_result_subtask_id,
     _changed_files_satisfy_required_test_files,
     _changed_python_syntax_errors,
     _clear_active_worker_attempt_marker,
@@ -149,6 +150,22 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 },
             ),
             "worker-1--subtask-1",
+        )
+
+    def test_dispatch_abort_subtask_id_ignores_execution_suffix(self) -> None:
+        self.assertEqual(
+            _abort_result_subtask_id(
+                {"id": "subtask-1"},
+                Path("worker-1--subtask-1--exec-123"),
+            ),
+            "subtask-1",
+        )
+        self.assertEqual(
+            _abort_result_subtask_id(
+                {},
+                Path("worker-1--subtask-1--exec-123"),
+            ),
+            "subtask-1",
         )
 
     def test_worker_no_progress_timeout_derives_from_effective_worker_budget(self) -> None:

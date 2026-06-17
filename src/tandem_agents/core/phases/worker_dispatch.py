@@ -113,6 +113,19 @@ def _diff_applies_to_head(worktree: Path, diff_text: str) -> bool:
     return ok
 
 
+def _abort_result_subtask_id(subtask: dict[str, Any] | None, worktree: Path | None = None) -> str:
+    subtask_id = str((subtask or {}).get("id") or "").strip()
+    if subtask_id:
+        return subtask_id
+    name = str(getattr(worktree, "name", "") or "").strip()
+    if "--" not in name:
+        return ""
+    subtask_id = name.split("--", 1)[1]
+    if "--exec-" in subtask_id:
+        subtask_id = subtask_id.split("--exec-", 1)[0]
+    return subtask_id.strip()
+
+
 def _sync_verifiable_worker_diff(
     ctx: RunContext,
     *,
@@ -724,7 +737,6 @@ def dispatch_workers(ctx: RunContext) -> None:
             if not same_digest:
                 diff_ok, diff_check_detail = _diff_apply_check(worktree, diff_text)
             if not diff_ok:
-                active_worker_snapshot_digests[wid] = digest
                 snapshot = active_worker_progress_snapshots.get(wid)
                 append_event(
                     ctx.layout["events"],
@@ -778,13 +790,11 @@ def dispatch_workers(ctx: RunContext) -> None:
                 }
                 active_worker_snapshot_digests[wid] = digest
                 active_worker_progress_snapshots[wid] = snapshot
-                subtask_id = ""
                 with active_workers_lock:
-                    for key, path in active_worker_worktrees.items():
-                        if key == wid:
-                            name = path.name
-                            subtask_id = name.split("--", 1)[1] if "--" in name else ""
-                            break
+                    subtask_id = _abort_result_subtask_id(
+                        active_worker_subtasks.get(wid),
+                        active_worker_worktrees.get(wid),
+                    )
                     active_worker_abort_results[wid] = {
                         "worker_id": wid,
                         "subtask_id": subtask_id,
