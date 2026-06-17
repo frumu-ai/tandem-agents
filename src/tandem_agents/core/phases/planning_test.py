@@ -2188,15 +2188,31 @@ class PlanningPreScreenTest(unittest.TestCase):
             self.assertEqual(result["returncode"], 0)
             self.assertEqual(result["engine"], {"skipped": True, "reason": "repo_context_required_files"})
             subtask_ids = [subtask["id"] for subtask in ctx.manager_plan["subtasks"]]
-            self.assertEqual(subtask_ids[0], "fallback-throughput-config-controls")
-            self.assertIn("config_types.py", " ".join(ctx.manager_plan["subtasks"][0]["files"]))
-            config_criteria = " ".join(ctx.manager_plan["subtasks"][0]["acceptance_criteria"])
-            self.assertIn("defaults", config_criteria.lower())
-            self.assertIn("max_concurrent_worker_runs", config_criteria)
-            self.assertIn("resolve_config(root, env={...})", config_criteria)
-            self.assertIn("Do not add alias helpers", config_criteria)
-            self.assertIn("config.aca", config_criteria)
-            self.assertIn("cfg.scheduler.<exact field>", ctx.manager_plan["subtasks"][0]["scope_note"])
+            self.assertEqual(
+                subtask_ids[:3],
+                [
+                    "fallback-throughput-config-types",
+                    "fallback-throughput-config-loader",
+                    "fallback-throughput-config-loader-tests",
+                ],
+            )
+            config_types = ctx.manager_plan["subtasks"][0]
+            self.assertEqual(config_types["files"], ["src/tandem_agents/config/config_types.py"])
+            self.assertIn("defaults", " ".join(config_types["acceptance_criteria"]).lower())
+            self.assertIn("max_concurrent_worker_runs", " ".join(config_types["acceptance_criteria"]))
+            self.assertIn("config_types.py", config_types["scope_note"])
+            config_loader = ctx.manager_plan["subtasks"][1]
+            self.assertEqual(config_loader["files"], ["src/tandem_agents/config/config_loader.py"])
+            loader_criteria = " ".join(config_loader["acceptance_criteria"])
+            self.assertIn("ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS", loader_criteria)
+            self.assertIn("Do not add alias helpers", loader_criteria)
+            self.assertIn("config.aca", loader_criteria)
+            config_tests = ctx.manager_plan["subtasks"][2]
+            self.assertEqual(config_tests["files"], ["src/tandem_agents/config/config_loader_test.py"])
+            test_criteria = " ".join(config_tests["acceptance_criteria"])
+            self.assertIn("resolve_config(root, env={...})", test_criteria)
+            self.assertIn("config.scheduler.max_concurrent_worker_runs", test_criteria)
+            self.assertIn("test-only slice", config_tests["scope_note"])
             self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
             scheduler_subtask = next(
                 subtask
@@ -2207,8 +2223,9 @@ class PlanningPreScreenTest(unittest.TestCase):
             self.assertIn("max_concurrent_worker_runs", scheduler_criteria)
             self.assertIn("worker_concurrency_reached", scheduler_criteria)
             self.assertIn("plan_task_admissions", scheduler_subtask["scope_note"])
-            self.assertIn("fallback-throughput-worker-metrics", subtask_ids)
-            self.assertIn("fallback-throughput-operator-cockpit", subtask_ids)
+            self.assertNotIn("fallback-throughput-worker-metrics", subtask_ids)
+            self.assertNotIn("fallback-throughput-operator-cockpit", subtask_ids)
+            self.assertEqual(len(subtask_ids), ctx.cfg.swarm.max_workers)
             events = [
                 json.loads(line)
                 for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()

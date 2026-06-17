@@ -892,36 +892,63 @@ def _deterministic_invalid_manager_subtasks(
             }
         )
 
-    throughput_config_files = [
-        path
-        for path in (
-            by_name.get("config_types.py"),
-            by_name.get("config_loader.py"),
-            by_name.get("config_loader_test.py"),
-        )
-        if path
-    ]
-    if throughput_config_files:
+    config_types_file = by_name.get("config_types.py")
+    config_loader_file = by_name.get("config_loader.py")
+    config_loader_test_file = by_name.get("config_loader_test.py")
+    if config_types_file:
         planned.append(
             {
-                "id": "fallback-throughput-config-controls",
-                "title": f"{title} - scheduler budget config controls",
-                "goal": "Add explicit scheduler budget, concurrency, rate-limit, CI, and merge queue backpressure config fields.",
-                "files": throughput_config_files,
-                "target_files": throughput_config_files,
+                "id": "fallback-throughput-config-types",
+                "title": f"{title} - scheduler budget config fields",
+                "goal": "Add the explicit scheduler budget, concurrency, rate-limit, CI, and merge queue backpressure config fields.",
+                "files": [config_types_file],
+                "target_files": [config_types_file],
                 "acceptance_criteria": [
                     "In src/tandem_agents/config/config_types.py, extend SchedulerConfig with max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure. Use max_concurrent_worker_runs=4, max_daily_model_spend_cents=0, and True for each backpressure toggle as defaults.",
+                    "Add those exact scheduler fields to ResolvedConfig.as_dict() under the scheduler payload if the scheduler payload enumerates fields explicitly.",
+                    "Do not add alias helpers, legacy scheduler key translation, config.aca fields, an ACAConfig type, or new scheduler field names such as max_parallel_workers, max_pending_tasks, worker_start_interval_seconds, max_run_cost_usd, max_worker_cost_usd, max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
+                ],
+                "scope_note": (
+                    "Mechanical slice 1 of 3 for throughput config controls. Edit only config_types.py. "
+                    "Do not touch config_loader.py or config_loader_test.py in this slice."
+                ),
+            }
+        )
+    if config_loader_file:
+        planned.append(
+            {
+                "id": "fallback-throughput-config-loader",
+                "title": f"{title} - scheduler budget config loader",
+                "goal": "Wire exact scheduler budget and backpressure config fields from YAML and environment into SchedulerConfig.",
+                "files": [config_loader_file],
+                "target_files": [config_loader_file],
+                "acceptance_criteria": [
                     "In src/tandem_agents/config/config_loader.py, load those fields from scheduler YAML keys and ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS, ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS, ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE, ACA_SCHEDULER_CI_BACKPRESSURE, and ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE env vars.",
+                    "Use the existing int and bool config loader helpers directly in the SchedulerConfig(...) construction.",
+                    "Do not add alias helpers, legacy scheduler key translation, config.aca fields, an ACAConfig type, or new scheduler field names such as max_parallel_workers, max_pending_tasks, worker_start_interval_seconds, max_run_cost_usd, max_worker_cost_usd, max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
+                ],
+                "scope_note": (
+                    "Mechanical slice 2 of 3 for throughput config controls. Edit only config_loader.py. "
+                    "Assume SchedulerConfig already has the exact fields; do not add tests in this slice."
+                ),
+            }
+        )
+    if config_loader_test_file:
+        planned.append(
+            {
+                "id": "fallback-throughput-config-loader-tests",
+                "title": f"{title} - scheduler budget config loader tests",
+                "goal": "Add focused config loader coverage for exact scheduler budget and backpressure fields.",
+                "files": [config_loader_test_file],
+                "target_files": [config_loader_test_file],
+                "acceptance_criteria": [
                     "In src/tandem_agents/config/config_loader_test.py, add one focused test covering defaults plus env overrides for those exact config.scheduler fields: max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
                     "The test must call resolve_config(root, env={...}) and assert only config.scheduler.max_concurrent_worker_runs, config.scheduler.max_daily_model_spend_cents, config.scheduler.rate_limit_backpressure, config.scheduler.ci_backpressure, and config.scheduler.merge_queue_backpressure.",
                     "Do not add alias helpers, legacy scheduler key translation, config.aca fields, an ACAConfig type, or new scheduler field names such as max_parallel_workers, max_pending_tasks, worker_start_interval_seconds, max_run_cost_usd, max_worker_cost_usd, max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
                 ],
                 "scope_note": (
-                    "Suggested edit order: first read the SchedulerConfig class, then add the typed fields there; "
-                    "next read the scheduler construction in config_loader.py and wire the env/YAML loaders; "
-                    "finally add one config_loader_test case asserting cfg.scheduler.<exact field>. "
-                    "This slice is not about ACAConfig, config.aca, aliases, or helper normalization; edit only SchedulerConfig, the SchedulerConfig(...) construction, and one focused config_loader test. "
-                    "Avoid broad reads of the whole test file."
+                    "Mechanical slice 3 of 3 for throughput config controls. Edit only config_loader_test.py. "
+                    "This is a test-only slice after the config fields and loader wiring slices; do not edit production files here."
                 ),
             }
         )

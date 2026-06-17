@@ -18,6 +18,7 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _diff_is_destructive_rewrite,
     _failed_result_has_reviewable_source_and_test_diff,
     _reviewable_failed_diff_rejection,
+    _subtask_has_required_test_only_diff,
     _subtask_is_no_change_guard_candidate,
     _subtask_is_repair_no_change_guard_candidate,
     _tool_loop_summary_from_messages,
@@ -338,6 +339,46 @@ class WorkerDispatchTest(unittest.TestCase):
             _failed_result_has_reviewable_source_and_test_diff(
                 {**result, "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST"},
                 subtask,
+            )
+        )
+
+    def test_test_only_diff_guard_allows_pure_test_slice(self) -> None:
+        subtask = {
+            "files": ["src/tandem_agents/config/config_loader_test.py"],
+            "target_files": ["src/tandem_agents/config/config_loader_test.py"],
+            "acceptance_criteria": [
+                "Add focused config loader test coverage for exact scheduler fields.",
+            ],
+        }
+
+        self.assertFalse(
+            _subtask_has_required_test_only_diff(
+                subtask,
+                ["src/tandem_agents/config/config_loader_test.py"],
+            )
+        )
+
+    def test_test_only_diff_guard_rejects_required_production_followup(self) -> None:
+        subtask = {
+            "files": [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            "target_files": [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            "repair_requires_production_followup": ["src/tandem_agents/config/config_loader.py"],
+            "acceptance_criteria": [
+                "Tests cover the config loader regression.",
+                "Make the first new repair edit in the required production file.",
+            ],
+        }
+
+        self.assertTrue(
+            _subtask_has_required_test_only_diff(
+                subtask,
+                ["src/tandem_agents/config/config_loader_test.py"],
             )
         )
 

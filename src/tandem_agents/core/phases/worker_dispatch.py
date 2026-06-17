@@ -724,6 +724,51 @@ def _subtask_has_verifiable_source_and_test_diff(
     return any(not _is_test_path(path) for path in changed_files)
 
 
+def _subtask_requires_production_followup_for_test_only_diff(subtask: dict[str, Any]) -> bool:
+    explicit_followups = [
+        str(path or "").strip()
+        for path in subtask.get("repair_requires_production_followup") or []
+        if str(path or "").strip()
+    ]
+    if any(not _is_test_path(path) for path in explicit_followups):
+        return True
+    declared_files = [
+        str(path or "").strip()
+        for field in ("target_files", "files")
+        for path in (subtask.get(field) or [])
+        if str(path or "").strip()
+    ]
+    production_files = [path for path in declared_files if not _is_test_path(path)]
+    if not production_files:
+        return False
+    text_parts: list[Any] = [
+        subtask.get("title"),
+        subtask.get("goal"),
+        subtask.get("scope_note"),
+    ]
+    for field in ("acceptance_criteria", "deliverables"):
+        value = subtask.get(field)
+        if isinstance(value, (list, tuple, set)):
+            text_parts.extend(value)
+        elif value:
+            text_parts.append(value)
+    text = "\n".join(str(part or "").lower() for part in text_parts)
+    return any(
+        marker in text
+        for marker in (
+            "production",
+            "implementation",
+            "behavior",
+            "source",
+            "wire",
+            "wiring",
+            "loader",
+            "regression",
+            "fix",
+        )
+    )
+
+
 def _failed_result_has_reviewable_source_and_test_diff(
     result: dict[str, Any],
     subtask: dict[str, Any],
@@ -751,6 +796,8 @@ def _subtask_has_required_test_only_diff(
     changed_files: list[str],
 ) -> bool:
     if not _subtask_requires_test_changes(subtask):
+        return False
+    if not _subtask_requires_production_followup_for_test_only_diff(subtask):
         return False
     if not changed_files:
         return False
