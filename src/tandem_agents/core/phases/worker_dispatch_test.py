@@ -284,6 +284,12 @@ class WorkerDispatchTest(unittest.TestCase):
                 subtask,
             )
         )
+        self.assertFalse(
+            _failed_result_has_reviewable_source_and_test_diff(
+                {**result, "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST"},
+                subtask,
+            )
+        )
 
     def test_destructive_diff_guard_counts_real_diff_lines(self) -> None:
         diff = "\n".join(

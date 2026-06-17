@@ -697,6 +697,13 @@ def _failed_result_has_reviewable_source_and_test_diff(
 ) -> bool:
     if int(result.get("returncode") or 0) == 0:
         return False
+    failure_reason = str(result.get("failure_reason") or "").strip()
+    if failure_reason in {
+        "WORKER_SYNTAX_INVALID_DIFF",
+        "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+        "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+    }:
+        return False
     patch_path = str(result.get("partial_diff_artifact") or "").strip()
     if not patch_path and isinstance(result.get("artifacts"), dict):
         patch_path = str(result["artifacts"].get("partial_diff") or "").strip()
