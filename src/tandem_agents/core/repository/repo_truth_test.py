@@ -167,6 +167,44 @@ class RepoTruthDiscoveryTest(unittest.TestCase):
 
             self.assertEqual(infer_command_checks(repo_path, ["src/app.py"], task={}), [])
 
+    def test_infer_command_checks_adds_python3_unittest_for_sibling_test_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            test_path = repo_path / "src" / "tandem_agents" / "api" / "run_isolation_test.py"
+            test_path.parent.mkdir(parents=True)
+            test_path.write_text("import unittest\n", encoding="utf-8")
+
+            commands = infer_command_checks(
+                repo_path,
+                ["src/tandem_agents/api/run_isolation_test.py"],
+                task={"acceptance_criteria": ["Run the targeted test."]},
+            )
+
+            self.assertEqual(
+                commands,
+                ["python3 -m unittest src.tandem_agents.api.run_isolation_test"],
+            )
+
+    def test_infer_command_checks_adds_existing_python_sibling_test_for_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            src_path = repo_path / "src" / "tandem_agents" / "api" / "run_isolation.py"
+            test_path = repo_path / "src" / "tandem_agents" / "api" / "run_isolation_test.py"
+            src_path.parent.mkdir(parents=True)
+            src_path.write_text("def ok():\n    return True\n", encoding="utf-8")
+            test_path.write_text("import unittest\n", encoding="utf-8")
+
+            commands = infer_command_checks(
+                repo_path,
+                ["src/tandem_agents/api/run_isolation.py"],
+                task={"acceptance_criteria": ["Verify the Python behavior."]},
+            )
+
+            self.assertEqual(
+                commands,
+                ["python3 -m unittest src.tandem_agents.api.run_isolation_test"],
+            )
+
     def test_infer_command_checks_adds_cargo_check_for_changed_crate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)

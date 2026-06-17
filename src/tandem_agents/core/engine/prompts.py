@@ -38,14 +38,43 @@ def _partial_diff_repair_prompt_mode(previous_feedback: str | None) -> str:
     feedback = str(previous_feedback or "")
     if "Preserved partial patch:" not in feedback and "worker_incomplete_diff" not in feedback:
         return ""
+    lowered = feedback.lower()
+    rejected_markers = (
+        "verification not run",
+        "rejected",
+        "reset",
+        "unverified",
+        "self-referential",
+        "test-only",
+        "helper-only",
+        "local oracle",
+        "not wired",
+        "limited to message formatting",
+        "unproductive partial diff",
+        "runaway guard",
+        "diff exceeded aca runaway",
+        "giant patch",
+    )
+    feedback_rejects_patch = any(marker in lowered for marker in rejected_markers)
+    reusable_guidance = (
+        "- Treat a preserved patch from `ENGINE_PROMPT_TIMEOUT` or a stalled engine as reusable continuation work unless the feedback explicitly rejects the patch quality.\n"
+        "- Do not treat the standard phrase `not treated as a completed worker result` as rejection by itself; it means the patch still needs a terminal worker verdict.\n"
+    )
+    rejected_guidance = ""
+    if feedback_rejects_patch:
+        rejected_guidance = (
+            "- If the feedback says the partial patch was rejected, reset, unverified, helper-only, self-referential, or not wired into production, use it only as failure evidence; plan a replacement repair against the parent task target files.\n"
+            "- If the feedback says the partial patch was rejected, reset, unverified, helper-only, self-referential, or not wired into production, "
+            "discard that approach and include the parent task target files needed to satisfy the original acceptance criteria.\n"
+        )
     return (
         "PARTIAL-DIFF REPAIR MODE:\n"
         "- Return exactly one subtask unless the feedback says multiple preserved patches exist.\n"
         "- If the feedback indicates the preserved patch is reusable, the subtask must first finish that patch and fix blockers named in the worker output excerpt.\n"
-        "- If the feedback says the partial patch was rejected, reset, unverified, incomplete, or not treated as completed, use it only as failure evidence; plan a replacement repair against the parent task target files.\n"
-        "- Keep `files` limited to changed files only when the feedback indicates the preserved patch is reusable.\n"
-        "- If the feedback says the partial patch was rejected, reset, unverified, incomplete, or not treated as completed, "
-        "discard that approach and include the parent task target files needed to satisfy the original acceptance criteria.\n"
+        f"{reusable_guidance}"
+        f"{rejected_guidance}"
+        "- Keep `files` limited to changed files only when the feedback indicates the preserved patch is reusable, except when the preserved patch changed only tests and the parent task contract names a direct production/source target; in that case include that minimal production target too.\n"
+        "- For a reusable test-only timeout patch, require the worker to finish the test patch and implement or verify the paired production behavior before marking the repair complete.\n"
         "- Do not plan unrelated scenario slices or broad follow-up work while repairing the partial-diff blocker.\n"
         "- Put the recovered blocker fixes in canonical `acceptance_criteria`, not only in summary or risks.\n\n"
     )
@@ -111,7 +140,6 @@ def _is_test_target_path(path: str) -> bool:
 
 def _subtask_mentions_test_work(subtask: dict[str, Any]) -> bool:
     parts: list[Any] = [subtask.get("title"), subtask.get("goal"), subtask.get("scope_note")]
-    parts.extend(_as_list(subtask.get("acceptance_criteria")))
     parts.extend(_as_list(subtask.get("deliverables")))
     text = "\n".join(str(part or "") for part in parts).lower()
     return any(word in text for word in ("test", "tests", "coverage", "regression"))
@@ -127,6 +155,21 @@ def _is_support_only_target_path(path: str) -> bool:
     if lowered.startswith("docs/") or "/docs/" in f"/{lowered}/":
         return True
     return any(lowered.endswith(ext) for ext in SUPPORT_ONLY_TARGET_EXTENSIONS)
+
+
+def _repair_requires_test_first(subtask: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(subtask.get(key) or "")
+        for key in (
+            "repair_worker_output_excerpt",
+            "repair_context",
+            "failure_reason",
+            "blocker_kind",
+        )
+    ).lower()
+    return "worker_off_track_testless_diff" in text or (
+        "changed only non-test files" in text and "required test files" in text
+    )
 
 
 def _split_substantive_and_support_targets(target_files: list[str]) -> tuple[list[str], list[str]]:
@@ -415,6 +458,7 @@ def build_manager_prompt(
         "Use acceptance_criteria for the concrete worker completion checklist; do not put the only completion criteria in a non-canonical field like scope.\n\n"
         "Keep each subtask narrow: prefer 1-3 high-signal files. For large split test suites or subsystem-wide tasks, "
         "choose the smallest existing test/API surface plus the direct implementation file, and leave other follow-up slices as separate subtasks or risks.\n\n"
+        "If several lifecycle behaviors share the same source/test files, split them into multiple sequential subtasks with no more than three concrete acceptance criteria each instead of giving one worker the whole checklist.\n\n"
         "When listing files in subtasks, use repository-relative paths only, such as `package.json` or `src/app.js`.\n"
         "Do not use absolute container paths like `/workspace/...`.\n\n"
         "Do not use git-ignored or private source-note paths such as `docs/internal/...` as worker deliverables. "
@@ -548,9 +592,21 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "Do not stop with an analysis-only blocker unless editing the tracked target files would be unsafe, "
             "and name that concrete safety reason.\n"
         )
-        if required_test_targets and _subtask_mentions_test_work(subtask):
+        production_followup_targets = [
+            str(path).strip()
+            for path in _as_list(subtask.get("repair_requires_production_followup"))
+            if str(path).strip()
+        ]
+        if production_followup_targets:
             write_required_guidance += (
-                "\nThis is a test/regression coverage subtask. Read and edit at least one required test target first: "
+                "\nThis repair carries a preserved test-only partial diff. Read the carried test patch for context, "
+                "then make the first new semantic edit in the paired production target before adding or changing more tests: "
+                f"{json.dumps(production_followup_targets)}. A test-only diff fails this repair unless you report a concrete blocker "
+                "explaining why no production edit is safe.\n"
+            )
+        elif required_test_targets and (_repair_requires_test_first(subtask) or _subtask_mentions_test_work(subtask)):
+            write_required_guidance += (
+                "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
                 f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
                 "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
             )
@@ -629,7 +685,9 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         "You must use tools to inspect the worktree, create or edit the required files, and verify the result.\n"
         "Do not merely describe intended changes. If you did not actually change files, report a blocker instead.\n"
         "Before finishing, verify the changed files with read/glob/grep or bash commands in the worktree.\n"
-        "Once a substantive diff exists, stop expanding scope: run one lightweight verification or file readback, then return the final completion note.\n"
+        "Once a substantive diff exists, stop expanding scope; run one lightweight verification or file readback, retry a narrower readback if a tool is skipped, then return the final completion note.\n"
+        "For Python sibling test files under `src/`, prefer `python3 -m unittest <module.path>`; use `python3 -m py_compile <changed files>` as a fallback if dependencies needed by the test command are unavailable.\n"
+        "Do not treat missing `pytest` as a blocker when an equivalent `python3 -m unittest ...` command can exercise the changed Python test module.\n"
         "When a subtask needs coverage for private helpers, add real tests inside the source module that defines those helpers; do not add placeholder integration or contract test files.\n"
         "When adding tests, prefer additive test modules or additive cases; do not rewrite existing tests unless the task explicitly requires changing them.\n"
         "If browser tools are available, use them to verify your changes.\n"
@@ -671,6 +729,7 @@ def build_integration_prompt(run_id: str, task: dict[str, Any], worker_notes: li
         "If the repository state still looks incomplete, report that as a blocker instead of pretending integration succeeded.\n"
         "Reject any out-of-scope edits or edits outside the declared target files.\n"
         "Your summary is advisory only; do not invent missing-file claims if the repository already contains the files.\n"
+        "For Python sibling test files under `src/`, prefer `python3 -m unittest <module.path>`; do not use bare `python` unless a task-provided command requires it.\n"
         "Return a short JSON object with summary, risks, and tests.\n\n"
         f"Task title: {task['title']}\n"
         f"Task contract:\n{contract_block}\n\n"
@@ -744,6 +803,7 @@ def build_test_prompt(
         "Run the most relevant validation commands for this repository and task.\n"
         "Prefer the listed verification commands and include them in your answer if they were available.\n"
         "Base your verdict on the actual repository state. Do not fail the run just because a worker had a noisy tool error if the target files exist and are readable.\n"
+        "For Python sibling test files under `src/`, prefer `python3 -m unittest <module.path>`; do not use bare `python` unless a task-provided command requires it.\n"
         "Return JSON only with keys: next_action, commands, results, notes.\n"
         "Set next_action to one of `pass`, `repair_needed`, `blocked`, or `human_review_needed`.\n"
         "CRITICAL: You MUST use ONLY relative paths (e.g., `package.json` or `src/app.js`) for ALL tool calls.\n"

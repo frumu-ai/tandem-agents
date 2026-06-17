@@ -22,6 +22,7 @@ from src.tandem_agents.core.engine.coder_backend import (
     execute_coder_run,
 )
 from src.tandem_agents.core.engine.engine import (
+    _engine_request_json,
     checkout_run_branch,
     commit_repository_changes,
     engine_env,
@@ -63,7 +64,7 @@ from src.tandem_agents.core.integrations.linear_mcp import (
     linear_status_name_for_task_state,
     linear_update_issue,
 )
-from src.tandem_agents.core.repository.repository import _git_repo_args, fetch_pr_refs, repository_binding_issues
+from src.tandem_agents.core.repository.repository import _git_repo_args, fetch_pr_refs, repository_binding_issues, worker_worktree_name
 from src.tandem_agents.core.task_contract import task_contract_payload
 from src.tandem_agents.core.scheduling.outbox_dispatcher import dispatch_outbox_tick
 from src.tandem_agents.core.scheduling.coder_supervisor import apply_coder_result
@@ -137,9 +138,22 @@ _RETRYABLE_WORKER_BLOCKER_KINDS = {
     "worker_runaway_diff",
     "worker_unproductive_diff",
     "worker_corrupt_diff",
+    "carry_forward_patch_apply_failed",
     "worker_no_diff",
     "engine_tool_loop_stalled",
     "engine_tool_loop_stalled_no_diff",
+    "engine_prompt_timeout",
+}
+
+_PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS = {
+    "worker_incomplete_diff",
+    "worker_corrupt_diff",
+    "worker_no_progress",
+    "worker_off_track",
+    "worker_runaway_diff",
+    "worker_unproductive_diff",
+    "carry_forward_patch_apply_failed",
+    "engine_tool_loop_stalled",
     "engine_prompt_timeout",
 }
 
@@ -451,6 +465,13 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
             first.get("recovery_action")
             or "Retry with a smaller prompt that requires a real implementation-backed assertion before comments."
         )
+    elif kind == "carry_forward_patch_apply_failed":
+        message = failure_reason or "ACA could not apply the preserved partial diff before retry."
+        phase_detail = f"{worker_id} could not apply preserved partial diff"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Discard the corrupt preserved patch and replan a fresh narrow repair against parent target files."
+        )
     elif kind == "ignored_path_changes":
         ignored = first.get("ignored_files") or []
         ignored_text = f" Ignored files: {', '.join(str(path) for path in ignored)}." if ignored else ""
@@ -517,7 +538,7 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
     changed_text = "\n".join(f"- {path}" for path in changed_files) if changed_files else "- none"
     worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
     patch_path = str(worker.get("partial_diff_artifact") or ((worker.get("artifacts") or {}).get("partial_diff") if isinstance(worker.get("artifacts"), dict) else "") or "").strip()
-    stdout_excerpt = str(worker.get("stdout") or "").strip()
+    stdout_excerpt = _compact_partial_diff_retry_excerpt(str(worker.get("stdout") or "").strip(), kind, bool(patch_path))
     if len(stdout_excerpt) > 2000:
         stdout_excerpt = stdout_excerpt[:2000] + "\n..."
     return "\n\n".join(
@@ -526,6 +547,7 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
             f"CRITICAL: Worker attempt {attempt + 1} failed with retryable blocker `{kind}`.",
             str(blocker.get("message") or "").strip(),
             f"Detail: {blocker.get('detail')}" if blocker.get("detail") else "",
+            f"Recovery action: {blocker.get('recovery_action')}" if blocker.get("recovery_action") else "",
             "Changed files from the failed attempt:\n" + changed_text,
             f"Preserved partial patch: `{patch_path}`" if patch_path else "",
             "Worker output excerpt:\n" + stdout_excerpt if stdout_excerpt else "",
@@ -542,6 +564,42 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
         )
         if part
     )
+
+
+def _compact_partial_diff_retry_excerpt(stdout: str, kind: str, has_patch: bool) -> str:
+    if not has_patch:
+        return stdout
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if "aca preserved this partial worker diff" in lowered:
+            continue
+        if "partial diff is not treated as a completed worker result" in lowered:
+            continue
+        if line == "- __aca_temp_probe.txt":
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    compacted = "\n".join(lines).strip()
+    if not compacted and kind in {"engine_prompt_timeout", "engine_tool_loop_stalled"}:
+        return "ENGINE_PROMPT_TIMEOUT before the worker returned a terminal response."
+    return compacted
+
+
+def _worker_failure_has_partial_diff(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    if str(worker.get("partial_diff_artifact") or "").strip():
+        return True
+    artifacts = worker.get("artifacts")
+    return isinstance(artifacts, dict) and bool(str(artifacts.get("partial_diff") or "").strip())
 
 
 def _worker_incomplete_diff_extra_retries(cfg: ResolvedConfig) -> int:
@@ -569,14 +627,10 @@ def _worker_failure_can_retry(
         return False
     if attempt < base_max_loops - 1:
         return True
-    if str(blocker.get("kind") or "").strip() not in {
-        "worker_incomplete_diff",
-        "worker_corrupt_diff",
-        "worker_no_progress",
-        "worker_off_track",
-        "worker_runaway_diff",
-        "worker_unproductive_diff",
-    }:
+    kind = str(blocker.get("kind") or "").strip()
+    if kind not in _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS:
+        return False
+    if kind in {"engine_tool_loop_stalled", "engine_prompt_timeout"} and not _worker_failure_has_partial_diff(blocker):
         return False
     extra_retries = _worker_incomplete_diff_extra_retries(cfg)
     return attempt < base_max_loops + extra_retries - 1
@@ -611,6 +665,46 @@ def _verification_can_retry(
         return False
     extra_retries = _worker_incomplete_diff_extra_retries(cfg)
     return attempt < base_max_loops + extra_retries - 1
+
+
+def _integration_can_retry(
+    cfg: ResolvedConfig,
+    ctx: "_PhaseRunContext",
+    attempt: int,
+    base_max_loops: int,
+) -> bool:
+    if _verification_can_retry(cfg, ctx, attempt, base_max_loops):
+        return True
+    if not _repair_state_has_worker_incomplete_diff(ctx):
+        return False
+    raw = str(getattr(cfg, "env", {}).get("ACA_INTEGRATION_REJECTION_EXTRA_RETRIES", "") or "").strip()
+    if raw:
+        try:
+            extra_retries = max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_INTEGRATION_REJECTION_EXTRA_RETRIES=%r", raw)
+            extra_retries = 1
+    else:
+        extra_retries = 1
+    worker_extra_retries = _worker_incomplete_diff_extra_retries(cfg)
+    return attempt < base_max_loops + worker_extra_retries + extra_retries - 1
+
+
+def _discard_partial_diff_repair_artifacts(ctx: "_PhaseRunContext", *, reason: str) -> None:
+    for source in (getattr(ctx, "status", None), getattr(ctx, "blackboard", None)):
+        if not isinstance(source, dict):
+            continue
+        repair = source.get("repair")
+        if not isinstance(repair, dict):
+            continue
+        artifacts = repair.pop("partial_diff_artifacts", None)
+        if artifacts:
+            discarded = repair.setdefault("discarded_partial_diff_artifacts", [])
+            if isinstance(discarded, list):
+                discarded.extend(artifacts if isinstance(artifacts, list) else [artifacts])
+        if repair.get("partial_diff_state") == "preserved_not_accepted":
+            repair["partial_diff_state"] = "discarded_after_integration_rejection"
+        repair["partial_diff_discard_reason"] = reason
 
 
 def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1003,6 +1097,7 @@ def _run_start_preflight(
 
 
 COORDINATION_LOST_THRESHOLD = 3
+_TERMINAL_LEASE_STATUSES = {"completed", "blocked", "failed", "cancelled", "canceled"}
 
 
 def _sync_status_coordination_from_lease(ctx: "_PhaseRunContext | None", lease: dict[str, Any] | None) -> None:
@@ -1135,8 +1230,16 @@ def _touch_coordination(
     if lease_id:
         result = coordination.heartbeat_lease(lease_id, lease_ttl_seconds=lease_ttl_seconds)
         if result is None:
-            heartbeat_ok = False
             current_lease = _lookup_coordination_lease(coordination, lease_id)
+            current_status = ""
+            if isinstance(current_lease, dict):
+                current_status = str(current_lease.get("status") or "").strip().lower()
+            if current_status in _TERMINAL_LEASE_STATUSES:
+                if ctx is not None:
+                    ctx.consecutive_heartbeat_misses = 0
+                    _sync_status_coordination_from_lease(ctx, current_lease)
+                return True
+            heartbeat_ok = False
             if ctx is not None:
                 ctx.consecutive_heartbeat_misses = int(ctx.consecutive_heartbeat_misses or 0) + 1
                 lease_status = _mark_coordination_heartbeat_miss(
@@ -1624,35 +1727,68 @@ def _normalize_manager_subtasks(
                 + "."
             )
             scope_note = f"{scope_note}\n{extra}".strip()
-        if task_path_constrained:
+        repair_scoped = bool(
+            item.get("carry_forward_patch")
+            or item.get("discarded_partial_diff_patch")
+            or item.get("deterministic_testless_repair")
+            or item.get("deterministic_partial_diff_repair")
+            or item.get("repair_requires_test_followup")
+            or item.get("repair_requires_production_followup")
+        )
+        if task_path_constrained and not repair_scoped:
             allowed = set(normalized_task_target_files)
             if not normalized_files or any(entry not in allowed for entry in normalized_files):
                 normalized_files = list(normalized_task_target_files)
-        if task_path_constrained:
-            normalized_target_files = list(normalized_task_target_files)
+        if task_path_constrained and not repair_scoped:
+            allowed = set(normalized_task_target_files)
+            if not normalized_target_files or any(entry not in allowed for entry in normalized_target_files):
+                normalized_target_files = list(normalized_files)
         elif not normalized_target_files and normalized_files:
             normalized_target_files = list(normalized_files)
-        normalized.append(
-            {
-                "id": str(item.get("id") or item.get("subtask_id") or f"subtask-{index}").strip(),
-                "title": title,
-                "goal": goal,
-                "description": description,
-                "acceptance_criteria": acceptance_criteria,
-                "deliverables": deliverables,
-                "files": normalized_files,
-                "target_files": normalized_target_files,
-                "ignored_target_files": ignored_files,
-                "verification_commands": verification_commands,
-                "dependencies": dependencies,
-                "program_goal": str(item.get("program_goal") or task.get("program_goal") or "").strip() or None,
-                "local_goal": str(item.get("local_goal") or task.get("local_goal") or goal).strip(),
-                "in_scope": in_scope,
-                "out_of_scope": out_of_scope,
-                "status": str(item.get("status") or "pending").strip(),
-                "scope_note": scope_note,
-            }
-        )
+        item_scope_note = str(item.get("scope_note") or "").strip()
+        if item_scope_note:
+            scope_note = f"{scope_note}\n{item_scope_note}".strip()
+        normalized_item = {
+            "id": str(item.get("id") or item.get("subtask_id") or f"subtask-{index}").strip(),
+            "title": title,
+            "goal": goal,
+            "description": description,
+            "acceptance_criteria": acceptance_criteria,
+            "deliverables": deliverables,
+            "files": normalized_files,
+            "target_files": normalized_target_files,
+            "ignored_target_files": ignored_files,
+            "verification_commands": verification_commands,
+            "dependencies": dependencies,
+            "program_goal": str(item.get("program_goal") or task.get("program_goal") or "").strip() or None,
+            "local_goal": str(item.get("local_goal") or task.get("local_goal") or goal).strip(),
+            "in_scope": in_scope,
+            "out_of_scope": out_of_scope,
+            "status": str(item.get("status") or "pending").strip(),
+            "scope_note": scope_note,
+        }
+        for key in (
+            "carry_forward_patch",
+            "discarded_partial_diff_patch",
+            "deterministic_testless_repair",
+            "deterministic_partial_diff_repair",
+            "repair_source_subtask_id",
+            "repair_source_worker_id",
+            "repair_changed_files",
+            "repair_requires_test_followup",
+            "repair_requires_production_followup",
+            "repair_worker_output_excerpt",
+            "repair_failure_summary",
+            "repair_parent_target_files",
+            "repair_deferred_files",
+            "repair_deferred_acceptance_criteria",
+            "repair_original_goal",
+            "repair_verification_first",
+            "write_required",
+        ):
+            if key in item:
+                normalized_item[key] = item[key]
+        normalized.append(normalized_item)
     if normalized:
         if discovered_files and not suppress_discovered_targets:
             chunks = [discovered_files[i::len(normalized)] for i in range(len(normalized))]
@@ -1772,6 +1908,8 @@ def _collect_worker_changed_files(worker_results: list[dict[str, Any]]) -> list[
             while rel_path.startswith("./"):
                 rel_path = rel_path[2:]
             if not rel_path or rel_path in seen:
+                continue
+            if rel_path == "__aca_temp_probe.txt":
                 continue
             if rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
                 continue
@@ -1909,7 +2047,22 @@ def _execute_local_worker_pool(
     results: list[dict[str, Any]] = []
     timeout = float(worker_timeout_seconds or 0)
 
+    def _prepare_worker_execution_subtask(
+        subtask: dict[str, Any],
+        worker_id: str,
+        index: int,
+    ) -> dict[str, Any]:
+        prepared = dict(subtask)
+        subtask_id = str(prepared.get("id") or f"subtask-{index}").strip()
+        execution_id = slugify(f"{index}-{time.time_ns()}", limit=24)
+        prepared["_worker_execution_id"] = execution_id
+        prepared["_worker_worktree_name"] = (
+            f"{worker_worktree_name(worker_id, subtask_id)}--exec-{execution_id}"
+        )
+        return prepared
+
     def _run_one(index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        subtask = _prepare_worker_execution_subtask(subtask, worker_id, index)
         if on_start is not None:
             try:
                 on_start(worker_id, subtask)
@@ -1960,6 +2113,71 @@ def _execute_local_worker_pool(
                     result.get("subtask_id"),
                 )
 
+    def _terminal_worker_event_result(
+        index: int,
+        subtask: dict[str, Any],
+        worker_id: str,
+    ) -> dict[str, Any] | None:
+        events_path = run_dir / "events.jsonl"
+        if not events_path.exists():
+            return None
+        execution_id = str(subtask.get("_worker_execution_id") or "").strip()
+        subtask_id = str(subtask.get("id") or "").strip()
+        latest: dict[str, Any] | None = None
+        try:
+            lines = events_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            event_type = str(event.get("type") or "").strip()
+            if event_type not in {"worker.completed", "worker.failed"}:
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if str(payload.get("worker_id") or "").strip() != worker_id:
+                continue
+            if subtask_id and str(payload.get("subtask_id") or "").strip() != subtask_id:
+                continue
+            if execution_id and str(payload.get("execution_id") or "").strip() != execution_id:
+                continue
+            latest = {"event_type": event_type, "payload": dict(payload)}
+        if latest is None:
+            return None
+        payload = latest["payload"]
+        returncode = int(payload.get("returncode") or (0 if latest["event_type"] == "worker.completed" else 1))
+        result = {
+            "worker_id": worker_id,
+            "subtask_index": index,
+            "subtask_id": subtask.get("id"),
+            "title": subtask.get("title"),
+            "status": "completed" if returncode == 0 else "failed",
+            "returncode": returncode,
+            "worktree": "",
+            "log_path": str(run_dir / "logs" / f"{worker_id}.log"),
+            "output_excerpt": (
+                "Worker emitted a terminal event before the pool timeout fired; "
+                "ACA used that terminal event instead of recording stale no-progress."
+            ),
+            "write_required": bool(subtask.get("write_required", True)),
+            "verified_existing": False,
+        }
+        for key in (
+            "partial_diff_artifact",
+            "partial_diff_state",
+            "changed_files",
+            "synced_files",
+            "failure_reason",
+            "blocker_kind",
+            "recovery_action",
+            "engine",
+        ):
+            if payload.get(key) not in (None, "", []):
+                result[key] = payload[key]
+        return result
+
     def _timeout_result(
         index: int,
         subtask: dict[str, Any],
@@ -2002,6 +2220,9 @@ def _execute_local_worker_pool(
         return result
 
     def _timed_out_worker_result(future, index: int, subtask: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        terminal_event_result = _terminal_worker_event_result(index, subtask, worker_id)
+        if terminal_event_result is not None:
+            return terminal_event_result
         if future.cancel():
             return _timeout_result(index, subtask, worker_id)
         logger.warning(
@@ -3081,6 +3302,7 @@ def _run_once_internal(
             getattr(ctx_local, "lease_id", None),
         )
         try:
+            blocker = _crash_blocker_for_exception(cfg, exc)
             return block_run(
                 run_id=run_id,
                 run_dir=run_dir,
@@ -3090,11 +3312,16 @@ def _run_once_internal(
                 repo=getattr(ctx_local, "repo", None) if ctx_local else None,
                 engine=getattr(ctx_local, "engine", {}) if ctx_local else {},
                 phase=phase_str,
-                kind="internal_error",
-                message=f"Unhandled exception: {exc}",
-                phase_detail=str(exc),
+                kind=blocker["kind"],
+                message=blocker["message"],
+                phase_detail=blocker["phase_detail"],
                 coordination=coordination,
                 existing_status=getattr(ctx_local, "status", None) if ctx_local else None,
+                event_payload=(
+                    {"authorization_url": blocker["authorization_url"]}
+                    if blocker.get("authorization_url")
+                    else None
+                ),
             )
         except Exception:
             logger.exception("Failed to write blocked-on-crash status (run_id=%s)", run_id)
@@ -3127,6 +3354,67 @@ def _run_once_internal(
                     ctx_final.lease_id,
                     run_id,
                 )
+
+
+def _crash_blocker_for_exception(cfg: ResolvedConfig, exc: Exception) -> dict[str, str]:
+    detail = str(exc)
+    if _exception_is_linear_mcp_auth_required(cfg, detail):
+        authorization_url = _linear_mcp_authorization_url(cfg)
+        url_sentence = f" Authorization URL: {authorization_url}" if authorization_url else ""
+        return {
+            "kind": "linear_mcp_auth_required",
+            "message": (
+                "Linear MCP authorization is required. Reconnect the Linear MCP server in the Tandem "
+                f"control panel, then rerun this ACA task.{url_sentence}"
+            ),
+            "phase_detail": detail,
+            "authorization_url": authorization_url,
+        }
+    return {
+        "kind": "internal_error",
+        "message": f"Unhandled exception: {exc}",
+        "phase_detail": detail,
+    }
+
+
+def _linear_mcp_authorization_url(cfg: ResolvedConfig) -> str:
+    try:
+        server_name = linear_mcp_server_name(cfg)
+        payload = _engine_request_json(cfg, "/mcp", timeout=5.0)
+    except Exception:
+        logger.debug("Failed to load Linear MCP auth challenge from Tandem engine", exc_info=True)
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    server = payload.get(server_name)
+    if not isinstance(server, dict):
+        return ""
+    challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
+    if isinstance(challenge, dict):
+        authorization_url = str(
+            challenge.get("authorization_url")
+            or challenge.get("authorizationUrl")
+            or ""
+        ).strip()
+        if authorization_url:
+            return authorization_url
+    return str(server.get("authorizationUrl") or "").strip()
+
+
+def _exception_is_linear_mcp_auth_required(cfg: ResolvedConfig, detail: str) -> bool:
+    if str(getattr(cfg.task_source, "type", "") or "").strip().lower() != "linear":
+        return False
+    normalized = detail.lower()
+    auth_markers = (
+        "awaiting authorization",
+        "authorization required",
+        "mcp oauth token refresh failed",
+        "invalid_grant",
+        "client id mismatch",
+    )
+    return any(marker in normalized for marker in auth_markers) and (
+        "linear" in normalized or "mcp" in normalized or "oauth" in normalized
+    )
 
 
 def _status_run_value(status: Any) -> str:
@@ -3500,7 +3788,7 @@ def _run_once_internal_impl(
                 if completed_subtask_ids:
                     ctx.blackboard.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
                     ctx.status.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
-                if worker_blocker["kind"] == "worker_incomplete_diff":
+                if partial_diff_artifacts:
                     for repair_state in (
                         ctx.blackboard.setdefault("repair", {}),
                         ctx.status.setdefault("repair", {}),
@@ -3509,6 +3797,8 @@ def _run_once_internal_impl(
                         sources = repair_state.setdefault("extra_retry_sources", [])
                         if isinstance(sources, list) and "worker_incomplete_diff" not in sources:
                             sources.append("worker_incomplete_diff")
+                        if isinstance(sources, list) and worker_blocker["kind"] not in sources:
+                            sources.append(worker_blocker["kind"])
                 _append_blackboard_note(
                     ctx.blackboard,
                     f"Attempt {attempt + 1} hit retryable worker blocker `{worker_blocker['kind']}`. Retrying.",
@@ -3605,11 +3895,24 @@ def _run_once_internal_impl(
             )
 
         # 4e. Integration prompt  (still inline — small and tightly coupled to result handling)
+        ctx.status = set_status(
+            ctx.status,
+            layout,
+            phase="integration",
+            phase_detail="manager integration",
+            phase_role="manager",
+        )
         integration_result = _run_integration_prompt(ctx)
+        integration_blocker = _integration_blocker_message(integration_result)
         append_event(
             layout["events"],
-            "manager.completed" if integration_result["returncode"] == 0 else "manager.failed",
-            run_id, {"stage": "integration", "returncode": integration_result["returncode"]},
+            _integration_event_type(integration_result),
+            run_id,
+            {
+                "stage": "integration",
+                "returncode": integration_result["returncode"],
+                "blocker": integration_blocker,
+            },
             task_id=ctx.task.get("task_id"), role="manager", repo={"path": ctx.repo.get("path")},
         )
 
@@ -3633,7 +3936,6 @@ def _run_once_internal_impl(
             else:
                 return _block_integration_failed(ctx)
         else:
-            integration_blocker = _integration_blocker_message(integration_result)
             if integration_blocker:
                 if _integration_semantic_blocker_can_defer_to_review(integration_result, integration_blocker):
                     _append_blackboard_note(
@@ -3651,8 +3953,26 @@ def _run_once_internal_impl(
                     )
                     save_blackboard(layout["blackboard"], ctx.blackboard)
                     write_blackboard_snapshot(run_dir, ctx.blackboard)
-                elif attempt < base_max_loops - 1:
+                elif _integration_can_retry(cfg, ctx, attempt, base_max_loops):
                     previous_feedback = _integration_retry_feedback(ctx, attempt, integration_blocker, integration_result)
+                    rejected_patch = _preserve_and_reset_blocked_worktree(
+                        ctx,
+                        reason="integration_retry_repair_needed",
+                        artifact_name=f"retry-{attempt + 1}-integration-rejected-working-diff.patch",
+                    )
+                    _discard_partial_diff_repair_artifacts(
+                        ctx,
+                        reason="Integration review rejected the carried partial diff as incomplete.",
+                    )
+                    if rejected_patch is not None:
+                        previous_feedback = (
+                            f"{previous_feedback}\n\n"
+                            "The rejected working diff was preserved and the shared checkout was reset "
+                            f"before this retry. Inspect or reuse only useful hunks from `{rejected_patch}`; "
+                            "do not keep helper-only or unwired behavior just because it came from a preserved timeout patch."
+                        )
+                    save_blackboard(layout["blackboard"], ctx.blackboard)
+                    write_blackboard_snapshot(run_dir, ctx.blackboard)
                     continue
                 return _block_integration_failed(ctx, integration_blocker)
 
@@ -3684,6 +4004,10 @@ def _run_once_internal_impl(
                     ctx,
                     reason=f"verification_retry_{getattr(verification, 'failure_category', 'failed')}",
                     artifact_name=f"retry-{attempt + 1}-rejected-working-diff.patch",
+                )
+                _discard_partial_diff_repair_artifacts(
+                    ctx,
+                    reason="Review/verification rejected the carried partial diff as incomplete.",
                 )
                 if rejected_patch is not None:
                     previous_feedback = (
@@ -3770,6 +4094,14 @@ def _integration_blocker_message(integration_result: dict[str, Any]) -> str | No
     if required_fixes:
         return "Integration review reported required fixes." + details
     return None
+
+
+def _integration_event_type(integration_result: dict[str, Any]) -> str:
+    if int(integration_result.get("returncode") or 0) != 0:
+        return "manager.failed"
+    if _integration_blocker_message(integration_result):
+        return "manager.failed"
+    return "manager.completed"
 
 
 def _integration_failure_can_defer_to_review(integration_result: dict[str, Any]) -> bool:

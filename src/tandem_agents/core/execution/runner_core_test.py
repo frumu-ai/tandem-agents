@@ -14,18 +14,23 @@ from textwrap import dedent
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.verification.coding_run_contract import build_coding_run_contract
 from src.tandem_agents.core.engine.prompts import build_manager_prompt
+from src.tandem_agents.core.execution.run_lifecycle import block_run
 from src.tandem_agents.core.execution.runner_core import (
     _completed_subtask_ids_for_retry,
     _all_subtasks_verified_existing,
     _annotate_pr_candidate_current_layout,
     _auto_approve_loop,
     _collect_worker_changed_files,
+    _crash_blocker_for_exception,
     _execute_local_worker_pool,
     _final_lease_release_decision,
     _has_unresolved_write_required_worker_failure,
     _integration_blocker_message,
+    _integration_can_retry,
     _integration_failure_can_defer_to_review,
+    _integration_event_type,
     _integration_semantic_blocker_can_defer_to_review,
+    _linear_mcp_authorization_url,
     _linear_comment_task_summary,
     _permission_requests_from_payload,
     _partial_diff_artifacts_for_retry,
@@ -42,6 +47,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _worker_failure_can_retry,
     _worker_failure_retry_feedback,
     _worker_incomplete_diff_extra_retries,
+    _discard_partial_diff_repair_artifacts,
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
@@ -50,6 +56,7 @@ from src.tandem_agents.core.execution.runner_core import (
 )
 from src.tandem_agents.core.engine.process_utils import run_command
 from src.tandem_agents.core.engine.prompts import build_worker_prompt
+from src.tandem_agents.runtime.runstate import append_event
 
 
 class RunnerCoreDiscoveryTest(unittest.TestCase):
@@ -77,6 +84,121 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             encoding="utf-8",
         )
         return resolve_config(root)
+
+    def test_crash_blocker_classifies_linear_mcp_oauth_refresh_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.type = "linear"
+
+            blocker = _crash_blocker_for_exception(
+                cfg,
+                RuntimeError(
+                    "Server error '500 Internal Server Error' for url 'http://127.0.0.1:39731/tool/execute'; "
+                    "mcp oauth token refresh failed with HTTP 400: invalid_grant Client ID mismatch"
+                ),
+            )
+
+            self.assertEqual(blocker["kind"], "linear_mcp_auth_required")
+            self.assertIn("Reconnect the Linear MCP server", blocker["message"])
+            self.assertIn("invalid_grant", blocker["phase_detail"])
+
+    def test_crash_blocker_classifies_linear_mcp_pending_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.type = "linear"
+
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._linear_mcp_authorization_url",
+                return_value="https://linear.example.test/authorize",
+            ):
+                blocker = _crash_blocker_for_exception(
+                    cfg,
+                    RuntimeError("Linear MCP server 'linear' is awaiting authorization."),
+                )
+
+            self.assertEqual(blocker["kind"], "linear_mcp_auth_required")
+            self.assertIn("https://linear.example.test/authorize", blocker["message"])
+            self.assertEqual(blocker["authorization_url"], "https://linear.example.test/authorize")
+
+    def test_block_run_merges_structured_event_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            run_dir = root / "runs" / "run-1"
+            run_dir.mkdir(parents=True)
+            layout = {
+                "status": run_dir / "status.json",
+                "events": run_dir / "events.jsonl",
+                "summary": run_dir / "summary.md",
+            }
+
+            block_run(
+                run_id="run-1",
+                run_dir=run_dir,
+                layout=layout,
+                cfg=cfg,
+                task={"title": "Auth task"},
+                repo={"path": str(root)},
+                engine={},
+                phase="intake",
+                kind="linear_mcp_auth_required",
+                message="Linear auth required",
+                event_payload={"authorization_url": "https://linear.example.test/authorize"},
+            )
+
+            event = json.loads(layout["events"].read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["type"], "run.blocked")
+            self.assertEqual(
+                event["payload"]["authorization_url"],
+                "https://linear.example.test/authorize",
+            )
+
+    def test_crash_blocker_handles_missing_linear_mcp_auth_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.type = "linear"
+
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._linear_mcp_authorization_url",
+                return_value="",
+            ):
+                blocker = _crash_blocker_for_exception(
+                    cfg,
+                    RuntimeError("Linear MCP server 'linear' is awaiting authorization."),
+                )
+
+            self.assertEqual(blocker["kind"], "linear_mcp_auth_required")
+            self.assertNotIn("Authorization URL:", blocker["message"])
+
+    def test_linear_mcp_authorization_url_reads_engine_challenge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._engine_request_json",
+                return_value={
+                    "linear": {
+                        "last_auth_challenge": {
+                            "authorization_url": "https://linear.example.test/authorize"
+                        }
+                    }
+                },
+            ):
+                self.assertEqual(
+                    _linear_mcp_authorization_url(cfg),
+                    "https://linear.example.test/authorize",
+                )
+
+    def test_crash_blocker_keeps_non_linear_oauth_text_internal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+
+            blocker = _crash_blocker_for_exception(
+                cfg,
+                RuntimeError("mcp oauth token refresh failed with HTTP 400: invalid_grant"),
+            )
+
+            self.assertEqual(blocker["kind"], "internal_error")
+            self.assertIn("Unhandled exception", blocker["message"])
 
     def test_permission_requests_from_payload_accepts_engine_requests_shape(self) -> None:
         payload = {
@@ -219,6 +341,67 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(event["type"], "coordination_lost")
             self.assertEqual(event["payload"]["lease_status"], "stale")
 
+    def test_touch_coordination_ignores_late_heartbeat_after_completed_lease(self) -> None:
+        class FakeCoordination:
+            def __init__(self) -> None:
+                self.updated_runs: list[dict[str, object]] = []
+
+            def heartbeat_lease(self, _lease_id: str, *, lease_ttl_seconds: int) -> None:
+                self.lease_ttl_seconds = lease_ttl_seconds
+                return None
+
+            def get_lease(self, lease_id: str) -> dict[str, object]:
+                return {
+                    "lease_id": lease_id,
+                    "task_key": "task-1",
+                    "worker_id": "worker-1",
+                    "host_id": "host-1",
+                    "status": "completed",
+                    "heartbeat_at_ms": 111,
+                    "expires_at_ms": 222,
+                }
+
+            def update_run(self, run_id: str, **kwargs: object) -> None:
+                self.updated_runs.append({"run_id": run_id, **kwargs})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            status_path = run_dir / "status.json"
+            events_path = run_dir / "events.jsonl"
+            ctx = SimpleNamespace(
+                run_id="run-1",
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "coordination": {
+                        "lease_id": "lease-1",
+                        "lease_status": "active",
+                    },
+                },
+                layout={"status": status_path, "events": events_path},
+                consecutive_heartbeat_misses=2,
+                coordination_lost=False,
+            )
+            coordination = FakeCoordination()
+
+            for _ in range(3):
+                heartbeat_ok = _touch_coordination(
+                    coordination,
+                    run_id="run-1",
+                    lease_id="lease-1",
+                    lease_ttl_seconds=300,
+                    status="running",
+                    phase="worker_execution",
+                    ctx=ctx,
+                )
+
+            self.assertTrue(heartbeat_ok)
+            self.assertFalse(ctx.coordination_lost)
+            self.assertEqual(ctx.consecutive_heartbeat_misses, 0)
+            self.assertEqual(ctx.status["run"]["status"], "running")
+            self.assertEqual(ctx.status["coordination"]["lease_status"], "completed")
+            self.assertEqual(coordination.updated_runs, [])
+            self.assertFalse(events_path.exists())
+
     def test_execute_local_worker_pool_reports_no_progress_timeout(self) -> None:
         def stalled_runner(*_args):
             time.sleep(0.05)
@@ -252,6 +435,53 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(results[0]["worker_abandoned_after_timeout"])
         self.assertIn("no terminal result", results[0]["failure_reason"])
         self.assertIn("did not wait for the stuck worker thread", results[0]["recovery_action"])
+
+    def test_worker_pool_uses_terminal_event_before_timeout_result(self) -> None:
+        def event_then_stall(_cfg, run_id, _repo_path, run_dir, task, subtask, worker_id, _index):
+            append_event(
+                run_dir / "events.jsonl",
+                "worker.completed",
+                run_id,
+                {
+                    "worker_id": worker_id,
+                    "subtask_id": subtask["id"],
+                    "execution_id": subtask.get("_worker_execution_id"),
+                    "returncode": 0,
+                    "changed_files": ["src/app.py"],
+                    "synced_files": ["src/app.py"],
+                },
+                task_id=task.get("task_id"),
+                role="worker",
+                repo={"path": str(_repo_path)},
+            )
+            time.sleep(0.05)
+            return {
+                "status": "completed",
+                "returncode": 0,
+                "changed_files": ["src/app.py"],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "runs" / "run-1"
+            results = _execute_local_worker_pool(
+                self._config(root),
+                "run-1",
+                root,
+                run_dir,
+                {"task_id": "TAN-1"},
+                [{"id": "subtask-1", "title": "Do work", "write_required": True}],
+                1,
+                worker_runner=event_then_stall,
+                worker_timeout_seconds=0.01,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "completed")
+        self.assertEqual(results[0]["returncode"], 0)
+        self.assertEqual(results[0]["changed_files"], ["src/app.py"])
+        self.assertNotEqual(results[0].get("blocker_kind"), "worker_no_progress")
+        self.assertIn("terminal event", results[0].get("output_excerpt", ""))
 
     def test_abandoned_no_progress_worker_does_not_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,6 +565,41 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(started, [("worker-1", "subtask-1")])
+
+    def test_execute_local_worker_pool_assigns_unique_execution_worktrees(self) -> None:
+        seen_worktrees: list[str] = []
+
+        def worker_runner(_cfg, _run_id, _repo_path, _run_dir, _task, subtask, worker_id, index):
+            seen_worktrees.append(str(subtask.get("_worker_worktree_name") or ""))
+            return {
+                "worker_id": worker_id,
+                "subtask_index": index,
+                "subtask_id": subtask["id"],
+                "title": subtask["title"],
+                "status": "failed",
+                "returncode": 1,
+                "blocker_kind": "worker_incomplete_diff",
+                "write_required": True,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subtask = {"id": "subtask-1", "title": "Do work", "write_required": True}
+            for _ in range(2):
+                _execute_local_worker_pool(
+                    self._config(root),
+                    "run-1",
+                    root,
+                    root / "runs" / "run-1",
+                    {"task_id": "TAN-1"},
+                    [subtask],
+                    1,
+                    worker_runner=worker_runner,
+                )
+
+        self.assertEqual(len(seen_worktrees), 2)
+        self.assertNotEqual(seen_worktrees[0], seen_worktrees[1])
+        self.assertTrue(all(name.startswith("worker-1--subtask-1--exec-") for name in seen_worktrees))
 
     def test_manager_subtask_deliverable_fills_acceptance_criteria(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -431,6 +696,83 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             subtasks[0]["acceptance_criteria"],
             ["Add YAML eval scenarios and bounded-exposure assertions for no bulk export."],
         )
+
+    def test_manager_subtask_preserves_deterministic_repair_scope(self) -> None:
+        repair_files = [
+            "src/tandem_agents/core/repository/repository.py",
+            "src/tandem_agents/core/repository/repository_test.py",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {
+                    "title": "TAN-170",
+                    "target_files": [
+                        *repair_files,
+                        "src/tandem_agents/runtime/operator_dashboard.py",
+                        "src/tandem_agents/runtime/operator_dashboard_test.py",
+                        "src/tandem_agents/runtime/operator_view_test.py",
+                    ],
+                },
+                [
+                    {
+                        "id": "repair-testless-partial-diff",
+                        "title": "Repair testless partial diff",
+                        "goal": "Repair the rejected repository partial diff with required test coverage.",
+                        "files": repair_files,
+                        "target_files": repair_files,
+                        "acceptance_criteria": ["Read and edit the required test file first."],
+                        "discarded_partial_diff_patch": "/runs/run-1/artifacts/worker-1.patch",
+                        "deterministic_testless_repair": True,
+                        "deterministic_partial_diff_repair": True,
+                        "repair_changed_files": ["src/tandem_agents/core/repository/repository.py"],
+                        "repair_requires_test_followup": [
+                            "src/tandem_agents/core/repository/repository_test.py",
+                        ],
+                        "scope_note": "Only repair the rejected repository diff.",
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        self.assertEqual(subtasks[0]["files"], repair_files)
+        self.assertEqual(subtasks[0]["target_files"], repair_files)
+        self.assertTrue(subtasks[0]["deterministic_testless_repair"])
+        self.assertTrue(subtasks[0]["deterministic_partial_diff_repair"])
+        self.assertEqual(
+            subtasks[0]["repair_requires_test_followup"],
+            ["src/tandem_agents/core/repository/repository_test.py"],
+        )
+        self.assertIn("Only repair the rejected repository diff.", subtasks[0]["scope_note"])
+
+    def test_manager_subtask_keeps_worker_targets_narrow_with_task_targets(self) -> None:
+        task_target_files = [
+            "src/tandem_agents/core/phases/task_intake.py",
+            "src/tandem_agents/core/repository/repository.py",
+            "src/tandem_agents/core/repository/repository_test.py",
+            "src/tandem_agents/core/phases/finalize.py",
+            "src/tandem_agents/core/phases/pr_body.py",
+        ]
+        worker_files = [
+            "src/tandem_agents/core/repository/repository.py",
+            "src/tandem_agents/core/repository/repository_test.py",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {"title": "TAN-170", "target_files": task_target_files},
+                [
+                    {
+                        "id": "subtask-1",
+                        "title": "Add repository primitives",
+                        "goal": "Implement repository worktree primitives.",
+                        "files": worker_files,
+                        "acceptance_criteria": ["Repository code and tests cover isolated worktrees."],
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        self.assertEqual(subtasks[0]["files"], worker_files)
+        self.assertEqual(subtasks[0]["target_files"], worker_files)
 
     def test_manager_subtask_filters_gitignored_target_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1375,7 +1717,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
     def test_collect_worker_changed_files_dedupes_and_rejects_parent_paths(self) -> None:
         files = _collect_worker_changed_files(
             [
-                {"changed_files": ["./src/app.ts", "src/app.ts", "../outside.txt"]},
+                {"changed_files": ["./src/app.ts", "src/app.ts", "../outside.txt", "__aca_temp_probe.txt"]},
                 {"changed_files": ["packages/panel/src/App.tsx", "safe/../unsafe.ts"]},
             ]
         )
@@ -1413,7 +1755,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "worker_id": "worker-1",
                     "subtask_id": "subtask-1",
                     "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
-                    "changed_files": ["crates/eval/src/scoring.rs"],
+                    "changed_files": ["crates/eval/src/scoring.rs", "__aca_temp_probe.txt"],
                     "stdout": "Remaining implementation blockers: missing passes() method.",
                 }
             ]
@@ -1424,6 +1766,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             artifacts[0]["worker_output_excerpt"],
             "Remaining implementation blockers: missing passes() method.",
         )
+        self.assertEqual(artifacts[0]["changed_files"], ["crates/eval/src/scoring.rs"])
 
     def test_worker_no_progress_builds_base_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
@@ -1470,6 +1813,32 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             )
         )
 
+    def test_carry_forward_patch_apply_failure_is_retryable_with_discard_feedback(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "CARRY_FORWARD_PATCH_APPLY_FAILED",
+                    "blocker_kind": "carry_forward_patch_apply_failed",
+                    "stdout": "ACA could not apply the preserved partial worker diff before retry.",
+                    "recovery_action": "Discard this preserved patch for the next repair attempt.",
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertEqual(blocker["kind"], "carry_forward_patch_apply_failed")
+        self.assertIn("could not apply preserved partial diff", blocker["phase_detail"])
+        self.assertIsNotNone(feedback)
+        self.assertIn("carry_forward_patch_apply_failed", feedback or "")
+        self.assertIn("Discard this preserved patch", feedback or "")
+        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+
     def test_incomplete_diff_gets_two_extra_worker_repair_loops_by_default(self) -> None:
         cfg = SimpleNamespace(env={})
         blocker = {"kind": "worker_incomplete_diff"}
@@ -1479,6 +1848,58 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
         self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_engine_timeout_with_partial_diff_gets_extra_repair_budget(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "engine_prompt_timeout",
+            "worker": {
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.partial-worker-diff.patch",
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(
+            _worker_failure_can_retry(
+                cfg,
+                {"kind": "engine_prompt_timeout", "worker": {}},
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_engine_timeout_retry_feedback_compacts_preserved_patch_boilerplate(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                    "blocker_kind": "engine_prompt_timeout",
+                    "changed_files": ["src/tandem_agents/api/worktree_isolation.py"],
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.partial-worker-diff.patch",
+                    "stdout": (
+                        "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync worker prompt did not finish within 300s.\n"
+                        "ACA preserved this partial worker diff because the Tandem engine stalled before a terminal response.\n"
+                        "The partial diff is not treated as a completed worker result; retry or block with this evidence.\n"
+                    ),
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 1)
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("retryable blocker `engine_prompt_timeout`", feedback or "")
+        self.assertIn("ENGINE_PROMPT_TIMEOUT", feedback or "")
+        self.assertIn("Preserved partial patch", feedback or "")
+        self.assertNotIn("not treated as a completed worker result", feedback or "")
 
     def test_worker_off_track_builds_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
@@ -1605,11 +2026,60 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
         self.assertFalse(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
 
+    def test_integration_can_use_incomplete_diff_extra_repair_budget(self) -> None:
+        cfg = SimpleNamespace(env={})
+        ctx = SimpleNamespace(
+            status={
+                "repair": {
+                    "extra_retry_source": "worker_incomplete_diff",
+                    "partial_diff_artifacts": [{"patch_path": "/runs/run-1/artifacts/worker.patch"}],
+                    "partial_diff_state": "preserved_not_accepted",
+                }
+            },
+            blackboard={},
+        )
+
+        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
+        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
+        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+
     def test_verification_extra_repair_budget_requires_incomplete_diff_state(self) -> None:
         cfg = SimpleNamespace(env={})
         ctx = SimpleNamespace(status={"repair": {}}, blackboard={})
 
         self.assertFalse(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
+        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
+
+    def test_discard_partial_diff_repair_artifacts_marks_stale_timeout_patch(self) -> None:
+        ctx = SimpleNamespace(
+            status={
+                "repair": {
+                    "extra_retry_source": "worker_incomplete_diff",
+                    "partial_diff_artifacts": [{"patch_path": "/runs/run-1/artifacts/worker.patch"}],
+                    "partial_diff_state": "preserved_not_accepted",
+                }
+            },
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [{"patch_path": "/runs/run-1/artifacts/worker.patch"}],
+                    "partial_diff_state": "preserved_not_accepted",
+                }
+            },
+        )
+
+        _discard_partial_diff_repair_artifacts(ctx, reason="integration rejected helper-only patch")
+
+        for source in (ctx.status, ctx.blackboard):
+            repair = source["repair"]
+            self.assertNotIn("partial_diff_artifacts", repair)
+            self.assertEqual(repair["partial_diff_state"], "discarded_after_integration_rejection")
+            self.assertEqual(repair["partial_diff_discard_reason"], "integration rejected helper-only patch")
+            self.assertEqual(
+                repair["discarded_partial_diff_artifacts"][0]["patch_path"],
+                "/runs/run-1/artifacts/worker.patch",
+            )
+        self.assertTrue(_verification_can_retry(SimpleNamespace(env={}), ctx, attempt=2, base_max_loops=2))
 
     def test_retryable_worker_failure_collects_partial_diff_artifact(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
@@ -1674,6 +2144,18 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("Integration review did not approve", message or "")
         self.assertIn("Duplicate findLast import remains", message or "")
         self.assertIn("missing PR", message or "")
+
+    def test_integration_event_type_marks_zero_exit_semantic_blocker_failed(self) -> None:
+        blocked = {
+            "returncode": 0,
+            "stdout": '{"status":"blocked","approved":false,"summary":"No usable diff."}',
+        }
+        ok = {"returncode": 0, "stdout": '{"status":"approved","approved":true}'}
+        failed = {"returncode": 1, "stdout": "integration command failed"}
+
+        self.assertEqual(_integration_event_type(blocked), "manager.failed")
+        self.assertEqual(_integration_event_type(ok), "manager.completed")
+        self.assertEqual(_integration_event_type(failed), "manager.failed")
 
     def test_integration_engine_watchdog_failure_defers_to_review(self) -> None:
         result = {

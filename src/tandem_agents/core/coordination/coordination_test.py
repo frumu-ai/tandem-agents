@@ -292,15 +292,104 @@ class CoordinationStoreTest(unittest.TestCase):
 
             with store.connection() as conn:
                 conn.execute("UPDATE workers SET last_seen_at_ms = 0 WHERE worker_id = ?", ("worker-dead",))
+                conn.execute("UPDATE leases SET heartbeat_at_ms = 0 WHERE lease_id = ?", (lease_id,))
 
             reaped = coordination_reaper_tick(cfg)
             self.assertEqual(len(reaped), 1)
+            self.assertEqual(reaped[0]["lease_id"], lease_id)
+            self.assertEqual(reaped[0]["run_id"], "run-worker-death")
+            self.assertEqual(reaped[0]["task_id"], "task-worker-death")
+            self.assertEqual(reaped[0]["release_reason"], "worker stale")
             self.assertEqual(store.get_lease(lease_id)["status"], "stale")
             stale_task = store.get_task(claim["task"]["task_key"])
             self.assertEqual(stale_task["status"], "stale")
             self.assertIsNone(stale_task["claimed_lease_id"])
             self.assertIsNone(stale_task["claimed_run_id"])
             self.assertEqual(store.snapshot()["workers"][0]["status"], "idle")
+
+    def test_reaper_tick_keeps_owner_lease_with_fresh_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+
+            task = {
+                "task_id": "task-fresh-heartbeat",
+                "title": "Fresh Heartbeat",
+                "source": {"type": "manual", "prompt": "Do the thing"},
+                "repo": {"slug": "frumu-ai/example", "path": str(root / "repo")},
+            }
+            store.register_task(task, repo=task["repo"])
+            claim = store.claim_task(
+                task,
+                run_id="run-fresh-heartbeat",
+                worker_id="worker-owner",
+                host_id="host-a",
+                lease_ttl_seconds=3600,
+                repo=task["repo"],
+            )
+            lease_id = claim["lease"]["lease_id"]
+
+            with store.connection() as conn:
+                conn.execute("UPDATE workers SET last_seen_at_ms = 0 WHERE worker_id = ?", ("worker-owner",))
+
+            reaped = coordination_reaper_tick(cfg)
+
+            self.assertEqual(reaped, [])
+            self.assertEqual(store.get_lease(lease_id)["status"], "active")
+            task_row = store.get_task(claim["task"]["task_key"])
+            self.assertEqual(task_row["claimed_lease_id"], lease_id)
+            worker = store.snapshot()["workers"][0]
+            self.assertEqual(worker["status"], "busy")
+            self.assertEqual(worker["current_lease_id"], lease_id)
+
+    def test_reaper_tick_does_not_reclaim_lease_from_non_owner_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+
+            task = {
+                "task_id": "task-local-worker",
+                "title": "Local Worker",
+                "source": {"type": "manual", "prompt": "Do the thing"},
+                "repo": {"slug": "frumu-ai/example", "path": str(root / "repo")},
+            }
+            store.register_task(task, repo=task["repo"])
+            claim = store.claim_task(
+                task,
+                run_id="run-local-worker",
+                worker_id="manager-worker",
+                host_id="host-a",
+                lease_ttl_seconds=3600,
+                repo=task["repo"],
+            )
+            lease_id = claim["lease"]["lease_id"]
+            store.register_worker(
+                worker_id="local-worker-1",
+                host_id="host-a",
+                role="worker",
+                status="busy",
+                capabilities={"mode": "local-worker-pool"},
+                current_run_id="run-local-worker",
+                current_lease_id=lease_id,
+            )
+
+            with store.connection() as conn:
+                conn.execute(
+                    "UPDATE workers SET last_seen_at_ms = 0 WHERE worker_id = ?",
+                    ("local-worker-1",),
+                )
+
+            reaped = coordination_reaper_tick(cfg)
+            self.assertEqual(len(reaped), 1)
+            self.assertEqual(store.get_lease(lease_id)["status"], "active")
+            task_row = store.get_task(claim["task"]["task_key"])
+            self.assertEqual(task_row["claimed_lease_id"], lease_id)
+            self.assertEqual(task_row["claimed_run_id"], "run-local-worker")
+            workers = {worker["worker_id"]: worker for worker in store.snapshot()["workers"]}
+            self.assertEqual(workers["local-worker-1"]["status"], "idle")
+            self.assertIsNone(workers["local-worker-1"]["current_lease_id"])
 
     def test_reaper_tick_reclaims_all_stale_workers_on_dead_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

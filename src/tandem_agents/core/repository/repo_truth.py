@@ -682,6 +682,43 @@ def _cargo_package_name(manifest_path: Path) -> str:
     return str(package.get("name") or "").strip()
 
 
+def _python_unittest_module(rel_path: str) -> str:
+    path = Path(rel_path)
+    if path.suffix != ".py":
+        return ""
+    stem = path.stem
+    if not (stem.startswith("test_") or stem.endswith("_test")):
+        return ""
+    parts = path.with_suffix("").parts
+    if not parts or any(not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", part) for part in parts):
+        return ""
+    return ".".join(parts)
+
+
+def _python_test_commands(repo_path: Path, normalized_files: list[str]) -> list[str]:
+    commands: list[str] = []
+    for rel_path in normalized_files:
+        path = Path(rel_path)
+        candidates: list[str] = []
+        if path.suffix == ".py" and path.is_relative_to(Path("src")):
+            if path.stem.startswith("test_") or path.stem.endswith("_test"):
+                candidates.append(path.as_posix())
+            else:
+                sibling_suffix = path.with_name(f"{path.stem}_test.py")
+                sibling_prefix = path.with_name(f"test_{path.name}")
+                candidates.extend([sibling_suffix.as_posix(), sibling_prefix.as_posix()])
+        for candidate in candidates:
+            module = _python_unittest_module(candidate)
+            if not module:
+                continue
+            if not (repo_path / candidate).exists() and candidate != rel_path:
+                continue
+            command = f"python3 -m unittest {module}"
+            if command not in commands:
+                commands.append(command)
+    return commands
+
+
 def infer_command_checks(
     repo_path: Path,
     changed_files: list[str],
@@ -718,6 +755,9 @@ def infer_command_checks(
         if not package_name:
             continue
         command = f"cargo check -p {shlex.quote(package_name)}"
+        if command not in commands:
+            commands.append(command)
+    for command in _python_test_commands(repo_path, normalized_files):
         if command not in commands:
             commands.append(command)
 

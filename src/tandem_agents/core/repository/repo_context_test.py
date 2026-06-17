@@ -247,6 +247,31 @@ class RepoContextForTaskTest(unittest.TestCase):
         self.assertIn("CoderGithubProjectBinding", hints["task"])
         self.assertIn("crates/tandem-server/src/http/coder_parts/part09.rs", hints["task"])
 
+    def test_aca_worktree_isolation_task_routes_to_lifecycle_files(self) -> None:
+        task = {
+            "task_id": "TAN-170",
+            "identifier": "TAN-170",
+            "title": "LACA-12 Add per-issue worktree and branch isolation for parallel ACA runs",
+            "description": (
+                "Make parallel ACA execution safe by isolating each Linear issue in its "
+                "own worktree/branch and detecting cross-run conflicts before PR creation."
+            ),
+            "acceptance_criteria": [
+                "Create one worktree and branch per claimed Linear issue.",
+                "Detect overlapping file edits across active ACA runs.",
+                "PR metadata links back to Linear issue and ACA run id.",
+            ],
+        }
+
+        hints = repo_context_hints_for_task(task)
+
+        self.assertEqual(hints["path_scope"], "src/tandem_agents/core")
+        self.assertIn("src/tandem_agents/core/phases/task_intake.py", hints["required_files"])
+        self.assertIn("src/tandem_agents/core/repository/repository.py", hints["required_files"])
+        self.assertIn("src/tandem_agents/core/repository/repository_test.py", hints["required_files"])
+        self.assertIn("run_task_intake", hints["task"])
+        self.assertIn("checkout_run_branch", hints["task"])
+
     def test_falls_back_when_repo_context_bundle_tool_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

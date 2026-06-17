@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -19,6 +21,8 @@ from src.tandem_agents.api.main import (
     _operator_coordination_state,
     _operator_terminalize_reset_run,
     _project_runtime_env,
+    _terminalize_expired_coordination_run,
+    update_project_task_state,
     app,
 )
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
@@ -134,6 +138,98 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             ]
             self.assertEqual(events[-1]["type"], "run.blocked")
             self.assertEqual(events[-1]["payload"]["target_status"], "Backlog")
+
+    def test_operator_state_update_rejects_active_run_reset_without_force(self) -> None:
+        cfg = SimpleNamespace(task_source=SimpleNamespace(type="linear"))
+        with patch("src.tandem_agents.api.main._project_config", return_value=({}, cfg)), \
+            patch(
+                "src.tandem_agents.api.main._active_run_claim_for_task",
+                return_value={"run_id": "run-1", "lease_id": "lease-1"},
+            ), \
+            patch("src.tandem_agents.api.main.linear_update_issue") as update_issue:
+            with self.assertRaises(api_main.HTTPException) as raised:
+                asyncio.run(
+                    update_project_task_state(
+                        "project",
+                        "TAN-170",
+                        {"state": "Backlog"},
+                        token="secret-token",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["active_run"]["run_id"], "run-1")
+        update_issue.assert_not_called()
+
+    def test_terminalize_expired_coordination_run_marks_zombie_status_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            cfg = resolve_config(root)
+            run_id = f"run-expired-{root.name}"
+            run_dir = cfg.output_root() / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "status.json").write_text(
+                json.dumps(
+                    {
+                        "run": {
+                            "run_id": run_id,
+                            "status": "running",
+                            "updated_at_ms": 1,
+                            "completed_at_ms": None,
+                        },
+                        "task": {"task_id": "TAN-170", "title": "Lease expiry test"},
+                        "phase": {"name": "worker_execution", "detail": "running"},
+                        "coordination": {
+                            "lease_id": "lease-expired",
+                            "lease_status": "active",
+                        },
+                        "blocker": {"active": False, "kind": None, "message": None},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            api_main.run_manager.create_run(run_id, "test")
+
+            try:
+                updated = _terminalize_expired_coordination_run(
+                    cfg,
+                    {
+                        "run_id": run_id,
+                        "lease_id": "lease-expired",
+                        "task_key": "linear:team/project:TAN-170",
+                        "worker_id": "worker-1",
+                        "host_id": "host-a",
+                        "status": "stale",
+                        "release_reason": "expired",
+                        "heartbeat_at_ms": 11,
+                        "expires_at_ms": 22,
+                    },
+                )
+
+                self.assertTrue(updated)
+                status_payload = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+                self.assertEqual(status_payload["run"]["status"], "blocked")
+                self.assertIsNotNone(status_payload["run"]["completed_at_ms"])
+                self.assertEqual(status_payload["phase"]["name"], "coordination")
+                self.assertEqual(status_payload["phase"]["role"], "coordinator")
+                self.assertEqual(status_payload["coordination"]["lease_status"], "stale")
+                self.assertEqual(status_payload["coordination"]["lease_release_reason"], "expired")
+                self.assertEqual(status_payload["blocker"]["kind"], "coordination_lease_expired")
+                self.assertIn("lease-expired", status_payload["blocker"]["message"])
+                summary = (run_dir / "summary.md").read_text(encoding="utf-8")
+                self.assertIn("Lease expiry test", summary)
+                events = [
+                    json.loads(line)
+                    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(events[-1]["type"], "run.blocked")
+                self.assertEqual(events[-1]["payload"]["kind"], "coordination_lease_expired")
+                self.assertFalse(api_main.run_manager.runs[run_id].is_running)
+            finally:
+                with api_main.run_manager._lock:
+                    api_main.run_manager.runs.pop(run_id, None)
 
     def test_active_run_claim_for_task_finds_orphaned_active_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

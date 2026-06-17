@@ -118,6 +118,7 @@ def block_run(
     coordination: CoordinationStore | None = None,
     worker_results: list[dict[str, Any]] | None = None,
     existing_status: dict[str, Any] | None = None,
+    event_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Handle the entire blocked-run lifecycle in one call.
 
@@ -147,6 +148,8 @@ def block_run(
         worker_results:  Optional list of worker results for summary rendering.
         existing_status: If a status dict was already partially built, pass it here
                          instead of creating a fresh one.
+        event_payload:   Optional structured fields to merge into the run.blocked
+                         event payload.
 
     Returns:
         Standard run-result dict: {"run_id", "status", "layout"}.
@@ -190,12 +193,10 @@ def block_run(
             worker_results=worker_results,
         ),
     )
-    append_event(
-        layout["events"],
-        "run.blocked",
-        run_id,
-        {"kind": kind, "phase": phase, "detail": effective_detail},
-    )
+    blocked_event_payload = {"kind": kind, "phase": phase, "detail": effective_detail}
+    if event_payload:
+        blocked_event_payload.update(event_payload)
+    append_event(layout["events"], "run.blocked", run_id, blocked_event_payload)
 
     if coordination is not None:
         try:

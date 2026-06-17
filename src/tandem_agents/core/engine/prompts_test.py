@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from src.tandem_agents.core.engine.prompts import (
     _compact_pr_context,
+    build_integration_prompt,
     build_manager_prompt,
     build_review_prompt,
     build_test_prompt,
@@ -60,6 +61,14 @@ class ReviewTestPromptDiffTest(unittest.TestCase):
 
         self.assertIn("ACA inferred these verification commands", prompt)
         self.assertIn("pnpm -C packages/tandem-control-panel run build", prompt)
+        self.assertIn("python3 -m unittest", prompt)
+        self.assertIn("do not use bare `python`", prompt)
+
+    def test_integration_prompt_prefers_python3_unittest_for_python_tests(self) -> None:
+        prompt = build_integration_prompt("run1", _TASK, _NOTES)
+
+        self.assertIn("python3 -m unittest", prompt)
+        self.assertIn("do not use bare `python`", prompt)
 
     def test_review_prompt_notes_empty_diff(self) -> None:
         prompt = build_review_prompt("run1", _TASK, _NOTES, repo_diff="")
@@ -128,6 +137,14 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
         self.assertIn("pr_candidate_context.json", prompt)
         self.assertNotIn("refs/aca/pr-", prompt)
+
+    def test_worker_prompt_allows_fallback_readback_when_verification_tool_is_skipped(self) -> None:
+        prompt = build_worker_prompt("run1", "worker-1", self._subtask(files=["src/app.py"]), self._TASK, "/wt")
+
+        self.assertIn("retry a narrower readback if a tool is skipped", prompt)
+        self.assertIn("then return the final completion note", prompt)
+        self.assertIn("python3 -m unittest", prompt)
+        self.assertIn("Do not treat missing `pytest` as a blocker", prompt)
 
     def test_worker_prompt_bounds_verbose_task_payloads(self) -> None:
         task = {
@@ -264,6 +281,7 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("standalone duplicate implementation", prompt)
         self.assertIn("live smoke/API path", prompt)
         self.assertIn("prefer 1-3 high-signal files", prompt)
+        self.assertIn("no more than three concrete acceptance criteria", prompt)
         self.assertIn("graph-derived required edit files", prompt)
         self.assertIn("plan worker deliverables around those paths first", prompt)
         self.assertIn("discovery/read-only context", prompt)
@@ -292,6 +310,33 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("missing passes() method", prompt)
         self.assertIn("limited to changed files only when", prompt)
         self.assertIn("Put the recovered blocker fixes in canonical `acceptance_criteria`", prompt)
+
+    def test_manager_prompt_treats_engine_timeout_partial_diff_as_reusable(self) -> None:
+        prompt = build_manager_prompt(
+            "run1",
+            {
+                "title": "Repair preserved timeout diff",
+                "description": "Finish the partial patch",
+                "task_contract": {},
+            },
+            {"path": "/repo"},
+            _stub_config(),
+            previous_feedback=(
+                "CRITICAL: Worker attempt 2 failed with retryable blocker `engine_prompt_timeout`.\n"
+                "Changed files from the failed attempt:\n- src/tandem_agents/api/worktree_isolation.py\n"
+                "Preserved partial patch: `runs/x/artifacts/worker.patch`\n"
+                "Worker output excerpt:\n"
+                "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync worker prompt did not finish within 300s.\n"
+                "The partial diff is not treated as a completed worker result; retry or block with this evidence."
+            ),
+        )
+
+        self.assertIn("PARTIAL-DIFF REPAIR MODE", prompt)
+        self.assertIn("Treat a preserved patch from `ENGINE_PROMPT_TIMEOUT`", prompt)
+        self.assertIn("not treated as a completed worker result` as rejection by itself", prompt)
+        self.assertIn("preserved patch changed only tests", prompt)
+        self.assertIn("paired production behavior", prompt)
+        self.assertNotIn("use it only as failure evidence", prompt)
 
     def test_manager_prompt_expands_rejected_partial_diff_to_parent_targets(self) -> None:
         prompt = build_manager_prompt(
@@ -341,6 +386,80 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("Do not use no-op patches, comment-only changes", prompt)
         self.assertIn("temporary files", prompt)
         self.assertIn("will fail review", prompt)
+
+    def test_implementation_subtask_with_test_acceptance_does_not_force_test_first(self) -> None:
+        subtask = self._subtask(
+            title="Add repository worktree and branch lifecycle primitives",
+            goal="Implement repository-layer operations needed to create dedicated branch worktrees.",
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            write_required=True,
+            acceptance_criteria=[
+                "Repository code can create a deterministic branch and worktree for a run.",
+                "Repository tests cover branch and worktree creation.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Required substantive write targets", prompt)
+        self.assertNotIn("This is a test/regression coverage subtask", prompt)
+        self.assertNotIn("Read and edit at least one required test target first", prompt)
+
+    def test_testless_diff_repair_prompt_requires_test_first(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            write_required=True,
+            repair_worker_output_excerpt=(
+                "WORKER_OFF_TRACK_TESTLESS_DIFF\n"
+                "Worker drifted off the required regression/test coverage path: after 224s it had "
+                "changed only non-test files while required test files were "
+                "src/tandem_agents/core/repository/repository_test.py."
+            ),
+            acceptance_criteria=["Finish repository isolation with tests."],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("must satisfy required test coverage", prompt)
+        self.assertIn("Read and edit at least one required test target first", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository_test.py", prompt)
+        self.assertIn("A production-only diff fails this worker", prompt)
+
+    def test_test_only_partial_repair_prompt_requires_production_first(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_requires_production_followup=["src/tandem_agents/core/repository/repository.py"],
+            write_required=True,
+            acceptance_criteria=["Finish the preserved repository isolation tests."],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("preserved test-only partial diff", prompt)
+        self.assertIn("first new semantic edit in the paired production target", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
+        self.assertNotIn("Read and edit at least one required test target first", prompt)
 
     def test_write_required_prompt_treats_metadata_targets_as_support_only(self) -> None:
         subtask = self._subtask(
