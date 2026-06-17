@@ -1922,11 +1922,19 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 base_max_loops=2,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             _worker_failure_can_retry(
                 SimpleNamespace(env={}),
                 blocker,
                 attempt=3,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=4,
                 base_max_loops=2,
             )
         )
@@ -2001,15 +2009,16 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("Discard this preserved patch", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
-    def test_incomplete_diff_gets_two_extra_worker_repair_loops_by_default(self) -> None:
+    def test_incomplete_diff_gets_three_extra_worker_repair_loops_by_default(self) -> None:
         cfg = SimpleNamespace(env={})
         blocker = {"kind": "worker_incomplete_diff"}
 
-        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 2)
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 3)
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
 
     def test_engine_timeout_with_partial_diff_gets_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2023,7 +2032,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
         self.assertFalse(
             _worker_failure_can_retry(
                 cfg,
@@ -2156,7 +2166,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
 
     def test_incomplete_diff_extra_retry_budget_can_be_disabled(self) -> None:
         cfg = SimpleNamespace(env={"ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES": "0"})
@@ -2186,7 +2197,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
-        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
 
     def test_integration_can_use_incomplete_diff_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2204,7 +2216,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
-        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=5, base_max_loops=2))
 
     def test_integration_prompt_timeout_uses_watchdog_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

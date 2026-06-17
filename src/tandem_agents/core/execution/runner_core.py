@@ -608,7 +608,7 @@ def _worker_incomplete_diff_extra_retries(cfg: ResolvedConfig) -> int:
             return max(0, int(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES=%r", raw)
-    return 2
+    return 3
 
 
 def _worker_failure_can_retry(
