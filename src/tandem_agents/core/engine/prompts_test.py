@@ -411,6 +411,9 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("Required substantive write targets", prompt)
         self.assertNotIn("This is a test/regression coverage subtask", prompt)
         self.assertNotIn("Read and edit at least one required test target first", prompt)
+        self.assertIn("must keep test coverage paired with production behavior", prompt)
+        self.assertIn("first behavioral edit in a paired production target", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
 
     def test_testless_diff_repair_prompt_requires_test_first(self) -> None:
         subtask = self._subtask(
@@ -536,6 +539,37 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("First actions: read the target files", prompt)
         self.assertIn("verification did not run", prompt)
         self.assertNotIn("/runs/run-1/artifacts/worker-1.patch", prompt)
+
+    def test_worker_prompt_treats_applied_carry_forward_patch_as_current_diff(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            discarded_partial_diff_patch="/runs/run-1/artifacts/rejected.patch",
+            carry_forward_patches=[
+                "/runs/run-1/artifacts/source.patch",
+                "/runs/run-1/artifacts/test.patch",
+            ],
+            repair_changed_files=[
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            repair_failure_summary="source and test partials were verified separately",
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Carry-forward repair directive:", prompt)
+        self.assertIn("already applied the preserved partial patch data", prompt)
+        self.assertIn("Inspect the current target files and working diff only", prompt)
+        self.assertNotIn("The previous partial diff was rejected; do not apply or copy it as-is", prompt)
+        self.assertNotIn("/runs/run-1/artifacts/source.patch", prompt)
+        self.assertNotIn("/runs/run-1/artifacts/test.patch", prompt)
 
 
 if __name__ == "__main__":

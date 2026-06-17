@@ -87,6 +87,21 @@ class WorkerFailureCoercionTest(unittest.TestCase):
         )
         self.assertFalse(_worker_note_reports_blocked("Blocked by dependency analysis is not a final blocked status."))
 
+    def test_json_blocked_status_reports_blocker(self) -> None:
+        self.assertTrue(
+            _worker_note_reports_blocked(
+                json.dumps(
+                    {
+                        "status": "blocked",
+                        "approved": False,
+                        "blockers": ["verification was not run"],
+                    }
+                )
+            )
+        )
+        self.assertTrue(_worker_note_reports_blocked(json.dumps({"status": "completed", "approved": False})))
+        self.assertFalse(_worker_note_reports_blocked(json.dumps({"status": "completed", "approved": True})))
+
     def test_worker_clear_active_attempt_removes_matching_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
@@ -1008,6 +1023,58 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(result["changed_files"], ["src/worktrees.py"])
             self.assertTrue(Path(result["partial_diff_artifact"]).exists())
             self.assertIn("Blocked.", result["stdout"])
+            self.assertIn("treating the worker as failed", result["stdout"])
+
+    def test_json_blocked_worker_note_with_diff_is_preserved_not_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "worktrees.py"
+            target.parent.mkdir()
+            target.write_text("def branch_name() -> str:\n    return 'old'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/worktrees.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("def branch_name() -> str:\n    return 'new'\n", encoding="utf-8")
+
+            result = _coerce_worker_failure(
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        {
+                            "status": "blocked",
+                            "approved": False,
+                            "changed_files": [],
+                            "validation_performed": ["Inspected src/worktrees.py."],
+                            "blockers": ["No verification was run."],
+                        },
+                        indent=2,
+                    ),
+                    "log_path": str(log_path),
+                },
+                log_path,
+                worktree,
+                {
+                    "id": "subtask-1",
+                    "title": "Finish worktree helper",
+                    "files": ["src/worktrees.py"],
+                    "target_files": ["src/worktrees.py"],
+                },
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_REPORTED_BLOCKER")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertEqual(result["changed_files"], ["src/worktrees.py"])
+            self.assertTrue(Path(result["partial_diff_artifact"]).exists())
+            self.assertIn('"status": "blocked"', result["stdout"])
             self.assertIn("treating the worker as failed", result["stdout"])
 
     def test_malformed_blocked_status_boundary_is_preserved_not_completed(self) -> None:

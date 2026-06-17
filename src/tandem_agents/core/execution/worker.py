@@ -1665,7 +1665,23 @@ def _terminalized_note_reports_blockers(text: str) -> bool:
 
 
 def _worker_note_reports_blocked(text: str) -> bool:
-    return bool(WORKER_BLOCKED_STATUS_RE.search(str(text or "")))
+    raw = str(text or "")
+    stripped = raw.strip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            status = str(payload.get("status") or "").strip().lower()
+            if status in {"blocked", "failed", "failure"}:
+                return True
+            if payload.get("approved") is False:
+                return True
+            blockers = payload.get("blockers")
+            if isinstance(blockers, list) and any(str(item).strip() for item in blockers):
+                return True
+    return bool(WORKER_BLOCKED_STATUS_RE.search(raw))
 
 
 def _terminalized_note_reports_no_visible_verification(text: str) -> bool:
@@ -3640,8 +3656,15 @@ def run_worker_subtask(
     worktree = create_worktree(repo_path, worktree_path)
     log_path = layout["logs"] / f"{worker_id}.log"
     carry_forward_patch = str(subtask.get("carry_forward_patch") or "").strip()
+    carry_forward_patches = [
+        str(path).strip()
+        for path in (subtask.get("carry_forward_patches") or [])
+        if str(path).strip()
+    ]
     if carry_forward_patch:
-        patch_path = Path(carry_forward_patch)
+        carry_forward_patches.insert(0, carry_forward_patch)
+    for raw_patch_path in list(dict.fromkeys(carry_forward_patches)):
+        patch_path = Path(raw_patch_path)
         if not _apply_carry_forward_patch(worktree, patch_path, log_path):
             return _carry_forward_patch_failure_result(patch_path, worker_id, subtask, log_path)
     subtask = _materialize_worker_context(worktree, subtask)

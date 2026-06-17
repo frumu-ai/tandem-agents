@@ -12,6 +12,7 @@ The planning phase repeats inside the repair loop (max_loops iterations).
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import logging
 import re
@@ -204,6 +205,35 @@ def _paired_production_path_for_test_file(test_path: str, candidate_files: list[
     return sorted(scored_candidates)[0][1]
 
 
+def _direct_production_candidates_for_test_file(test_path: str) -> list[str]:
+    test_rel = _normalize_repo_relative_path(test_path)
+    if not test_rel:
+        return []
+    test_obj = Path(test_rel)
+    name = test_obj.name
+    candidates: list[str] = []
+    if name.endswith("_test.py"):
+        candidates.append(test_obj.with_name(f"{name.removesuffix('_test.py')}.py").as_posix())
+    for test_suffix, source_suffix in (
+        (".test.py", ".py"),
+        (".test.ts", ".ts"),
+        (".test.tsx", ".tsx"),
+        (".spec.ts", ".ts"),
+        (".spec.tsx", ".tsx"),
+    ):
+        if name.endswith(test_suffix):
+            candidates.append(test_obj.with_name(f"{name.removesuffix(test_suffix)}{source_suffix}").as_posix())
+    if name.startswith("test_") and name.endswith(".py"):
+        candidates.append(test_obj.with_name(f"{name.removeprefix('test_')}").as_posix())
+        if test_obj.parent.name == "tests":
+            candidates.append(test_obj.parent.parent.joinpath(name.removeprefix("test_")).as_posix())
+    return [
+        rel_path
+        for rel_path in dict.fromkeys(_normalize_repo_relative_path(candidate) for candidate in candidates)
+        if rel_path and _repo_path_looks_like_production_source_file(rel_path)
+    ]
+
+
 def _source_partial_declared_test_followup_files(subtask: dict[str, Any]) -> list[str]:
     changed_files = [
         rel_path
@@ -292,6 +322,26 @@ def _test_only_partial_production_followup_files(
         return declared_production_files[:1]
     sticky_production_files = [path for path in candidate_files if _repo_path_looks_like_production_source_file(path)]
     return sticky_production_files[:1]
+
+
+def _test_only_partial_existing_sibling_production_files(
+    ctx: RunContext,
+    test_files: list[str],
+) -> list[str]:
+    try:
+        repo_path = ctx.repo_path
+    except Exception:
+        repo_path = Path(".")
+    production_files: list[str] = []
+    for test_file in test_files:
+        for candidate in _direct_production_candidates_for_test_file(test_file):
+            try:
+                if (repo_path / candidate).is_file():
+                    production_files.append(candidate)
+                    break
+            except OSError:
+                continue
+    return list(dict.fromkeys(production_files))
 
 
 
@@ -437,6 +487,7 @@ def _split_dense_serial_subtasks(
         ]
         skip_repair_split = bool(
             subtask.get("carry_forward_patch")
+            or subtask.get("carry_forward_patches")
             or subtask.get("discarded_partial_diff_patch")
             or subtask.get("repair_parent_target_files")
         )
@@ -458,8 +509,8 @@ def _split_dense_serial_subtasks(
         original_scope_note = str(subtask.get("scope_note") or "").strip()
         split_note = (
             "ACA split this dense manager subtask into serial slices because swarm is disabled. "
-            "Focus only on this slice's acceptance criteria; later slices cover the remaining criteria "
-            "against the same target files."
+            "Only one worker slice runs at a time; focus on this slice's acceptance criteria, "
+            "then later slices cover the remaining criteria against the same target files."
         )
         for chunk_index, chunk in enumerate(chunks, start=1):
             cloned = dict(subtask)
@@ -547,18 +598,32 @@ def _prepare_subtasks(ctx: RunContext) -> tuple[list[str], list[dict[str, Any]]]
     """
     from src.tandem_agents.core.execution import runner_core as _rc  # noqa: PLC0415
     from pathlib import Path
-    # Dispatch concurrency is limited later. When swarm is disabled, preserve
-    # manager subtasks and run them serially instead of compacting a broad plan
-    # into one prompt that can exhaust the engine iteration/timeout budget.
-    planning_subtask_limit = max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1)
+    # Dispatch concurrency is limited later. When swarm is disabled, preserve a
+    # small serial queue of manager slices instead of merging all work into one
+    # oversized prompt.
+    planning_subtask_limit = (
+        max(1, int(ctx.cfg.swarm.max_workers or 1))
+        if ctx.cfg.swarm.enabled
+        else _serial_subtask_limit(ctx.cfg)
+    )
     discovered_files, subtasks = _rc._prepare_subtasks_with_discovery(
         ctx.task,
         ctx.manager_plan,
         Path(ctx.repo.get("path") or "."),
         planning_subtask_limit,
-        merge_manager_subtasks=ctx.cfg.swarm.enabled,
+        merge_manager_subtasks=bool(ctx.cfg.swarm.enabled),
     )
     return _constrain_invalid_manager_fallback(ctx, discovered_files, subtasks)
+
+
+def _serial_subtask_limit(cfg: Any) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_SERIAL_SUBTASK_LIMIT", "") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_SERIAL_SUBTASK_LIMIT=%r", raw)
+    return 4
 
 
 def _safe_repo_context_path(rel_path: Any, repo_path: Path) -> str:
@@ -949,6 +1014,7 @@ def _partial_diff_patch_is_reusable(worker_output_excerpt: str) -> bool:
         "redundant",
         "worker_off_track_testless_diff",
         "changed only non-test files",
+        "changed only required test files",
         "required test files",
         "worker drifted off the required regression/test coverage path",
     )
@@ -998,6 +1064,9 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         )
         if rel_path
     ] if isinstance(ctx.task, dict) else []
+    complementary_plan = _deterministic_complementary_partial_diff_repair_plan(ctx, artifacts, parent_targets)
+    if complementary_plan is not None:
+        return complementary_plan
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
@@ -1109,6 +1178,8 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
             },
             parent_targets,
         )
+        if not production_followup_files:
+            production_followup_files = _test_only_partial_existing_sibling_production_files(ctx, test_files)
         active_files = list(dict.fromkeys([*production_followup_files, *test_files]))
         if not test_files or not production_followup_files or not active_files:
             continue
@@ -1164,6 +1235,104 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
     return None
 
 
+def _deterministic_complementary_partial_diff_repair_plan(
+    ctx: RunContext,
+    artifacts: list[Any],
+    parent_targets: list[str],
+) -> dict[str, Any] | None:
+    test_artifacts: list[dict[str, Any]] = []
+    source_artifacts: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        changed_files = _partial_diff_changed_files(artifact)
+        excerpt = str(artifact.get("worker_output_excerpt") or "").lower()
+        if _all_changed_files_are_tests(changed_files) and (
+            "changed only required test files" in excerpt or "test-only" in excerpt
+        ):
+            test_artifacts.append(artifact)
+        elif changed_files and all(_repo_path_looks_like_production_source_file(path) for path in changed_files) and (
+            "changed only non-test files" in excerpt or "worker_off_track_testless_diff" in excerpt
+        ):
+            source_artifacts.append(artifact)
+    if not test_artifacts or not source_artifacts:
+        return None
+    for test_artifact in test_artifacts:
+        test_files = [path for path in _partial_diff_changed_files(test_artifact) if _repo_path_looks_like_test_file(path)]
+        for source_artifact in source_artifacts:
+            source_files = [
+                path
+                for path in _partial_diff_changed_files(source_artifact)
+                if _repo_path_looks_like_production_source_file(path)
+            ]
+            paired_source_files = [
+                source_file
+                for source_file in source_files
+                if any(_paired_production_path_for_test_file(test_file, source_files) == source_file for test_file in test_files)
+            ] or source_files[:1]
+            if parent_targets:
+                paired_source_files = [path for path in paired_source_files if path in parent_targets] or paired_source_files
+                test_files = [path for path in test_files if path in parent_targets] or test_files
+            active_files = list(dict.fromkeys([*paired_source_files, *test_files]))
+            patches = [
+                str(source_artifact.get("patch_path") or "").strip(),
+                str(test_artifact.get("patch_path") or "").strip(),
+            ]
+            patches = [patch for patch in dict.fromkeys(patches) if patch]
+            if not paired_source_files or not test_files or len(patches) < 2:
+                continue
+            source_text = ", ".join(paired_source_files)
+            test_text = ", ".join(test_files)
+            return {
+                "summary": (
+                    "Deterministic repair for complementary source-only and test-only partial diffs; "
+                    "ACA will apply both saved patches before asking the worker to verify and fix the combined diff."
+                ),
+                "subtasks": [
+                    {
+                        "id": str(test_artifact.get("subtask_id") or "complementary-diff-repair").strip()
+                        or "complementary-diff-repair",
+                        "title": "Verify complementary source and test partial diffs",
+                        "goal": "Verify and minimally fix the combined source+test repair for " + ", ".join(active_files) + ".",
+                        "files": active_files,
+                        "target_files": active_files,
+                        "acceptance_criteria": [
+                            "ACA applied the preserved production patch and test patch before this worker starts; inspect the combined diff in "
+                            + ", ".join(active_files)
+                            + ".",
+                            "Run the narrowest deterministic verification for "
+                            + test_text
+                            + "; if it fails, fix only the paired production/test behavior in "
+                            + ", ".join(active_files)
+                            + ".",
+                            "Do not expand into broader manager scope unless a direct import, compile, or test failure in the active files requires it.",
+                        ],
+                        "carry_forward_patches": patches,
+                        "repair_source_subtask_id": str(test_artifact.get("subtask_id") or "").strip(),
+                        "repair_source_worker_id": str(test_artifact.get("worker_id") or "").strip(),
+                        "repair_changed_files": active_files,
+                        "repair_requires_production_followup": paired_source_files,
+                        "repair_requires_test_followup": test_files,
+                        "repair_verification_first": True,
+                        "deterministic_partial_diff_repair": True,
+                        "write_required": False,
+                        "scope_note": (
+                            "ACA detected complementary partial diffs: one production-only patch for "
+                            + source_text
+                            + " and one test-only patch for "
+                            + test_text
+                            + ". Both patches are applied before this worker starts; verify/fix the combined source+test diff."
+                        ),
+                    }
+                ],
+                "risks": [
+                    "If either preserved patch no longer applies, ACA will fail closed and retry with fresh repair evidence."
+                ],
+                "tests": ["Run the narrowest deterministic verification for " + test_text + "."],
+            }
+    return None
+
+
 def _mark_manager_planning_started(ctx: RunContext) -> None:
     from src.tandem_agents.runtime.run_output import set_status
 
@@ -1175,6 +1344,16 @@ def _mark_manager_planning_started(ctx: RunContext) -> None:
         phase_role="manager",
         run_status="running",
     )
+
+
+def _manager_prompt_timeout_seconds(cfg: Any) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_MANAGER_PROMPT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_MANAGER_PROMPT_TIMEOUT_SECONDS=%r", raw)
+    return 300.0
 
 
 def _deterministic_testless_repair_active(subtasks: list[dict[str, Any]]) -> bool:
@@ -1371,7 +1550,7 @@ def _constrain_extra_partial_diff_repair_subtasks(
     base_max_loops = _repair_int(repair.get("base_max_loops"))
     if not attempt or not base_max_loops or attempt <= base_max_loops:
         return
-    carried = [subtask for subtask in subtasks if subtask.get("carry_forward_patch")]
+    carried = [subtask for subtask in subtasks if subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches")]
     rejected = [
         subtask
         for subtask in subtasks
@@ -1456,7 +1635,7 @@ def _merge_or_defer_sticky_expected_files(
     if not sticky_missing_from_plan or not subtasks:
         return
     first = subtasks[0]
-    partial_diff_repair = bool(first.get("carry_forward_patch"))
+    partial_diff_repair = bool(first.get("carry_forward_patch") or first.get("carry_forward_patches"))
     rejected_partial_diff_repair = bool(
         first.get("discarded_partial_diff_patch") or first.get("repair_parent_target_files")
     )
@@ -1534,7 +1713,7 @@ def _merge_or_defer_sticky_expected_files(
         + "."
     )
     first["scope_note"] = f"{existing_scope_note}\n{sticky_note}".strip()
-    if production_followup_files and first.get("carry_forward_patch"):
+    if production_followup_files and (first.get("carry_forward_patch") or first.get("carry_forward_patches")):
         _narrow_carried_partial_diff_subtask(first)
 
 
@@ -1718,8 +1897,10 @@ def run_manager_prompt(ctx: RunContext) -> None:
         }
 
     logger.info("Running manager prompt (run_id=%s)", ctx.run_id)
-    with _rc._coordination_heartbeat(ctx, phase="planning"):
-        manager_result = stream_tandem_prompt(
+    timeout_seconds = _manager_prompt_timeout_seconds(ctx.cfg)
+
+    def _stream_manager_prompt() -> dict[str, Any]:
+        return stream_tandem_prompt(
             ctx.cfg,
             role="manager",
             prompt=manager_prompt,
@@ -1730,6 +1911,43 @@ def run_manager_prompt(ctx: RunContext) -> None:
             log_path=ctx.layout["logs"] / "manager.log",
             config_path=None,
         )
+
+    with _rc._coordination_heartbeat(ctx, phase="planning"):
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aca-manager")
+        future = executor.submit(_stream_manager_prompt)
+        try:
+            manager_result = future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            message = (
+                "ENGINE_PROMPT_TIMEOUT: ACA manager planning prompt exceeded "
+                f"{timeout_seconds:.0f}s without producing a plan. The run will use "
+                "contract-based fallback planning instead of remaining stuck in planning."
+            )
+            try:
+                log_path = ctx.layout["logs"] / "manager.log"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(message + "\n")
+            except Exception:
+                logger.debug("Failed to append manager watchdog message", exc_info=True)
+            manager_result = {
+                "role": "manager",
+                "returncode": 1,
+                "stdout": message,
+                "stderr": "",
+                "log_path": str(ctx.layout["logs"] / "manager.log"),
+                "failure_reason": message,
+                "blocker_kind": "manager_prompt_timeout",
+                "recovery_action": (
+                    "Use ACA's contract-based fallback planner for this attempt; inspect manager.log "
+                    "and engine run state if manager prompts repeatedly time out."
+                ),
+                "engine": {
+                    "stream_reason": "manager_prompt_timeout",
+                    "timeout_seconds": timeout_seconds,
+                },
+            }
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     parsed_plan, invalid_plan_reason = _manager_plan_from_stdout(str(manager_result.get("stdout") or ""))
     if invalid_plan_reason:
@@ -1876,7 +2094,11 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
             str(subtask.get("id") or "").strip() in completed_repair_subtask_ids
             and subtask_satisfied(repo_path, subtask)
         )
-        repair_requires_worker = bool(subtask.get("carry_forward_patch") or subtask.get("discarded_partial_diff_patch"))
+        repair_requires_worker = bool(
+            subtask.get("carry_forward_patch")
+            or subtask.get("carry_forward_patches")
+            or subtask.get("discarded_partial_diff_patch")
+        )
         subtask["pre_satisfied"] = (
             False
             if repair_requires_worker

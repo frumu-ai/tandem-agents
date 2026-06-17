@@ -288,6 +288,60 @@ def _worker_verifiable_diff_abort_seconds(ctx: RunContext) -> float:
     return 240.0
 
 
+def _worker_repair_no_change_abort_seconds(ctx: RunContext) -> float:
+    raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS=%r", raw)
+    return 180.0
+
+
+def _worker_no_change_abort_seconds(ctx: RunContext) -> float:
+    raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_NO_CHANGE_ABORT_SECONDS") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_NO_CHANGE_ABORT_SECONDS=%r", raw)
+    return 240.0
+
+
+def _subtask_is_repair_no_change_guard_candidate(subtask: dict[str, Any]) -> bool:
+    if not bool(subtask.get("write_required", True)):
+        return False
+    return bool(
+        subtask.get("deterministic_partial_diff_repair")
+        or subtask.get("deterministic_testless_repair")
+        or subtask.get("discarded_partial_diff_patch")
+        or subtask.get("carry_forward_patch")
+        or subtask.get("carry_forward_patches")
+    )
+
+
+def _subtask_is_no_change_guard_candidate(subtask: dict[str, Any]) -> bool:
+    if not bool(subtask.get("write_required", True)):
+        return False
+    if _subtask_is_repair_no_change_guard_candidate(subtask):
+        return False
+    return True
+
+
+def _worktree_has_any_changes(worktree: Path) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        logger.debug("Failed to inspect worker worktree status for no-change guard: %s", result.stderr)
+        return True
+    return bool((result.stdout or "").strip())
+
+
 def _subtask_has_verifiable_source_and_test_diff(
     subtask: dict[str, Any],
     changed_files: list[str],
@@ -672,14 +726,18 @@ def dispatch_workers(ctx: RunContext) -> None:
         phase="worker_execution",
         ctx=ctx,
     )
+    max_parallel_workers = max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1)
+    queued_worker_slices = len(ctx.pending_subtasks)
     append_event(
         ctx.layout["events"],
         "swarm.spawned",
         ctx.run_id,
         {
             "planned_workers": len(ctx.planned_subtasks),
-            "max_parallel": max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1),
-            "spawned_workers": len(ctx.pending_subtasks),
+            "max_parallel": max_parallel_workers,
+            "spawned_workers": min(queued_worker_slices, max_parallel_workers),
+            "queued_workers": queued_worker_slices,
+            "scheduled_workers": queued_worker_slices,
         },
         task_id=ctx.task.get("task_id"),
         role="manager",
@@ -1340,6 +1398,79 @@ def dispatch_workers(ctx: RunContext) -> None:
         active_worker_snapshot_threads.append(thread)
         thread.start()
 
+    def _maybe_abort_no_change_repair_worker(wid: str, worktree: Path) -> None:
+        with active_workers_lock:
+            if active_worker_abort_results.get(wid):
+                return
+            subtask = dict(active_worker_subtasks.get(wid) or {})
+            started_at = float(active_worker_started_at.get(wid) or time.monotonic())
+        if _subtask_is_repair_no_change_guard_candidate(subtask):
+            abort_seconds = _worker_repair_no_change_abort_seconds(ctx)
+            event_type = "worker.repair_no_change_detected"
+            failure_reason = "WORKER_REPAIR_NO_CHANGE"
+            reason = "repair worker made no filesystem changes"
+            excerpt = (
+                "Repair worker made no filesystem changes before the no-change guard fired: "
+                "after {elapsed:.0f}s it had not edited any target files."
+            )
+            recovery_action = (
+                "Retry with a smaller repair prompt or healthier engine route. The worker should read and edit "
+                "the first required target before spending a full prompt budget."
+            )
+        elif _subtask_is_no_change_guard_candidate(subtask):
+            abort_seconds = _worker_no_change_abort_seconds(ctx)
+            event_type = "worker.no_change_detected"
+            failure_reason = "WORKER_NO_CHANGE"
+            reason = "write-required worker made no filesystem changes"
+            excerpt = (
+                "Write-required worker made no filesystem changes before the no-change guard fired: "
+                "after {elapsed:.0f}s it had not edited any target files."
+            )
+            recovery_action = (
+                "Retry with a smaller worker prompt or healthier engine route. The worker should read and edit "
+                "a declared target before spending a full prompt budget."
+            )
+        else:
+            return
+        if abort_seconds <= 0:
+            return
+        elapsed_seconds = max(0.0, time.monotonic() - started_at)
+        if elapsed_seconds < abort_seconds:
+            return
+        if _worktree_has_any_changes(worktree):
+            return
+        subtask_id = str(subtask.get("id") or "").strip()
+        result = {
+            "worker_id": wid,
+            "subtask_id": subtask_id,
+            "status": "failed",
+            "returncode": 1,
+            "failure_reason": failure_reason,
+            "blocker_kind": "worker_no_progress",
+            "output_excerpt": excerpt.format(elapsed=elapsed_seconds),
+            "recovery_action": recovery_action,
+            "write_required": True,
+            "verified_existing": False,
+        }
+        with active_workers_lock:
+            active_worker_abort_results[wid] = result
+        _clear_active_worker_attempt_marker(ctx, wid)
+        append_event(
+            ctx.layout["events"],
+            event_type,
+            ctx.run_id,
+            {
+                "worker_id": wid,
+                "subtask_id": subtask_id,
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "abort_seconds": abort_seconds,
+                "reason": reason,
+            },
+            task_id=ctx.task.get("task_id"),
+            role="worker",
+            repo={"path": ctx.repo.get("path")},
+        )
+
     def _attach_progress_snapshot_to_failed_result(result: dict[str, Any]) -> None:
         if result.get("returncode") == 0 or result.get("partial_diff_artifact"):
             return
@@ -1412,6 +1543,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                 worktree = worktrees.get(wid)
                 if worktree:
                     _schedule_worker_progress_snapshot(wid, worktree)
+                    _maybe_abort_no_change_repair_worker(wid, worktree)
             now = time.monotonic()
             progress_interval = max(30.0, float(ctx.cfg.coordination.heartbeat_interval_seconds or 1) * 2.0)
             nonlocal last_progress_event_at
@@ -1524,7 +1656,7 @@ def dispatch_workers(ctx: RunContext) -> None:
             ctx.run_dir,
             ctx.task,
             ctx.pending_subtasks,
-            max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1),
+            max_parallel_workers,
             on_start=_on_start,
             on_result=_on_result,
             abort_result=_abort_result,

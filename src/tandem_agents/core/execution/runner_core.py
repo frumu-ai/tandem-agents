@@ -625,6 +625,10 @@ def _worker_failure_can_retry(
         and worker.get("worker_abandoned_after_timeout")
     ):
         return False
+    if str(blocker.get("kind") or "").strip() == "worker_no_progress" and isinstance(worker, dict):
+        failure_reason = str(worker.get("failure_reason") or "").strip()
+        if failure_reason in {"WORKER_NO_CHANGE", "WORKER_REPAIR_NO_CHANGE"}:
+            return False
     if attempt < base_max_loops - 1:
         return True
     kind = str(blocker.get("kind") or "").strip()
@@ -690,6 +694,16 @@ def _integration_can_retry(
     return attempt < base_max_loops + worker_extra_retries + extra_retries - 1
 
 
+def _integration_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS=%r", raw)
+    return 300.0
+
+
 def _discard_partial_diff_repair_artifacts(ctx: "_PhaseRunContext", *, reason: str) -> None:
     for source in (getattr(ctx, "status", None), getattr(ctx, "blackboard", None)):
         if not isinstance(source, dict):
@@ -732,6 +746,40 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
             entry["worker_output_excerpt"] = output_excerpt
         if entry not in artifacts:
             artifacts.append(entry)
+    return artifacts
+
+
+def _merge_partial_diff_artifacts_for_retry(
+    existing: Any,
+    new_artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def artifact_key(artifact: dict[str, Any]) -> str:
+        patch_path = str(artifact.get("patch_path") or "").strip()
+        if patch_path:
+            return f"patch:{patch_path}"
+        changed_files = ",".join(str(path).strip() for path in artifact.get("changed_files") or [])
+        return ":".join(
+            [
+                str(artifact.get("subtask_id") or "").strip(),
+                str(artifact.get("worker_id") or "").strip(),
+                changed_files,
+            ]
+        )
+
+    for raw_artifact in [
+        *(existing if isinstance(existing, list) else []),
+        *new_artifacts,
+    ]:
+        if not isinstance(raw_artifact, dict):
+            continue
+        key = artifact_key(raw_artifact)
+        if not key or key in seen:
+            continue
+        artifacts.append(dict(raw_artifact))
+        seen.add(key)
     return artifacts
 
 
@@ -1729,6 +1777,7 @@ def _normalize_manager_subtasks(
             scope_note = f"{scope_note}\n{extra}".strip()
         repair_scoped = bool(
             item.get("carry_forward_patch")
+            or item.get("carry_forward_patches")
             or item.get("discarded_partial_diff_patch")
             or item.get("deterministic_testless_repair")
             or item.get("deterministic_partial_diff_repair")
@@ -1769,6 +1818,7 @@ def _normalize_manager_subtasks(
         }
         for key in (
             "carry_forward_patch",
+            "carry_forward_patches",
             "discarded_partial_diff_patch",
             "deterministic_testless_repair",
             "deterministic_partial_diff_repair",
@@ -1846,8 +1896,6 @@ def _prepare_subtasks_with_discovery(
         ]
     elif max_workers <= 1 and merge_manager_subtasks and has_manager_subtasks and len(subtasks) > 1:
         subtasks = _merge_manager_subtasks_for_single_worker(task, subtasks)
-    if has_manager_subtasks:
-        return discovered_files, subtasks
     return discovered_files, subtasks[: max(1, max_workers)]
 
 
@@ -3781,6 +3829,11 @@ def _run_once_internal_impl(
                 partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
                 completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
                 if partial_diff_artifacts:
+                    existing_artifacts = (ctx.blackboard.setdefault("repair", {})).get("partial_diff_artifacts")
+                    partial_diff_artifacts = _merge_partial_diff_artifacts_for_retry(
+                        existing_artifacts,
+                        partial_diff_artifacts,
+                    )
                     ctx.blackboard.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
                     ctx.blackboard.setdefault("repair", {})["partial_diff_state"] = "preserved_not_accepted"
                     ctx.status.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
@@ -4059,7 +4112,9 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
         provider=integration_cli_provider,
         model=integration_model,
     )
-    with _coordination_heartbeat(ctx, phase="integration"):
+    timeout_seconds = _integration_prompt_timeout_seconds(ctx.cfg)
+
+    def _stream() -> dict[str, Any]:
         return stream_tandem_prompt(
             ctx.cfg,
             role="integration",
@@ -4071,6 +4126,51 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
             log_path=ctx.layout["logs"] / "manager-integration.log",
             config_path=None,
         )
+
+    with _coordination_heartbeat(ctx, phase="integration"):
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aca-integration")
+        future = executor.submit(_stream)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            message = (
+                "ENGINE_TOOL_LOOP_STALLED: ACA integration prompt exceeded "
+                f"{timeout_seconds:.1f}s without a terminal result. "
+                "The run orchestration watchdog abandoned integration so review and deterministic "
+                "verification can decide the recovered worker diff instead of leaving the run stuck.\n"
+            )
+            try:
+                log_path = ctx.layout["logs"] / "manager-integration.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(message)
+            except OSError:
+                logger.debug("Failed to append integration watchdog message", exc_info=True)
+            return {
+                "role": "integration",
+                "returncode": 1,
+                "stdout": message,
+                "log_path": str(ctx.layout["logs"] / "manager-integration.log"),
+                "cwd": str(ctx.repo_path),
+                "session_id": "",
+                "engine_run_id": "",
+                "engine": {
+                    "timeout_seconds": timeout_seconds,
+                    "stream_reason": "integration_prompt_timeout",
+                    "abandoned": True,
+                },
+                "failure_reason": "ENGINE_TOOL_LOOP_STALLED",
+                "blocker_kind": "engine_tool_loop_stalled",
+                "recovery_action": (
+                    "Inspect manager-integration.log and engine session snapshots; ACA deferred "
+                    "the stuck integration pass to review and deterministic verification."
+                ),
+            }
+        finally:
+            if future.done():
+                executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _integration_blocker_message(integration_result: dict[str, Any]) -> str | None:
