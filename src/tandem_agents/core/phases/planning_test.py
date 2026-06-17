@@ -2095,7 +2095,9 @@ class PlanningPreScreenTest(unittest.TestCase):
             config_criteria = " ".join(ctx.manager_plan["subtasks"][0]["acceptance_criteria"])
             self.assertIn("defaults", config_criteria.lower())
             self.assertIn("max_concurrent_worker_runs", config_criteria)
+            self.assertIn("resolve_config(root, env={...})", config_criteria)
             self.assertIn("Do not add alias helpers", config_criteria)
+            self.assertIn("config.aca", config_criteria)
             self.assertIn("cfg.scheduler.<exact field>", ctx.manager_plan["subtasks"][0]["scope_note"])
             self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
             scheduler_subtask = next(
