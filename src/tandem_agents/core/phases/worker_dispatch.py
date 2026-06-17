@@ -2234,6 +2234,12 @@ def dispatch_workers(ctx: RunContext) -> None:
             changed_files = [str(path or "").strip() for path in result.get("changed_files") or [] if str(path or "").strip()]
             rejection = _reviewable_failed_diff_rejection(result_worktree, result_subtask, changed_files)
             if rejection is not None:
+                result["failure_reason"] = result.get("failure_reason") or "WORKER_VERIFIABLE_DIFF_REJECTED"
+                result["blocker_kind"] = result.get("blocker_kind") or "worker_incomplete_diff"
+                result["recovery_action"] = (
+                    "ACA rejected the preserved source+test diff before syncing it: "
+                    + str(rejection.get("message") or rejection.get("reason") or "failed focused validation")
+                )
                 append_event(
                     ctx.layout["events"],
                     "worker.verifiable_failed_diff_rejected",
@@ -2252,46 +2258,46 @@ def dispatch_workers(ctx: RunContext) -> None:
                     role="worker",
                     repo={"path": ctx.repo.get("path")},
                 )
-                return
-            sync_ok, merged_changed_files, synced_files, sync_error = _sync_verifiable_worker_diff(
-                ctx,
-                worker_id=wid,
-                subtask_id=subtask_id,
-                worktree=result_worktree,
-                changed_files=changed_files,
-            )
-            if sync_ok:
-                result["status"] = "completed"
-                result["returncode"] = 0
-                result["partial_diff_state"] = "reviewable_terminalized"
-                result["changed_files"] = merged_changed_files
-                result["synced_files"] = synced_files
-                result["failure_reason"] = None
-                result["blocker_kind"] = None
-                result["recovery_action"] = None
-                result["output_excerpt"] = (
-                    "Worker returned a blocker after producing a source plus required-test diff. "
-                    "ACA synced the reviewable diff for manager review and tests instead of retrying it."
-                )
-                append_event(
-                    ctx.layout["events"],
-                    "worker.verifiable_failed_diff_synced",
-                    ctx.run_id,
-                    {
-                        "worker_id": wid,
-                        "subtask_id": subtask_id,
-                        "changed_files": merged_changed_files,
-                        "synced_files": synced_files,
-                    },
-                    task_id=ctx.task.get("task_id"),
-                    role="worker",
-                    repo={"path": ctx.repo.get("path")},
-                )
             else:
-                result["recovery_action"] = (
-                    "ACA found a source plus required-test partial diff but could not sync it for review: "
-                    + str(sync_error or "unknown sync error")
+                sync_ok, merged_changed_files, synced_files, sync_error = _sync_verifiable_worker_diff(
+                    ctx,
+                    worker_id=wid,
+                    subtask_id=subtask_id,
+                    worktree=result_worktree,
+                    changed_files=changed_files,
                 )
+                if sync_ok:
+                    result["status"] = "completed"
+                    result["returncode"] = 0
+                    result["partial_diff_state"] = "reviewable_terminalized"
+                    result["changed_files"] = merged_changed_files
+                    result["synced_files"] = synced_files
+                    result["failure_reason"] = None
+                    result["blocker_kind"] = None
+                    result["recovery_action"] = None
+                    result["output_excerpt"] = (
+                        "Worker returned a blocker after producing a source plus required-test diff. "
+                        "ACA synced the reviewable diff for manager review and tests instead of retrying it."
+                    )
+                    append_event(
+                        ctx.layout["events"],
+                        "worker.verifiable_failed_diff_synced",
+                        ctx.run_id,
+                        {
+                            "worker_id": wid,
+                            "subtask_id": subtask_id,
+                            "changed_files": merged_changed_files,
+                            "synced_files": synced_files,
+                        },
+                        task_id=ctx.task.get("task_id"),
+                        role="worker",
+                        repo={"path": ctx.repo.get("path")},
+                    )
+                else:
+                    result["recovery_action"] = (
+                        "ACA found a source plus required-test partial diff but could not sync it for review: "
+                        + str(sync_error or "unknown sync error")
+                    )
         _rc._record_worker_result(ctx.blackboard, ctx.worker_results, result)
         for item in ctx.blackboard["subtasks"]:
             if item.get("id") == subtask_id:

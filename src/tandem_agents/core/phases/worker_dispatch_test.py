@@ -356,6 +356,117 @@ class WorkerDispatchTest(unittest.TestCase):
         self.assertTrue(_diff_is_destructive_rewrite(diff, max_deletions=25))
         self.assertFalse(_diff_is_destructive_rewrite(diff, max_deletions=26))
 
+    def test_rejected_failed_diff_records_worker_result_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run-1"
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            worktree = run_dir / "worktrees" / "worker-1--slice-1"
+            package = worktree / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            for init_path in [
+                worktree / "src" / "__init__.py",
+                worktree / "src" / "tandem_agents" / "__init__.py",
+                package / "__init__.py",
+            ]:
+                init_path.write_text("", encoding="utf-8")
+            (package / "config_loader.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (package / "config_loader_test.py").write_text("import unittest\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "aca@example.test"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA Test"], cwd=worktree, check=True)
+            subprocess.run(["git", "add", "."], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True)
+            (package / "config_loader.py").write_text("VALUE = 2\n", encoding="utf-8")
+            (package / "config_loader_test.py").write_text(
+                "import unittest\n"
+                "from src.tandem_agents.config.config_loader import VALUE\n",
+                encoding="utf-8",
+            )
+            layout = ensure_layout(run_dir)
+            subtask = {
+                "id": "slice-1",
+                "title": "Add exact scheduler config regression",
+                "_worker_worktree_name": "worker-1--slice-1",
+                "write_required": True,
+                "files": [
+                    "src/tandem_agents/config/config_loader.py",
+                    "src/tandem_agents/config/config_loader_test.py",
+                ],
+                "acceptance_criteria": ["Tests cover the config loader regression."],
+            }
+            cfg = SimpleNamespace(
+                env={},
+                swarm=SimpleNamespace(enabled=False, max_workers=1),
+                coordination=SimpleNamespace(lease_ttl_seconds=30, heartbeat_interval_seconds=120),
+                repository=SimpleNamespace(slug="frumu-ai/tandem-agents"),
+                provider_for_role=lambda _role: ("openai", "gpt-5.5"),
+            )
+            ctx = SimpleNamespace(
+                cfg=cfg,
+                run_id="run-1",
+                run_dir=run_dir,
+                repo_path=repo_path,
+                layout=layout,
+                task={"task_id": "TAN-173"},
+                repo={"path": str(repo_path), "slug": "frumu-ai/tandem-agents"},
+                planned_subtasks=[dict(subtask)],
+                pending_subtasks=[dict(subtask)],
+                worker_results=[],
+                blackboard={"subtasks": [dict(subtask)]},
+                status=initial_status(
+                    "run-1",
+                    {"task_id": "TAN-173"},
+                    {"path": str(repo_path)},
+                    {},
+                    {},
+                    {},
+                    run_dir,
+                ),
+                coordination=_FakeCoordination(),
+                lease_id=None,
+                claim_identity={"host_id": "host-1"},
+            )
+
+            def fake_execute_pool(*_args, **kwargs):
+                kwargs["on_start"]("worker-1", subtask)
+                kwargs["on_result"](
+                    {
+                        "worker_id": "worker-1",
+                        "subtask_id": "slice-1",
+                        "status": "failed",
+                        "returncode": 1,
+                        "partial_diff_artifact": str(run_dir / "artifacts" / "worker-1.patch"),
+                        "changed_files": [
+                            "src/tandem_agents/config/config_loader.py",
+                            "src/tandem_agents/config/config_loader_test.py",
+                        ],
+                        "blocker_kind": "engine_prompt_timeout",
+                    }
+                )
+                return []
+
+            with (
+                mock.patch(
+                    "src.tandem_agents.core.execution.runner_core._execute_local_worker_pool",
+                    side_effect=fake_execute_pool,
+                ),
+                mock.patch("src.tandem_agents.core.phases.worker_dispatch._post_dispatch_validation"),
+            ):
+                dispatch_workers(ctx)
+
+            self.assertEqual(len(ctx.worker_results), 1)
+            self.assertEqual(ctx.worker_results[0]["status"], "failed")
+            self.assertEqual(ctx.worker_results[0]["blocker_kind"], "engine_prompt_timeout")
+            events = [
+                json.loads(line)
+                for line in layout["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn("worker.verifiable_failed_diff_rejected", [event["type"] for event in events])
+            self.assertNotIn("worker.verifiable_failed_diff_synced", [event["type"] for event in events])
+            self.assertEqual(ctx.status["metrics"]["failed_workers"], 1)
+
     def test_serial_dispatch_reports_one_spawned_worker_with_queued_slices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
