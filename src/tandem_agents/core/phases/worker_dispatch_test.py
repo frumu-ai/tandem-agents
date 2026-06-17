@@ -13,6 +13,7 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _changed_python_test_modules,
     _changed_python_tests_result,
     _diff_add_delete_counts,
+    _diff_has_substantive_required_test_addition,
     _diff_is_destructive_rewrite,
     _failed_result_has_reviewable_source_and_test_diff,
     _subtask_is_no_change_guard_candidate,
@@ -182,6 +183,30 @@ class WorkerDispatchTest(unittest.TestCase):
         self.assertEqual(result["returncode"], 1)
         self.assertIn("src.tandem_agents.config.config_loader_test", " ".join(result["command"]))
         self.assertIn("FAILED", result["output"])
+
+    def test_substantive_required_test_addition_rejects_import_only_diff(self) -> None:
+        import_only = "\n".join(
+            [
+                "diff --git a/src/tandem_agents/config/config_loader_test.py b/src/tandem_agents/config/config_loader_test.py",
+                "--- a/src/tandem_agents/config/config_loader_test.py",
+                "+++ b/src/tandem_agents/config/config_loader_test.py",
+                "+from unittest.mock import patch",
+            ]
+        )
+        assertion_diff = "\n".join(
+            [
+                "diff --git a/src/tandem_agents/config/config_loader_test.py b/src/tandem_agents/config/config_loader_test.py",
+                "--- a/src/tandem_agents/config/config_loader_test.py",
+                "+++ b/src/tandem_agents/config/config_loader_test.py",
+                "+    def test_loads_scheduler_caps(self):",
+                "+        self.assertEqual(config.scheduler.max_concurrent_worker_runs, 2)",
+            ]
+        )
+
+        required = ["src/tandem_agents/config/config_loader_test.py"]
+
+        self.assertFalse(_diff_has_substantive_required_test_addition(import_only, required))
+        self.assertTrue(_diff_has_substantive_required_test_addition(assertion_diff, required))
 
     def test_cancel_active_worker_engine_session_deletes_marked_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

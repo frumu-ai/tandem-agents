@@ -428,6 +428,41 @@ def _changed_files_satisfy_required_test_files(
     return any(_is_test_path(path) for path in changed)
 
 
+def _diff_has_substantive_required_test_addition(
+    diff_text: str,
+    required_test_files: list[str],
+) -> bool:
+    required = {str(path or "").strip().replace("\\", "/") for path in required_test_files if str(path or "").strip()}
+    current_file = ""
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("diff --git "):
+            current_file = ""
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_file = parts[3][2:]
+            continue
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/") :].strip()
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        normalized_file = current_file.replace("\\", "/")
+        if required:
+            if normalized_file not in required:
+                continue
+        elif not _is_test_path(normalized_file):
+            continue
+        added = line[1:].strip()
+        lowered = added.lower()
+        if re.match(r"(async\s+)?def\s+test[_a-z0-9]*\s*\(", added):
+            return True
+        if "self.assert" in added or "assert " in lowered or lowered.startswith("assert"):
+            return True
+        if "pytest.raises" in added or "unittest.mock" in added and "assert" in lowered:
+            return True
+    return False
+
+
 def _subtask_requires_test_changes(subtask: dict[str, Any]) -> bool:
     if not _subtask_required_test_files(subtask):
         return False
@@ -1634,6 +1669,69 @@ def dispatch_workers(ctx: RunContext) -> None:
                 and elapsed_seconds >= verifiable_abort_seconds
                 and _subtask_has_verifiable_source_and_test_diff(subtask, changed_files)
             ):
+                if not _diff_has_substantive_required_test_addition(diff_text, required_test_files):
+                    artifact_path.write_text(
+                        "# Partial worker diff captured during worker progress heartbeat\n"
+                        "# Reason: active worker produced source and required-test file changes without a substantive test assertion before terminal result\n\n"
+                        f"## changed files\n\n{status_rows}\n\n"
+                        "## verifiable diff guard\n\n"
+                        f"- elapsed_seconds: {elapsed_seconds:.1f}\n"
+                        f"- abort_seconds: {verifiable_abort_seconds:.1f}\n"
+                        f"- required_test_files: {required_test_files}\n"
+                        "- reason: changed test files did not add a test method or assertion; retry should add meaningful regression coverage before sync\n\n"
+                        f"## git diff --binary\n\n{diff_text}\n",
+                        encoding="utf-8",
+                    )
+                    snapshot = {
+                        "worker_id": wid,
+                        "partial_diff_artifact": str(artifact_path),
+                        "changed_files": list(changed_files),
+                        "partial_diff_state": "preserved_not_accepted",
+                        "source": "worker_verifiable_diff_weak_test_guard",
+                        "diff_bytes": diff_bytes,
+                        "diff_lines": diff_lines,
+                        "elapsed_seconds": round(elapsed_seconds, 1),
+                        "abort_seconds": verifiable_abort_seconds,
+                        "required_test_files": required_test_files,
+                    }
+                    active_worker_snapshot_digests[wid] = digest
+                    active_worker_progress_snapshots[wid] = snapshot
+                    subtask_id = str(subtask.get("id") or "").strip()
+                    with active_workers_lock:
+                        active_worker_abort_results[wid] = {
+                            "worker_id": wid,
+                            "subtask_id": subtask_id,
+                            "status": "failed",
+                            "returncode": 1,
+                            "partial_diff_state": "preserved_not_accepted",
+                            "partial_diff_artifact": str(artifact_path),
+                            "artifacts": {"partial_diff": str(artifact_path)},
+                            "changed_files": list(changed_files),
+                            "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+                            "blocker_kind": "worker_incomplete_diff",
+                            "output_excerpt": (
+                                "Worker produced source plus required-test file changes, but the test diff did not add "
+                                f"a test method or assertion after {elapsed_seconds:.0f}s."
+                            ),
+                            "recovery_action": (
+                                "Retry with the preserved patch already applied. Add a meaningful regression assertion "
+                                "in the required test file before syncing the diff."
+                            ),
+                            "write_required": True,
+                            "verified_existing": False,
+                            **_subtask_retry_metadata(subtask),
+                        }
+                    _clear_active_worker_attempt_marker(ctx, wid)
+                    append_event(
+                        ctx.layout["events"],
+                        "worker.verifiable_diff_weak_test",
+                        ctx.run_id,
+                        snapshot,
+                        task_id=ctx.task.get("task_id"),
+                        role="worker",
+                        repo={"path": ctx.repo.get("path")},
+                    )
+                    return snapshot
                 test_result = _changed_python_tests_result(worktree, changed_files)
                 if test_result is not None and not bool(test_result.get("ok")):
                     command = [str(part) for part in test_result.get("command") or []]
