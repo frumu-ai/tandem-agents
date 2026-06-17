@@ -366,6 +366,24 @@ def _worktree_has_any_changes(worktree: Path) -> bool:
     return bool((result.stdout or "").strip())
 
 
+def _diff_add_delete_counts(diff_text: str) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
+
+
+def _diff_is_destructive_rewrite(diff_text: str, *, max_deletions: int) -> bool:
+    additions, deletions = _diff_add_delete_counts(diff_text)
+    return deletions >= max_deletions and deletions > max(20, additions * 2)
+
+
 def _subtask_has_verifiable_source_and_test_diff(
     subtask: dict[str, Any],
     changed_files: list[str],
@@ -808,6 +826,15 @@ def dispatch_workers(ctx: RunContext) -> None:
                 logger.warning("Ignoring invalid ACA_WORKER_RUNAWAY_DIFF_MAX_BYTES=%r", raw)
         return 1_000_000
 
+    def _destructive_diff_max_deletions() -> int:
+        raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_DESTRUCTIVE_DIFF_MAX_DELETIONS") or "").strip()
+        if raw:
+            try:
+                return max(25, int(raw))
+            except ValueError:
+                logger.warning("Ignoring invalid ACA_WORKER_DESTRUCTIVE_DIFF_MAX_DELETIONS=%r", raw)
+        return 200
+
     def _snapshot_worker_progress_diff(wid: str, worktree: Path) -> dict[str, Any] | None:
         try:
             from src.tandem_agents.core.execution.worker import (  # noqa: PLC0415
@@ -861,6 +888,77 @@ def dispatch_workers(ctx: RunContext) -> None:
             artifact_path = artifacts_dir / f"{artifact_stem}.progress-partial-worker-diff.patch"
             status_rows = "\n".join(f"- {path}" for path in changed_files)
             max_bytes = _runaway_diff_max_bytes()
+            max_deletions = _destructive_diff_max_deletions()
+            additions, deletions = _diff_add_delete_counts(diff_text)
+            if _diff_is_destructive_rewrite(diff_text, max_deletions=max_deletions):
+                excerpt = diff_text[:20_000].rstrip()
+                artifact_path.write_text(
+                    "# Partial worker diff captured during worker progress heartbeat\n"
+                    "# Reason: active worker diff tripped ACA destructive rewrite guard\n\n"
+                    f"## changed files\n\n{status_rows}\n\n"
+                    "## destructive rewrite guard\n\n"
+                    f"- additions: {additions}\n"
+                    f"- deletions: {deletions}\n"
+                    f"- max_deletions: {max_deletions}\n"
+                    "- reason: diff deletes far more code than it adds before producing a terminal result\n\n"
+                    "## clipped git diff excerpt\n\n"
+                    f"{excerpt}\n",
+                    encoding="utf-8",
+                )
+                snapshot = {
+                    "worker_id": wid,
+                    "partial_diff_artifact": str(artifact_path),
+                    "changed_files": list(changed_files),
+                    "partial_diff_state": "preserved_not_accepted",
+                    "source": "worker_destructive_diff_guard",
+                    "diff_bytes": diff_bytes,
+                    "diff_lines": diff_lines,
+                    "additions": additions,
+                    "deletions": deletions,
+                    "max_deletions": max_deletions,
+                }
+                active_worker_snapshot_digests[wid] = digest
+                active_worker_progress_snapshots[wid] = snapshot
+                with active_workers_lock:
+                    subtask = active_worker_subtasks.get(wid)
+                    subtask_id = _abort_result_subtask_id(
+                        subtask,
+                        active_worker_worktrees.get(wid),
+                    )
+                    active_worker_abort_results[wid] = {
+                        "worker_id": wid,
+                        "subtask_id": subtask_id,
+                        "status": "failed",
+                        "returncode": 1,
+                        "partial_diff_state": "preserved_not_accepted",
+                        "partial_diff_artifact": str(artifact_path),
+                        "artifacts": {"partial_diff": str(artifact_path)},
+                        "changed_files": list(changed_files),
+                        "failure_reason": "WORKER_DESTRUCTIVE_DIFF",
+                        "blocker_kind": "worker_runaway_diff",
+                        "output_excerpt": (
+                            "Worker diff tripped ACA destructive rewrite guard "
+                            f"({deletions} deletions, {additions} additions; max deletions {max_deletions}). "
+                            "ACA preserved a clipped summary and abandoned this worker before more churn."
+                        ),
+                        "recovery_action": (
+                            "Retry with a smaller scoped prompt. Preserve existing file structure and avoid broad rewrites."
+                        ),
+                        "write_required": True,
+                        "verified_existing": False,
+                        **_subtask_retry_metadata(subtask),
+                    }
+                _clear_active_worker_attempt_marker(ctx, wid)
+                append_event(
+                    ctx.layout["events"],
+                    "worker.runaway_diff_detected",
+                    ctx.run_id,
+                    snapshot,
+                    task_id=ctx.task.get("task_id"),
+                    role="worker",
+                    repo={"path": ctx.repo.get("path")},
+                )
+                return snapshot
             if diff_bytes > max_bytes:
                 excerpt = diff_text[:20_000].rstrip()
                 artifact_path.write_text(

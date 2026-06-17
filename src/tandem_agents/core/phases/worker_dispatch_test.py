@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.tandem_agents.core.phases.worker_dispatch import (
+    _diff_add_delete_counts,
+    _diff_is_destructive_rewrite,
     _failed_result_has_reviewable_source_and_test_diff,
     _subtask_is_no_change_guard_candidate,
     _subtask_is_repair_no_change_guard_candidate,
@@ -117,6 +119,21 @@ class WorkerDispatchTest(unittest.TestCase):
                 subtask,
             )
         )
+
+    def test_destructive_diff_guard_counts_real_diff_lines(self) -> None:
+        diff = "\n".join(
+            [
+                "diff --git a/src/file.py b/src/file.py",
+                "--- a/src/file.py",
+                "+++ b/src/file.py",
+                "+new = True",
+                *[f"-old_{index} = True" for index in range(25)],
+            ]
+        )
+
+        self.assertEqual(_diff_add_delete_counts(diff), (1, 25))
+        self.assertTrue(_diff_is_destructive_rewrite(diff, max_deletions=25))
+        self.assertFalse(_diff_is_destructive_rewrite(diff, max_deletions=26))
 
     def test_serial_dispatch_reports_one_spawned_worker_with_queued_slices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
