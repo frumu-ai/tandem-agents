@@ -1508,7 +1508,8 @@ def dispatch_workers(ctx: RunContext) -> None:
                             "ACA preserved a clipped summary and abandoned this worker before more churn."
                         ),
                         "recovery_action": (
-                            "Retry with a smaller scoped prompt. Preserve existing file structure and avoid broad rewrites."
+                            "Block this run and inspect the clipped diff evidence before resetting the task. "
+                            "The next prompt must preserve existing file structure and avoid broad rewrites."
                         ),
                         "write_required": True,
                         "verified_existing": False,
@@ -1574,8 +1575,8 @@ def dispatch_workers(ctx: RunContext) -> None:
                             "and abandoned this worker instead of writing a giant patch artifact."
                         ),
                         "recovery_action": (
-                            "Retry with a smaller scoped prompt and require the worker to inspect diff stats "
-                            "before continuing after large generated edits."
+                            "Block this run and inspect the clipped diff evidence before resetting the task. "
+                            "The next prompt must inspect diff stats before continuing after large generated edits."
                         ),
                         "write_required": True,
                         "verified_existing": False,

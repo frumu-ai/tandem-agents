@@ -2164,7 +2164,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("retryable blocker `worker_off_track`", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
-    def test_worker_runaway_diff_builds_retry_feedback(self) -> None:
+    def test_worker_runaway_diff_blocks_without_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
             worker_results=[
                 {
@@ -2184,10 +2184,9 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
 
-        self.assertIsNotNone(feedback)
+        self.assertIsNone(feedback)
         self.assertEqual(blocker["kind"], "worker_runaway_diff")
-        self.assertIn("retryable blocker `worker_runaway_diff`", feedback or "")
-        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
     def test_worker_unproductive_diff_builds_retry_feedback(self) -> None:
         ctx = SimpleNamespace(

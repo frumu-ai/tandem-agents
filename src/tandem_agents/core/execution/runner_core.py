@@ -135,7 +135,6 @@ _RETRYABLE_WORKER_BLOCKER_KINDS = {
     "worker_incomplete_diff",
     "worker_no_progress",
     "worker_off_track",
-    "worker_runaway_diff",
     "worker_unproductive_diff",
     "worker_corrupt_diff",
     "carry_forward_patch_apply_failed",
@@ -150,7 +149,6 @@ _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS = {
     "worker_corrupt_diff",
     "worker_no_progress",
     "worker_off_track",
-    "worker_runaway_diff",
     "carry_forward_patch_apply_failed",
     "engine_tool_loop_stalled",
     "engine_prompt_timeout",
@@ -455,7 +453,7 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
         phase_detail = f"{worker_id} tripped the runaway diff guard"
         recovery_action = (
             first.get("recovery_action")
-            or "Retry with a smaller scoped prompt and inspect diff stats before continuing."
+            or "Inspect the clipped diff evidence and fix the edit path before resetting this task for another run."
         )
     elif kind == "worker_unproductive_diff":
         message = failure_reason or "Worker produced a placeholder or comment-only diff."
@@ -617,20 +615,22 @@ def _worker_failure_can_retry(
     attempt: int,
     base_max_loops: int,
 ) -> bool:
+    kind = str(blocker.get("kind") or "").strip()
+    if kind not in _RETRYABLE_WORKER_BLOCKER_KINDS:
+        return False
     worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
     if (
-        str(blocker.get("kind") or "").strip() == "worker_no_progress"
+        kind == "worker_no_progress"
         and isinstance(worker, dict)
         and worker.get("worker_abandoned_after_timeout")
     ):
         return False
-    if str(blocker.get("kind") or "").strip() == "worker_no_progress" and isinstance(worker, dict):
+    if kind == "worker_no_progress" and isinstance(worker, dict):
         failure_reason = str(worker.get("failure_reason") or "").strip()
         if failure_reason in {"WORKER_NO_CHANGE", "WORKER_REPAIR_NO_CHANGE"}:
             return False
     if attempt < base_max_loops - 1:
         return True
-    kind = str(blocker.get("kind") or "").strip()
     if kind not in _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS:
         return False
     if kind in {"engine_tool_loop_stalled", "engine_prompt_timeout"} and not _worker_failure_has_partial_diff(blocker):
