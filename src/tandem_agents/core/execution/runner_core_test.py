@@ -25,6 +25,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _collect_worker_changed_files,
     _crash_blocker_for_exception,
     _execute_local_worker_pool,
+    _failed_subtask_for_retry,
     _final_lease_release_decision,
     _has_unresolved_write_required_worker_failure,
     _integration_blocker_message,
@@ -2020,6 +2021,21 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in deferred], ["subtask-2", "subtask-3"])
         self.assertIsNot(deferred[0], pending[1])
+
+    def test_failed_subtask_for_retry_keeps_failed_serial_slice(self) -> None:
+        pending = [
+            {"id": "subtask-1", "title": "One"},
+            {"id": "subtask-2", "title": "Two"},
+            {"id": "subtask-3", "title": "Three"},
+        ]
+        results = [{"subtask_id": "subtask-2", "returncode": 1}]
+
+        failed = _failed_subtask_for_retry(pending, results)
+
+        self.assertIsNotNone(failed)
+        assert failed is not None
+        self.assertEqual(failed["id"], "subtask-2")
+        self.assertIsNot(failed, pending[1])
 
     def test_unproductive_diff_does_not_get_extra_partial_diff_retries(self) -> None:
         cfg = SimpleNamespace(env={})

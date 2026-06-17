@@ -2232,6 +2232,106 @@ class PlanningPreScreenTest(unittest.TestCase):
             ]
             self.assertEqual(events[-1]["type"], "manager.deterministic_repo_context_plan")
 
+    def test_run_manager_prompt_reuses_deterministic_repair_queue_without_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            repo_path = Path(tmp) / "repo"
+            for child in ("artifacts", "logs"):
+                (run_dir / child).mkdir(parents=True, exist_ok=True)
+            repo_path.mkdir()
+            status_path = run_dir / "status.json"
+            failed_subtask = {
+                "id": "fallback-throughput-config-loader",
+                "title": "Config loader",
+                "files": ["src/tandem_agents/config/config_loader.py"],
+                "target_files": ["src/tandem_agents/config/config_loader.py"],
+                "acceptance_criteria": ["Load exact scheduler fields."],
+            }
+            deferred_subtask = {
+                "id": "fallback-throughput-config-loader-tests",
+                "title": "Config loader tests",
+                "files": ["src/tandem_agents/config/config_loader_test.py"],
+                "target_files": ["src/tandem_agents/config/config_loader_test.py"],
+                "acceptance_criteria": ["Test exact scheduler fields."],
+            }
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={}, swarm=SimpleNamespace(max_workers=4, enabled=False)),
+                repo_path=repo_path,
+                task={
+                    "task_id": "TAN-173",
+                    "title": "LACA-15 Add ACA throughput metrics, backpressure, and cost controls",
+                    "execution_kind": "code_edit",
+                    "source": {"type": "linear"},
+                },
+                repo={"path": str(repo_path)},
+                layout={
+                    "run_dir": run_dir,
+                    "artifacts": run_dir / "artifacts",
+                    "logs": run_dir / "logs",
+                    "events": run_dir / "events.jsonl",
+                    "blackboard": run_dir / "blackboard.yaml",
+                    "status": status_path,
+                },
+                run_dir=run_dir,
+                run_id="run-1",
+                blackboard={
+                    "manager_deterministic_repo_context_plan": {"reason": "repo_context_required_files"},
+                    "repair": {
+                        "attempt": 2,
+                        "completed_subtask_ids": ["fallback-throughput-config-types"],
+                        "failed_subtask": failed_subtask,
+                        "deferred_subtasks": [deferred_subtask],
+                    },
+                },
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "phase": {"name": "task_resolution", "detail": "task resolved"},
+                    "blocker": {"active": False, "kind": None, "message": None, "owner_role": None},
+                    "metrics": {},
+                    "repair": {"attempt": 2},
+                },
+            )
+            repo_context = SimpleNamespace(
+                source="repo.context_bundle",
+                fallback_used=False,
+                error=None,
+                artifact_path="",
+                path_scope="src/tandem_agents",
+                required_files=[],
+                index_source="stored",
+                index_status="refreshed",
+                index_error=None,
+                text="",
+            )
+
+            with (
+                mock.patch(
+                    "src.tandem_agents.core.repository.repo_context.repo_context_for_task",
+                    return_value=repo_context,
+                ),
+                mock.patch(
+                    "src.tandem_agents.core.engine.engine.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5"},
+                ),
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt") as stream_prompt,
+            ):
+                result = run_manager_prompt(ctx)
+
+            stream_prompt.assert_not_called()
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["engine"], {"skipped": True, "reason": "deterministic_repo_context_repair_queue"})
+            self.assertEqual(
+                [subtask["id"] for subtask in ctx.manager_plan["subtasks"]],
+                ["fallback-throughput-config-loader", "fallback-throughput-config-loader-tests"],
+            )
+            self.assertIn("retrying this deterministic repo-context slice", ctx.manager_plan["subtasks"][0]["scope_note"])
+            self.assertIn("deferred this deterministic repo-context slice", ctx.manager_plan["subtasks"][1]["scope_note"])
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "manager.deterministic_repo_context_repair_plan")
+
     def test_invalid_manager_fallback_builds_deterministic_repo_context_subtasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

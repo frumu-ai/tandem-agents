@@ -1151,6 +1151,88 @@ def _deterministic_repo_context_manager_result(ctx: RunContext) -> dict[str, Any
     }
 
 
+def _deterministic_repo_context_repair_manager_result(ctx: RunContext) -> dict[str, Any] | None:
+    if "manager_deterministic_repo_context_plan" not in ctx.blackboard:
+        return None
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    if not isinstance(repair, dict):
+        return None
+    attempt = _repair_int(repair.get("attempt"))
+    if attempt <= 1:
+        return None
+
+    completed_ids = {
+        str(subtask_id or "").strip()
+        for subtask_id in repair.get("completed_subtask_ids") or []
+        if str(subtask_id or "").strip()
+    }
+    subtasks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_subtask(raw_subtask: Any, note: str) -> None:
+        if not isinstance(raw_subtask, dict):
+            return
+        subtask = dict(raw_subtask)
+        subtask_id = str(subtask.get("id") or "").strip()
+        if not subtask_id or subtask_id in completed_ids or subtask_id in seen:
+            return
+        scope_note = str(subtask.get("scope_note") or "").strip()
+        if note not in scope_note:
+            subtask["scope_note"] = f"{scope_note}\n{note}".strip()
+        subtasks.append(subtask)
+        seen.add(subtask_id)
+
+    add_subtask(
+        repair.get("failed_subtask"),
+        "ACA is retrying this deterministic repo-context slice exactly after the previous worker failed.",
+    )
+    for item in repair.get("deferred_subtasks") or []:
+        add_subtask(
+            item,
+            "ACA deferred this deterministic repo-context slice while retrying an earlier failed slice.",
+        )
+    if not subtasks:
+        return None
+
+    ctx.manager_plan = {
+        "summary": "ACA reused the deterministic repo-context repair queue instead of broad replanning.",
+        "subtasks": subtasks,
+        "risks": [
+            "Repair planning was constrained to the failed deterministic slice plus deferred deterministic slices."
+        ],
+        "tests": [],
+    }
+    ctx.blackboard["manager_plan"] = ctx.manager_plan
+    ctx.blackboard["manager_deterministic_repo_context_repair_plan"] = {
+        "reason": "deterministic_repo_context_repair_queue",
+        "attempt": attempt,
+        "completed_subtask_ids": sorted(completed_ids),
+        "planned_workers": len(subtasks),
+        "subtask_ids": [str(subtask.get("id") or "").strip() for subtask in subtasks],
+    }
+    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+    from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
+
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    append_event(
+        ctx.layout["events"],
+        "manager.deterministic_repo_context_repair_plan",
+        ctx.run_id,
+        ctx.blackboard["manager_deterministic_repo_context_repair_plan"],
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    return {
+        "role": "manager",
+        "returncode": 0,
+        "stdout": json.dumps(ctx.manager_plan),
+        "stderr": "",
+        "engine": {"skipped": True, "reason": "deterministic_repo_context_repair_queue"},
+    }
+
+
 def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[str, Any]]) -> None:
     repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
     artifacts = repair.get("partial_diff_artifacts") if isinstance(repair, dict) else []
@@ -2385,6 +2467,10 @@ def run_manager_prompt(ctx: RunContext) -> None:
     save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
     write_blackboard_snapshot(ctx.layout["run_dir"], ctx.blackboard)
     write_status(ctx.layout["status"], ctx.status)
+
+    deterministic_repo_context_repair_result = _deterministic_repo_context_repair_manager_result(ctx)
+    if deterministic_repo_context_repair_result is not None:
+        return deterministic_repo_context_repair_result
 
     deterministic_repo_context_result = _deterministic_repo_context_manager_result(ctx)
     if deterministic_repo_context_result is not None:
