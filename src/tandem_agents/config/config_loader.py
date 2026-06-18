@@ -510,6 +510,49 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
                 default=DEFAULT_SCHEDULER_POLICY,
             )
         ),
+        max_concurrent_worker_runs=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS",
+                    yaml_value=scheduler_data.get("max_concurrent_worker_runs"),
+                    default=4,
+                ),
+                4,
+            ),
+        ),
+        max_daily_model_spend_cents=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS",
+                    yaml_value=scheduler_data.get("max_daily_model_spend_cents"),
+                    default=0,
+                ),
+                0,
+            ),
+        ),
+        rate_limit_backpressure=_as_bool(
+            pick(
+                "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE",
+                yaml_value=scheduler_data.get("rate_limit_backpressure"),
+                default=True,
+            )
+        ),
+        ci_backpressure=_as_bool(
+            pick(
+                "ACA_SCHEDULER_CI_BACKPRESSURE",
+                yaml_value=scheduler_data.get("ci_backpressure"),
+                default=True,
+            )
+        ),
+        merge_queue_backpressure=_as_bool(
+            pick(
+                "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE",
+                yaml_value=scheduler_data.get("merge_queue_backpressure"),
+                default=True,
+            )
+        ),
         max_active_tasks=max(
             1,
             _as_int(

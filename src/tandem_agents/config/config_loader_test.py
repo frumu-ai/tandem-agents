@@ -41,6 +41,55 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
             self.assertEqual(cfg.scheduler.max_active_tasks_per_project, 1)
             self.assertEqual(cfg.scheduler.max_active_tasks_per_repo, 1)
 
+    def test_scheduler_budget_and_backpressure_env_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: manual
+                      prompt: Do the thing
+                    repository:
+                      slug: frumu-ai/example
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            defaults = resolve_config(root)
+
+            self.assertEqual(defaults.scheduler.max_concurrent_worker_runs, 4)
+            self.assertEqual(defaults.scheduler.max_daily_model_spend_cents, 0)
+            self.assertTrue(defaults.scheduler.rate_limit_backpressure)
+            self.assertTrue(defaults.scheduler.ci_backpressure)
+            self.assertTrue(defaults.scheduler.merge_queue_backpressure)
+
+            cfg = resolve_config(
+                root,
+                env={
+                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS": "2",
+                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS": "1234",
+                    "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE": "false",
+                    "ACA_SCHEDULER_CI_BACKPRESSURE": "false",
+                    "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE": "false",
+                },
+            )
+
+            self.assertEqual(cfg.scheduler.max_concurrent_worker_runs, 2)
+            self.assertEqual(cfg.scheduler.max_daily_model_spend_cents, 1234)
+            self.assertFalse(cfg.scheduler.rate_limit_backpressure)
+            self.assertFalse(cfg.scheduler.ci_backpressure)
+            self.assertFalse(cfg.scheduler.merge_queue_backpressure)
+
     def test_task_source_payload_can_come_from_env_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

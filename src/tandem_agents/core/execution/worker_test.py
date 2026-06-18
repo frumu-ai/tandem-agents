@@ -80,6 +80,20 @@ from src.tandem_agents.core.phases.worker_dispatch import (
 )
 
 
+_PRE_THROUGHPUT_CONFIG_LOADER = """\
+def build_scheduler_config():
+    return SchedulerConfig(
+        policy=str(
+            pick("ACA_SCHEDULER_POLICY", default="fair")
+        ),
+        max_active_tasks=max(
+            1,
+            _as_int(pick("ACA_SCHEDULER_MAX_ACTIVE_TASKS", default=2), 2),
+        ),
+    )
+"""
+
+
 class WorkerFailureCoercionTest(unittest.TestCase):
     def test_dash_blocked_heading_reports_blocker(self) -> None:
         self.assertTrue(
@@ -1979,8 +1993,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             root = Path(tmp)
             target = root / "src/tandem_agents/config/config_loader.py"
             target.parent.mkdir(parents=True)
-            source = Path("src/tandem_agents/config/config_loader.py")
-            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            target.write_text(_PRE_THROUGHPUT_CONFIG_LOADER, encoding="utf-8")
             log_path = root / "worker.log"
 
             result = _run_deterministic_throughput_slice(
@@ -2010,10 +2023,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             worktree.mkdir()
             target = worktree / "src/tandem_agents/config/config_loader.py"
             target.parent.mkdir(parents=True)
-            target.write_text(
-                Path("src/tandem_agents/config/config_loader.py").read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
+            target.write_text(_PRE_THROUGHPUT_CONFIG_LOADER, encoding="utf-8")
             cfg = SimpleNamespace()
 
             def summarize(result: dict[str, object], *_args: object) -> dict[str, object]:

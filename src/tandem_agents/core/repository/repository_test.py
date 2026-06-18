@@ -34,6 +34,13 @@ from src.tandem_agents.core.repository.repository import (
 
 
 def _config_for_repo(root: Path, repo_path: Path):
+    if (repo_path / ".git").exists():
+        remote_result = run_command(["git", "-C", str(repo_path), "remote", "get-url", "origin"])
+        if remote_result.returncode != 0:
+            run_command(["git", "-C", str(repo_path), "remote", "add", "origin", "https://github.com/acme/demo.git"])
+        head_result = run_command(["git", "-C", str(repo_path), "rev-parse", "--verify", "HEAD"])
+        if head_result.returncode == 0:
+            run_command(["git", "-C", str(repo_path), "update-ref", "refs/remotes/origin/main", "HEAD"])
     (root / "agent.yaml").write_text(
         "\n".join(
             [
@@ -46,6 +53,7 @@ def _config_for_repo(root: Path, repo_path: Path):
                 "  prompt: x",
                 "repository:",
                 f"  path: {repo_path}",
+                f"  worktree_root: {root}",
                 "provider:",
                 "  id: openai",
                 "  model: gpt-4.1-mini",
@@ -232,7 +240,10 @@ class RepositoryNamingTest(unittest.TestCase):
             run_command(["git", "clone", str(bare), str(checkout)])
 
             cfg = _config_for_repo(root, checkout)
-            results = fetch_pr_refs(cfg, checkout, [1])
+            with mock.patch(
+                "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+            ):
+                results = fetch_pr_refs(cfg, checkout, [1])
 
             self.assertEqual(len(results), 1)
             self.assertTrue(results[0]["ok"], results[0])
@@ -256,7 +267,10 @@ class RepositoryNamingTest(unittest.TestCase):
             run_command(["git", "clone", str(bare), str(checkout)])
 
             cfg = _config_for_repo(root, checkout)
-            results = fetch_pr_refs(cfg, checkout, [999])
+            with mock.patch(
+                "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+            ):
+                results = fetch_pr_refs(cfg, checkout, [999])
 
             self.assertEqual(len(results), 1)
             self.assertFalse(results[0]["ok"])
@@ -293,6 +307,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository safety",
                         "repository:",
                         f"  path: {repo_dir}",
+                        f"  worktree_root: {root}",
                         "  clone_url: https://github.com/acme/demo.git",
                         "provider:",
                         "  id: openai",
@@ -328,6 +343,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  path: board.yaml",
                         "repository:",
                         f"  path: {repo_dir}",
+                        f"  worktree_root: {root}",
                         "provider:",
                         "  id: openai",
                         "  model: gpt-4.1-mini",
@@ -373,6 +389,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository clone",
                         "repository:",
                         f"  path: {target}",
+                        f"  worktree_root: {root}",
                         f"  clone_url: {source}",
                         "provider:",
                         "  id: openai",
@@ -386,11 +403,85 @@ class RepositoryNamingTest(unittest.TestCase):
             )
             cfg = resolve_config(root)
 
-            repo = resolve_repository(cfg)
+            with mock.patch(
+                "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+            ):
+                repo = resolve_repository(cfg)
 
             self.assertEqual(Path(repo["path"]).resolve(), target.resolve())
             self.assertTrue((target / ".git").exists())
             self.assertTrue((target / "README.md").exists())
+
+    def test_resolve_repository_rejects_local_clone_url_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "workspace" / "checkout"
+            source.mkdir(parents=True, exist_ok=True)
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (root / "agent.yaml").write_text(
+                "\n".join(
+                    [
+                        "agent:",
+                        "  name: ACA",
+                        "tandem:",
+                        "  base_url: http://127.0.0.1:39733",
+                        "task_source:",
+                        "  type: manual",
+                        "  prompt: Repository clone",
+                        "repository:",
+                        f"  path: {target}",
+                        f"  worktree_root: {root / 'workspace'}",
+                        f"  clone_url: {source}",
+                        "provider:",
+                        "  id: openai",
+                        "  model: gpt-4.1-mini",
+                        "output:",
+                        "  root: runs",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cfg = resolve_config(root)
+
+            with self.assertRaisesRegex(RuntimeError, "must reference GitHub"):
+                resolve_repository(cfg)
+
+    def test_resolve_repository_rejects_repo_path_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            workspace = root / "workspace"
+            outside.mkdir(parents=True, exist_ok=True)
+            workspace.mkdir(parents=True, exist_ok=True)
+            (root / "agent.yaml").write_text(
+                "\n".join(
+                    [
+                        "agent:",
+                        "  name: ACA",
+                        "tandem:",
+                        "  base_url: http://127.0.0.1:39733",
+                        "task_source:",
+                        "  type: manual",
+                        "  prompt: Repository path",
+                        "repository:",
+                        f"  path: {outside}",
+                        f"  worktree_root: {workspace}",
+                        "provider:",
+                        "  id: openai",
+                        "  model: gpt-4.1-mini",
+                        "output:",
+                        "  root: runs",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cfg = resolve_config(root)
+
+            with self.assertRaisesRegex(RuntimeError, "inside ACA workspace root"):
+                resolve_repository(cfg)
 
     def test_resolve_repository_uses_token_file_for_private_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,6 +503,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository clone",
                         "repository:",
                         f"  path: {repo_dir}",
+                        f"  worktree_root: {root}",
                         f"  clone_url: https://github.com/acme/private-repo.git",
                         f"  credential_file: {token_file}",
                         "provider:",
@@ -446,6 +538,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository clone",
                         "repository:",
                         "  path: repo",
+                        f"  worktree_root: {root}",
                         "  clone_url: https://github.com/acme/private-repo.git",
                         "provider:",
                         "  id: openai",
@@ -492,6 +585,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository pull",
                         "repository:",
                         f"  path: {target}",
+                        f"  worktree_root: {root}",
                         f"  clone_url: {source}",
                         "  default_branch: main",
                         "provider:",
@@ -506,9 +600,60 @@ class RepositoryNamingTest(unittest.TestCase):
             )
             cfg = resolve_config(root)
 
-            resolve_repository(cfg)
+            with mock.patch(
+                "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+            ):
+                resolve_repository(cfg)
 
             self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "two\n")
+
+    def test_resolve_repository_rejects_default_branch_ahead_of_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "checkout"
+            source.mkdir(parents=True, exist_ok=True)
+            ident = ["-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid"]
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("origin\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), *ident, "add", "README.md"])
+            run_command(["git", "-C", str(source), *ident, "commit", "-m", "origin"])
+            run_command(["git", "clone", str(source), str(target)])
+            (target / "LOCAL.md").write_text("local only\n", encoding="utf-8")
+            run_command(["git", "-C", str(target), *ident, "add", "LOCAL.md"])
+            run_command(["git", "-C", str(target), *ident, "commit", "-m", "local only"])
+            (root / "agent.yaml").write_text(
+                "\n".join(
+                    [
+                        "agent:",
+                        "  name: ACA",
+                        "tandem:",
+                        "  base_url: http://127.0.0.1:39733",
+                        "task_source:",
+                        "  type: manual",
+                        "  prompt: Repository pull",
+                        "repository:",
+                        f"  path: {target}",
+                        f"  worktree_root: {root}",
+                        f"  clone_url: {source}",
+                        "  default_branch: main",
+                        "provider:",
+                        "  id: openai",
+                        "  model: gpt-4.1-mini",
+                        "output:",
+                        "  root: runs",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cfg = resolve_config(root)
+
+            with self.assertRaisesRegex(RuntimeError, "ahead of `origin/main`"):
+                with mock.patch(
+                    "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+                ):
+                    resolve_repository(cfg)
 
     def test_concurrent_resolve_repository_serializes_shared_checkout_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -535,6 +680,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository pull",
                         "repository:",
                         f"  path: {target}",
+                        f"  worktree_root: {root}",
                         f"  clone_url: {source}",
                         "  default_branch: main",
                         "provider:",
@@ -549,8 +695,11 @@ class RepositoryNamingTest(unittest.TestCase):
             )
             cfg = resolve_config(root)
 
-            with ThreadPoolExecutor(max_workers=6) as pool:
-                repos = list(pool.map(lambda _: resolve_repository(cfg), range(12)))
+            with mock.patch(
+                "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+            ):
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    repos = list(pool.map(lambda _: resolve_repository(cfg), range(12)))
 
             self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "two\n")
             self.assertEqual({Path(repo["path"]).resolve() for repo in repos}, {target.resolve()})
@@ -579,6 +728,7 @@ class RepositoryNamingTest(unittest.TestCase):
                         "  prompt: Repository pull",
                         "repository:",
                         f"  path: {target}",
+                        f"  worktree_root: {root}",
                         f"  clone_url: {source}",
                         "provider:",
                         "  id: openai",
@@ -593,7 +743,10 @@ class RepositoryNamingTest(unittest.TestCase):
             cfg = resolve_config(root)
 
             with self.assertRaisesRegex(RuntimeError, "uncommitted changes"):
-                resolve_repository(cfg)
+                with mock.patch(
+                    "src.tandem_agents.core.repository.repository._validate_github_repository_reference"
+                ):
+                    resolve_repository(cfg)
 
     def test_checkout_run_branch_fails_when_default_checkout_is_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
