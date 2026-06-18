@@ -1079,9 +1079,18 @@ def _run_start_preflight(
             "artifact": str(artifact_path),
             "repo_path": str(repo_path),
             "engine_visible_repo_path": str(engine_repo_path),
-            "git_status_ok": result.returncode == 0,
+            "git_status_ok": result.returncode == 0
+            and not re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout),
         },
     )
+    if result.returncode == 0 and re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout):
+        return preflight, {
+            "kind": "repository_base_not_synced",
+            "message": result.stdout.strip(),
+            "recovery_action": (
+                "Fetch GitHub and make the ACA default branch match origin before starting a run."
+            ),
+        }
     if result.returncode == 0:
         return preflight, None
     kind = "repo_safe_directory" if "dubious ownership" in detail.lower() else "engine_workspace_unreachable"

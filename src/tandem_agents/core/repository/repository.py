@@ -41,15 +41,64 @@ def _github_pat(cfg: ResolvedConfig) -> str:
 
 
 def _is_github_clone_url(clone_url: str) -> bool:
+    text = str(clone_url or "").strip()
+    if text.startswith("git@github.com:"):
+        return True
     try:
-        parsed = urlparse(clone_url)
+        parsed = urlparse(text)
     except Exception:
         return False
     host = (parsed.hostname or "").lower()
     return host == "github.com"
 
 
+def _validate_github_repository_reference(cfg: ResolvedConfig, value: str, *, field_name: str) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if _is_github_clone_url(text):
+        return
+    raise RuntimeError(
+        f"{field_name} must reference GitHub; ACA refuses local repository references: {text}"
+    )
+
+
+def _validate_remote_name(remote_name: str) -> str:
+    remote = str(remote_name or "origin").strip() or "origin"
+    if (
+        remote.startswith("/")
+        or remote.startswith("~")
+        or remote.startswith("./")
+        or remote.startswith("../")
+        or "://" in remote
+        or "\\" in remote
+    ):
+        raise RuntimeError(
+            f"repository.remote_name must be a git remote name, not a path or URL: {remote}"
+        )
+    return remote
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _ensure_repo_path_in_workspace(cfg: ResolvedConfig, repo_path: Path) -> None:
+    workspace_root = cfg.repository_worktree_root()
+    if _path_is_within(repo_path, workspace_root):
+        return
+    raise RuntimeError(
+        "Repository path must stay inside ACA workspace root "
+        f"{workspace_root}: {repo_path.resolve()}"
+    )
+
+
 def _git_clone_args_and_env(cfg: ResolvedConfig, clone_url: str, target: Path) -> tuple[list[str], dict[str, str]]:
+    _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     env = dict(cfg.env)
     env["GIT_TERMINAL_PROMPT"] = "0"
     args = ["git"]
@@ -63,6 +112,7 @@ def _git_clone_args_and_env(cfg: ResolvedConfig, clone_url: str, target: Path) -
 
 
 def _git_auth_args(cfg: ResolvedConfig, clone_url: str) -> tuple[list[str], dict[str, str]]:
+    _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     env = dict(cfg.env)
     env["GIT_TERMINAL_PROMPT"] = "0"
     args = ["git"]
@@ -104,15 +154,20 @@ def _remote_is_empty(cfg: ResolvedConfig, clone_url: str) -> bool:
 def _remote_url_for_existing_repo(cfg: ResolvedConfig, repo_path: Path) -> str:
     configured = str(cfg.repository.clone_url or "").strip()
     if configured:
+        _validate_github_repository_reference(cfg, configured, field_name="repository.clone_url")
         return configured
-    remote_name = cfg.repository.remote_name or "origin"
+    remote_name = _validate_remote_name(cfg.repository.remote_name or "origin")
     result = run_command(_git_repo_args(repo_path, "remote", "get-url", remote_name), env=cfg.env)
-    return result.stdout.strip() if result.returncode == 0 else ""
+    remote_url = result.stdout.strip() if result.returncode == 0 else ""
+    if remote_url:
+        _validate_github_repository_reference(cfg, remote_url, field_name=f"remote.{remote_name}.url")
+    return remote_url
 
 
 def _configured_clone_url(cfg: ResolvedConfig) -> str:
     clone_url = str(cfg.repository.clone_url or "").strip()
     if clone_url:
+        _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
         return clone_url
     slug = str(cfg.repository.slug or "").strip().strip("/")
     if "/" in slug:
@@ -121,6 +176,7 @@ def _configured_clone_url(cfg: ResolvedConfig) -> str:
 
 
 def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
+    _ensure_repo_path_in_workspace(cfg, repo_path)
     status = run_command(_git_repo_args(repo_path, "status", "--porcelain"), env=cfg.env)
     if status.returncode != 0:
         raise RuntimeError(status.stderr.strip() or status.stdout.strip())
@@ -129,7 +185,7 @@ def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
             f"Repository has uncommitted changes and ACA will not pull over them: {repo_path}"
         )
 
-    remote_name = cfg.repository.remote_name or "origin"
+    remote_name = _validate_remote_name(cfg.repository.remote_name or "origin")
     default_branch = cfg.repository.default_branch or "main"
     remote_url = _remote_url_for_existing_repo(cfg, repo_path)
     if not remote_url:
@@ -153,9 +209,36 @@ def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
     )
     if pull_result.returncode != 0:
         raise RuntimeError(pull_result.stderr.strip() or pull_result.stdout.strip())
+    _ensure_default_branch_matches_remote(repo_path, remote_name, default_branch)
+
+
+def _ensure_default_branch_matches_remote(repo_path: Path, remote_name: str, default_branch: str) -> None:
+    remote = _validate_remote_name(remote_name)
+    branch = str(default_branch or "main").strip() or "main"
+    remote_ref = f"{remote}/{branch}"
+    local_ref = branch
+    remote_exists = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", remote_ref))
+    if remote_exists.returncode != 0:
+        raise RuntimeError(f"Remote default branch `{remote_ref}` is not available for ACA checkout.")
+    counts = run_command(_git_repo_args(repo_path, "rev-list", "--left-right", "--count", f"{remote_ref}...{local_ref}"))
+    if counts.returncode != 0:
+        raise RuntimeError(counts.stderr.strip() or counts.stdout.strip())
+    parts = counts.stdout.strip().split()
+    behind = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+    ahead = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if ahead:
+        raise RuntimeError(
+            f"Default branch `{branch}` is ahead of `{remote_ref}` by {ahead} commits; "
+            "ACA refuses to base work on local-only commits."
+        )
+    if behind:
+        raise RuntimeError(
+            f"Default branch `{branch}` is behind `{remote_ref}` by {behind} commits after sync."
+        )
 
 
 def _bootstrap_local_repository(cfg: ResolvedConfig, target: Path) -> Path:
+    _ensure_repo_path_in_workspace(cfg, target)
     target.mkdir(parents=True, exist_ok=True)
     identity_args = _git_identity_args(cfg)
     init_result = run_command(
@@ -197,6 +280,8 @@ def _bootstrap_local_repository(cfg: ResolvedConfig, target: Path) -> Path:
 
 
 def _bootstrap_empty_repository(cfg: ResolvedConfig, clone_url: str, target: Path) -> Path:
+    _ensure_repo_path_in_workspace(cfg, target)
+    _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     target.mkdir(parents=True, exist_ok=True)
     identity_args = _git_identity_args(cfg)
     init_result = run_command(
@@ -268,10 +353,26 @@ def _clone_url_to_slug(clone_url: str) -> str:
 def repository_binding_issues(cfg: ResolvedConfig) -> list[str]:
     issues: list[str] = []
     repo_path = cfg.repository_path()
-    clone_url = _configured_clone_url(cfg)
     slug = str(cfg.repository.slug or "").strip()
+    clone_url = str(cfg.repository.clone_url or "").strip()
+    if not clone_url and "/" in slug:
+        clone_url = f"https://github.com/{slug.strip('/')}.git"
     credential_file = str(cfg.repository.credential_file or "").strip()
+    try:
+        _validate_remote_name(cfg.repository.remote_name or "origin")
+    except RuntimeError as exc:
+        issues.append(str(exc))
+    if clone_url:
+        try:
+            _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
+        except RuntimeError as exc:
+            issues.append(str(exc))
     if repo_path is not None:
+        if not _path_is_within(repo_path, cfg.repository_worktree_root()):
+            issues.append(
+                "repository.path must stay inside ACA workspace root "
+                f"{cfg.repository_worktree_root()}: {repo_path}"
+            )
         if repo_path.exists():
             if repo_path.is_file():
                 issues.append(f"repository.path points to a file, not a directory: {repo_path}")
@@ -334,6 +435,7 @@ def worker_worktree_name(worker_id: str, subtask_id: str | None = None) -> str:
 def _resolve_repository_unlocked(cfg: ResolvedConfig) -> dict[str, Any]:
     repo_path_hint = cfg.repository_path()
     if repo_path_hint:
+        _ensure_repo_path_in_workspace(cfg, repo_path_hint)
         clone_url = _configured_clone_url(cfg)
         if repo_path_hint.exists():
             if (repo_path_hint / ".git").exists():
@@ -371,6 +473,7 @@ def _resolve_repository_unlocked(cfg: ResolvedConfig) -> dict[str, Any]:
         worktree_root = cfg.repository_worktree_root()
         worktree_root.mkdir(parents=True, exist_ok=True)
         target = worktree_root / _repo_target_name(cfg)
+        _ensure_repo_path_in_workspace(cfg, target)
         if (target / ".git").exists():
             repo_path = target.resolve()
             _sync_existing_repository(cfg, repo_path)
@@ -401,6 +504,8 @@ def resolve_repository(cfg: ResolvedConfig) -> dict[str, Any]:
 def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) -> str:
     """Creates and checkouts a new branch for the run."""
     default_branch = cfg.repository.default_branch or "main"
+    remote_name = _validate_remote_name(cfg.repository.remote_name or "origin")
+    _ensure_repo_path_in_workspace(cfg, repo_path)
     checkout_default = run_command(_git_repo_args(repo_path, "checkout", default_branch), env=cfg.env)
     if checkout_default.returncode != 0:
         raise RuntimeError(checkout_default.stderr.strip() or checkout_default.stdout.strip())
@@ -411,15 +516,21 @@ def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) 
     if status.stdout.strip():
         raise RuntimeError(f"Repository has uncommitted changes before run branch checkout: {repo_path}")
 
-    create_result = run_command(_git_repo_args(repo_path, "checkout", "-b", branch_name), env=cfg.env)
+    base_ref = f"{remote_name}/{default_branch}"
+    remote_ref = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", base_ref), env=cfg.env)
+    if remote_ref.returncode != 0:
+        raise RuntimeError(
+            f"Remote default branch `{base_ref}` is not available for ACA run branch checkout."
+        )
+    _ensure_default_branch_matches_remote(repo_path, remote_name, default_branch)
+
+    branch_exists = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", branch_name), env=cfg.env)
+    if branch_exists.returncode == 0:
+        raise RuntimeError(f"ACA run branch already exists and will not be reused: {branch_name}")
+
+    create_result = run_command(_git_repo_args(repo_path, "checkout", "-b", branch_name, base_ref), env=cfg.env)
     if create_result.returncode != 0:
-        checkout_existing = run_command(_git_repo_args(repo_path, "checkout", branch_name), env=cfg.env)
-        if checkout_existing.returncode != 0:
-            detail = checkout_existing.stderr.strip() or checkout_existing.stdout.strip()
-            create_detail = create_result.stderr.strip() or create_result.stdout.strip()
-            raise RuntimeError(
-                f"Could not checkout ACA run branch `{branch_name}`: {detail or create_detail}"
-            )
+        raise RuntimeError(create_result.stderr.strip() or create_result.stdout.strip())
 
     current = current_repository_branch(repo_path, cfg=cfg)
     if current != branch_name:
