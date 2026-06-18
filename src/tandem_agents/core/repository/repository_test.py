@@ -628,7 +628,65 @@ class RepositoryNamingTest(unittest.TestCase):
 
             self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "two\n")
 
-    def test_resolve_repository_rejects_default_branch_ahead_of_origin(self) -> None:
+    def test_resolve_repository_archives_and_resets_managed_default_branch_ahead_of_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace" / "repos"
+            source = workspace / "source"
+            target = workspace / "checkout"
+            source.mkdir(parents=True, exist_ok=True)
+            ident = ["-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid"]
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("origin\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), *ident, "add", "README.md"])
+            run_command(["git", "-C", str(source), *ident, "commit", "-m", "origin"])
+            run_command(["git", "clone", str(source), str(target)])
+            (target / "LOCAL.md").write_text("local only\n", encoding="utf-8")
+            run_command(["git", "-C", str(target), *ident, "add", "LOCAL.md"])
+            run_command(["git", "-C", str(target), *ident, "commit", "-m", "local only"])
+            local_head = run_command(["git", "-C", str(target), "rev-parse", "HEAD"]).stdout.strip()
+            (root / "agent.yaml").write_text(
+                "\n".join(
+                    [
+                        "agent:",
+                        "  name: ACA",
+                        "tandem:",
+                        "  base_url: http://127.0.0.1:39733",
+                        "task_source:",
+                        "  type: manual",
+                        "  prompt: Repository pull",
+                        "repository:",
+                        "  path: workspace/repos/checkout",
+                        "  worktree_root: workspace/repos",
+                        f"  clone_url: {source}",
+                        "  allowed_hosts: local",
+                        "  default_branch: main",
+                        "provider:",
+                        "  id: openai",
+                        "  model: gpt-4.1-mini",
+                        "output:",
+                        "  root: runs",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cfg = resolve_config(root)
+
+            resolve_repository(cfg)
+
+            self.assertFalse((target / "LOCAL.md").exists())
+            counts = run_command(["git", "-C", str(target), "rev-list", "--left-right", "--count", "origin/main...main"])
+            self.assertEqual(counts.stdout.strip(), "0\t0")
+            backups = run_command(["git", "-C", str(target), "branch", "--list", "aca/archive/main/*"])
+            backup_names = [line.strip().lstrip("* ").strip() for line in backups.stdout.splitlines() if line.strip()]
+            self.assertEqual(len(backup_names), 1, backups.stdout)
+            backup_head = run_command(["git", "-C", str(target), "rev-parse", backup_names[0]]).stdout.strip()
+            self.assertEqual(backup_head, local_head)
+            show = run_command(["git", "-C", str(target), "show", "--name-only", "--format=", backup_names[0]])
+            self.assertIn("LOCAL.md", show.stdout)
+
+    def test_resolve_repository_rejects_non_managed_default_branch_ahead_of_origin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
