@@ -1766,6 +1766,11 @@ def _missing_required_production_anchor_tokens(subtask: dict[str, Any], diff_tex
             "rate_limit_backpressure: bool",
             "ci_backpressure: bool",
             "merge_queue_backpressure: bool",
+            "\"max_concurrent_worker_runs\": self.scheduler.max_concurrent_worker_runs",
+            "\"max_daily_model_spend_cents\": self.scheduler.max_daily_model_spend_cents",
+            "\"rate_limit_backpressure\": self.scheduler.rate_limit_backpressure",
+            "\"ci_backpressure\": self.scheduler.ci_backpressure",
+            "\"merge_queue_backpressure\": self.scheduler.merge_queue_backpressure",
         ],
         "fallback-throughput-config-loader": [
             "SchedulerConfig(",

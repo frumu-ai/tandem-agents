@@ -27,6 +27,7 @@ from src.tandem_agents.core.execution.worker import (
     _git_ignored_paths,
     _manager_plan_stream_complete,
     _materialize_worker_context,
+    _missing_required_production_anchor_tokens,
     _preserve_partial_worker_diff,
     _recover_nonzero_result_with_diff,
     _recover_nonzero_result_if_diff_satisfies_subtask,
@@ -2306,6 +2307,19 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(result["failure_reason"], "TERMINALIZED_MISSING_PRODUCTION_ANCHORS")
             self.assertIn("max_concurrent_worker_runs: int", result["recovery_action"])
             self.assertNotIn("terminalized_after_tool_loop", result)
+
+    def test_production_anchors_require_config_type_fields_and_serialization(self) -> None:
+        subtask = {"id": "fallback-throughput-config-types"}
+        dataclass_only_diff = (
+            "+    max_concurrent_worker_runs: int = DEFAULT_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS\n"
+            "+    max_daily_model_spend_cents: int = DEFAULT_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS\n"
+            "+    rate_limit_backpressure: bool = DEFAULT_SCHEDULER_RATE_LIMIT_BACKPRESSURE\n"
+            "+    ci_backpressure: bool = DEFAULT_SCHEDULER_CI_BACKPRESSURE\n"
+            "+    merge_queue_backpressure: bool = DEFAULT_SCHEDULER_MERGE_QUEUE_BACKPRESSURE\n"
+        )
+        missing = _missing_required_production_anchor_tokens(subtask, dataclass_only_diff)
+
+        self.assertIn('"max_concurrent_worker_runs": self.scheduler.max_concurrent_worker_runs', missing)
 
     def test_tool_loop_terminalize_skips_deferred_partial_diff_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
