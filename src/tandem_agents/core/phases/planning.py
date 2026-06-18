@@ -970,9 +970,9 @@ def _deterministic_invalid_manager_subtasks(
                 "files": throughput_scheduler_files,
                 "target_files": throughput_scheduler_files,
                 "acceptance_criteria": [
-                    "In src/tandem_agents/core/scheduling/scheduler.py, make plan_task_admissions enforce cfg.scheduler.max_concurrent_worker_runs by setting max_total to the lower of max_active_tasks and max_concurrent_worker_runs when the worker cap is positive.",
-                    "Include max_concurrent_worker_runs in the plan_task_admissions limits payload so the operator can see which worker cap was applied.",
-                    "When queued work remains because len(admitted) reaches max_concurrent_worker_runs, append blocked entries for those remaining candidates with reason worker_concurrency_reached, preserving task_key, project_key, repo_key, scope_mode, and scope_paths.",
+                    "In src/tandem_agents/core/scheduling/scheduler.py, make plan_task_admissions enforce cfg.scheduler.max_concurrent_worker_runs by subtracting currently active work before admitting new tasks.",
+                    "Include max_concurrent_worker_runs and remaining worker slots in the plan_task_admissions limits payload so the operator can see which worker cap was applied.",
+                    "When queued work remains because active-plus-admitted work reaches max_concurrent_worker_runs, append blocked entries for those remaining candidates with reason worker_concurrency_reached, preserving task_key, project_key, repo_key, scope_mode, and scope_paths.",
                     "In src/tandem_agents/core/scheduling/scheduler_test.py, add a focused test with max_active_tasks above max_concurrent_worker_runs that proves otherwise-admissible work is blocked with worker_concurrency_reached.",
                     "Update any existing scheduler test that intentionally admits six tasks so it sets max_concurrent_worker_runs high enough for that scenario.",
                     "Keep the change limited to scheduler behavior and its direct tests; config parsing is handled by the config-control slice.",
@@ -1101,6 +1101,8 @@ def _should_use_deterministic_repo_context_plan(ctx: RunContext) -> bool:
     repo_context = ctx.blackboard.get("repo_context") if isinstance(ctx.blackboard, dict) else {}
     if not isinstance(repo_context, dict) or not bool(repo_context.get("required_files_applied_as_target_files")):
         return False
+    if "manager_invalid_plan" not in ctx.blackboard and not getattr(ctx, "_manager_fallback_required", False):
+        return False
     source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
     source_type = str(source.get("type") or "").strip() if isinstance(source, dict) else ""
     execution_kind = str(ctx.task.get("execution_kind") or "").strip()
@@ -1115,16 +1117,19 @@ def _deterministic_repo_context_manager_result(ctx: RunContext) -> dict[str, Any
     if not fallback_files or not subtasks:
         return None
     ctx.manager_plan = {
-        "summary": "ACA used graph-required repo-context files to build a deterministic worker plan.",
+        "summary": (
+            "ACA used graph-required repo-context files to build a deterministic worker plan after "
+            "manager planning failed."
+        ),
         "subtasks": subtasks,
         "risks": [
-            "Manager engine planning was skipped because the repo graph supplied concrete required files."
+            "Manager engine planning previously failed; deterministic repo-context fallback is scoped to required files."
         ],
         "tests": [],
     }
     ctx.blackboard["manager_plan"] = ctx.manager_plan
     ctx.blackboard["manager_deterministic_repo_context_plan"] = {
-        "reason": "repo_context_required_files",
+        "reason": "repo_context_required_files_after_manager_failure",
         "planned_workers": len(subtasks),
         "required_files": fallback_files,
     }
@@ -1147,7 +1152,7 @@ def _deterministic_repo_context_manager_result(ctx: RunContext) -> dict[str, Any
         "returncode": 0,
         "stdout": json.dumps(ctx.manager_plan),
         "stderr": "",
-        "engine": {"skipped": True, "reason": "repo_context_required_files"},
+        "engine": {"skipped": True, "reason": "repo_context_required_files_after_manager_failure"},
     }
 
 

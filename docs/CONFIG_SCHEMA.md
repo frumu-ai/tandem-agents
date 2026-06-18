@@ -117,6 +117,7 @@ Optional fields:
 - `default_branch`: string, defaults to `main`
 - `worktree_root`: string, host-side worktree base
 - `remote_name`: string, defaults to `origin`
+- `allowed_hosts`: comma-separated remote host allow-list, defaults to `github.com`; use `*` for any network git host or `local` for local clone URLs that stay inside `worktree_root`
 
 ### `provider`
 
@@ -308,6 +309,7 @@ Behavior:
 - `ACA_WORKTREE_ROOT` -> `repository.worktree_root`
 - `ACA_WORKSPACE_ROOT` -> container workspace base used by Docker Compose
 - `ACA_REMOTE_NAME` -> `repository.remote_name`
+- `ACA_REPO_ALLOWED_HOSTS` -> `repository.allowed_hosts`
 - `AUTOCODER_REPO_*` and related branch/remote names -> legacy aliases still accepted by the loader
 
 ### Provider / Model

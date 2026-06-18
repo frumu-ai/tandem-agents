@@ -475,7 +475,15 @@ def plan_task_admissions(
     admitted: list[dict[str, Any]] = []
     max_active_total = max(1, int(cfg.scheduler.max_active_tasks))
     max_worker_runs = max(0, int(cfg.scheduler.max_concurrent_worker_runs))
-    max_total = min(max_active_total, max_worker_runs) if max_worker_runs > 0 else max_active_total
+    active_total_count = len(active_for_capacity)
+    active_worker_count = max(len(active_for_capacity), len(active_coder_runs))
+    remaining_active_slots = max(0, max_active_total - active_total_count)
+    remaining_worker_slots = (
+        max(0, max_worker_runs - active_worker_count)
+        if max_worker_runs > 0
+        else remaining_active_slots
+    )
+    max_total = min(remaining_active_slots, remaining_worker_slots)
     max_per_project = max(1, int(cfg.scheduler.max_active_tasks_per_project))
     max_per_repo = max(1, int(cfg.scheduler.max_active_tasks_per_repo))
     ordered_projects = sorted(grouped.keys())
@@ -583,7 +591,12 @@ def plan_task_admissions(
         if not progressed:
             break
 
-    if max_worker_runs > 0 and len(admitted) >= max_worker_runs:
+    capacity_reason = ""
+    if max_worker_runs > 0 and active_worker_count + len(admitted) >= max_worker_runs:
+        capacity_reason = "worker_concurrency_reached"
+    elif active_total_count + len(admitted) >= max_active_total:
+        capacity_reason = "active_capacity_reached"
+    if capacity_reason:
         for queue in grouped.values():
             for task in list(queue):
                 task_scopes = task_file_scopes(task)
@@ -592,7 +605,7 @@ def plan_task_admissions(
                         "task_key": task.get("task_key"),
                         "project_key": task_project_key(task),
                         "repo_key": task_repo_key(task),
-                        "reason": "worker_concurrency_reached",
+                        "reason": capacity_reason,
                         "scope_mode": _scope_mode(task),
                         "scope_paths": ["/".join(parts) for parts in task_scopes],
                     }
@@ -602,8 +615,10 @@ def plan_task_admissions(
     snapshot = {
         "policy": cfg.scheduler.policy,
         "limits": {
-            "max_active_tasks": max_total,
+            "max_active_tasks": max_active_total,
             "max_concurrent_worker_runs": max_worker_runs,
+            "remaining_active_slots": remaining_active_slots,
+            "remaining_worker_slots": remaining_worker_slots,
             "max_active_tasks_per_project": max_per_project,
             "max_active_tasks_per_repo": max_per_repo,
             "queue_depth_limit": cfg.scheduler.queue_depth_limit,

@@ -619,14 +619,24 @@ def _deterministic_throughput_scheduler_controls(worktree: Path, *, tests_only: 
                 "    max_total = max(1, int(cfg.scheduler.max_active_tasks))\n",
                 "    max_active_total = max(1, int(cfg.scheduler.max_active_tasks))\n"
                 "    max_worker_runs = max(0, int(cfg.scheduler.max_concurrent_worker_runs))\n"
-                "    max_total = min(max_active_total, max_worker_runs) if max_worker_runs > 0 else max_active_total\n",
+                "    active_total_count = len(active_for_capacity)\n"
+                "    active_worker_count = max(len(active_for_capacity), len(active_coder_runs))\n"
+                "    remaining_active_slots = max(0, max_active_total - active_total_count)\n"
+                "    remaining_worker_slots = (\n"
+                "        max(0, max_worker_runs - active_worker_count)\n"
+                "        if max_worker_runs > 0\n"
+                "        else remaining_active_slots\n"
+                "    )\n"
+                "    max_total = min(remaining_active_slots, remaining_worker_slots)\n",
             )
             changed = changed or inserted
             text, inserted = _replace_once(
                 text,
                 '            "max_active_tasks": max_total,\n',
-                '            "max_active_tasks": max_total,\n'
+                '            "max_active_tasks": max_active_total,\n'
                 '            "max_concurrent_worker_runs": max_worker_runs,\n',
+                '            "remaining_active_slots": remaining_active_slots,\n'
+                '            "remaining_worker_slots": remaining_worker_slots,\n',
             )
             changed = changed or inserted
         if "worker_concurrency_reached" not in text:
@@ -635,7 +645,12 @@ def _deterministic_throughput_scheduler_controls(worktree: Path, *, tests_only: 
                 "        if not progressed:\n            break\n\n    snapshot = {\n",
                 "        if not progressed:\n"
                 "            break\n\n"
-                "    if max_worker_runs > 0 and len(admitted) >= max_worker_runs:\n"
+                "    capacity_reason = \"\"\n"
+                "    if max_worker_runs > 0 and active_worker_count + len(admitted) >= max_worker_runs:\n"
+                "        capacity_reason = \"worker_concurrency_reached\"\n"
+                "    elif active_total_count + len(admitted) >= max_active_total:\n"
+                "        capacity_reason = \"active_capacity_reached\"\n"
+                "    if capacity_reason:\n"
                 "        for queue in grouped.values():\n"
                 "            for task in list(queue):\n"
                 "                task_scopes = task_file_scopes(task)\n"
@@ -644,7 +659,7 @@ def _deterministic_throughput_scheduler_controls(worktree: Path, *, tests_only: 
                 '                        "task_key": task.get("task_key"),\n'
                 '                        "project_key": task_project_key(task),\n'
                 '                        "repo_key": task_repo_key(task),\n'
-                '                        "reason": "worker_concurrency_reached",\n'
+                '                        "reason": capacity_reason,\n'
                 '                        "scope_mode": _scope_mode(task),\n'
                 '                        "scope_paths": ["/".join(parts) for parts in task_scopes],\n'
                 "                    }\n"

@@ -27,6 +27,7 @@ from src.tandem_agents.core.phases.planning import (
     _remote_code_task_requires_worker_execution,
     _sanitize_partial_diff_artifact_paths_in_plan,
     _serial_subtask_limit,
+    _should_use_deterministic_repo_context_plan,
     _split_dense_serial_subtasks,
     _write_required_after_prescreen,
     run_manager_prompt,
@@ -2098,7 +2099,17 @@ class PlanningPreScreenTest(unittest.TestCase):
             invalid_events = [event for event in events if event["type"] == "manager.invalid_plan"]
             self.assertEqual(invalid_events[-1]["payload"]["recoverable"], True)
 
-    def test_run_manager_prompt_uses_deterministic_repo_context_plan_without_engine(self) -> None:
+    def test_deterministic_repo_context_plan_requires_previous_manager_failure(self) -> None:
+        ctx = SimpleNamespace(
+            blackboard={"repo_context": {"required_files_applied_as_target_files": True}},
+            task={"execution_kind": "code_edit", "source": {"type": "linear"}},
+        )
+
+        self.assertFalse(_should_use_deterministic_repo_context_plan(ctx))
+        ctx.blackboard["manager_invalid_plan"] = {"reason": "Manager planning did not return JSON."}
+        self.assertTrue(_should_use_deterministic_repo_context_plan(ctx))
+
+    def test_run_manager_prompt_uses_deterministic_repo_context_plan_after_manager_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run-1"
             repo_path = Path(tmp) / "repo"
@@ -2150,7 +2161,7 @@ class PlanningPreScreenTest(unittest.TestCase):
                 },
                 run_dir=run_dir,
                 run_id="run-1",
-                blackboard={},
+                blackboard={"manager_invalid_plan": {"reason": "Manager planning did not return JSON."}},
                 status={
                     "run": {"run_id": "run-1", "status": "running"},
                     "phase": {"name": "task_resolution", "detail": "task resolved"},
@@ -2186,7 +2197,10 @@ class PlanningPreScreenTest(unittest.TestCase):
 
             stream_prompt.assert_not_called()
             self.assertEqual(result["returncode"], 0)
-            self.assertEqual(result["engine"], {"skipped": True, "reason": "repo_context_required_files"})
+            self.assertEqual(
+                result["engine"],
+                {"skipped": True, "reason": "repo_context_required_files_after_manager_failure"},
+            )
             subtask_ids = [subtask["id"] for subtask in ctx.manager_plan["subtasks"]]
             self.assertEqual(
                 subtask_ids[:3],

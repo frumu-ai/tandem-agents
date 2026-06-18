@@ -40,6 +40,7 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
             self.assertEqual(cfg.scheduler.max_active_tasks, 1)
             self.assertEqual(cfg.scheduler.max_active_tasks_per_project, 1)
             self.assertEqual(cfg.scheduler.max_active_tasks_per_repo, 1)
+            self.assertEqual(cfg.repository.allowed_hosts, "github.com")
 
     def test_scheduler_budget_and_backpressure_env_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,6 +90,34 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
             self.assertFalse(cfg.scheduler.rate_limit_backpressure)
             self.assertFalse(cfg.scheduler.ci_backpressure)
             self.assertFalse(cfg.scheduler.merge_queue_backpressure)
+
+    def test_repository_allowed_hosts_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: manual
+                      prompt: Do the thing
+                    repository:
+                      slug: frumu-ai/example
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(root, env={"ACA_REPO_ALLOWED_HOSTS": "github.com,gitlab.example"})
+
+            self.assertEqual(cfg.repository.allowed_hosts, "github.com,gitlab.example")
 
     def test_task_source_payload_can_come_from_env_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

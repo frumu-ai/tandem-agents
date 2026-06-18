@@ -268,6 +268,41 @@ class SchedulerTest(unittest.TestCase):
             blocked_reasons = {item["reason"] for item in plan["blocked"]}
             self.assertIn("worker_concurrency_reached", blocked_reasons)
 
+    def test_scheduler_worker_concurrency_cap_counts_active_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 10
+            cfg.scheduler.max_concurrent_worker_runs = 4
+            cfg.scheduler.max_active_tasks_per_project = 10
+            cfg.scheduler.max_active_tasks_per_repo = 10
+
+            store = CoordinationStore.from_config(cfg)
+            for suffix in ("a", "b", "c", "d"):
+                active = {
+                    "task_id": f"active-{suffix}",
+                    "title": f"Active {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/active-{suffix}", "path": str(root / f"active-{suffix}")},
+                    "files": [f"src/active-{suffix}.py"],
+                }
+                store.register_task(active, repo=active["repo"], status="active")
+            for suffix in ("e", "f", "g"):
+                queued = {
+                    "task_id": f"queued-{suffix}",
+                    "title": f"Queued {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/queued-{suffix}", "path": str(root / f"queued-{suffix}")},
+                    "files": [f"src/queued-{suffix}.py"],
+                }
+                store.register_task(queued, repo=queued["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertFalse(plan["admitted"])
+            self.assertEqual(plan["limits"]["remaining_worker_slots"], 0)
+            self.assertEqual({item["reason"] for item in plan["blocked"]}, {"worker_concurrency_reached"})
+
     def test_scheduler_scans_active_coder_runs_once_per_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

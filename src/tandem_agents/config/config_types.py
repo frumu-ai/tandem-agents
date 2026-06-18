@@ -243,6 +243,7 @@ class RepositoryConfig:
     worktree_root: str = ""
     remote_name: str = DEFAULT_REMOTE_NAME
     credential_file: str = ""
+    allowed_hosts: str = "github.com"
 
 
 @dataclass
@@ -528,6 +529,7 @@ class ResolvedConfig:
                 "worktree_root": str(self.repository_worktree_root()),
                 "remote_name": self.repository.remote_name,
                 "credential_file": self.repository.credential_file,
+                "allowed_hosts": self.repository.allowed_hosts,
             },
             "provider": {
                 "id": self.provider.id,

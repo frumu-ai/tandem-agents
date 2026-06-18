@@ -10,7 +10,7 @@ from pathlib import Path
 WORKTREE_LOCK = threading.Lock()
 REPO_SYNC_LOCK = threading.Lock()
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from src.tandem_agents.config.config import ResolvedConfig
 from src.tandem_agents.core.engine.process_utils import CommandResult, run_command
@@ -52,15 +52,80 @@ def _is_github_clone_url(clone_url: str) -> bool:
     return host == "github.com"
 
 
-def _validate_github_repository_reference(cfg: ResolvedConfig, value: str, *, field_name: str) -> None:
+def _allowed_repository_hosts(cfg: ResolvedConfig) -> set[str]:
+    raw = str(getattr(cfg.repository, "allowed_hosts", "") or "github.com").strip()
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def _scp_like_git_host(value: str) -> str:
+    if "://" in value:
+        return ""
+    match = re.match(r"^(?:(?:[^/@:]+)@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>.+)$", value)
+    if not match:
+        return ""
+    return match.group("host").lower()
+
+
+def _repository_reference_host(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    scp_host = _scp_like_git_host(text)
+    if scp_host:
+        return scp_host
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return ""
+    return (parsed.hostname or "").lower()
+
+
+def _local_repository_reference_path(cfg: ResolvedConfig, value: str) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if _scp_like_git_host(text):
+        return None
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        parsed = None
+    if parsed is not None and parsed.scheme and parsed.scheme != "file":
+        return None
+    if parsed is not None and parsed.scheme == "file":
+        path = Path(unquote(parsed.path))
+    else:
+        path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = (cfg.root_dir / path).resolve()
+    return path
+
+
+def _validate_repository_reference(cfg: ResolvedConfig, value: str, *, field_name: str) -> None:
     text = str(value or "").strip()
     if not text:
         return
-    if _is_github_clone_url(text):
+    allowed_hosts = _allowed_repository_hosts(cfg)
+    local_path = _local_repository_reference_path(cfg, text)
+    if local_path is not None:
+        if "local" not in allowed_hosts:
+            raise RuntimeError(
+                f"{field_name} must reference an allowed repository host "
+                f"({', '.join(sorted(allowed_hosts))}); local repository references are disabled: {text}"
+            )
+        if _path_is_within(local_path, cfg.repository_worktree_root()):
+            return
+        raise RuntimeError(
+            "Local repository references must stay inside ACA workspace root "
+            f"{cfg.repository_worktree_root()}: {local_path.resolve()}"
+        )
+    if "*" in allowed_hosts:
         return
-    raise RuntimeError(
-        f"{field_name} must reference GitHub; ACA refuses local repository references: {text}"
-    )
+    host = _repository_reference_host(text)
+    if host and host in allowed_hosts:
+        return
+    allowed = ", ".join(sorted(allowed_hosts)) or "github.com"
+    raise RuntimeError(f"{field_name} must reference an allowed repository host ({allowed}): {text}")
 
 
 def _validate_remote_name(remote_name: str) -> str:
@@ -98,7 +163,7 @@ def _ensure_repo_path_in_workspace(cfg: ResolvedConfig, repo_path: Path) -> None
 
 
 def _git_clone_args_and_env(cfg: ResolvedConfig, clone_url: str, target: Path) -> tuple[list[str], dict[str, str]]:
-    _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
+    _validate_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     env = dict(cfg.env)
     env["GIT_TERMINAL_PROMPT"] = "0"
     args = ["git"]
@@ -112,7 +177,7 @@ def _git_clone_args_and_env(cfg: ResolvedConfig, clone_url: str, target: Path) -
 
 
 def _git_auth_args(cfg: ResolvedConfig, clone_url: str) -> tuple[list[str], dict[str, str]]:
-    _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
+    _validate_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     env = dict(cfg.env)
     env["GIT_TERMINAL_PROMPT"] = "0"
     args = ["git"]
@@ -154,20 +219,20 @@ def _remote_is_empty(cfg: ResolvedConfig, clone_url: str) -> bool:
 def _remote_url_for_existing_repo(cfg: ResolvedConfig, repo_path: Path) -> str:
     configured = str(cfg.repository.clone_url or "").strip()
     if configured:
-        _validate_github_repository_reference(cfg, configured, field_name="repository.clone_url")
+        _validate_repository_reference(cfg, configured, field_name="repository.clone_url")
         return configured
     remote_name = _validate_remote_name(cfg.repository.remote_name or "origin")
     result = run_command(_git_repo_args(repo_path, "remote", "get-url", remote_name), env=cfg.env)
     remote_url = result.stdout.strip() if result.returncode == 0 else ""
     if remote_url:
-        _validate_github_repository_reference(cfg, remote_url, field_name=f"remote.{remote_name}.url")
+        _validate_repository_reference(cfg, remote_url, field_name=f"remote.{remote_name}.url")
     return remote_url
 
 
 def _configured_clone_url(cfg: ResolvedConfig) -> str:
     clone_url = str(cfg.repository.clone_url or "").strip()
     if clone_url:
-        _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
+        _validate_repository_reference(cfg, clone_url, field_name="repository.clone_url")
         return clone_url
     slug = str(cfg.repository.slug or "").strip().strip("/")
     if "/" in slug:
@@ -281,7 +346,7 @@ def _bootstrap_local_repository(cfg: ResolvedConfig, target: Path) -> Path:
 
 def _bootstrap_empty_repository(cfg: ResolvedConfig, clone_url: str, target: Path) -> Path:
     _ensure_repo_path_in_workspace(cfg, target)
-    _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
+    _validate_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     target.mkdir(parents=True, exist_ok=True)
     identity_args = _git_identity_args(cfg)
     init_result = run_command(
@@ -364,7 +429,7 @@ def repository_binding_issues(cfg: ResolvedConfig) -> list[str]:
         issues.append(str(exc))
     if clone_url:
         try:
-            _validate_github_repository_reference(cfg, clone_url, field_name="repository.clone_url")
+            _validate_repository_reference(cfg, clone_url, field_name="repository.clone_url")
         except RuntimeError as exc:
             issues.append(str(exc))
     if repo_path is not None:
