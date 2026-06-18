@@ -87,6 +87,13 @@ class ReviewTestPromptDiffTest(unittest.TestCase):
         self.assertIn("Do not require a PR branch", prompt)
         self.assertIn("worker applicability notes", prompt)
 
+    def test_review_prompt_limits_scope_to_explicit_acceptance_criteria(self) -> None:
+        prompt = build_review_prompt("run1", _TASK, _NOTES, repo_diff="diff --git a/app.py b/app.py\n")
+
+        self.assertIn("Review only against the explicit task contract", prompt)
+        self.assertIn("Do not expand scope from the title", prompt)
+        self.assertIn("numbered checklist as controlling", prompt)
+
 
 class CompactPrContextTest(unittest.TestCase):
     def test_drops_full_patch_keeps_excerpt_and_metadata(self) -> None:
