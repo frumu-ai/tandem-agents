@@ -210,6 +210,46 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "https://linear.example.test/authorize",
                 )
 
+    def test_linear_mcp_authorization_url_reads_nested_engine_challenge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._engine_request_json",
+                return_value={
+                    "servers": {
+                        "linear": {
+                            "lastAuthChallenge": {
+                                "authorizationUrl": "https://linear.example.test/authorize"
+                            }
+                        }
+                    }
+                },
+            ):
+                self.assertEqual(
+                    _linear_mcp_authorization_url(cfg),
+                    "https://linear.example.test/authorize",
+                )
+
+    def test_linear_mcp_authorization_url_reads_pending_auth_challenge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._engine_request_json",
+                return_value={
+                    "linear": {
+                        "pending_auth_by_tool": {
+                            "linear": {
+                                "authorization_url": "https://linear.example.test/authorize"
+                            }
+                        }
+                    }
+                },
+            ):
+                self.assertEqual(
+                    _linear_mcp_authorization_url(cfg),
+                    "https://linear.example.test/authorize",
+                )
+
     def test_crash_blocker_keeps_non_linear_oauth_text_internal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))

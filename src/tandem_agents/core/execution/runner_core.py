@@ -3510,7 +3510,10 @@ def _linear_mcp_authorization_url(cfg: ResolvedConfig) -> str:
         return ""
     if not isinstance(payload, dict):
         return ""
-    server = payload.get(server_name)
+    servers = payload.get("servers")
+    if not isinstance(servers, dict):
+        servers = payload
+    server = servers.get(server_name)
     if not isinstance(server, dict):
         return ""
     challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
@@ -3522,6 +3525,18 @@ def _linear_mcp_authorization_url(cfg: ResolvedConfig) -> str:
         ).strip()
         if authorization_url:
             return authorization_url
+    pending_auth = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+    if isinstance(pending_auth, dict):
+        for challenge in pending_auth.values():
+            if not isinstance(challenge, dict):
+                continue
+            authorization_url = str(
+                challenge.get("authorization_url")
+                or challenge.get("authorizationUrl")
+                or ""
+            ).strip()
+            if authorization_url:
+                return authorization_url
     return str(server.get("authorizationUrl") or "").strip()
 
 
