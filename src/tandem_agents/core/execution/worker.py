@@ -1702,6 +1702,61 @@ def _terminalized_note_reports_no_visible_verification(text: str) -> bool:
     return any(marker in normalized for marker in no_verification_markers)
 
 
+def _positive_contract_identifier_tokens(subtask: dict[str, Any]) -> list[str]:
+    ignored_tokens = {
+        "as_dict",
+        "task_key",
+        "project_key",
+        "repo_key",
+        "scope_mode",
+        "scope_paths",
+    }
+
+    def _is_contract_field_token(token: str) -> bool:
+        if token in ignored_tokens:
+            return False
+        return (
+            token.startswith("max_")
+            or token.startswith("min_")
+            or token.startswith("aca_")
+            or token.endswith("_backpressure")
+            or token.endswith("_reached")
+            or token.endswith("_cents")
+            or token.endswith("_seconds")
+            or token.endswith("_limit")
+        )
+
+    values: list[str] = []
+    for field in ("acceptance_criteria", "deliverables"):
+        value = subtask.get(field)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item or "") for item in value)
+        elif value:
+            values.append(str(value))
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        lowered = value.lower()
+        if "do not add" in lowered or "out of scope" in lowered:
+            continue
+        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", value):
+            normalized = token.lower()
+            if not _is_contract_field_token(normalized):
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                tokens.append(normalized)
+    return tokens
+
+
+def _missing_contract_identifier_tokens(subtask: dict[str, Any], diff_text: str) -> list[str]:
+    tokens = _positive_contract_identifier_tokens(subtask)
+    if not tokens:
+        return []
+    normalized_diff = str(diff_text or "").lower()
+    return [token for token in tokens if token not in normalized_diff]
+
+
 def _changed_files_are_all_tests(changed_files: list[str]) -> bool:
     paths = [
         _normalize_target_path(path)
@@ -2632,6 +2687,31 @@ def _terminalize_worker_after_tool_loop(
         result["changed_files"] = changed_files
         result["engine"] = engine_meta
         return result
+    if _changed_files_are_all_tests(changed_files):
+        missing_tokens = _missing_contract_identifier_tokens(subtask, diff_excerpt)
+        if missing_tokens:
+            incomplete = _preserve_partial_worker_diff(
+                dict(result),
+                log_path,
+                worktree,
+                reason="TERMINALIZED_MISSING_CONTRACT_TOKENS",
+            )
+            token_text = ", ".join(missing_tokens)
+            rejection_note = (
+                "\nACA rejected the terminalized worker note because the recovered test-only diff "
+                f"is missing required contract identifiers: {token_text}. Replace the partial diff "
+                "with assertions that use the exact required field/env names before retrying.\n"
+            )
+            incomplete["stdout"] = f"{result.get('stdout') or ''}{note}{rejection_note}"
+            incomplete["failure_reason"] = "TERMINALIZED_MISSING_CONTRACT_TOKENS"
+            incomplete["blocker_kind"] = "worker_incomplete_diff"
+            incomplete["recovery_action"] = (
+                "Replace the preserved test-only diff with one that includes the exact required "
+                f"contract identifiers: {token_text}."
+            )
+            incomplete["changed_files"] = changed_files
+            incomplete["engine"] = engine_meta
+            return incomplete
     if _terminalized_note_reports_no_visible_verification(text) and _changed_files_are_all_tests(changed_files):
         incomplete = _preserve_partial_worker_diff(
             dict(result),

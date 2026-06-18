@@ -2533,6 +2533,89 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertTrue(Path(result["partial_diff_artifact"]).exists())
             self.assertNotIn("terminalized_after_tool_loop", result)
 
+    def test_tool_loop_terminalize_reports_missing_contract_tokens_for_test_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            test_file = worktree / "src" / "tandem_agents" / "config" / "config_loader_test.py"
+            test_file.parent.mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            test_file.write_text("class ConfigLoaderTest: pass\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/tandem_agents/config/config_loader_test.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            test_file.write_text(
+                test_file.read_text(encoding="utf-8")
+                + "\ndef test_scheduler_budget_env():\n"
+                + "    env = {\n"
+                + "        'TANDEM_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS': '7',\n"
+                + "        'TANDEM_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS': '12345',\n"
+                + "        'TANDEM_SCHEDULER_RATE_LIMIT_BACKPRESSURE': 'false',\n"
+                + "    }\n"
+                + "    assert 'max_concurrent_worker_runs' in str(env)\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                return_value="terminal-session",
+            ), mock.patch(
+                "src.tandem_agents.core.execution.worker._prompt_sync_with_connect_retries",
+                return_value={
+                    "messages": [
+                        {
+                            "info": {"role": "assistant"},
+                            "parts": [
+                                {
+                                    "text": (
+                                        "Changed config loader tests.\n"
+                                        "Verification: verification not run.\n"
+                                        "Remaining implementation blockers: none visible from the diff."
+                                    )
+                                }
+                            ],
+                        }
+                    ]
+                },
+            ):
+                result = _terminalize_worker_after_tool_loop(
+                    SimpleNamespace(env={}),
+                    {
+                        "returncode": 1,
+                        "stdout": "ENGINE_PROMPT_TIMEOUT\n",
+                        "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                        "blocker_kind": "engine_prompt_timeout",
+                    },
+                    log_path,
+                    worktree,
+                    {
+                        "title": "Add scheduler budget config loader tests",
+                        "files": ["src/tandem_agents/config/config_loader_test.py"],
+                        "acceptance_criteria": [
+                            "Assert ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS, "
+                            "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS, "
+                            "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE, "
+                            "ACA_SCHEDULER_CI_BACKPRESSURE, and "
+                            "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE env vars.",
+                        ],
+                    },
+                    role="worker-1",
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    require_filesystem_changes=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "TERMINALIZED_MISSING_CONTRACT_TOKENS")
+            self.assertIn("aca_scheduler_max_concurrent_worker_runs", result["stdout"])
+            self.assertIn("aca_scheduler_ci_backpressure", result["recovery_action"])
+            self.assertNotIn("terminalized_after_tool_loop", result)
+
     def test_private_helper_subtask_does_not_accept_nearby_integration_test_only_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp) / "repo"
