@@ -943,6 +943,131 @@ class WorkerDispatchTest(unittest.TestCase):
                 [event["type"] for event in events],
             )
 
+    def test_scoped_production_failed_diff_with_terminalized_blockers_does_not_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run-1"
+            repo_path = root / "repo"
+            worktree = run_dir / "worktrees" / "worker-1--slice-1"
+            for base in (repo_path, worktree):
+                package = base / "src" / "tandem_agents" / "config"
+                package.mkdir(parents=True)
+                (package / "config_types.py").write_text(
+                    "DEFAULT_SCHEDULER_QUEUE_DEPTH_LIMIT = 50\n\n"
+                    "class SchedulerConfig:\n"
+                    "    queue_depth_limit: int = DEFAULT_SCHEDULER_QUEUE_DEPTH_LIMIT\n",
+                    encoding="utf-8",
+                )
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "aca@example.test"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA Test"], cwd=worktree, check=True)
+            subprocess.run(["git", "add", "."], cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, capture_output=True)
+            (worktree / "src" / "tandem_agents" / "config" / "config_types.py").write_text(
+                "DEFAULT_SCHEDULER_QUEUE_DEPTH_LIMIT = 50\n"
+                "DEFAULT_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS = 4\n"
+                "DEFAULT_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS = 0\n"
+                "DEFAULT_SCHEDULER_RATE_LIMIT_BACKPRESSURE = True\n"
+                "DEFAULT_SCHEDULER_CI_BACKPRESSURE = True\n"
+                "DEFAULT_SCHEDULER_MERGE_QUEUE_BACKPRESSURE = True\n\n"
+                "class SchedulerConfig:\n"
+                "    queue_depth_limit: int = DEFAULT_SCHEDULER_QUEUE_DEPTH_LIMIT\n"
+                "    max_concurrent_worker_runs: int = DEFAULT_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS\n"
+                "    max_daily_model_spend_cents: int = DEFAULT_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS\n"
+                "    rate_limit_backpressure: bool = DEFAULT_SCHEDULER_BACKPRESSURE_ENABLED\n"
+                "    ci_backpressure: bool = DEFAULT_SCHEDULER_BACKPRESSURE_ENABLED\n"
+                "    merge_queue_backpressure: bool = DEFAULT_SCHEDULER_BACKPRESSURE_ENABLED\n",
+                encoding="utf-8",
+            )
+            layout = ensure_layout(run_dir)
+            subtask = {
+                "id": "slice-1",
+                "title": "Add scheduler throughput config fields",
+                "_worker_worktree_name": "worker-1--slice-1",
+                "write_required": True,
+                "files": ["src/tandem_agents/config/config_types.py"],
+                "target_files": ["src/tandem_agents/config/config_types.py"],
+                "acceptance_criteria": [
+                    "Add max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
+                ],
+            }
+            cfg = SimpleNamespace(
+                env={},
+                swarm=SimpleNamespace(enabled=False, max_workers=1),
+                coordination=SimpleNamespace(lease_ttl_seconds=30, heartbeat_interval_seconds=120),
+                repository=SimpleNamespace(slug="frumu-ai/tandem-agents"),
+                provider_for_role=lambda _role: ("openai", "gpt-5.5"),
+            )
+            ctx = SimpleNamespace(
+                cfg=cfg,
+                run_id="run-1",
+                run_dir=run_dir,
+                repo_path=repo_path,
+                layout=layout,
+                task={"task_id": "TAN-173"},
+                repo={"path": str(repo_path), "slug": "frumu-ai/tandem-agents"},
+                planned_subtasks=[dict(subtask)],
+                pending_subtasks=[dict(subtask)],
+                worker_results=[],
+                blackboard={"subtasks": [dict(subtask)]},
+                status=initial_status(
+                    "run-1",
+                    {"task_id": "TAN-173"},
+                    {"path": str(repo_path)},
+                    {},
+                    {},
+                    {},
+                    run_dir,
+                ),
+                coordination=_FakeCoordination(),
+                lease_id=None,
+                claim_identity={"host_id": "host-1"},
+            )
+
+            def fake_execute_pool(*_args, **kwargs):
+                kwargs["on_start"]("worker-1", subtask)
+                kwargs["on_result"](
+                    {
+                        "worker_id": "worker-1",
+                        "subtask_id": "slice-1",
+                        "status": "failed",
+                        "returncode": 1,
+                        "partial_diff_artifact": str(run_dir / "artifacts" / "worker-1.patch"),
+                        "changed_files": ["src/tandem_agents/config/config_types.py"],
+                        "blocker_kind": "worker_incomplete_diff",
+                        "stdout": (
+                            "ENGINE_TOOL_LOOP_TERMINALIZED\n"
+                            "Remaining implementation blockers:\n"
+                            "- DEFAULT_SCHEDULER_BACKPRESSURE_ENABLED is undefined."
+                        ),
+                    }
+                )
+                return []
+
+            with (
+                mock.patch(
+                    "src.tandem_agents.core.execution.runner_core._execute_local_worker_pool",
+                    side_effect=fake_execute_pool,
+                ),
+                mock.patch("src.tandem_agents.core.phases.worker_dispatch._post_dispatch_validation"),
+            ):
+                dispatch_workers(ctx)
+
+            self.assertEqual(len(ctx.worker_results), 1)
+            self.assertEqual(ctx.worker_results[0]["status"], "failed")
+            self.assertNotIn(
+                "max_concurrent_worker_runs",
+                (repo_path / "src" / "tandem_agents" / "config" / "config_types.py").read_text(encoding="utf-8"),
+            )
+            events = [
+                json.loads(line)
+                for line in layout["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertNotIn(
+                "worker.reviewable_production_failed_diff_synced",
+                [event["type"] for event in events],
+            )
+
     def test_serial_dispatch_reports_one_spawned_worker_with_queued_slices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

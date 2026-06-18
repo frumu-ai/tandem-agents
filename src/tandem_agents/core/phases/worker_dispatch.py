@@ -948,6 +948,15 @@ def _failed_result_has_reviewable_production_diff(
         patch_path = str(result["artifacts"].get("partial_diff") or "").strip()
     if not patch_path:
         return False
+    result_text = "\n".join(
+        str(result.get(field) or "")
+        for field in ("stdout", "stderr", "output_excerpt", "recovery_action", "failure_reason")
+    )
+    if result_text.strip():
+        from src.tandem_agents.core.execution.worker import _terminalized_note_reports_blockers
+
+        if _terminalized_note_reports_blockers(result_text):
+            return False
     if _subtask_requires_test_changes(subtask):
         return False
     changed_files = [str(path or "").strip().replace("\\", "/") for path in result.get("changed_files") or [] if str(path or "").strip()]
