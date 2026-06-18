@@ -1908,6 +1908,71 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 retry_result["partial_diff_artifact"],
             )
 
+    def test_run_worker_subtask_uses_prompt_sync_first_for_deterministic_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            repo_path.mkdir()
+            worktree.mkdir()
+            cfg = SimpleNamespace()
+            worker_result = {
+                "returncode": 0,
+                "stdout": "done",
+                "log_path": str(run_dir / "logs" / "worker-1.log"),
+            }
+
+            def summarize(result: dict[str, object], *_args: object) -> dict[str, object]:
+                return dict(result)
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.stream_tandem_prompt",
+                    return_value=worker_result,
+                ) as stream_prompt, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._terminalize_worker_after_tool_loop",
+                    side_effect=lambda _cfg, result, *_args, **_kwargs: result,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._coerce_worker_failure",
+                    side_effect=lambda result, *_args, **_kwargs: result,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._recover_nonzero_result_if_diff_satisfies_subtask",
+                    side_effect=lambda result, *_args, **_kwargs: result,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes"), \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", side_effect=summarize):
+                output = run_worker_subtask(
+                    cfg,
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-173", "source": {"type": "manual"}, "title": "Task"},
+                    {
+                        "id": "fallback-throughput-config-loader",
+                        "title": "Config loader",
+                        "goal": "Add exact scheduler env wiring",
+                        "files": ["src/tandem_agents/config/config_loader.py"],
+                        "scope_note": "Mechanical slice 2 of 3 for throughput config controls.",
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 0)
+            self.assertTrue(stream_prompt.call_args.kwargs["write_required"])
+            self.assertTrue(stream_prompt.call_args.kwargs["prompt_sync_first"])
+
     def test_worker_incomplete_diff_defers_retry_to_outer_repair_loop(self) -> None:
         self.assertFalse(
             _worker_result_should_retry(

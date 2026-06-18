@@ -423,6 +423,14 @@ def _worker_timeout_multiplier(subtask: dict[str, Any]) -> float:
     return min(2.0, 1.0 + (0.08 * max(0, target_count - 6)))
 
 
+def _subtask_prefers_prompt_sync_first(subtask: dict[str, Any]) -> bool:
+    subtask_id = str(subtask.get("id") or "").strip()
+    if subtask_id.startswith("fallback-throughput-"):
+        return True
+    scope_note = str(subtask.get("scope_note") or "").lower()
+    return "mechanical slice" in scope_note and "deterministic repo-context" in scope_note
+
+
 def _engine_exception_is_timeout(exc: Exception) -> bool:
     text = str(exc).lower()
     return "timed out" in text or "timeout" in text or "operation did not finish within" in text
@@ -4158,6 +4166,7 @@ def run_worker_subtask(
         config_path=config_path,
         require_tool_use=True,
         write_required=write_required,
+        prompt_sync_first=_subtask_prefers_prompt_sync_first(subtask) if write_required else None,
         timeout_multiplier=timeout_multiplier,
     )
     result["write_required"] = write_required
