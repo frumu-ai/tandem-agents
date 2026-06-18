@@ -162,8 +162,8 @@ def _server_auth_url(server: dict[str, Any]) -> str:
     return _nonempty(server.get("authorization_url") or server.get("authorizationUrl"))
 
 
-def _linear_mcp_admission_blocker(cfg: ResolvedConfig, queued: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not cfg.linear_mcp.enabled or not any(_task_source_type(task) == "linear" for task in queued):
+def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
+    if not cfg.linear_mcp.enabled:
         return None
     server_name = linear_mcp_server_name(cfg)
     try:
@@ -187,6 +187,36 @@ def _linear_mcp_admission_blocker(cfg: ResolvedConfig, queued: list[dict[str, An
         "blocked_reason": blocked_reason,
         "authorization_url": _server_auth_url(server),
     }
+
+
+def _linear_mcp_admission_blocker(cfg: ResolvedConfig, queued: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not any(_task_source_type(task) == "linear" for task in queued):
+        return None
+    return _linear_mcp_status_blocker(cfg)
+
+
+def scheduler_integration_blockers(cfg: ResolvedConfig, *, project_key: str = "") -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if str(cfg.task_source.type or "").strip().lower() == "linear":
+        blocker = _linear_mcp_status_blocker(cfg)
+        if blocker is not None:
+            blockers.append(
+                {
+                    "source_type": "linear",
+                    "project_key": _nonempty(project_key)
+                    or task_project_key(
+                        {
+                            "source": {
+                                "type": "linear",
+                                "team": cfg.task_source.team,
+                                "project": cfg.task_source.project,
+                            }
+                        }
+                    ),
+                    **blocker,
+                }
+            )
+    return blockers
 
 
 def scheduler_snapshot(

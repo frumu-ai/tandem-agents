@@ -25,7 +25,12 @@ from src.tandem_agents.config.config import resolve_config, validate_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.coordination.coordination_reaper import coordination_reaper_interval, coordination_reaper_tick
 from src.tandem_agents.core.execution.runtime_entrypoints import run_coordinator
-from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot, task_project_key
+from src.tandem_agents.core.scheduling.scheduler import (
+    plan_task_admissions,
+    scheduler_integration_blockers,
+    scheduler_snapshot,
+    task_project_key,
+)
 from src.tandem_agents.core.scheduling.scheduler_dispatcher import dispatch_scheduled_runs
 from src.tandem_agents.core.scheduling.coder_supervisor import (
     list_active_coder_runs,
@@ -304,13 +309,7 @@ def _all_projects(root: Path) -> Dict[str, Any]:
 
 
 def _active_scheduler_project_keys(root: Path, cfg=None) -> set[str]:
-    workspace = _workspace_view(root, cfg)
-    active_project_id = str((workspace.get("workspace") or {}).get("active_project_id") or "").strip()
-    projects = workspace.get("projects") or []
-    active_project = next(
-        (project for project in projects if str(project.get("id") or "").strip() == active_project_id),
-        None,
-    )
+    active_project = _active_scheduler_project(root, cfg)
     if not isinstance(active_project, dict):
         return set()
     source = active_project.get("source") if isinstance(active_project.get("source"), dict) else active_project.get("task_source")
@@ -318,6 +317,32 @@ def _active_scheduler_project_keys(root: Path, cfg=None) -> set[str]:
         return set()
     key = task_project_key({"source": source})
     return {key} if key else set()
+
+
+def _active_scheduler_project(root: Path, cfg=None) -> dict[str, Any] | None:
+    workspace = _workspace_view(root, cfg)
+    active_project_id = str((workspace.get("workspace") or {}).get("active_project_id") or "").strip()
+    projects = workspace.get("projects") or []
+    active_project = next(
+        (project for project in projects if str(project.get("id") or "").strip() == active_project_id),
+        None,
+    )
+    return active_project if isinstance(active_project, dict) else None
+
+
+def _active_scheduler_integration_blockers(root: Path, cfg=None) -> list[dict[str, Any]]:
+    active_project = _active_scheduler_project(root, cfg)
+    if not isinstance(active_project, dict):
+        return []
+    project_id = str(active_project.get("id") or active_project.get("slug") or "").strip()
+    source = active_project.get("source") if isinstance(active_project.get("source"), dict) else active_project.get("task_source")
+    project_key = task_project_key({"source": source}) if isinstance(source, dict) else ""
+    try:
+        _, project_cfg = _project_config(root, project_id)
+    except Exception:
+        logger.debug("Failed to resolve active scheduler project config for integration blockers", exc_info=True)
+        return []
+    return scheduler_integration_blockers(project_cfg, project_key=project_key)
 
 
 def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: str = "") -> Dict[str, str]:
@@ -2367,10 +2392,16 @@ async def get_scheduler_plan(limit: int = 25, token: str = Depends(get_token)):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
+    integration_blockers = _active_scheduler_integration_blockers(root, cfg)
     bounded_limit = max(1, min(limit, 100))
     snapshot = scheduler_snapshot(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
     plan = plan_task_admissions(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
-    return {"snapshot": snapshot, "plan": plan, "project_filter": sorted(project_keys)}
+    return {
+        "snapshot": snapshot,
+        "plan": plan,
+        "project_filter": sorted(project_keys),
+        "integration_blockers": integration_blockers,
+    }
 
 
 @app.post("/scheduler/dispatch")
@@ -2387,6 +2418,7 @@ async def dispatch_scheduler_batch(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
+    integration_blockers = _active_scheduler_integration_blockers(root, cfg)
     result = dispatch_scheduled_runs(
         cfg,
         coordination=store,
@@ -2395,6 +2427,7 @@ async def dispatch_scheduler_batch(
         project_keys=project_keys,
     )
     result["project_filter"] = sorted(project_keys)
+    result["integration_blockers"] = integration_blockers
     return result
 
 if __name__ == "__main__":

@@ -7,7 +7,13 @@ from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
-from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot, task_project_key, task_repo_key
+from src.tandem_agents.core.scheduling.scheduler import (
+    plan_task_admissions,
+    scheduler_integration_blockers,
+    scheduler_snapshot,
+    task_project_key,
+    task_repo_key,
+)
 from src.tandem_agents.runtime.runstate import initial_blackboard, initial_status, save_blackboard, write_status
 
 
@@ -320,6 +326,33 @@ class SchedulerTest(unittest.TestCase):
                 plan["blocked"][0]["authorization_url"],
                 "https://linear.example.test/authorize",
             )
+
+    def test_scheduler_reports_linear_integration_blocker_without_queued_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.task_source.type = "linear"
+            cfg.task_source.team = "team-1"
+            cfg.task_source.project = "project-target"
+            cfg.linear_mcp.enabled = True
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_auth_challenge": {
+                        "authorization_url": "https://linear.example.test/authorize"
+                    },
+                    "last_error": "Authorization required.",
+                },
+            ):
+                blockers = scheduler_integration_blockers(cfg)
+
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(blockers[0]["project_key"], "linear:team-1/project-target")
 
     def test_scheduler_project_filter_keeps_global_active_repo_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -594,6 +594,64 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                 cfg = resolve_config(root)
                 self.assertEqual(_active_scheduler_project_keys(root, cfg), {"linear:team-1/project-1"})
 
+    def test_scheduler_plan_reports_active_linear_integration_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/workspace/projects",
+                        params={
+                            "slug": "linear-target",
+                            "repo_path": "repos/tandem",
+                            "name": "Linear Target",
+                        },
+                        json={
+                            "type": "linear",
+                            "team": "team-1",
+                            "project": "project-1",
+                        },
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    set_active = client.post(
+                        "/workspace/active/linear-target",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(set_active.status_code, 200, set_active.text)
+
+                    with patch(
+                        "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                        return_value={
+                            "name": "linear",
+                            "auth_kind": "oauth",
+                            "connected": False,
+                            "last_auth_challenge": {
+                                "authorization_url": "https://linear.example.test/authorize"
+                            },
+                            "last_error": "Authorization required.",
+                        },
+                    ):
+                        plan = client.get(
+                            "/scheduler/plan",
+                            headers={"Authorization": "Bearer secret-token"},
+                        )
+
+            self.assertEqual(plan.status_code, 200, plan.text)
+            payload = plan.json()
+            self.assertEqual(payload["project_filter"], ["linear:team-1/project-1"])
+            self.assertEqual(payload["integration_blockers"][0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(
+                payload["integration_blockers"][0]["authorization_url"],
+                "https://linear.example.test/authorize",
+            )
+
     def test_linear_auth_redirect_origin_reads_redirect_uri(self) -> None:
         url = (
             "https://mcp.linear.app/authorize?"
