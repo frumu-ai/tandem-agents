@@ -2392,7 +2392,7 @@ async def get_scheduler_plan(limit: int = 25, token: str = Depends(get_token)):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
-    integration_blockers = _active_scheduler_integration_blockers(root, cfg)
+    integration_blockers = await asyncio.to_thread(_active_scheduler_integration_blockers, root, cfg)
     bounded_limit = max(1, min(limit, 100))
     snapshot = scheduler_snapshot(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
     plan = plan_task_admissions(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
@@ -2418,7 +2418,7 @@ async def dispatch_scheduler_batch(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
-    integration_blockers = _active_scheduler_integration_blockers(root, cfg)
+    integration_blockers = await asyncio.to_thread(_active_scheduler_integration_blockers, root, cfg)
     result = dispatch_scheduled_runs(
         cfg,
         coordination=store,
