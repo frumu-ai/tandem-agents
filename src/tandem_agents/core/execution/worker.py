@@ -1757,6 +1757,42 @@ def _missing_contract_identifier_tokens(subtask: dict[str, Any], diff_text: str)
     return [token for token in tokens if token not in normalized_diff]
 
 
+def _missing_required_production_anchor_tokens(subtask: dict[str, Any], diff_text: str) -> list[str]:
+    subtask_id = str(subtask.get("id") or "").strip()
+    anchors_by_subtask = {
+        "fallback-throughput-config-types": [
+            "max_concurrent_worker_runs: int",
+            "max_daily_model_spend_cents: int",
+            "rate_limit_backpressure: bool",
+            "ci_backpressure: bool",
+            "merge_queue_backpressure: bool",
+        ],
+        "fallback-throughput-config-loader": [
+            "SchedulerConfig(",
+            "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS",
+            "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS",
+            "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE",
+            "ACA_SCHEDULER_CI_BACKPRESSURE",
+            "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE",
+        ],
+        "fallback-throughput-scheduler-controls-part-1": [
+            "max_concurrent_worker_runs",
+        ],
+        "fallback-throughput-scheduler-controls-part-2": [
+            "worker_concurrency_reached",
+        ],
+        "fallback-throughput-scheduler-controls": [
+            "max_concurrent_worker_runs",
+            "worker_concurrency_reached",
+        ],
+    }
+    anchors = anchors_by_subtask.get(subtask_id)
+    if not anchors:
+        return []
+    normalized_diff = str(diff_text or "").lower()
+    return [anchor for anchor in anchors if anchor.lower() not in normalized_diff]
+
+
 def _changed_files_are_all_tests(changed_files: list[str]) -> bool:
     paths = [
         _normalize_target_path(path)
@@ -2712,6 +2748,30 @@ def _terminalize_worker_after_tool_loop(
             incomplete["changed_files"] = changed_files
             incomplete["engine"] = engine_meta
             return incomplete
+    missing_production_anchors = _missing_required_production_anchor_tokens(subtask, diff_excerpt)
+    if missing_production_anchors:
+        incomplete = _preserve_partial_worker_diff(
+            dict(result),
+            log_path,
+            worktree,
+            reason="TERMINALIZED_MISSING_PRODUCTION_ANCHORS",
+        )
+        anchor_text = ", ".join(missing_production_anchors)
+        rejection_note = (
+            "\nACA rejected the terminalized worker note because the recovered production diff "
+            f"is missing required implementation anchors: {anchor_text}. Replace the partial diff "
+            "with the actual requested implementation before retrying.\n"
+        )
+        incomplete["stdout"] = f"{result.get('stdout') or ''}{note}{rejection_note}"
+        incomplete["failure_reason"] = "TERMINALIZED_MISSING_PRODUCTION_ANCHORS"
+        incomplete["blocker_kind"] = "worker_incomplete_diff"
+        incomplete["recovery_action"] = (
+            "Replace the preserved production diff with one that includes the required "
+            f"implementation anchors: {anchor_text}."
+        )
+        incomplete["changed_files"] = changed_files
+        incomplete["engine"] = engine_meta
+        return incomplete
     if _terminalized_note_reports_no_visible_verification(text) and _changed_files_are_all_tests(changed_files):
         incomplete = _preserve_partial_worker_diff(
             dict(result),

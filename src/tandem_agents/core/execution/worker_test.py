@@ -2216,6 +2216,97 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(kwargs["tool_mode"], "none")
             self.assertFalse(kwargs["write_required"])
 
+    def test_tool_loop_terminalize_rejects_missing_production_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            target = worktree / "src" / "tandem_agents" / "config" / "config_types.py"
+            target.parent.mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target.write_text(
+                "class SchedulerConfig:\n"
+                "    policy: str = 'serial'\n\n"
+                "class ResolvedConfig:\n"
+                "    def as_dict(self):\n"
+                "        return {'scheduler': {'policy': self.scheduler.policy}}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "src/tandem_agents/config/config_types.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text(
+                "class SchedulerConfig:\n"
+                "    policy: str = 'serial'\n\n"
+                "class ResolvedConfig:\n"
+                "    def as_dict(self):\n"
+                "        return {'scheduler': {\n"
+                "            'max_concurrent_worker_runs': self.scheduler.max_concurrent_worker_runs,\n"
+                "            'max_daily_model_spend_cents': self.scheduler.max_daily_model_spend_cents,\n"
+                "            'rate_limit_backpressure': self.scheduler.rate_limit_backpressure,\n"
+                "            'ci_backpressure': self.scheduler.ci_backpressure,\n"
+                "            'merge_queue_backpressure': self.scheduler.merge_queue_backpressure,\n"
+                "            'policy': self.scheduler.policy,\n"
+                "        }}\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                return_value="terminal-session",
+            ), mock.patch(
+                "src.tandem_agents.core.execution.worker._prompt_sync_with_connect_retries",
+                return_value={
+                    "messages": [
+                        {
+                            "info": {"role": "assistant"},
+                            "parts": [
+                                {
+                                    "text": (
+                                        "Changed config_types serialization.\n"
+                                        "Verification: verification not run.\n"
+                                        "Remaining implementation blockers: none visible from the provided diff excerpt."
+                                    )
+                                }
+                            ],
+                        }
+                    ]
+                },
+            ):
+                result = _terminalize_worker_after_tool_loop(
+                    SimpleNamespace(env={}),
+                    {
+                        "returncode": 1,
+                        "stdout": "ENGINE_PROMPT_TIMEOUT\n",
+                        "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                        "blocker_kind": "engine_prompt_timeout",
+                    },
+                    log_path,
+                    worktree,
+                    {
+                        "id": "fallback-throughput-config-types",
+                        "title": "Add scheduler budget config fields",
+                        "files": ["src/tandem_agents/config/config_types.py"],
+                        "acceptance_criteria": [
+                            "Add max_concurrent_worker_runs, max_daily_model_spend_cents, "
+                            "rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
+                        ],
+                    },
+                    role="worker-1",
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    require_filesystem_changes=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "TERMINALIZED_MISSING_PRODUCTION_ANCHORS")
+            self.assertIn("max_concurrent_worker_runs: int", result["recovery_action"])
+            self.assertNotIn("terminalized_after_tool_loop", result)
+
     def test_tool_loop_terminalize_skips_deferred_partial_diff_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
