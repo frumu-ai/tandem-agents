@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any
@@ -149,7 +150,8 @@ async def mcp_rpc(request: Request, payload: JsonRpcRequest, _: str = Depends(ge
         tool_args = params.get("arguments") or {}
         if tool_name == "describe_aca":
             root = Path(os.environ.get("ACA_ROOT", "."))
-            return _jsonrpc_result(payload.id, {"overview": build_aca_overview(root)})
+            overview = await asyncio.to_thread(build_aca_overview, root)
+            return _jsonrpc_result(payload.id, {"overview": overview})
         return _jsonrpc_error(payload.id, -32601, f"Unknown tool '{tool_name}'.", status_code=404)
 
     return _jsonrpc_error(payload.id, -32601, f"Unsupported method '{method}'.", status_code=404)

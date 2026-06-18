@@ -185,7 +185,8 @@ Optional fields:
 - `coder_wait_timeout_seconds`: how long ACA should poll a Tandem coder run before reporting that ACA's supervisor wait budget expired; default `3600`
 - `coder_poll_interval_seconds`: how often ACA should poll Tandem for coder run status; default `15`
 - `coder_supervisor_enabled`: keep reconciling detached Tandem coder runs after ACA request timeout or process restart; default `true`
-- `ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS`: maximum time the API startup hook waits for the initial coder-supervisor reconciliation before serving requests; default `10`
+- `ACA_CODER_SUPERVISOR_STARTUP_RECONCILE`: run an initial coder-supervisor reconciliation during API startup before the periodic loop starts; default `false`
+- `ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS`: maximum time the API startup hook waits for the initial coder-supervisor reconciliation when startup reconciliation is enabled; default `10`
 - `coder_supervisor_interval_seconds`: background reconciliation interval; default `30`
 - `coder_supervisor_batch_size`: maximum active coder runs checked per supervisor tick; default `100`
 - `coder_cancel_on_source_terminal`: allow ACA to cancel a still-running Tandem coder run when the source task is already terminal; default `true`
@@ -320,6 +321,7 @@ Behavior:
 - `ACA_CODER_WAIT_TIMEOUT_SECONDS` -> `execution.coder_wait_timeout_seconds`
 - `ACA_CODER_POLL_INTERVAL_SECONDS` -> `execution.coder_poll_interval_seconds`
 - `ACA_CODER_SUPERVISOR_ENABLED` -> `execution.coder_supervisor_enabled`
+- `ACA_CODER_SUPERVISOR_STARTUP_RECONCILE` -> API startup-only initial supervisor reconciliation opt-in
 - `ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS` -> API startup-only supervisor reconciliation timeout
 - `ACA_CODER_SUPERVISOR_INTERVAL_SECONDS` -> `execution.coder_supervisor_interval_seconds`
 - `ACA_CODER_SUPERVISOR_BATCH_SIZE` -> `execution.coder_supervisor_batch_size`

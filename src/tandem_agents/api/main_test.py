@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import tempfile
 import threading
@@ -294,6 +295,33 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertTrue(second_done.is_set())
         self.assertEqual(calls, ["start", "end", "start", "end"])
+
+    def test_coder_supervisor_startup_reconcile_is_opt_in(self) -> None:
+        async def exercise() -> None:
+            await api_main._start_coder_supervisor()
+            task = api_main._coder_supervisor_task
+            self.assertIsNotNone(task)
+            api_main._coder_supervisor_stop.set()
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            api_main._coder_supervisor_task = None
+
+        cfg = SimpleNamespace(
+            execution=SimpleNamespace(
+                coder_supervisor_enabled=True,
+                coder_supervisor_interval_seconds=3600,
+            )
+        )
+        with (
+            patch.object(api_main, "resolve_config", return_value=cfg),
+            patch.object(api_main, "_coder_supervisor_startup_reconcile_enabled", return_value=False),
+            patch.object(api_main, "reconcile_active_coder_runs", return_value={"count": 0}) as reconcile,
+        ):
+            asyncio.run(exercise())
+
+        reconcile.assert_not_called()
 
     def test_approvals_status_query_filters_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

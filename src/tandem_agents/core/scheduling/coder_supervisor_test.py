@@ -127,6 +127,46 @@ def _seed_completed_run_with_pr(cfg, store: CoordinationStore, *, run_id: str = 
 
 
 class CoderSupervisorTest(unittest.TestCase):
+    def test_active_coder_run_listing_skips_inactive_blackboards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            run_dir = cfg.output_root() / "run-inactive"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            task = {
+                "task_id": "task-inactive",
+                "title": "Inactive",
+                "source": {"type": "manual", "prompt": "done"},
+            }
+            repo = {"slug": "acme/demo", "path": str(cfg.root_dir / "repo")}
+            status = initial_status(
+                "run-inactive",
+                task,
+                repo,
+                {"version": "engine"},
+                {"id": "openai", "model": "gpt-5.5"},
+                {"enabled": False, "shared_model": False, "max_workers": 1},
+                run_dir,
+            )
+            status["run"]["status"] = "completed"
+            status["phase"] = {"name": "handoff", "detail": "done", "role": "manager", "updated_at_ms": 1}
+            write_status(run_dir / "status.json", status)
+            (run_dir / "blackboard.yaml").write_text(
+                "notes:\n"
+                "  - This completed run has no coder or pull request lifecycle markers.\n"
+                f"  - {'x' * 20000}\n",
+                encoding="utf-8",
+            )
+            _seed_completed_run_with_pr(cfg, store)
+
+            with patch.object(coder_supervisor, "load_blackboard", wraps=coder_supervisor.load_blackboard) as load_blackboard_mock:
+                active = coder_supervisor.list_active_coder_runs(cfg)
+
+            self.assertEqual([item["run_id"] for item in active], ["run-pr"])
+            loaded_blackboards = {Path(call.args[0]) for call in load_blackboard_mock.call_args_list}
+            self.assertNotIn(run_dir / "blackboard.yaml", loaded_blackboards)
+            self.assertIn(cfg.output_root() / "run-pr" / "blackboard.yaml", loaded_blackboards)
+
     def test_non_terminal_run_stays_running_and_heartbeats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _config(Path(tmp))
