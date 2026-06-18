@@ -409,6 +409,8 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn('First read only the smallest relevant part of ["src/tandem_agents/config/config_loader.py"]', prompt)
         self.assertIn("make the first semantic edit in that target before inspecting unrelated files", prompt)
         self.assertIn("do not explore the parent task surface until after a real diff exists", prompt)
+        self.assertIn("Do not stop after imports, constants, or scaffolding", prompt)
+        self.assertIn("update the read path or config construction", prompt)
 
     def test_implementation_subtask_with_test_acceptance_does_not_force_test_first(self) -> None:
         subtask = self._subtask(

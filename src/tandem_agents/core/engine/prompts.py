@@ -579,6 +579,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             f"- First read only the smallest relevant part of {json.dumps(substantive_target_files[:1])}.\n"
             "- Then make the first semantic edit in that target before inspecting unrelated files.\n"
             "- Stay inside the listed target files and acceptance criteria; do not explore the parent task surface until after a real diff exists.\n"
+            "- Do not stop after imports, constants, or scaffolding. If the slice wires config/env fields, the first diff must also update the read path or config construction that consumes those fields.\n"
             "- Once the diff exists, run one lightweight readback or syntax check and return the completion note.\n"
         )
     repair_directive_block = _repair_directive_block(subtask, target_files)
