@@ -229,7 +229,7 @@ def _control_panel_public_origin(cfg: ResolvedConfig) -> str:
     return ""
 
 
-def _request_linear_auth_url(cfg: ResolvedConfig, server_name: str) -> str:
+def _request_linear_auth_url(cfg: ResolvedConfig, server_name: str, *, refresh: bool = False) -> str:
     headers: dict[str, str] = {}
     token = cfg.tandem_token()
     if token:
@@ -242,8 +242,9 @@ def _request_linear_auth_url(cfg: ResolvedConfig, server_name: str) -> str:
         headers["X-Forwarded-Proto"] = parsed.scheme or "https"
         headers["X-Forwarded-Host"] = parsed.netloc
 
+    action = "refresh" if refresh else "auth"
     request = Request(
-        f"{cfg.tandem.base_url.rstrip('/')}/mcp/{quote(server_name)}/auth",
+        f"{cfg.tandem.base_url.rstrip('/')}/mcp/{quote(server_name)}/{action}",
         headers=headers,
         method="POST",
     )
@@ -278,6 +279,7 @@ def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
     auth_kind = _nonempty(server.get("auth_kind") or server.get("authKind")).lower()
     challenge_age_ms = _server_auth_challenge_age_ms(server)
     refresh_auth_url = not authorization_url
+    force_refresh = False
     if (
         auth_kind == "oauth"
         and authorization_url
@@ -285,9 +287,10 @@ def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
         and challenge_age_ms > _linear_auth_challenge_max_age_ms()
     ):
         refresh_auth_url = True
+        force_refresh = True
     if auth_kind == "oauth" and refresh_auth_url:
         try:
-            authorization_url = _request_linear_auth_url(cfg, server_name)
+            authorization_url = _request_linear_auth_url(cfg, server_name, refresh=force_refresh)
         except Exception:
             authorization_url = ""
     return {

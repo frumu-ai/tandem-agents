@@ -383,7 +383,7 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(len(blockers), 1)
             self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
             self.assertEqual(blockers[0]["authorization_url"], "https://linear.example.test/authorize")
-            request_auth.assert_called_once_with(cfg, "linear")
+            request_auth.assert_called_once_with(cfg, "linear", refresh=False)
 
     def test_scheduler_refreshes_stale_linear_auth_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,7 +417,7 @@ class SchedulerTest(unittest.TestCase):
 
             self.assertEqual(len(blockers), 1)
             self.assertEqual(blockers[0]["authorization_url"], "https://linear.example.test/new-authorize")
-            request_auth.assert_called_once_with(cfg, "linear")
+            request_auth.assert_called_once_with(cfg, "linear", refresh=True)
 
     def test_scheduler_project_filter_keeps_global_active_repo_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
