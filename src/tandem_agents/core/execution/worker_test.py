@@ -258,7 +258,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             [{"id": "subtask-1", "title": "Small task", "files": ["src/app.py"]}],
         )
 
-        self.assertEqual(timeout, 290.0)
+        self.assertEqual(timeout, 530.0)
 
     def test_worker_no_progress_timeout_scales_for_large_subtasks(self) -> None:
         ctx = SimpleNamespace(
@@ -1402,8 +1402,8 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             )
         )
 
-    def test_verification_first_repair_does_not_require_new_real_diff(self) -> None:
-        self.assertFalse(
+    def test_verification_first_repair_requires_real_diff_budget(self) -> None:
+        self.assertTrue(
             _subtask_requires_real_diff(
                 {
                     "title": "Finish repository worktree isolation and conflict detection patch",
@@ -4002,6 +4002,87 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(result["engine"]["messages_path"], str(Path(tmp) / "worker.engine-messages-session-1.json"))
             self.assertEqual(result["failure_reason"], "")
             self.assertEqual(result["blocker_kind"], "")
+
+    def test_empty_async_worker_response_retries_in_fresh_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session") as delete_session, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    side_effect=[
+                        {"text": "", "completed": True, "reason": "", "event_count": 1},
+                        {"text": "fresh session completed", "completed": True, "reason": "", "event_count": 2},
+                    ],
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("fresh session completed", result["stdout"])
+            self.assertEqual(create_session.call_count, 2)
+            self.assertIn(mock.call(mock.ANY, "session-1"), delete_session.mock_calls)
+            self.assertEqual(prompt_async.call_count, 2)
+            self.assertEqual(result["engine"]["empty_response_session_id"], "session-1")
+            self.assertEqual(result["engine"]["session_id"], "session-2")
+            self.assertEqual(result["engine"]["fallback_mode"], "async_empty_response_fresh_session")
+            self.assertIn("fresh session", log_path.read_text(encoding="utf-8"))
+
+    def test_cancelled_async_worker_response_does_not_retry_or_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1") as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    return_value={"run_id": "run-1"},
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={"text": "", "completed": False, "reason": "cancelled", "event_count": 4},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.prompt_tandem_session_sync") as prompt_sync:
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_RUN_CANCELLED")
+            self.assertEqual(result["blocker_kind"], "engine_run_cancelled")
+            self.assertEqual(result["engine"]["stream_reason"], "cancelled")
+            self.assertIsNone(result["engine"]["fallback_mode"])
+            create_session.assert_called_once()
+            prompt_async.assert_called_once()
+            prompt_sync.assert_not_called()
+            self.assertIn("ENGINE_RUN_CANCELLED", result["stdout"])
 
     def test_write_required_worker_can_opt_out_of_prompt_sync_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

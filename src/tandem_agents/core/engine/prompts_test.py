@@ -472,6 +472,7 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("must satisfy required test coverage", prompt)
         self.assertIn("Read and edit at least one required test target first", prompt)
         self.assertIn("src/tandem_agents/core/repository/repository_test.py", prompt)
+        self.assertIn("test-only final diff fails", prompt)
         self.assertIn("A production-only diff fails this worker", prompt)
 
     def test_test_only_partial_repair_prompt_requires_production_first(self) -> None:
@@ -602,6 +603,33 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertNotIn("The previous partial diff was rejected; do not apply or copy it as-is", prompt)
         self.assertNotIn("/runs/run-1/artifacts/source.patch", prompt)
         self.assertNotIn("/runs/run-1/artifacts/test.patch", prompt)
+
+    def test_worker_prompt_includes_carry_forward_directive_for_single_preserved_patch(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            carry_forward_patch="/runs/run-1/artifacts/worker.patch",
+            repair_changed_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_verification_first=True,
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Carry-forward repair directive:", prompt)
+        self.assertIn("already applied the preserved partial patch data", prompt)
+        self.assertIn("carried diff counts as the required working-tree change", prompt)
+        self.assertIn("Run the focused verification first", prompt)
+        self.assertNotIn("/runs/run-1/artifacts/worker.patch", prompt)
 
 
 if __name__ == "__main__":

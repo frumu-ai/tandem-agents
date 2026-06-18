@@ -197,9 +197,9 @@ def _subtask_contract_for_worker(subtask: dict[str, Any], target_files: list[str
 
 
 def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) -> str:
-    if not subtask.get("discarded_partial_diff_patch"):
-        return ""
     carries_preserved_patch = bool(subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches"))
+    if not subtask.get("discarded_partial_diff_patch") and not carries_preserved_patch:
+        return ""
     summary = _clip_prompt_text(subtask.get("repair_failure_summary"), 300)
     changed_files = [
         str(entry).strip()
@@ -617,6 +617,14 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "Do not stop with an analysis-only blocker unless editing the tracked target files would be unsafe, "
             "and name that concrete safety reason.\n"
         )
+        if subtask.get("repair_verification_first") and (
+            subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches")
+        ):
+            write_required_guidance += (
+                "\nThis repair starts from an already-applied preserved diff. That carried diff counts as the required "
+                "working-tree change for this worker. Run the focused verification first; make a new edit only if "
+                "that verification fails or the carried diff is incomplete.\n"
+            )
         production_followup_targets = [
             str(path).strip()
             for path in _as_list(subtask.get("repair_requires_production_followup"))
@@ -633,7 +641,9 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             write_required_guidance += (
                 "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
                 f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
-                "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
+                "minimal production change needed for that assertion. Do not continue expanding tests or stop with a test-only diff; "
+                "a test-only final diff fails unless you report a concrete blocker explaining why no production edit is safe. "
+                "A production-only diff fails this worker.\n"
             )
         elif required_test_targets and _subtask_mentions_test_work(subtask):
             paired_production_targets = [
@@ -652,7 +662,9 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
                 write_required_guidance += (
                     "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
                     f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
-                    "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
+                    "minimal production change needed for that assertion. Do not continue expanding tests or stop with a test-only diff; "
+                    "a test-only final diff fails unless you report a concrete blocker explaining why no production edit is safe. "
+                    "A production-only diff fails this worker.\n"
                 )
     no_target_guidance = ""
     if not target_files:

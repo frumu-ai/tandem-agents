@@ -36,6 +36,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _integration_semantic_blocker_can_defer_to_review,
     _linear_mcp_authorization_url,
     _linear_comment_task_summary,
+    _merge_worker_partial_diff_artifacts_into_repair,
     _permission_requests_from_payload,
     _partial_diff_artifacts_for_retry,
     _merge_partial_diff_artifacts_for_retry,
@@ -1874,7 +1875,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(artifacts[0]["changed_files"], ["crates/eval/src/scoring.rs"])
 
-    def test_failed_verifiable_diff_artifact_is_not_marked_reusable(self) -> None:
+    def test_failed_verifiable_diff_artifact_can_be_reused_for_repair(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
             [
                 {
@@ -1888,15 +1889,31 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
                     "blocker_kind": "worker_incomplete_diff",
                     "output_excerpt": "Worker produced source plus required-test changes, but focused tests failed.",
-                    "recovery_action": "Retry from clean target files.",
+                    "verification_command": [
+                        "python3",
+                        "-m",
+                        "unittest",
+                        "src.tandem_agents.config.config_loader_test",
+                    ],
+                    "verification_returncode": 1,
+                    "verification_timed_out": False,
+                    "verification_output_excerpt": "AttributeError: config.aca.throughput",
+                    "recovery_action": "Retry with the preserved source+test patch already applied.",
                 }
             ]
         )
 
         self.assertEqual(len(artifacts), 1)
-        self.assertFalse(artifacts[0]["patch_reusable"])
+        self.assertNotIn("patch_reusable", artifacts[0])
         self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_TEST_FAILED")
         self.assertIn("focused tests failed", artifacts[0]["worker_output_excerpt"])
+        self.assertEqual(
+            artifacts[0]["verification_command"],
+            ["python3", "-m", "unittest", "src.tandem_agents.config.config_loader_test"],
+        )
+        self.assertEqual(artifacts[0]["verification_returncode"], 1)
+        self.assertFalse(artifacts[0]["verification_timed_out"])
+        self.assertIn("config.aca.throughput", artifacts[0]["verification_output_excerpt"])
 
     def test_guard_rejected_source_and_test_only_artifacts_are_not_marked_reusable(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
@@ -1993,6 +2010,48 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             ],
         )
 
+    def test_terminal_worker_failure_merges_latest_partial_diff_artifact(self) -> None:
+        existing = {
+            "subtask_id": "subtask-1",
+            "worker_id": "worker-1",
+            "patch_path": "/runs/run-1/artifacts/source-only.patch",
+            "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+        }
+        ctx = SimpleNamespace(
+            status={"repair": {"partial_diff_artifacts": [dict(existing)]}},
+            blackboard={"repair": {"partial_diff_artifacts": [dict(existing)]}},
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/test-only.patch",
+                    "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+                    "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": "Worker changed only required test files.",
+                }
+            ],
+        )
+
+        merged = _merge_worker_partial_diff_artifacts_into_repair(
+            ctx,
+            blocker_kind="worker_incomplete_diff",
+        )
+
+        self.assertEqual(
+            [artifact["patch_path"] for artifact in merged],
+            [
+                "/runs/run-1/artifacts/source-only.patch",
+                "/runs/run-1/artifacts/test-only.patch",
+            ],
+        )
+        for repair in (ctx.status["repair"], ctx.blackboard["repair"]):
+            self.assertEqual(repair["partial_diff_artifacts"], merged)
+            self.assertEqual(repair["partial_diff_state"], "preserved_not_accepted")
+            self.assertIn("worker_incomplete_diff", repair["extra_retry_sources"])
+        self.assertFalse(merged[1]["patch_reusable"])
+
     def test_worker_no_progress_builds_base_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
             worker_results=[
@@ -2021,19 +2080,11 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 base_max_loops=2,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _worker_failure_can_retry(
                 SimpleNamespace(env={}),
                 blocker,
-                attempt=2,
-                base_max_loops=2,
-            )
-        )
-        self.assertTrue(
-            _worker_failure_can_retry(
-                SimpleNamespace(env={}),
-                blocker,
-                attempt=3,
+                attempt=1,
                 base_max_loops=2,
             )
         )
@@ -2041,7 +2092,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             _worker_failure_can_retry(
                 SimpleNamespace(env={}),
                 blocker,
-                attempt=4,
+                attempt=2,
                 base_max_loops=2,
             )
         )
@@ -2131,16 +2182,13 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("Discard this preserved patch", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
-    def test_incomplete_diff_gets_three_extra_worker_repair_loops_by_default(self) -> None:
+    def test_incomplete_diff_gets_no_extra_worker_repair_loops_by_default(self) -> None:
         cfg = SimpleNamespace(env={})
         blocker = {"kind": "worker_incomplete_diff"}
 
-        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 3)
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 0)
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
 
     def test_engine_timeout_with_partial_diff_gets_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2152,10 +2200,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         }
 
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertFalse(
             _worker_failure_can_retry(
                 cfg,
@@ -2285,10 +2330,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         cfg = SimpleNamespace(env={})
         blocker = {"kind": "worker_corrupt_diff"}
 
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
 
     def test_incomplete_diff_extra_retry_budget_can_be_disabled(self) -> None:
         cfg = SimpleNamespace(env={"ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES": "0"})
@@ -2316,10 +2358,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             blackboard={},
         )
 
-        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
-        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
-        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
-        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
 
     def test_integration_can_use_incomplete_diff_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2335,10 +2374,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
 
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
-        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
-        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
-        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
-        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=5, base_max_loops=2))
+        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
 
     def test_integration_prompt_timeout_uses_watchdog_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2424,7 +2460,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 repair["discarded_partial_diff_artifacts"][0]["patch_path"],
                 "/runs/run-1/artifacts/worker.patch",
             )
-        self.assertTrue(_verification_can_retry(SimpleNamespace(env={}), ctx, attempt=2, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(SimpleNamespace(env={}), ctx, attempt=2, base_max_loops=2))
 
     def test_retryable_worker_failure_collects_partial_diff_artifact(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(

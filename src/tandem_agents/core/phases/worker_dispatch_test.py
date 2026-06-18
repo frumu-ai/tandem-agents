@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -18,6 +19,11 @@ from src.tandem_agents.core.phases.worker_dispatch import (
     _filter_diff_text_to_files,
     _diff_has_substantive_required_test_addition,
     _diff_is_destructive_rewrite,
+    _latest_worker_retry_write_required,
+    _effective_worker_repair_no_change_abort_seconds,
+    _effective_worker_test_only_diff_abort_seconds,
+    _effective_worker_testless_diff_abort_seconds,
+    _effective_worker_no_change_abort_seconds,
     _failed_result_has_reviewable_production_diff,
     _failed_result_has_reviewable_source_and_test_diff,
     _reviewable_failed_diff_rejection,
@@ -49,7 +55,7 @@ class _FakeCoordination:
 
 class WorkerDispatchTest(unittest.TestCase):
     def test_no_change_timeout_defaults_and_ignores_invalid_env(self) -> None:
-        self.assertEqual(_worker_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 180.0)
+        self.assertEqual(_worker_no_change_abort_seconds(SimpleNamespace(cfg=SimpleNamespace(env={}))), 240.0)
         self.assertEqual(
             _worker_no_change_abort_seconds(
                 SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "90"}))
@@ -60,8 +66,189 @@ class WorkerDispatchTest(unittest.TestCase):
             _worker_no_change_abort_seconds(
                 SimpleNamespace(cfg=SimpleNamespace(env={"ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "bad"}))
             ),
-            180.0,
+            240.0,
         )
+
+    def test_effective_no_change_timeout_waits_for_async_no_text_classification(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "90",
+                    "ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS": "180",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "60",
+                }
+            )
+        )
+
+        timeout = _effective_worker_no_change_abort_seconds(
+            ctx,
+            {"id": "subtask-1", "files": ["src/app.py"], "write_required": True},
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 240.0)
+
+    def test_effective_no_change_timeout_waits_for_prompt_sync_first_budget(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "240",
+                    "ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS": "300",
+                    "ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS": "480",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "60",
+                }
+            )
+        )
+
+        timeout = _effective_worker_no_change_abort_seconds(
+            ctx,
+            {
+                "id": "fallback-throughput-repair",
+                "files": ["src/app.py"],
+                "write_required": True,
+            },
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 360.0)
+
+    def test_effective_no_change_timeout_keeps_larger_operator_override(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "600",
+                    "ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS": "180",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "60",
+                }
+            )
+        )
+
+        timeout = _effective_worker_no_change_abort_seconds(
+            ctx,
+            {"id": "subtask-1", "files": ["src/app.py"], "write_required": True},
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 600.0)
+
+    def test_effective_testless_diff_timeout_waits_for_worker_budget(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS": "120",
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "240",
+                    "ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS": "180",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "60",
+                }
+            )
+        )
+
+        timeout = _effective_worker_testless_diff_abort_seconds(
+            ctx,
+            {
+                "id": "subtask-1",
+                "files": ["src/app.py", "src/app_test.py"],
+                "write_required": True,
+            },
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 240.0)
+
+    def test_effective_test_only_diff_timeout_waits_for_worker_budget(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS": "120",
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "240",
+                    "ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS": "180",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "60",
+                }
+            )
+        )
+
+        timeout = _effective_worker_test_only_diff_abort_seconds(
+            ctx,
+            {
+                "id": "subtask-1",
+                "files": ["src/app.py", "src/app_test.py"],
+                "target_files": ["src/app.py", "src/app_test.py"],
+                "repair_requires_production_followup": ["src/app.py"],
+                "acceptance_criteria": [
+                    "Make the first new repair edit in the required production file.",
+                ],
+                "write_required": True,
+            },
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 240.0)
+
+    def test_effective_testless_diff_timeout_can_still_be_disabled(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS": "0",
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "240",
+                }
+            )
+        )
+
+        timeout = _effective_worker_testless_diff_abort_seconds(
+            ctx,
+            {"id": "subtask-1", "files": ["src/app.py"], "write_required": True},
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 0.0)
+
+    def test_effective_repair_no_change_timeout_waits_for_worker_budget(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS": "180",
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "240",
+                    "ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS": "180",
+                    "ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS": "60",
+                }
+            )
+        )
+
+        timeout = _effective_worker_repair_no_change_abort_seconds(
+            ctx,
+            {
+                "id": "subtask-1",
+                "files": ["src/app.py", "src/app_test.py"],
+                "write_required": True,
+                "deterministic_partial_diff_repair": True,
+            },
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 240.0)
+
+    def test_effective_repair_no_change_timeout_can_still_be_disabled(self) -> None:
+        ctx = SimpleNamespace(
+            cfg=SimpleNamespace(
+                env={
+                    "ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS": "0",
+                    "ACA_WORKER_NO_CHANGE_ABORT_SECONDS": "240",
+                }
+            )
+        )
+
+        timeout = _effective_worker_repair_no_change_abort_seconds(
+            ctx,
+            {
+                "id": "subtask-1",
+                "files": ["src/app.py"],
+                "write_required": True,
+                "deterministic_partial_diff_repair": True,
+            },
+            "worker-1",
+        )
+
+        self.assertEqual(timeout, 0.0)
 
     def test_tool_loop_summary_detects_invalid_patch_churn(self) -> None:
         messages = [
@@ -198,6 +385,44 @@ class WorkerDispatchTest(unittest.TestCase):
             )
         )
 
+    def test_latest_retry_write_required_uses_retry_started_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events_path = Path(tmp) / "events.jsonl"
+            events = [
+                {
+                    "type": "worker.started",
+                    "payload": {
+                        "worker_id": "worker-2",
+                        "execution_id": "exec-1",
+                    },
+                },
+                {
+                    "type": "worker.retry_started",
+                    "payload": {
+                        "worker_id": "worker-2",
+                        "execution_id": "exec-1",
+                        "write_required": False,
+                    },
+                },
+            ]
+            events_path.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+            ctx = SimpleNamespace(layout={"events": str(events_path)})
+
+            self.assertFalse(
+                _latest_worker_retry_write_required(
+                    ctx,
+                    "worker-2",
+                    {"_worker_execution_id": "exec-1", "write_required": True},
+                )
+            )
+            self.assertIsNone(
+                _latest_worker_retry_write_required(
+                    ctx,
+                    "worker-2",
+                    {"_worker_execution_id": "other-exec", "write_required": True},
+                )
+            )
+
     def test_changed_python_test_modules_targets_changed_tests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -317,6 +542,47 @@ class WorkerDispatchTest(unittest.TestCase):
         assert rejection is not None
         self.assertEqual(rejection["reason"], "focused_tests_failed")
         self.assertIn("FAILED", rejection["message"])
+
+    def test_changed_python_tests_result_scrubs_runtime_repo_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "src" / "tandem_agents" / "config"
+            package.mkdir(parents=True)
+            for init_path in [
+                root / "src" / "__init__.py",
+                root / "src" / "tandem_agents" / "__init__.py",
+                package / "__init__.py",
+            ]:
+                init_path.write_text("", encoding="utf-8")
+            test_path = package / "config_loader_test.py"
+            test_path.write_text(
+                "import os\n"
+                "import unittest\n\n"
+                "class ConfigLoaderEnvTest(unittest.TestCase):\n"
+                "    def test_runtime_repo_env_is_scrubbed(self):\n"
+                "        self.assertNotIn('ACA_REPO_PATH', os.environ)\n"
+                "        self.assertNotIn('ACA_WORKTREE_ROOT', os.environ)\n"
+                "        self.assertNotIn('TANDEM_CONTROL_PANEL_CONFIG_FILE', os.environ)\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ACA_REPO_PATH": "/workspace/repos/tandem-agents",
+                    "ACA_WORKTREE_ROOT": "/workspace/repos",
+                    "TANDEM_CONTROL_PANEL_CONFIG_FILE": "/workspace/tandem-data/control-panel-config.json",
+                },
+                clear=False,
+            ):
+                result = _changed_python_tests_result(
+                    root,
+                    ["src/tandem_agents/config/config_loader_test.py"],
+                )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result["ok"], result["output"])
 
     def test_cancel_active_worker_engine_session_deletes_marked_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

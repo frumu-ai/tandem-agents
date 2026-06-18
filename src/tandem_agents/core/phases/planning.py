@@ -202,6 +202,134 @@ def _compact_partial_diff_repair_context(worker_output_excerpt: str) -> str:
     return context[:500].rstrip()
 
 
+def _markdown_section(text: str, heading: str) -> str:
+    marker = f"## {heading}"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    body_start = text.find("\n", start)
+    if body_start < 0:
+        return ""
+    next_heading = text.find("\n## ", body_start + 1)
+    if next_heading < 0:
+        return text[body_start + 1 :].strip()
+    return text[body_start + 1 : next_heading].strip()
+
+
+def _compact_focused_test_failure_output(output: str) -> str:
+    raw_lines = [line.rstrip() for line in str(output or "").splitlines()]
+    selected: list[str] = []
+    selected_indexes: set[int] = set()
+    marker_indexes: list[int] = []
+    for index, raw_line in enumerate(raw_lines):
+        line = raw_line.strip()
+        if not line or set(line) <= {"=", "-"}:
+            continue
+        lowered = line.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "error",
+                "failed",
+                "failure",
+                "traceback",
+                "importerror",
+                "modulenotfounderror",
+                "syntaxerror",
+                "cannot import",
+                "attributeerror",
+                "assert",
+                "expected",
+                "actual",
+            )
+        ):
+            marker_indexes.append(index)
+
+    for marker_index in marker_indexes[:4]:
+        for index in range(max(0, marker_index - 3), min(len(raw_lines), marker_index + 2)):
+            if index in selected_indexes:
+                continue
+            line = raw_lines[index].strip()
+            if not line or set(line) <= {"=", "-"}:
+                continue
+            selected_indexes.add(index)
+            selected.append(line)
+            if len(selected) >= 12:
+                return " ".join(selected)[:900].rstrip()
+
+    if selected:
+        return " ".join(selected)[:900].rstrip()
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    interesting_markers = (
+        "error",
+        "failed",
+        "failure",
+        "traceback",
+        "importerror",
+        "modulenotfounderror",
+        "syntaxerror",
+        "cannot import",
+        "attributeerror",
+        "assert",
+        "expected",
+        "actual",
+    )
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if not line or set(line) <= {"=", "-"}:
+            continue
+        lowered = line.lower()
+        if not any(marker in lowered for marker in interesting_markers):
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+        if len(lines) >= 8:
+            break
+    return " ".join(lines)[:900].rstrip()
+
+
+def _partial_diff_focused_verification_context(artifact: dict[str, Any]) -> tuple[list[str], str]:
+    commands: list[str] = []
+
+    def _append_command(raw_command: Any) -> None:
+        if isinstance(raw_command, list):
+            command = " ".join(str(part or "").strip() for part in raw_command if str(part or "").strip())
+        else:
+            command = str(raw_command or "").strip()
+        if command and command not in commands:
+            commands.append(command)
+
+    _append_command(artifact.get("verification_command"))
+    output = str(artifact.get("verification_output_excerpt") or "").strip()
+    patch_path = str(artifact.get("patch_path") or "").strip()
+    if patch_path:
+        try:
+            text = Path(patch_path).read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if text:
+            verification_section = _markdown_section(text, "focused verification")
+            for raw_line in verification_section.splitlines():
+                line = raw_line.strip()
+                if line.lower().startswith("- command:"):
+                    _append_command(line.split(":", 1)[1].strip())
+            artifact_output = _markdown_section(text, "test output")
+            if artifact_output and artifact_output not in output:
+                output = f"{output}\n{artifact_output}".strip()
+
+    summary_parts: list[str] = []
+    if commands:
+        summary_parts.append("Focused verification command: " + commands[0])
+    failure_summary = _compact_focused_test_failure_output(output)
+    if failure_summary:
+        summary_parts.append("Focused failure: " + failure_summary)
+    return commands, " ".join(summary_parts).strip()
+
+
 def _repo_path_looks_like_test_file(path: str) -> bool:
     rel_path = _normalize_repo_relative_path(path)
     if not rel_path:
@@ -480,6 +608,18 @@ def _append_unique_repo_paths(subtask: dict[str, Any], paths: list[str]) -> None
         subtask[key] = values
 
 
+def _partial_diff_artifact_target_files(artifact: dict[str, Any]) -> list[str]:
+    files: list[str] = []
+    for key in ("subtask_target_files", "subtask_files"):
+        for raw_path in artifact.get(key) or []:
+            rel_path = _normalize_repo_relative_path(raw_path)
+            if rel_path and rel_path not in files:
+                files.append(rel_path)
+        if files:
+            break
+    return files
+
+
 def _repo_uses_sibling_python_tests(repo_path: Path) -> bool:
     if (repo_path / "tests").is_dir():
         return False
@@ -624,6 +764,42 @@ def _split_dense_serial_subtasks(
 
     if changed:
         subtasks[:] = split
+
+    fallback_cap_active = bool(
+        getattr(ctx, "_manager_fallback_required", False)
+        or (
+            isinstance(getattr(ctx, "blackboard", None), dict)
+            and (
+                "manager_invalid_plan" in ctx.blackboard
+                or "manager_deterministic_repo_context_plan" in ctx.blackboard
+            )
+        )
+    )
+    if not fallback_cap_active:
+        return
+
+    limit = _serial_subtask_limit(ctx.cfg)
+    if len(subtasks) <= limit:
+        return
+
+    retained = subtasks[:limit]
+    deferred = subtasks[limit:]
+    cap_note = (
+        f"ACA capped deterministic fallback planning to {limit} serial slice(s) "
+        "for spend safety after manager planning failed."
+    )
+    for subtask in retained:
+        scope_note = str(subtask.get("scope_note") or "").strip()
+        if cap_note not in scope_note:
+            subtask["scope_note"] = f"{scope_note}\n{cap_note}".strip()
+    if isinstance(getattr(ctx, "blackboard", None), dict):
+        ctx.blackboard["manager_fallback_serial_cap"] = {
+            "limit": limit,
+            "original_planned_workers": len(subtasks),
+            "retained_subtask_ids": [str(item.get("id") or "").strip() for item in retained],
+            "deferred_subtask_ids": [str(item.get("id") or "").strip() for item in deferred],
+        }
+    subtasks[:] = retained
 
 
 def _remote_code_task_requires_worker_execution(task: dict[str, Any]) -> bool:
@@ -1243,19 +1419,38 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
     artifacts = repair.get("partial_diff_artifacts") if isinstance(repair, dict) else []
     if not isinstance(artifacts, list) or not artifacts:
         return
-    for artifact in artifacts:
+    for artifact in reversed(artifacts):
         if not isinstance(artifact, dict):
             continue
         patch_path = str(artifact.get("patch_path") or "").strip()
         if not patch_path:
             continue
         subtask = _select_partial_diff_subtask(artifact, subtasks)
-        if subtask is None or subtask.get("carry_forward_patch") or subtask.get("discarded_partial_diff_patch"):
+        if (
+            subtask is None
+            or subtask.get("carry_forward_patch")
+            or subtask.get("carry_forward_patches")
+            or subtask.get("discarded_partial_diff_patch")
+        ):
             continue
         changed_files = _partial_diff_changed_files(artifact)
         worker_output_excerpt = str(artifact.get("worker_output_excerpt") or "").strip()
+        focused_verification_commands, focused_verification_context = _partial_diff_focused_verification_context(artifact)
+        if focused_verification_context:
+            worker_output_excerpt = (
+                focused_verification_context
+                if not worker_output_excerpt
+                else f"{focused_verification_context}\n{worker_output_excerpt}"
+            )
+        failure_reason = str(artifact.get("failure_reason") or "").strip()
+        focused_test_failed_source_and_test_patch = (
+            failure_reason == "WORKER_VERIFIABLE_DIFF_TEST_FAILED"
+            and _changed_files_include_source_and_test(changed_files)
+        )
         should_reapply_patch = _partial_diff_patch_is_reusable(worker_output_excerpt)
-        if artifact.get("patch_reusable") is False:
+        if focused_test_failed_source_and_test_patch:
+            should_reapply_patch = True
+        if artifact.get("patch_reusable") is False and not focused_test_failed_source_and_test_patch:
             should_reapply_patch = False
         excerpt_limit = 1200 if should_reapply_patch else 360
         if len(worker_output_excerpt) > excerpt_limit:
@@ -1286,9 +1481,10 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
                 )
                 if rel_path
             ] if isinstance(task_obj, dict) else []
-            if parent_target_files:
-                _append_unique_repo_paths(subtask, parent_target_files)
-                subtask["repair_parent_target_files"] = parent_target_files
+            repair_target_files = _partial_diff_artifact_target_files(artifact) or parent_target_files
+            if repair_target_files:
+                _append_unique_repo_paths(subtask, repair_target_files)
+                subtask["repair_parent_target_files"] = repair_target_files
                 criteria = [
                     str(entry).strip()
                     for entry in (subtask.get("acceptance_criteria") or [])
@@ -1296,8 +1492,8 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
                 ]
                 rewritten: list[str] = []
                 replacement = (
-                    "Keep repair edits scoped to the parent task target files: "
-                    + ", ".join(parent_target_files)
+                    "Keep repair edits scoped to the active repair target files: "
+                    + ", ".join(repair_target_files)
                     + "."
                 )
                 for entry in criteria:
@@ -1313,6 +1509,15 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
         subtask["repair_source_subtask_id"] = str(artifact.get("subtask_id") or "").strip()
         subtask["repair_source_worker_id"] = str(artifact.get("worker_id") or "").strip()
         subtask["repair_changed_files"] = changed_files
+        if focused_verification_commands:
+            existing_commands = [
+                str(command or "").strip()
+                for command in (subtask.get("verification_commands") or [])
+                if str(command or "").strip()
+            ]
+            subtask["verification_commands"] = list(
+                dict.fromkeys([*focused_verification_commands, *existing_commands])
+            )
         if worker_output_excerpt:
             subtask["repair_worker_output_excerpt"] = worker_output_excerpt
             criteria = [str(entry).strip() for entry in (subtask.get("acceptance_criteria") or []) if str(entry).strip()]
@@ -1357,7 +1562,7 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
                 else ""
             )
             parent_target_note = (
-                " Active repair targets are the parent task target files: "
+                " Active repair targets are: "
                 + ", ".join(subtask.get("repair_parent_target_files") or [])
                 + "."
                 if subtask.get("repair_parent_target_files")
@@ -1533,18 +1738,91 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         changed_files = _partial_diff_changed_files(artifact)
         patch_path = str(artifact.get("patch_path") or "").strip()
         failure_summary = _partial_diff_rejected_failure_summary(excerpt)
-        artifact_targets = [
-            rel_path
-            for rel_path in (
-                _normalize_repo_relative_path(raw_path)
-                for raw_path in (
-                    artifact.get("subtask_target_files")
-                    or artifact.get("subtask_files")
-                    or parent_targets
-                )
+        artifact_targets = _partial_diff_artifact_target_files(artifact) or parent_targets
+        failure_reason = str(artifact.get("failure_reason") or "").strip()
+        weak_test_rejection = failure_reason == "WORKER_VERIFIABLE_DIFF_WEAK_TEST" or any(
+            marker in lowered
+            for marker in (
+                "test diff did not add a test method",
+                "test diff did not add a test method or assertion",
+                "did not add a test method or assertion",
+                "weak test",
             )
-            if rel_path
-        ]
+        )
+        if weak_test_rejection:
+            source_files = [
+                path
+                for path in changed_files
+                if _repo_path_looks_like_production_source_file(path)
+            ] or [
+                path
+                for path in artifact_targets
+                if _repo_path_looks_like_production_source_file(path)
+            ]
+            required_test_files = [
+                path
+                for path in changed_files
+                if _repo_path_looks_like_test_file(path)
+            ] or [
+                path
+                for path in artifact_targets
+                if _repo_path_looks_like_test_file(path)
+            ]
+            if not source_files or not required_test_files:
+                continue
+            active_files = list(dict.fromkeys([*source_files, *required_test_files]))
+            source_text = ", ".join(source_files)
+            test_text = ", ".join(required_test_files)
+            subtask = {
+                "id": str(artifact.get("subtask_id") or "weak-test-diff-repair").strip() or "weak-test-diff-repair",
+                "title": "Repair weak source+test partial diff",
+                "goal": (
+                    "Replace the rejected weak-test partial worker diff with a production-backed regression for "
+                    + ", ".join(active_files)
+                    + "."
+                ),
+                "files": active_files,
+                "target_files": active_files,
+                "acceptance_criteria": [
+                    "Do not apply or copy the rejected weak-test partial patch.",
+                    "Make the first new repair edit in the required test file(s): "
+                    + test_text
+                    + "; add a real test method or assertion that exercises production behavior.",
+                    "Preserve or recreate only the minimal production behavior needed in: " + source_text + ".",
+                    "Do not mark this repair complete until the diff includes meaningful regression coverage in "
+                    + test_text
+                    + " plus production-backed behavior, and narrow verification has run or a concrete blocker is recorded.",
+                ],
+                "discarded_partial_diff_patch": patch_path,
+                "repair_source_subtask_id": str(artifact.get("subtask_id") or "").strip(),
+                "repair_source_worker_id": str(artifact.get("worker_id") or "").strip(),
+                "repair_changed_files": changed_files,
+                "repair_requires_test_followup": required_test_files,
+                "repair_worker_output_excerpt": excerpt[:1200],
+                "repair_failure_summary": failure_summary,
+                "repair_parent_target_files": active_files,
+                "deterministic_partial_diff_repair": True,
+                "write_required": True,
+                "scope_note": (
+                    "ACA generated this repair plan deterministically after rejecting a source+test partial "
+                    "diff whose test changes lacked a real test method or assertion. Active repair targets are: "
+                    + ", ".join(active_files)
+                    + "."
+                ),
+            }
+            return {
+                "summary": (
+                    "Deterministic repair for a weak source+test partial diff; ACA discarded the patch and "
+                    "narrowed the retry to the changed source plus required tests."
+                ),
+                "subtasks": [subtask],
+                "risks": [
+                    "The rejected weak-test patch is intentionally not replayed."
+                ],
+                "tests": [
+                    "Run the narrowest deterministic verification for " + test_text + "."
+                ],
+            }
         if (
             changed_files
             and all(_repo_path_looks_like_production_source_file(path) for path in changed_files)
@@ -1867,8 +2145,6 @@ def _deterministic_complementary_partial_diff_repair_plan(
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
-        if artifact.get("patch_reusable") is False:
-            continue
         changed_files = _partial_diff_changed_files(artifact)
         excerpt = str(artifact.get("worker_output_excerpt") or "").lower()
         if _all_changed_files_are_tests(changed_files) and (
@@ -1903,10 +2179,83 @@ def _deterministic_complementary_partial_diff_repair_plan(
                 str(test_artifact.get("patch_path") or "").strip(),
             ]
             patches = [patch for patch in dict.fromkeys(patches) if patch]
-            if not paired_source_files or not test_files or len(patches) < 2:
+            if not paired_source_files or not test_files:
                 continue
             source_text = ", ".join(paired_source_files)
             test_text = ", ".join(test_files)
+            source_failure_reason = str(source_artifact.get("failure_reason") or "").strip()
+            test_failure_reason = str(test_artifact.get("failure_reason") or "").strip()
+            pair_failed_only_for_missing_counterpart = (
+                source_failure_reason == "WORKER_OFF_TRACK_TESTLESS_DIFF"
+                and test_failure_reason == "WORKER_TEST_ONLY_DIFF"
+            )
+            patches_reusable = (
+                len(patches) >= 2
+                and (
+                    pair_failed_only_for_missing_counterpart
+                    or (
+                        source_artifact.get("patch_reusable") is not False
+                        and test_artifact.get("patch_reusable") is not False
+                    )
+                )
+            )
+            if not patches_reusable:
+                return {
+                    "summary": (
+                        "Deterministic repair for complementary rejected source-only and test-only partial "
+                        "diffs; ACA will rebuild both sides from a clean checkout without replaying either patch."
+                    ),
+                    "subtasks": [
+                        {
+                            "id": str(test_artifact.get("subtask_id") or "complementary-rejected-diff-repair").strip()
+                            or "complementary-rejected-diff-repair",
+                            "title": "Rebuild complementary source and test partial diffs",
+                            "goal": (
+                                "Rebuild a single source+test repair for "
+                                + ", ".join(active_files)
+                                + " without copying either rejected partial patch."
+                            ),
+                            "files": active_files,
+                            "target_files": active_files,
+                            "acceptance_criteria": [
+                                "Do not copy or replay the rejected partial patch artifacts.",
+                                "Make one substantive production edit in: " + source_text + ".",
+                                "Add or tighten meaningful regression coverage in: " + test_text + ".",
+                                "Do not mark this repair complete until the current diff includes both "
+                                + source_text
+                                + " and "
+                                + test_text
+                                + ", and narrow verification has run or a concrete blocker is recorded.",
+                            ],
+                            "discarded_partial_diff_patch": patches[0] if patches else "",
+                            "discarded_partial_diff_patches": patches,
+                            "repair_source_subtask_id": str(test_artifact.get("subtask_id") or "").strip(),
+                            "repair_source_worker_id": str(test_artifact.get("worker_id") or "").strip(),
+                            "repair_changed_files": active_files,
+                            "repair_requires_production_followup": paired_source_files,
+                            "repair_requires_test_followup": test_files,
+                            "repair_parent_target_files": active_files,
+                            "repair_failure_summary": (
+                                "previous retries produced separate source-only and test-only partial diffs"
+                            ),
+                            "deterministic_partial_diff_repair": True,
+                            "write_required": True,
+                            "scope_note": (
+                                "ACA detected complementary rejected partial diffs: one source-only attempt for "
+                                + source_text
+                                + " and one test-only attempt for "
+                                + test_text
+                                + ". Rebuild both sides from clean files; do not replay either rejected patch."
+                            ),
+                        }
+                    ],
+                    "risks": [
+                        "The rejected partial patches are intentionally not replayed; the worker must recreate the useful intent."
+                    ],
+                    "tests": ["Run the narrowest deterministic verification for " + test_text + "."],
+                }
+            if len(patches) < 2:
+                continue
             return {
                 "summary": (
                     "Deterministic repair for complementary source-only and test-only partial diffs; "
@@ -1996,7 +2345,7 @@ def _repair_int(value: Any) -> int:
 
 def _write_required_after_prescreen(subtask: dict[str, Any]) -> bool:
     if subtask.get("repair_verification_first"):
-        return False
+        return True
     return not bool(subtask.get("pre_satisfied"))
 
 
@@ -2019,7 +2368,7 @@ def _narrow_carried_partial_diff_subtask(subtask: dict[str, Any]) -> None:
         active_files = list(dict.fromkeys([*changed_files, *required_test_files]))
     verify_first_partial = _partial_diff_retry_should_verify_first(subtask, changed_files)
     if verify_first_partial:
-        subtask["write_required"] = False
+        subtask["write_required"] = True
         subtask["repair_verification_first"] = True
     if changed_files:
         previous_files = sorted(_subtask_declared_files(subtask).difference(active_files))
@@ -2035,6 +2384,16 @@ def _narrow_carried_partial_diff_subtask(subtask: dict[str, Any]) -> None:
             subtask["repair_requires_test_followup"] = required_test_files
     context = _compact_partial_diff_repair_context(str(subtask.get("repair_worker_output_excerpt") or ""))
     target_text = ", ".join(active_files) if active_files else "the files touched by the preserved patch"
+    verification_commands = [
+        str(command or "").strip()
+        for command in (subtask.get("verification_commands") or [])
+        if str(command or "").strip()
+    ]
+    verification_instruction = (
+        "Run this focused verification first: " + "; ".join(verification_commands[:2]) + "."
+        if verification_commands
+        else "Run the narrow deterministic verification first."
+    )
     original_criteria = [
         str(entry).strip()
         for entry in (subtask.get("acceptance_criteria") or [])
@@ -2051,7 +2410,7 @@ def _narrow_carried_partial_diff_subtask(subtask: dict[str, Any]) -> None:
     if verify_first_partial:
         criteria = [
             "Apply and inspect the preserved source+test patch in: " + target_text + ".",
-            "Run the narrow deterministic verification first; if it passes, return a terminal completion note without making another mandatory edit.",
+            verification_instruction + " If it passes, return a terminal completion note without making another mandatory edit.",
             "If verification fails, fix only the failing behavior in the preserved source/test files and rerun the narrow verification or record the exact blocker.",
         ]
         if context:
@@ -2098,7 +2457,7 @@ def _narrow_carried_partial_diff_subtask(subtask: dict[str, Any]) -> None:
             "Do not expand into deferred manager scope unless a direct import or compile/test failure in the preserved files requires it.",
         )
     subtask["acceptance_criteria"] = criteria
-    subtask["write_required"] = not verify_first_partial
+    subtask["write_required"] = True
     original_goal = str(subtask.get("goal") or "").strip()
     if original_goal and "repair_original_goal" not in subtask:
         subtask["repair_original_goal"] = original_goal
@@ -2139,12 +2498,12 @@ def _compact_rejected_partial_diff_subtask(subtask: dict[str, Any]) -> None:
     ]
     if original_criteria and "repair_deferred_acceptance_criteria" not in subtask:
         subtask["repair_deferred_acceptance_criteria"] = original_criteria
-    target_text = ", ".join(target_files) if target_files else "the active parent task target files"
+    target_text = ", ".join(target_files) if target_files else "the active repair target files"
     changed_text = ", ".join(changed_files) if changed_files else "none recorded"
     failure_summary = str(subtask.get("repair_failure_summary") or "").strip()
     criteria = [
         "Replace the rejected or incomplete partial-diff approach before expanding scope.",
-        "Keep repair edits scoped to the parent task target files: " + target_text + ".",
+        "Keep repair edits scoped to the active repair target files: " + target_text + ".",
         "Use the rejected diff only as failure evidence; do not read, apply, copy, or reference its patch artifact.",
         "Rejected diff touched: " + changed_text + ".",
         "Add one deterministic production-backed assertion or implementation slice that addresses the failure summary.",
@@ -2199,8 +2558,8 @@ def _constrain_extra_partial_diff_repair_subtasks(
         chosen["target_files"] = list(dict.fromkeys(parent_target_files))
         existing_scope_note = str(chosen.get("scope_note") or "").strip()
         parent_note = (
-            "ACA kept this extra repair attempt on the parent task target files because the preserved "
-            "partial diff was rejected or incomplete. Active repair targets are the parent task targets: "
+            "ACA kept this extra repair attempt on the active repair target files because the preserved "
+            "partial diff was rejected or incomplete. Active repair targets are: "
             + ", ".join(parent_target_files)
             + "."
         )

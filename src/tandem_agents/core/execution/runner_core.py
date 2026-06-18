@@ -606,7 +606,7 @@ def _worker_incomplete_diff_extra_retries(cfg: ResolvedConfig) -> int:
             return max(0, int(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES=%r", raw)
-    return 3
+    return 0
 
 
 def _worker_failure_can_retry(
@@ -751,7 +751,6 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
         if failure_reason in {
             "WORKER_OFF_TRACK_TESTLESS_DIFF",
             "WORKER_TEST_ONLY_DIFF",
-            "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
             "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
         }:
             entry["patch_reusable"] = False
@@ -759,6 +758,19 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
             entry["changed_files"] = changed_files
         if output_excerpt:
             entry["worker_output_excerpt"] = output_excerpt
+        verification_command = result.get("verification_command")
+        if isinstance(verification_command, list):
+            command_parts = [str(part or "").strip() for part in verification_command if str(part or "").strip()]
+            if command_parts:
+                entry["verification_command"] = command_parts
+        for metadata_key in (
+            "verification_returncode",
+            "verification_timed_out",
+            "verification_output_excerpt",
+        ):
+            metadata_value = result.get(metadata_key)
+            if metadata_value not in (None, "", [], {}, ()):
+                entry[metadata_key] = metadata_value
         for metadata_key in ("subtask_files", "subtask_target_files"):
             metadata_value = result.get(metadata_key)
             if isinstance(metadata_value, list):
@@ -802,6 +814,31 @@ def _merge_partial_diff_artifacts_for_retry(
         artifacts.append(dict(raw_artifact))
         seen.add(key)
     return artifacts
+
+
+def _merge_worker_partial_diff_artifacts_into_repair(
+    ctx: Any,
+    *,
+    blocker_kind: str = "",
+) -> list[dict[str, Any]]:
+    partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
+    if not partial_diff_artifacts:
+        return []
+    status_repair = ctx.status.setdefault("repair", {})
+    blackboard_repair = ctx.blackboard.setdefault("repair", {})
+    existing = blackboard_repair.get("partial_diff_artifacts") or status_repair.get("partial_diff_artifacts")
+    merged = _merge_partial_diff_artifacts_for_retry(existing, partial_diff_artifacts)
+    for repair_state in (blackboard_repair, status_repair):
+        repair_state["partial_diff_artifacts"] = merged
+        repair_state["partial_diff_state"] = "preserved_not_accepted"
+        repair_state["extra_retry_source"] = repair_state.get("extra_retry_source") or "worker_incomplete_diff"
+        sources = repair_state.setdefault("extra_retry_sources", [])
+        if isinstance(sources, list):
+            if "worker_incomplete_diff" not in sources:
+                sources.append("worker_incomplete_diff")
+            if blocker_kind and blocker_kind not in sources:
+                sources.append(blocker_kind)
+    return merged
 
 
 def _completed_subtask_ids_for_retry(worker_results: list[dict[str, Any]]) -> list[str]:
@@ -5013,10 +5050,12 @@ def _block_worker_failure(ctx: "_PhaseRunContext") -> dict[str, Any]:
     if blocker.get("engine"):
         ctx.status.setdefault("engine", {}).update(blocker["engine"])
     ctx.status.setdefault("artifacts", {})
+    _merge_worker_partial_diff_artifacts_into_repair(ctx, blocker_kind=blocker.get("kind", ""))
     for key in ("events_path", "messages_path", "sync_snapshot_path"):
         value = (blocker.get("engine") or {}).get(key)
         if value:
             ctx.status["artifacts"][f"engine_{key.replace('_path', '')}"] = value
+    write_status(ctx.layout["status"], ctx.status)
     ctx.blackboard.setdefault("blockers", []).append(
         {
             "kind": blocker["kind"],

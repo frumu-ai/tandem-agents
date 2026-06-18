@@ -90,7 +90,7 @@ WORKER_BLOCKED_STATUS_RE = re.compile(
     r"(?im)^\s*(?:status\s*:\s*blocked.*|blocked(?:\s*(?:[^\w\s].*)?)?)\s*$"
 )
 
-TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "dispatch_timeout"}
+TERMINAL_ENGINE_STREAM_REASONS = {"timeout", "no_text_timeout", "dispatch_timeout", "cancelled", "canceled"}
 NON_RETRYABLE_WORKER_BLOCKERS = {
     "coordination_lost",
     "engine_empty_response",
@@ -2481,7 +2481,7 @@ def _subtask_requires_real_diff(subtask: dict[str, Any]) -> bool:
     if subtask.get("pr_candidate_context") or subtask.get("pr_candidate_refs"):
         return True
     if subtask.get("repair_verification_first"):
-        return False
+        return True
     if not _subtask_targets(subtask):
         return False
     text = _subtask_search_text(subtask)
@@ -4024,12 +4024,44 @@ def stream_tandem_prompt(
 
                 stdout_text, completed, run_id, stream_reason = _run_async_once(prompt, 0)
                 if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
-                    stop_result = _worker_stop_result("same-session async retry")
+                    stop_result = _worker_stop_result("fresh-session async retry")
                     if stop_result is not None:
                         return stop_result
+                    previous_session_id = session_id
+                    engine_meta["empty_response_session_id"] = previous_session_id
+                    if previous_session_id:
+                        try:
+                            _call_with_timeout(
+                                lambda: delete_tandem_session(cfg, previous_session_id),
+                                timeout_seconds=5.0,
+                            )
+                        except Exception:
+                            logger.debug("Failed to delete empty-response session before retry", exc_info=True)
+                    session_temperature = None
+                    if hasattr(cfg, "sampling_for_role"):
+                        session_temperature = cfg.sampling_for_role(role).get("temperature")
+                    session_id = create_tandem_session(
+                        cfg,
+                        title=f"ACA {role} empty response retry",
+                        directory=cwd,
+                        provider=provider,
+                        model=model,
+                        temperature=session_temperature,
+                        permission_rules=session_permission_rules,
+                    )
+                    engine_meta["session_id"] = session_id
+                    engine_meta["fallback_mode"] = "async_empty_response_fresh_session"
+                    engine_meta["run_id"] = ""
+                    last_run_id = ""
+                    _mark_active_worker_engine_session(
+                        log_path,
+                        worker_id=role,
+                        session_id=session_id,
+                        cwd=cwd,
+                    )
                     retry_notice = (
                         f"ENGINE_EMPTY_RESPONSE_RETRY: engine run {run_id or 'unknown'} completed "
-                        "without transcript text; retrying once in the same session.\n"
+                        "without transcript text; retrying once in a fresh session.\n"
                     )
                     log.write(retry_notice)
                     log.flush()
@@ -4196,6 +4228,13 @@ def stream_tandem_prompt(
                         "assistant progress long enough to trip the ACA watchdog. Last engine run: "
                         f"{run_id or last_run_id or 'unknown'}.\n"
                     )
+                elif stream_reason in {"cancelled", "canceled"}:
+                    failure_reason = "ENGINE_RUN_CANCELLED"
+                    blocker_kind = "engine_run_cancelled"
+                    stdout_text = (
+                        "ENGINE_RUN_CANCELLED: Tandem engine cancelled the active worker run. "
+                        f"Last engine run: {run_id or last_run_id or 'unknown'}.\n"
+                    )
                 else:
                     failure_reason = "ENGINE_EMPTY_RESPONSE"
                     blocker_kind = "engine_empty_response"
@@ -4243,6 +4282,10 @@ def stream_tandem_prompt(
                 elif blocker_kind == "engine_prompt_timeout":
                     recovery_action = (
                         "Inspect engine/session snapshots and retry with a smaller scoped prompt or healthier provider route."
+                    )
+                elif blocker_kind == "engine_run_cancelled":
+                    recovery_action = (
+                        "ACA treated the engine cancellation as terminal for this worker; reset or retrigger the task when ready."
                     )
                 elif blocker_kind:
                     recovery_action = (

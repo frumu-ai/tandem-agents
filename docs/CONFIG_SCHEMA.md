@@ -193,8 +193,9 @@ Optional fields:
 - `ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS`: legacy worker prompt-sync timeout for write-required workers; default `300`
 - `ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS`: maximum scaled legacy worker prompt-sync timeout; default `480`
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS`: outer worker watchdog for no terminal result; default `540`
-- `ACA_WORKER_NO_CHANGE_ABORT_SECONDS`: write-required worker no-change watchdog; default `240`
+- `ACA_WORKER_NO_CHANGE_ABORT_SECONDS`: write-required worker no-change watchdog floor; default `240`
 - `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS`: repair-worker no-change watchdog; default `180`
+- `ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES`: extra full repair loops for preserved partial/incomplete worker diffs; default `0`
 - `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS`: outer manager planning watchdog; default `90`
 - `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS`: outer integration watchdog; default `300`
 - `ACA_SERIAL_SUBTASK_LIMIT`: maximum planned worker slices for disabled-swarm serial runs; default `4`
@@ -329,8 +330,9 @@ Behavior:
 - `ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS` -> legacy worker prompt-sync timeout
 - `ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS` -> legacy worker prompt-sync scaled cap
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS` -> legacy worker no-progress watchdog
-- `ACA_WORKER_NO_CHANGE_ABORT_SECONDS` -> write-required worker no-change watchdog
+- `ACA_WORKER_NO_CHANGE_ABORT_SECONDS` -> write-required worker no-change watchdog floor
 - `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS` -> repair-worker no-change watchdog
+- `ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES` -> extra full repair loops for preserved partial/incomplete worker diffs
 - `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS` -> legacy manager planning watchdog
 - `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS` -> legacy manager integration watchdog
 - `ACA_SERIAL_SUBTASK_LIMIT` -> disabled-swarm serial planning slice limit

@@ -410,6 +410,28 @@ def _changed_python_test_modules(worktree: Path, changed_files: list[str]) -> li
     return modules
 
 
+_FOCUSED_PYTHON_TEST_ENV_DENYLIST = {
+    "ACA_REPO_PATH",
+    "AUTOCODER_REPO_PATH",
+    "ACA_REPO_SLUG",
+    "AUTOCODER_REPO_SLUG",
+    "ACA_REPO_URL",
+    "AUTOCODER_REPO_URL",
+    "ACA_WORKTREE_ROOT",
+    "AUTOCODER_WORKTREE_ROOT",
+    "ACA_REPO_ALLOWED_HOSTS",
+    "ACA_REPO_TOKEN_FILE",
+    "TANDEM_CONTROL_PANEL_CONFIG_FILE",
+}
+
+
+def _focused_python_test_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in _FOCUSED_PYTHON_TEST_ENV_DENYLIST:
+        env.pop(key, None)
+    return env
+
+
 def _changed_python_tests_result(worktree: Path, changed_files: list[str]) -> dict[str, Any] | None:
     modules = _changed_python_test_modules(worktree, changed_files)
     if not modules:
@@ -419,6 +441,7 @@ def _changed_python_tests_result(worktree: Path, changed_files: list[str]) -> di
         result = subprocess.run(
             command,
             cwd=worktree,
+            env=_focused_python_test_env(),
             capture_output=True,
             text=True,
             check=False,
@@ -580,6 +603,28 @@ def _worker_testless_diff_abort_seconds(ctx: RunContext) -> float:
     return 120.0
 
 
+def _effective_worker_testless_diff_abort_seconds(
+    ctx: RunContext,
+    subtask: dict[str, Any],
+    worker_id: str,
+) -> float:
+    configured = _worker_testless_diff_abort_seconds(ctx)
+    if configured <= 0:
+        return configured
+    return max(configured, _effective_worker_no_change_abort_seconds(ctx, subtask, worker_id))
+
+
+def _effective_worker_test_only_diff_abort_seconds(
+    ctx: RunContext,
+    subtask: dict[str, Any],
+    worker_id: str,
+) -> float:
+    configured = _worker_testless_diff_abort_seconds(ctx)
+    if configured <= 0:
+        return configured
+    return max(configured, _effective_worker_no_change_abort_seconds(ctx, subtask, worker_id))
+
+
 def _worker_comment_only_diff_abort_seconds(ctx: RunContext) -> float:
     raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_COMMENT_ONLY_DIFF_ABORT_SECONDS") or "").strip()
     if raw:
@@ -610,6 +655,17 @@ def _worker_repair_no_change_abort_seconds(ctx: RunContext) -> float:
     return 180.0
 
 
+def _effective_worker_repair_no_change_abort_seconds(
+    ctx: RunContext,
+    subtask: dict[str, Any],
+    worker_id: str,
+) -> float:
+    configured = _worker_repair_no_change_abort_seconds(ctx)
+    if configured <= 0:
+        return configured
+    return max(configured, _effective_worker_no_change_abort_seconds(ctx, subtask, worker_id))
+
+
 def _worker_no_change_abort_seconds(ctx: RunContext) -> float:
     raw = str((getattr(ctx.cfg, "env", {}) or {}).get("ACA_WORKER_NO_CHANGE_ABORT_SECONDS") or "").strip()
     if raw:
@@ -617,7 +673,52 @@ def _worker_no_change_abort_seconds(ctx: RunContext) -> float:
             return max(0.0, float(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_NO_CHANGE_ABORT_SECONDS=%r", raw)
-    return 180.0
+    return 240.0
+
+
+def _effective_worker_no_change_abort_seconds(
+    ctx: RunContext,
+    subtask: dict[str, Any],
+    worker_id: str,
+) -> float:
+    configured = _worker_no_change_abort_seconds(ctx)
+    if configured <= 0:
+        return configured
+    try:
+        from src.tandem_agents.core.execution.worker import (
+            _scaled_async_no_text_timeout_seconds,
+            _scaled_prompt_sync_timeout_seconds,
+            _subtask_prefers_prompt_sync_first,
+            _use_prompt_sync_first,
+            _worker_terminalize_timeout_seconds,
+            _worker_timeout_multiplier,
+        )
+
+        write_required = bool(subtask.get("write_required", True))
+        timeout_multiplier = _worker_timeout_multiplier(subtask)
+        prompt_sync_first = _use_prompt_sync_first(
+            ctx.cfg,
+            _subtask_prefers_prompt_sync_first(subtask) if write_required else None,
+        )
+        if prompt_sync_first:
+            engine_budget = _scaled_prompt_sync_timeout_seconds(
+                ctx.cfg,
+                worker_id or "worker-1",
+                write_required,
+                timeout_multiplier,
+            )
+        else:
+            engine_budget = _scaled_async_no_text_timeout_seconds(
+                ctx.cfg,
+                worker_id or "worker-1",
+                write_required,
+                timeout_multiplier,
+            )
+        grace_seconds = _worker_terminalize_timeout_seconds(ctx.cfg)
+        return max(configured, engine_budget + grace_seconds)
+    except Exception:
+        logger.debug("Failed to derive effective worker no-change abort budget", exc_info=True)
+        return configured
 
 
 def _worker_no_diff_tool_loop_abort_seconds(ctx: RunContext) -> float:
@@ -749,6 +850,46 @@ def _subtask_is_no_change_guard_candidate(subtask: dict[str, Any]) -> bool:
     if _subtask_is_repair_no_change_guard_candidate(subtask):
         return False
     return True
+
+
+def _latest_worker_retry_write_required(
+    ctx: RunContext,
+    worker_id: str,
+    subtask: dict[str, Any],
+) -> bool | None:
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        return None
+    events_path = Path(ctx.layout.get("events") or "")
+    if not events_path.exists():
+        return None
+    execution_id = str(subtask.get("_worker_execution_id") or "").strip()
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = event.get("payload") if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("worker_id") or "").strip() != worker_id:
+            continue
+        event_type = str(event.get("type") or "").strip()
+        event_execution_id = str(payload.get("execution_id") or "").strip()
+        if execution_id and event_execution_id and event_execution_id != execution_id:
+            continue
+        if event_type == "worker.retry_started":
+            value = payload.get("write_required")
+            if isinstance(value, bool):
+                return value
+            return None
+        if event_type == "worker.started" and (not execution_id or event_execution_id == execution_id):
+            return None
+    return None
 
 
 def _worktree_has_any_changes(worktree: Path) -> bool:
@@ -1610,7 +1751,8 @@ def dispatch_workers(ctx: RunContext) -> None:
                 )
                 return snapshot
             elapsed_seconds = max(0.0, time.monotonic() - started_at)
-            testless_abort_seconds = _worker_testless_diff_abort_seconds(ctx)
+            testless_abort_seconds = _effective_worker_testless_diff_abort_seconds(ctx, subtask, wid)
+            test_only_abort_seconds = _effective_worker_test_only_diff_abort_seconds(ctx, subtask, wid)
             comment_only_abort_seconds = _worker_comment_only_diff_abort_seconds(ctx)
             required_test_files = _subtask_required_test_files(subtask)
             if (
@@ -1683,8 +1825,8 @@ def dispatch_workers(ctx: RunContext) -> None:
                 )
                 return snapshot
             if (
-                testless_abort_seconds > 0
-                and elapsed_seconds >= testless_abort_seconds
+                test_only_abort_seconds > 0
+                and elapsed_seconds >= test_only_abort_seconds
                 and _subtask_has_required_test_only_diff(subtask, changed_files)
             ):
                 artifact_path.write_text(
@@ -1693,7 +1835,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                     f"## changed files\n\n{status_rows}\n\n"
                     "## test-only guard\n\n"
                     f"- elapsed_seconds: {elapsed_seconds:.1f}\n"
-                    f"- abort_seconds: {testless_abort_seconds:.1f}\n"
+                    f"- abort_seconds: {test_only_abort_seconds:.1f}\n"
                     f"- required_test_files: {required_test_files}\n"
                     "- reason: subtask requires a production-path regression fix but the worker has only changed tests\n\n"
                     f"## git diff --binary\n\n{diff_text}\n",
@@ -1708,7 +1850,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                     "diff_bytes": diff_bytes,
                     "diff_lines": diff_lines,
                     "elapsed_seconds": round(elapsed_seconds, 1),
-                    "abort_seconds": testless_abort_seconds,
+                    "abort_seconds": test_only_abort_seconds,
                     "required_test_files": required_test_files,
                 }
                 active_worker_snapshot_digests[wid] = digest
@@ -2070,8 +2212,12 @@ def dispatch_workers(ctx: RunContext) -> None:
                             "blocker_kind": "worker_incomplete_diff",
                             "output_excerpt": (
                                 "Worker produced a source plus required-test partial diff, but focused tests failed "
-                                f"after {elapsed_seconds:.0f}s: {output[:500]}"
+                                f"after {elapsed_seconds:.0f}s: {output[:2000]}"
                             ),
+                            "verification_command": command,
+                            "verification_returncode": test_result.get("returncode"),
+                            "verification_timed_out": bool(test_result.get("timed_out")),
+                            "verification_output_excerpt": output[:4000],
                             "recovery_action": (
                                 "Retry with the preserved source+test patch already applied. Fix the focused test failure, "
                                 "then rerun the reported verification command before returning a terminal result."
@@ -2272,8 +2418,12 @@ def dispatch_workers(ctx: RunContext) -> None:
                 return
             subtask = dict(active_worker_subtasks.get(wid) or {})
             started_at = float(active_worker_started_at.get(wid) or time.monotonic())
+        retry_write_required = _latest_worker_retry_write_required(ctx, wid, subtask)
+        if retry_write_required is not None:
+            subtask["write_required"] = retry_write_required
         if _subtask_is_repair_no_change_guard_candidate(subtask):
-            abort_seconds = _worker_repair_no_change_abort_seconds(ctx)
+            abort_seconds = _effective_worker_repair_no_change_abort_seconds(ctx, subtask, wid)
+            configured_abort_seconds = _worker_repair_no_change_abort_seconds(ctx)
             event_type = "worker.repair_no_change_detected"
             failure_reason = "WORKER_REPAIR_NO_CHANGE"
             reason = "repair worker made no filesystem changes"
@@ -2286,7 +2436,8 @@ def dispatch_workers(ctx: RunContext) -> None:
                 "the first required target before spending a full prompt budget."
             )
         elif _subtask_is_no_change_guard_candidate(subtask):
-            abort_seconds = _worker_no_change_abort_seconds(ctx)
+            abort_seconds = _effective_worker_no_change_abort_seconds(ctx, subtask, wid)
+            configured_abort_seconds = _worker_no_change_abort_seconds(ctx)
             event_type = "worker.no_change_detected"
             failure_reason = "WORKER_NO_CHANGE"
             reason = "write-required worker made no filesystem changes"
@@ -2358,6 +2509,7 @@ def dispatch_workers(ctx: RunContext) -> None:
                 "subtask_id": subtask_id,
                 "elapsed_seconds": round(elapsed_seconds, 1),
                 "abort_seconds": abort_seconds,
+                "configured_abort_seconds": configured_abort_seconds,
                 "reason": reason,
             },
             task_id=ctx.task.get("task_id"),

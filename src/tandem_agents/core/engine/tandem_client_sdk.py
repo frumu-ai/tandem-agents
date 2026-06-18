@@ -648,6 +648,10 @@ def sdk_stream_run_text(
                             return
                     else:
                         events_without_text += 1
+                    if t in {"run.cancelled", "run.canceled", "session.run.cancelled", "session.run.canceled"}:
+                        completed = False
+                        reason = "cancelled"
+                        return
                     if t in {"run.complete", "run.completed", "run.failed", "session.run.finished"}:
                         completed = True
                         return
