@@ -126,6 +126,51 @@ class RepoTruthDiscoveryTest(unittest.TestCase):
             self.assertIn("index.html", discovered)
             self.assertIn("styles.css", discovered)
 
+    def test_subtask_satisfied_requires_exact_contract_identifiers(self) -> None:
+        subtask = {
+            "title": "Add scheduler throughput config loader tests",
+            "goal": "Add focused config loader coverage for exact scheduler budget and backpressure fields.",
+            "acceptance_criteria": [
+                "Assert config.scheduler.max_concurrent_worker_runs, "
+                "config.scheduler.max_daily_model_spend_cents, "
+                "config.scheduler.rate_limit_backpressure, "
+                "config.scheduler.ci_backpressure, and "
+                "config.scheduler.merge_queue_backpressure."
+            ],
+            "files": ["src/tandem_agents/config/config_loader_test.py"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            target = repo_path / "src" / "tandem_agents" / "config" / "config_loader_test.py"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                "\n".join(
+                    [
+                        "def test_existing_scheduler_config_loader_coverage():",
+                        "    assert 'scheduler' == 'scheduler'",
+                        "    assert 'config' == 'config'",
+                        "    assert 'backpressure' == 'backpressure'",
+                        "    assert 'budget' == 'budget'",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertFalse(subtask_satisfied(repo_path, subtask))
+
+            target.write_text(
+                target.read_text(encoding="utf-8")
+                + "assert config.scheduler.max_concurrent_worker_runs == 4\n"
+                + "assert config.scheduler.max_daily_model_spend_cents == 0\n"
+                + "assert config.scheduler.rate_limit_backpressure is True\n"
+                + "assert config.scheduler.ci_backpressure is True\n"
+                + "assert config.scheduler.merge_queue_backpressure is True\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(subtask_satisfied(repo_path, subtask))
+
     def test_infers_package_build_and_smoke_verification_for_changed_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)

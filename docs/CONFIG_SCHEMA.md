@@ -117,6 +117,7 @@ Optional fields:
 - `default_branch`: string, defaults to `main`
 - `worktree_root`: string, host-side worktree base
 - `remote_name`: string, defaults to `origin`
+- `allowed_hosts`: comma-separated remote host allow-list, defaults to `github.com`; use `*` for any network git host or `local` for local clone URLs that stay inside `worktree_root`
 
 ### `provider`
 
@@ -191,6 +192,11 @@ Optional fields:
 - `ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS`: legacy worker prompt-sync timeout for write-required workers; default `300`
 - `ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS`: maximum scaled legacy worker prompt-sync timeout; default `480`
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS`: outer worker watchdog for no terminal result; default `540`
+- `ACA_WORKER_NO_CHANGE_ABORT_SECONDS`: write-required worker no-change watchdog; default `240`
+- `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS`: repair-worker no-change watchdog; default `180`
+- `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS`: outer manager planning watchdog; default `90`
+- `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS`: outer integration watchdog; default `300`
+- `ACA_SERIAL_SUBTASK_LIMIT`: maximum planned worker slices for disabled-swarm serial runs; default `4`
 
 Behavior:
 
@@ -303,6 +309,7 @@ Behavior:
 - `ACA_WORKTREE_ROOT` -> `repository.worktree_root`
 - `ACA_WORKSPACE_ROOT` -> container workspace base used by Docker Compose
 - `ACA_REMOTE_NAME` -> `repository.remote_name`
+- `ACA_REPO_ALLOWED_HOSTS` -> `repository.allowed_hosts`
 - `AUTOCODER_REPO_*` and related branch/remote names -> legacy aliases still accepted by the loader
 
 ### Provider / Model
@@ -320,6 +327,11 @@ Behavior:
 - `ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS` -> legacy worker prompt-sync timeout
 - `ACA_WORKER_PROMPT_SYNC_MAX_TIMEOUT_SECONDS` -> legacy worker prompt-sync scaled cap
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS` -> legacy worker no-progress watchdog
+- `ACA_WORKER_NO_CHANGE_ABORT_SECONDS` -> write-required worker no-change watchdog
+- `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS` -> repair-worker no-change watchdog
+- `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS` -> legacy manager planning watchdog
+- `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS` -> legacy manager integration watchdog
+- `ACA_SERIAL_SUBTASK_LIMIT` -> disabled-swarm serial planning slice limit
 - `ACA_PROVIDER_KEY` -> primary generic provider secret for simple single-provider setups; ACA maps it onto the active provider's expected secret env var for Tandem subprocesses
 - `ACA_FALLBACK_PROVIDER` -> `provider.fallback_provider`
 - `ACA_REVIEW_POLICY` -> `review.policy`

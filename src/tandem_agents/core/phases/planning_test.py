@@ -4,24 +4,30 @@ import unittest
 import tempfile
 import json
 import contextlib
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from src.tandem_agents.core.phases.planning import (
     _align_python_test_targets_to_repo_conventions,
+    _append_deferred_repair_subtasks,
     _apply_repo_context_required_files_to_task,
     _carry_forward_partial_diff_artifacts,
+    _cancel_active_manager_engine_session,
     _constrain_extra_partial_diff_repair_subtasks,
     _completed_repair_worker_results,
     _deterministic_testless_partial_diff_repair_plan,
     _mark_manager_planning_started,
     _manager_plan_from_stdout,
+    _manager_prompt_timeout_seconds,
     _merge_or_defer_sticky_expected_files,
     _namespace_repair_retry_subtask_ids,
     _prepare_subtasks,
     _remote_code_task_requires_worker_execution,
     _sanitize_partial_diff_artifact_paths_in_plan,
+    _serial_subtask_limit,
+    _should_use_deterministic_repo_context_plan,
     _split_dense_serial_subtasks,
     _write_required_after_prescreen,
     run_manager_prompt,
@@ -29,6 +35,74 @@ from src.tandem_agents.core.phases.planning import (
 
 
 class PlanningPreScreenTest(unittest.TestCase):
+    def test_cancel_active_manager_engine_session_deletes_marked_session(self) -> None:
+        from src.tandem_agents.runtime.runstate import ensure_layout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            layout = ensure_layout(run_dir)
+            marker = run_dir / "active_worker_engine_sessions.json"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "manager": {
+                            "session_id": "session-1",
+                            "run_id": "run-1",
+                            "log_path": str(run_dir / "logs" / "manager.log"),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={}),
+                run_id="aca-run-1",
+                run_dir=run_dir,
+                layout=layout,
+                task={"task_id": "TAN-173"},
+                repo={"path": "/repo"},
+            )
+
+            with mock.patch("src.tandem_agents.core.phases.planning.delete_tandem_session") as delete_session:
+                _cancel_active_manager_engine_session(ctx, "manager_prompt_timeout")
+                for _ in range(50):
+                    if delete_session.call_count and "manager.engine_cancelled" in layout["events"].read_text(
+                        encoding="utf-8"
+                    ):
+                        break
+                    time.sleep(0.01)
+
+            delete_session.assert_called_once_with(ctx.cfg, "session-1")
+            self.assertFalse(marker.exists())
+            events = [
+                json.loads(line)
+                for line in layout["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [event["type"] for event in events],
+                ["manager.engine_cancel_requested", "manager.engine_cancelled"],
+            )
+
+    def test_append_deferred_repair_subtasks_resumes_serial_tail(self) -> None:
+        ctx = SimpleNamespace(
+            blackboard={
+                "repair": {
+                    "deferred_subtasks": [
+                        {"id": "subtask-2", "title": "Two", "files": ["src/two.py"]},
+                        {"id": "subtask-3", "title": "Three", "files": ["src/three.py"]},
+                    ]
+                }
+            },
+            status={},
+        )
+        subtasks = [{"id": "subtask-1", "title": "Repair", "files": ["src/one.py"]}]
+
+        _append_deferred_repair_subtasks(ctx, subtasks)
+
+        self.assertEqual([subtask["id"] for subtask in subtasks], ["subtask-1", "subtask-2", "subtask-3"])
+        self.assertIn("deferred this serial subtask", subtasks[1]["scope_note"])
+        self.assertEqual(ctx.blackboard["repair"]["deferred_subtasks_appended"], 2)
+
     def test_repo_context_required_files_become_task_targets_when_absent(self) -> None:
         task = {
             "execution_kind": "code_edit",
@@ -95,8 +169,31 @@ class PlanningPreScreenTest(unittest.TestCase):
             )
         )
 
+    def test_manager_prompt_timeout_defaults_and_ignores_invalid_env(self) -> None:
+        self.assertEqual(_manager_prompt_timeout_seconds(SimpleNamespace(env={})), 90.0)
+        self.assertEqual(
+            _manager_prompt_timeout_seconds(
+                SimpleNamespace(env={"ACA_MANAGER_PROMPT_TIMEOUT_SECONDS": "12.5"})
+            ),
+            12.5,
+        )
+        self.assertEqual(
+            _manager_prompt_timeout_seconds(
+                SimpleNamespace(env={"ACA_MANAGER_PROMPT_TIMEOUT_SECONDS": "not-a-number"})
+            ),
+            90.0,
+        )
+
+    def test_serial_subtask_limit_defaults_and_ignores_invalid_env(self) -> None:
+        self.assertEqual(_serial_subtask_limit(SimpleNamespace(env={})), 4)
+        self.assertEqual(_serial_subtask_limit(SimpleNamespace(env={"ACA_SERIAL_SUBTASK_LIMIT": "2"})), 2)
+        self.assertEqual(
+            _serial_subtask_limit(SimpleNamespace(env={"ACA_SERIAL_SUBTASK_LIMIT": "not-a-number"})),
+            4,
+        )
+
     def test_dense_subtasks_split_into_serial_slices_when_swarm_disabled(self) -> None:
-        ctx = SimpleNamespace(cfg=SimpleNamespace(swarm=SimpleNamespace(enabled=False)))
+        ctx = SimpleNamespace(cfg=SimpleNamespace(swarm=SimpleNamespace(enabled=False, max_workers=3)))
         subtasks = [
             {
                 "id": "subtask-1",
@@ -128,6 +225,24 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertEqual([len(item["acceptance_criteria"]) for item in subtasks], [3, 3, 1])
         self.assertTrue(all(item["files"] == subtasks[0]["files"] for item in subtasks))
         self.assertIn("serial slices", subtasks[0]["scope_note"])
+
+    def test_dense_subtasks_split_into_serial_slices_when_worker_limit_is_one(self) -> None:
+        ctx = SimpleNamespace(cfg=SimpleNamespace(swarm=SimpleNamespace(enabled=False, max_workers=1)))
+        subtasks = [
+            {
+                "id": "subtask-1",
+                "title": "Spend-safe slice",
+                "acceptance_criteria": ["one", "two", "three", "four"],
+                "files": ["src/a.py"],
+                "target_files": ["src/a.py"],
+            }
+        ]
+
+        _split_dense_serial_subtasks(ctx, subtasks, max_acceptance_criteria=2)
+
+        self.assertEqual([item["id"] for item in subtasks], ["subtask-1-part-1", "subtask-1-part-2"])
+        self.assertEqual([item["acceptance_criteria"] for item in subtasks], [["one", "two"], ["three", "four"]])
+        self.assertTrue(all("Only one worker slice runs at a time" in item["scope_note"] for item in subtasks))
 
     def test_dense_subtasks_are_not_split_when_swarm_enabled(self) -> None:
         ctx = SimpleNamespace(cfg=SimpleNamespace(swarm=SimpleNamespace(enabled=True)))
@@ -351,6 +466,56 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertIn("Start from the clean target files", subtasks[0]["scope_note"])
         self.assertIn("repository_test.py", subtasks[0]["scope_note"])
 
+    def test_failed_focused_verifiable_partial_diff_is_not_carried_forward(self) -> None:
+        parent_targets = [
+            "src/tandem_agents/config/config_types.py",
+            "src/tandem_agents/config/config_loader.py",
+            "src/tandem_agents/config/config_loader_test.py",
+        ]
+        ctx = SimpleNamespace(
+            task={"target_files": parent_targets},
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/worker-1.patch",
+                            "patch_reusable": False,
+                            "changed_files": [
+                                "src/tandem_agents/config/config_types.py",
+                                "src/tandem_agents/config/config_loader_test.py",
+                            ],
+                            "worker_output_excerpt": (
+                                "Worker produced a source plus required-test partial diff, "
+                                "but focused tests failed: AttributeError: config.aca.throughput"
+                            ),
+                        }
+                    ],
+                }
+            },
+        )
+        subtasks = [
+            {
+                "id": "subtask-1",
+                "files": ["src/tandem_agents/config/config_types.py"],
+                "target_files": ["src/tandem_agents/config/config_types.py"],
+                "acceptance_criteria": [
+                    "Assert exact config.scheduler fields.",
+                ],
+            }
+        ]
+
+        _carry_forward_partial_diff_artifacts(ctx, subtasks)
+
+        self.assertNotIn("carry_forward_patch", subtasks[0])
+        self.assertEqual(subtasks[0]["discarded_partial_diff_patch"], "/runs/run-1/artifacts/worker-1.patch")
+        self.assertEqual(subtasks[0]["files"], parent_targets)
+        self.assertEqual(subtasks[0]["target_files"], parent_targets)
+        self.assertIn("focused verification failed", subtasks[0]["repair_failure_summary"])
+        self.assertIn("wrong config namespace", subtasks[0]["repair_failure_summary"])
+        self.assertIn("Start from the clean target files", subtasks[0]["scope_note"])
+
     def test_testless_partial_diff_gets_deterministic_repair_plan(self) -> None:
         ctx = SimpleNamespace(
             task={
@@ -409,6 +574,132 @@ class PlanningPreScreenTest(unittest.TestCase):
                 "src/tandem_agents/core/phases/task_intake.py",
             ],
         )
+
+    def test_deterministic_repair_ignores_completed_stale_partial_artifacts(self) -> None:
+        ctx = SimpleNamespace(
+            task={
+                "target_files": [
+                    "src/tandem_agents/core/scheduling/scheduler.py",
+                    "src/tandem_agents/core/scheduling/scheduler_test.py",
+                    "src/tandem_agents/core/phases/worker_dispatch.py",
+                    "src/tandem_agents/core/phases/worker_dispatch_test.py",
+                ]
+            },
+            blackboard={
+                "repair": {
+                    "completed_subtask_ids": [
+                        "fallback-throughput-scheduler-controls-part-1",
+                        "fallback-throughput-scheduler-controls-part-2",
+                    ],
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "fallback-throughput-scheduler-controls-part-2",
+                            "worker_id": "worker-2",
+                            "patch_path": "/runs/run-1/artifacts/stale-test.patch",
+                            "changed_files": ["src/tandem_agents/core/scheduling/scheduler_test.py"],
+                            "worker_output_excerpt": "Worker changed only required test files for a regression subtask.",
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                        },
+                        {
+                            "subtask_id": "fallback-throughput-scheduler-controls-part-2",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/stale-source.patch",
+                            "changed_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                            "worker_output_excerpt": "Worker produced a source plus required-test diff.",
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                        },
+                        {
+                            "subtask_id": "fallback-throughput-worker-metrics",
+                            "worker_id": "worker-2",
+                            "patch_path": "/runs/run-1/artifacts/current-timeout.patch",
+                            "changed_files": ["src/tandem_agents/core/phases/worker_dispatch.py"],
+                            "worker_output_excerpt": (
+                                "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync worker prompt did not finish within 300s."
+                            ),
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/phases/worker_dispatch.py",
+                                "src/tandem_agents/core/phases/worker_dispatch_test.py",
+                            ],
+                        },
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(subtask["id"], "fallback-throughput-worker-metrics")
+        self.assertEqual(subtask["carry_forward_patch"], "/runs/run-1/artifacts/current-timeout.patch")
+        self.assertEqual(
+            subtask["files"],
+            [
+                "src/tandem_agents/core/phases/worker_dispatch.py",
+                "src/tandem_agents/core/phases/worker_dispatch_test.py",
+            ],
+        )
+        self.assertIn(
+            "src/tandem_agents/core/phases/worker_dispatch_test.py",
+            "\n".join(subtask["acceptance_criteria"]),
+        )
+
+    def test_unproductive_source_partial_gets_deterministic_repair_plan(self) -> None:
+        ctx = SimpleNamespace(
+            task={
+                "target_files": [
+                    "src/tandem_agents/core/scheduling/scheduler.py",
+                    "src/tandem_agents/core/scheduling/scheduler_test.py",
+                ]
+            },
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "fallback-throughput-scheduler-controls-part-2",
+                            "worker_id": "worker-2",
+                            "patch_path": "/runs/run-1/artifacts/comment-only.patch",
+                            "changed_files": ["src/tandem_agents/core/scheduling/scheduler.py"],
+                            "worker_output_excerpt": (
+                                "Worker produced an unproductive partial diff: worker diff is comment-only "
+                                "after the comment-only guard budget."
+                            ),
+                            "subtask_target_files": [
+                                "src/tandem_agents/core/scheduling/scheduler.py",
+                                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(subtask["id"], "fallback-throughput-scheduler-controls-part-2")
+        self.assertEqual(subtask["discarded_partial_diff_patch"], "/runs/run-1/artifacts/comment-only.patch")
+        self.assertNotIn("carry_forward_patch", subtask)
+        self.assertEqual(
+            subtask["files"],
+            [
+                "src/tandem_agents/core/scheduling/scheduler.py",
+                "src/tandem_agents/core/scheduling/scheduler_test.py",
+            ],
+        )
+        criteria = "\n".join(subtask["acceptance_criteria"])
+        self.assertIn("Do not apply or copy the rejected comment-only partial patch", criteria)
+        self.assertIn("non-comment production behavior change", criteria)
 
     def test_testless_deterministic_repair_defers_out_of_contract_required_tests(self) -> None:
         parent_targets = [
@@ -564,6 +855,209 @@ class PlanningPreScreenTest(unittest.TestCase):
         self.assertIn("Make the first new repair edit in the required production file", criteria)
         self.assertIn("Do not mark this repair complete with a test-only diff", criteria)
         self.assertNotIn("operator_dashboard_test.py", "\n".join(subtask["files"]))
+
+    def test_test_only_partial_diff_derives_sibling_production_target_without_parent_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            config_dir = repo_path / "src" / "tandem_agents" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config_loader.py").write_text("def load():\n    return None\n", encoding="utf-8")
+            (config_dir / "config_loader_test.py").write_text("import unittest\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={},
+                repo_path=repo_path,
+                blackboard={
+                    "repair": {
+                        "partial_diff_artifacts": [
+                            {
+                                "subtask_id": "subtask-1",
+                                "worker_id": "worker-1",
+                                "patch_path": "/runs/run-1/artifacts/worker-1.patch",
+                                "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                                "worker_output_excerpt": (
+                                    "Worker changed only required test files for a regression subtask: "
+                                    "after 184s it had not made the required production change."
+                                ),
+                            }
+                        ],
+                    }
+                },
+            )
+
+            plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(
+            subtask["files"],
+            [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        )
+        self.assertEqual(subtask["target_files"], subtask["files"])
+        self.assertEqual(
+            subtask["repair_requires_production_followup"],
+            ["src/tandem_agents/config/config_loader.py"],
+        )
+        criteria = "\n".join(subtask["acceptance_criteria"])
+        self.assertIn("Make the first new repair edit in the required production file", criteria)
+        self.assertIn("Do not mark this repair complete with a test-only diff", criteria)
+
+    def test_test_only_partial_diff_prefers_failed_subtask_targets_over_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            config_dir = repo_path / "src" / "tandem_agents" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config_loader.py").write_text("def load():\n    return None\n", encoding="utf-8")
+            (config_dir / "config_loader_test.py").write_text("import unittest\n", encoding="utf-8")
+            (repo_path / "scripts").mkdir()
+            (repo_path / "scripts" / "bootstrap_config.js").write_text("module.exports = {}\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={},
+                repo_path=repo_path,
+                blackboard={
+                    "repair": {
+                        "partial_diff_artifacts": [
+                            {
+                                "subtask_id": "subtask-2",
+                                "worker_id": "worker-2",
+                                "patch_path": "/runs/run-1/artifacts/worker-2.patch",
+                                "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                                "subtask_target_files": [
+                                    "scripts/bootstrap_config.js",
+                                    "src/tandem_agents/config/config_loader_test.py",
+                                ],
+                                "worker_output_excerpt": (
+                                    "Worker changed only required test files for a regression subtask: "
+                                    "after 182s it had not made the required production change."
+                                ),
+                            }
+                        ],
+                    }
+                },
+            )
+
+            plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(
+            subtask["files"],
+            [
+                "scripts/bootstrap_config.js",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        )
+        self.assertEqual(
+            subtask["repair_requires_production_followup"],
+            ["scripts/bootstrap_config.js"],
+        )
+        criteria = "\n".join(subtask["acceptance_criteria"])
+        self.assertIn("scripts/bootstrap_config.js", criteria)
+        self.assertNotIn("config_loader.py", criteria)
+
+    def test_complementary_source_and_test_partials_get_combined_verify_plan(self) -> None:
+        ctx = SimpleNamespace(
+            task={},
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/test.patch",
+                            "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                            "worker_output_excerpt": (
+                                "Worker changed only required test files for a regression subtask: "
+                                "after 184s it had not made the required production change."
+                            ),
+                        },
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/source.patch",
+                            "changed_files": ["src/tandem_agents/config/config_loader.py"],
+                            "worker_output_excerpt": (
+                                "Worker drifted off the required regression/test coverage path: after 185s "
+                                "it had changed only non-test files while required test files were "
+                                "src/tandem_agents/config/config_loader_test.py."
+                            ),
+                        },
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertEqual(subtask["title"], "Verify complementary source and test partial diffs")
+        self.assertEqual(
+            subtask["files"],
+            [
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        )
+        self.assertEqual(
+            subtask["carry_forward_patches"],
+            ["/runs/run-1/artifacts/source.patch", "/runs/run-1/artifacts/test.patch"],
+        )
+        self.assertTrue(subtask["repair_verification_first"])
+        self.assertFalse(subtask["write_required"])
+        criteria = "\n".join(subtask["acceptance_criteria"])
+        self.assertIn("ACA applied the preserved production patch and test patch", criteria)
+        self.assertIn("Run the narrowest deterministic verification", criteria)
+
+    def test_guard_rejected_partials_do_not_get_complementary_carry_forward_plan(self) -> None:
+        ctx = SimpleNamespace(
+            task={
+                "target_files": [
+                    "src/tandem_agents/config/config_types.py",
+                    "src/tandem_agents/config/config_loader.py",
+                    "src/tandem_agents/config/config_loader_test.py",
+                ]
+            },
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/test.patch",
+                            "patch_reusable": False,
+                            "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                            "worker_output_excerpt": (
+                                "Worker changed only required test files for a regression subtask: "
+                                "after 184s it had not made the required production change."
+                            ),
+                        },
+                        {
+                            "subtask_id": "subtask-1",
+                            "worker_id": "worker-1",
+                            "patch_path": "/runs/run-1/artifacts/source.patch",
+                            "patch_reusable": False,
+                            "changed_files": ["src/tandem_agents/config/config_types.py"],
+                            "worker_output_excerpt": (
+                                "Worker drifted off the required regression/test coverage path: after 185s "
+                                "it had changed only non-test files while required test files were "
+                                "src/tandem_agents/config/config_loader_test.py."
+                            ),
+                        },
+                    ],
+                }
+            },
+        )
+
+        plan = _deterministic_testless_partial_diff_repair_plan(ctx)
+
+        self.assertIsNotNone(plan)
+        subtask = plan["subtasks"][0]
+        self.assertNotEqual(subtask["title"], "Verify complementary source and test partial diffs")
+        self.assertNotIn("carry_forward_patches", subtask)
+        self.assertIn("Do not copy or replay the rejected partial patch", "\n".join(subtask["acceptance_criteria"]))
 
     def test_sticky_production_target_becomes_active_for_test_only_timeout_partial(self) -> None:
         ctx = SimpleNamespace(
@@ -1605,6 +2099,253 @@ class PlanningPreScreenTest(unittest.TestCase):
             invalid_events = [event for event in events if event["type"] == "manager.invalid_plan"]
             self.assertEqual(invalid_events[-1]["payload"]["recoverable"], True)
 
+    def test_deterministic_repo_context_plan_requires_previous_manager_failure(self) -> None:
+        ctx = SimpleNamespace(
+            blackboard={"repo_context": {"required_files_applied_as_target_files": True}},
+            task={"execution_kind": "code_edit", "source": {"type": "linear"}},
+        )
+
+        self.assertFalse(_should_use_deterministic_repo_context_plan(ctx))
+        ctx.blackboard["manager_invalid_plan"] = {"reason": "Manager planning did not return JSON."}
+        self.assertTrue(_should_use_deterministic_repo_context_plan(ctx))
+
+    def test_run_manager_prompt_uses_deterministic_repo_context_plan_after_manager_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            repo_path = Path(tmp) / "repo"
+            for child in ("artifacts", "logs"):
+                (run_dir / child).mkdir(parents=True, exist_ok=True)
+            repo_path.mkdir()
+            required_files = [
+                "src/tandem_agents/core/scheduling/scheduler.py",
+                "src/tandem_agents/core/scheduling/scheduler_test.py",
+                "src/tandem_agents/core/phases/worker_dispatch.py",
+                "src/tandem_agents/core/execution/runner_core.py",
+                "src/tandem_agents/runtime/operator_view.py",
+                "src/tandem_agents/runtime/operator_dashboard.py",
+                "src/tandem_agents/runtime/operator_dashboard_test.py",
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ]
+            for rel_path in required_files:
+                path = repo_path / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# test\n", encoding="utf-8")
+            artifact_path = run_dir / "artifacts" / "repo_context_bundle.json"
+            artifact_path.write_text(json.dumps({"bundle": {}, "graph_hints": {"required_files": required_files}}))
+            status_path = run_dir / "status.json"
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={}, swarm=SimpleNamespace(max_workers=4, enabled=False)),
+                repo_path=repo_path,
+                task={
+                    "task_id": "TAN-173",
+                    "title": "LACA-15 Add ACA throughput metrics, backpressure, and cost controls",
+                    "description": "Add backpressure, cost controls, metrics, and cockpit visibility.",
+                    "acceptance_criteria": [
+                        "Add global and per-repo budget/concurrency caps.",
+                        "Track issue cycle time, queue wait, active time, PR time, repair loops, merge time, token cost, tool calls, test time, and failure rate.",
+                        "Operator can see active workers, queued issues, blocked issues, costs, and failures.",
+                    ],
+                    "execution_kind": "code_edit",
+                    "source": {"type": "linear"},
+                },
+                repo={"path": str(repo_path)},
+                layout={
+                    "run_dir": run_dir,
+                    "artifacts": run_dir / "artifacts",
+                    "logs": run_dir / "logs",
+                    "events": run_dir / "events.jsonl",
+                    "blackboard": run_dir / "blackboard.yaml",
+                    "status": status_path,
+                },
+                run_dir=run_dir,
+                run_id="run-1",
+                blackboard={"manager_invalid_plan": {"reason": "Manager planning did not return JSON."}},
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "phase": {"name": "task_resolution", "detail": "task resolved"},
+                    "blocker": {"active": False, "kind": None, "message": None, "owner_role": None},
+                    "metrics": {},
+                },
+            )
+            repo_context = SimpleNamespace(
+                source="repo.context_bundle",
+                fallback_used=False,
+                error=None,
+                artifact_path=str(artifact_path),
+                path_scope="src/tandem_agents",
+                required_files=required_files,
+                index_source="stored",
+                index_status="refreshed",
+                index_error=None,
+                text="Required edit files:\n" + "\n".join(f"- {path}" for path in required_files),
+            )
+
+            with (
+                mock.patch(
+                    "src.tandem_agents.core.repository.repo_context.repo_context_for_task",
+                    return_value=repo_context,
+                ),
+                mock.patch(
+                    "src.tandem_agents.core.engine.engine.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5"},
+                ),
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt") as stream_prompt,
+            ):
+                result = run_manager_prompt(ctx)
+
+            stream_prompt.assert_not_called()
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(
+                result["engine"],
+                {"skipped": True, "reason": "repo_context_required_files_after_manager_failure"},
+            )
+            subtask_ids = [subtask["id"] for subtask in ctx.manager_plan["subtasks"]]
+            self.assertEqual(
+                subtask_ids[:3],
+                [
+                    "fallback-throughput-config-types",
+                    "fallback-throughput-config-loader",
+                    "fallback-throughput-config-loader-tests",
+                ],
+            )
+            config_types = ctx.manager_plan["subtasks"][0]
+            self.assertEqual(config_types["files"], ["src/tandem_agents/config/config_types.py"])
+            self.assertIn("defaults", " ".join(config_types["acceptance_criteria"]).lower())
+            self.assertIn("max_concurrent_worker_runs", " ".join(config_types["acceptance_criteria"]))
+            self.assertIn("config_types.py", config_types["scope_note"])
+            config_loader = ctx.manager_plan["subtasks"][1]
+            self.assertEqual(config_loader["files"], ["src/tandem_agents/config/config_loader.py"])
+            loader_criteria = " ".join(config_loader["acceptance_criteria"])
+            self.assertIn("ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS", loader_criteria)
+            self.assertIn("Do not add alias helpers", loader_criteria)
+            self.assertIn("config.aca", loader_criteria)
+            config_tests = ctx.manager_plan["subtasks"][2]
+            self.assertEqual(config_tests["files"], ["src/tandem_agents/config/config_loader_test.py"])
+            test_criteria = " ".join(config_tests["acceptance_criteria"])
+            self.assertIn("resolve_config(root, env={...})", test_criteria)
+            self.assertIn("config.scheduler.max_concurrent_worker_runs", test_criteria)
+            self.assertIn("test-only slice", config_tests["scope_note"])
+            self.assertIn("fallback-throughput-scheduler-controls", subtask_ids)
+            scheduler_subtask = next(
+                subtask
+                for subtask in ctx.manager_plan["subtasks"]
+                if subtask["id"] == "fallback-throughput-scheduler-controls"
+            )
+            scheduler_criteria = " ".join(scheduler_subtask["acceptance_criteria"])
+            self.assertIn("max_concurrent_worker_runs", scheduler_criteria)
+            self.assertIn("worker_concurrency_reached", scheduler_criteria)
+            self.assertIn("plan_task_admissions", scheduler_subtask["scope_note"])
+            self.assertNotIn("fallback-throughput-worker-metrics", subtask_ids)
+            self.assertNotIn("fallback-throughput-operator-cockpit", subtask_ids)
+            self.assertEqual(len(subtask_ids), ctx.cfg.swarm.max_workers)
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "manager.deterministic_repo_context_plan")
+
+    def test_run_manager_prompt_reuses_deterministic_repair_queue_without_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            repo_path = Path(tmp) / "repo"
+            for child in ("artifacts", "logs"):
+                (run_dir / child).mkdir(parents=True, exist_ok=True)
+            repo_path.mkdir()
+            status_path = run_dir / "status.json"
+            failed_subtask = {
+                "id": "fallback-throughput-config-loader",
+                "title": "Config loader",
+                "files": ["src/tandem_agents/config/config_loader.py"],
+                "target_files": ["src/tandem_agents/config/config_loader.py"],
+                "acceptance_criteria": ["Load exact scheduler fields."],
+            }
+            deferred_subtask = {
+                "id": "fallback-throughput-config-loader-tests",
+                "title": "Config loader tests",
+                "files": ["src/tandem_agents/config/config_loader_test.py"],
+                "target_files": ["src/tandem_agents/config/config_loader_test.py"],
+                "acceptance_criteria": ["Test exact scheduler fields."],
+            }
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={}, swarm=SimpleNamespace(max_workers=4, enabled=False)),
+                repo_path=repo_path,
+                task={
+                    "task_id": "TAN-173",
+                    "title": "LACA-15 Add ACA throughput metrics, backpressure, and cost controls",
+                    "execution_kind": "code_edit",
+                    "source": {"type": "linear"},
+                },
+                repo={"path": str(repo_path)},
+                layout={
+                    "run_dir": run_dir,
+                    "artifacts": run_dir / "artifacts",
+                    "logs": run_dir / "logs",
+                    "events": run_dir / "events.jsonl",
+                    "blackboard": run_dir / "blackboard.yaml",
+                    "status": status_path,
+                },
+                run_dir=run_dir,
+                run_id="run-1",
+                blackboard={
+                    "manager_deterministic_repo_context_plan": {"reason": "repo_context_required_files"},
+                    "repair": {
+                        "attempt": 2,
+                        "completed_subtask_ids": ["fallback-throughput-config-types"],
+                        "failed_subtask": failed_subtask,
+                        "deferred_subtasks": [deferred_subtask],
+                    },
+                },
+                status={
+                    "run": {"run_id": "run-1", "status": "running"},
+                    "phase": {"name": "task_resolution", "detail": "task resolved"},
+                    "blocker": {"active": False, "kind": None, "message": None, "owner_role": None},
+                    "metrics": {},
+                    "repair": {"attempt": 2},
+                },
+            )
+            repo_context = SimpleNamespace(
+                source="repo.context_bundle",
+                fallback_used=False,
+                error=None,
+                artifact_path="",
+                path_scope="src/tandem_agents",
+                required_files=[],
+                index_source="stored",
+                index_status="refreshed",
+                index_error=None,
+                text="",
+            )
+
+            with (
+                mock.patch(
+                    "src.tandem_agents.core.repository.repo_context.repo_context_for_task",
+                    return_value=repo_context,
+                ),
+                mock.patch(
+                    "src.tandem_agents.core.engine.engine.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5"},
+                ),
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt") as stream_prompt,
+            ):
+                result = run_manager_prompt(ctx)
+
+            stream_prompt.assert_not_called()
+            self.assertEqual(result["returncode"], 0)
+            self.assertEqual(result["engine"], {"skipped": True, "reason": "deterministic_repo_context_repair_queue"})
+            self.assertEqual(
+                [subtask["id"] for subtask in ctx.manager_plan["subtasks"]],
+                ["fallback-throughput-config-loader", "fallback-throughput-config-loader-tests"],
+            )
+            self.assertIn("retrying this deterministic repo-context slice", ctx.manager_plan["subtasks"][0]["scope_note"])
+            self.assertIn("deferred this deterministic repo-context slice", ctx.manager_plan["subtasks"][1]["scope_note"])
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "manager.deterministic_repo_context_repair_plan")
+
     def test_invalid_manager_fallback_builds_deterministic_repo_context_subtasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1757,6 +2498,55 @@ class PlanningPreScreenTest(unittest.TestCase):
 
             self.assertEqual(discovered_files, [])
             self.assertEqual(subtasks, [])
+
+    def test_prepare_subtasks_preserves_serial_manager_plan_when_swarm_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(swarm=SimpleNamespace(enabled=False, max_workers=1), env={}),
+                task={"title": "Cap worker fan-out"},
+                manager_plan={
+                    "subtasks": [
+                        {"id": "one", "title": "One", "goal": "First"},
+                        {"id": "two", "title": "Two", "goal": "Second"},
+                    ],
+                },
+                repo={"path": str(repo_path)},
+                repo_path=repo_path,
+                blackboard={},
+            )
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.runner_core._prepare_subtasks_with_discovery",
+                return_value=([], [{"id": "subtask-1", "title": "Merged", "goal": "Merged"}]),
+            ) as prepare:
+                _prepare_subtasks(ctx)
+
+            self.assertEqual(prepare.call_args.kwargs["merge_manager_subtasks"], False)
+            self.assertEqual(prepare.call_args.args[3], 4)
+
+    def test_prepare_subtasks_uses_configured_serial_subtask_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(
+                    swarm=SimpleNamespace(enabled=False, max_workers=1),
+                    env={"ACA_SERIAL_SUBTASK_LIMIT": "2"},
+                ),
+                task={"title": "Cap worker fan-out"},
+                manager_plan={"subtasks": []},
+                repo={"path": str(repo_path)},
+                repo_path=repo_path,
+                blackboard={},
+            )
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.runner_core._prepare_subtasks_with_discovery",
+                return_value=([], []),
+            ) as prepare:
+                _prepare_subtasks(ctx)
+
+            self.assertEqual(prepare.call_args.args[3], 2)
 
 
 if __name__ == "__main__":

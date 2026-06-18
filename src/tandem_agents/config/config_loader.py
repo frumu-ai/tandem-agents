@@ -254,6 +254,11 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
     repo_default_branch = pick("ACA_DEFAULT_BRANCH", "AUTOCODER_DEFAULT_BRANCH", yaml_value=repo_data.get("default_branch"), default=DEFAULT_BRANCH)
     repo_worktree_root = pick("ACA_WORKTREE_ROOT", "AUTOCODER_WORKTREE_ROOT", yaml_value=repo_data.get("worktree_root"), default="")
     repo_remote_name = pick("ACA_REMOTE_NAME", "AUTOCODER_REMOTE_NAME", yaml_value=repo_data.get("remote_name"), default=DEFAULT_REMOTE_NAME)
+    repo_allowed_hosts = pick(
+        "ACA_REPO_ALLOWED_HOSTS",
+        yaml_value=repo_data.get("allowed_hosts"),
+        default="github.com",
+    )
     repo_credential_file = pick(
         "ACA_REPO_TOKEN_FILE",
         yaml_value=repo_data.get("credential_file"),
@@ -267,6 +272,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         worktree_root=str(repo_worktree_root or ""),
         remote_name=str(repo_remote_name or DEFAULT_REMOTE_NAME),
         credential_file=str(repo_credential_file or ""),
+        allowed_hosts=str(repo_allowed_hosts or "github.com"),
     )
     provider_id_raw = str(pick("ACA_PROVIDER", "AUTOCODER_PROVIDER", yaml_value=provider_data.get("id"), default="")).strip()
     provider_model_raw = str(pick("ACA_MODEL", "AUTOCODER_MODEL", yaml_value=provider_data.get("model"), default="")).strip()
@@ -508,6 +514,49 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
                 "ACA_SCHEDULER_POLICY",
                 yaml_value=scheduler_data.get("policy"),
                 default=DEFAULT_SCHEDULER_POLICY,
+            )
+        ),
+        max_concurrent_worker_runs=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS",
+                    yaml_value=scheduler_data.get("max_concurrent_worker_runs"),
+                    default=4,
+                ),
+                4,
+            ),
+        ),
+        max_daily_model_spend_cents=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS",
+                    yaml_value=scheduler_data.get("max_daily_model_spend_cents"),
+                    default=0,
+                ),
+                0,
+            ),
+        ),
+        rate_limit_backpressure=_as_bool(
+            pick(
+                "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE",
+                yaml_value=scheduler_data.get("rate_limit_backpressure"),
+                default=True,
+            )
+        ),
+        ci_backpressure=_as_bool(
+            pick(
+                "ACA_SCHEDULER_CI_BACKPRESSURE",
+                yaml_value=scheduler_data.get("ci_backpressure"),
+                default=True,
+            )
+        ),
+        merge_queue_backpressure=_as_bool(
+            pick(
+                "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE",
+                yaml_value=scheduler_data.get("merge_queue_backpressure"),
+                default=True,
             )
         ),
         max_active_tasks=max(

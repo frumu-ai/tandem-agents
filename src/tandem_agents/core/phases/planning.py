@@ -12,12 +12,15 @@ The planning phase repeats inside the repair loop (max_loops iterations).
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
+from src.tandem_agents.core.engine.engine import delete_tandem_session
 from src.tandem_agents.core.phases.context import RunContext
 from src.tandem_agents.core.task_contract import task_contract_payload
 
@@ -43,6 +46,99 @@ _PRODUCTION_SOURCE_EXTENSIONS = {
     ".ts",
     ".tsx",
 }
+
+
+def _active_engine_sessions_path(ctx: RunContext) -> Path:
+    return ctx.run_dir / "active_worker_engine_sessions.json"
+
+
+def _pop_active_engine_session(ctx: RunContext, role: str) -> dict[str, Any]:
+    role = str(role or "").strip()
+    if not role:
+        return {}
+    path = _active_engine_sessions_path(ctx)
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    info = dict(loaded.pop(role, {}) or {})
+    if loaded:
+        from src.tandem_agents.utils.utils import atomic_write_json
+
+        atomic_write_json(path, loaded)
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return info
+
+
+def _cancel_active_manager_engine_session(ctx: RunContext, reason: str) -> None:
+    info = _pop_active_engine_session(ctx, "manager")
+    session_id = str(info.get("session_id") or "").strip()
+    if not session_id:
+        return
+    run_id = str(info.get("run_id") or "").strip()
+    reason = str(reason or "manager_cancelled").strip() or "manager_cancelled"
+    from src.tandem_agents.runtime.runstate import append_event
+
+    append_event(
+        ctx.layout["events"],
+        "manager.engine_cancel_requested",
+        ctx.run_id,
+        {
+            "session_id": session_id,
+            "engine_run_id": run_id,
+            "reason": reason,
+        },
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+
+    def _delete() -> None:
+        try:
+            delete_tandem_session(ctx.cfg, session_id)
+            append_event(
+                ctx.layout["events"],
+                "manager.engine_cancelled",
+                ctx.run_id,
+                {
+                    "session_id": session_id,
+                    "engine_run_id": run_id,
+                    "reason": reason,
+                },
+                task_id=ctx.task.get("task_id"),
+                role="manager",
+                repo={"path": ctx.repo.get("path")},
+            )
+        except Exception as exc:
+            append_event(
+                ctx.layout["events"],
+                "manager.engine_cancel_failed",
+                ctx.run_id,
+                {
+                    "session_id": session_id,
+                    "engine_run_id": run_id,
+                    "reason": reason,
+                    "error": str(exc)[:500],
+                },
+                task_id=ctx.task.get("task_id"),
+                role="manager",
+                repo={"path": ctx.repo.get("path")},
+            )
+
+    thread = threading.Thread(
+        target=_delete,
+        name="aca-cancel-engine-session-manager",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _normalize_repo_relative_path(value: Any) -> str:
@@ -204,6 +300,35 @@ def _paired_production_path_for_test_file(test_path: str, candidate_files: list[
     return sorted(scored_candidates)[0][1]
 
 
+def _direct_production_candidates_for_test_file(test_path: str) -> list[str]:
+    test_rel = _normalize_repo_relative_path(test_path)
+    if not test_rel:
+        return []
+    test_obj = Path(test_rel)
+    name = test_obj.name
+    candidates: list[str] = []
+    if name.endswith("_test.py"):
+        candidates.append(test_obj.with_name(f"{name.removesuffix('_test.py')}.py").as_posix())
+    for test_suffix, source_suffix in (
+        (".test.py", ".py"),
+        (".test.ts", ".ts"),
+        (".test.tsx", ".tsx"),
+        (".spec.ts", ".ts"),
+        (".spec.tsx", ".tsx"),
+    ):
+        if name.endswith(test_suffix):
+            candidates.append(test_obj.with_name(f"{name.removesuffix(test_suffix)}{source_suffix}").as_posix())
+    if name.startswith("test_") and name.endswith(".py"):
+        candidates.append(test_obj.with_name(f"{name.removeprefix('test_')}").as_posix())
+        if test_obj.parent.name == "tests":
+            candidates.append(test_obj.parent.parent.joinpath(name.removeprefix("test_")).as_posix())
+    return [
+        rel_path
+        for rel_path in dict.fromkeys(_normalize_repo_relative_path(candidate) for candidate in candidates)
+        if rel_path and _repo_path_looks_like_production_source_file(rel_path)
+    ]
+
+
 def _source_partial_declared_test_followup_files(subtask: dict[str, Any]) -> list[str]:
     changed_files = [
         rel_path
@@ -292,6 +417,26 @@ def _test_only_partial_production_followup_files(
         return declared_production_files[:1]
     sticky_production_files = [path for path in candidate_files if _repo_path_looks_like_production_source_file(path)]
     return sticky_production_files[:1]
+
+
+def _test_only_partial_existing_sibling_production_files(
+    ctx: RunContext,
+    test_files: list[str],
+) -> list[str]:
+    try:
+        repo_path = ctx.repo_path
+    except Exception:
+        repo_path = Path(".")
+    production_files: list[str] = []
+    for test_file in test_files:
+        for candidate in _direct_production_candidates_for_test_file(test_file):
+            try:
+                if (repo_path / candidate).is_file():
+                    production_files.append(candidate)
+                    break
+            except OSError:
+                continue
+    return list(dict.fromkeys(production_files))
 
 
 
@@ -437,6 +582,7 @@ def _split_dense_serial_subtasks(
         ]
         skip_repair_split = bool(
             subtask.get("carry_forward_patch")
+            or subtask.get("carry_forward_patches")
             or subtask.get("discarded_partial_diff_patch")
             or subtask.get("repair_parent_target_files")
         )
@@ -458,8 +604,8 @@ def _split_dense_serial_subtasks(
         original_scope_note = str(subtask.get("scope_note") or "").strip()
         split_note = (
             "ACA split this dense manager subtask into serial slices because swarm is disabled. "
-            "Focus only on this slice's acceptance criteria; later slices cover the remaining criteria "
-            "against the same target files."
+            "Only one worker slice runs at a time; focus on this slice's acceptance criteria, "
+            "then later slices cover the remaining criteria against the same target files."
         )
         for chunk_index, chunk in enumerate(chunks, start=1):
             cloned = dict(subtask)
@@ -547,18 +693,64 @@ def _prepare_subtasks(ctx: RunContext) -> tuple[list[str], list[dict[str, Any]]]
     """
     from src.tandem_agents.core.execution import runner_core as _rc  # noqa: PLC0415
     from pathlib import Path
-    # Dispatch concurrency is limited later. When swarm is disabled, preserve
-    # manager subtasks and run them serially instead of compacting a broad plan
-    # into one prompt that can exhaust the engine iteration/timeout budget.
-    planning_subtask_limit = max(1, ctx.cfg.swarm.max_workers if ctx.cfg.swarm.enabled else 1)
+    # Dispatch concurrency is limited later. When swarm is disabled, preserve a
+    # small serial queue of manager slices instead of merging all work into one
+    # oversized prompt.
+    planning_subtask_limit = (
+        max(1, int(ctx.cfg.swarm.max_workers or 1))
+        if ctx.cfg.swarm.enabled
+        else _serial_subtask_limit(ctx.cfg)
+    )
     discovered_files, subtasks = _rc._prepare_subtasks_with_discovery(
         ctx.task,
         ctx.manager_plan,
         Path(ctx.repo.get("path") or "."),
         planning_subtask_limit,
-        merge_manager_subtasks=ctx.cfg.swarm.enabled,
+        merge_manager_subtasks=bool(ctx.cfg.swarm.enabled),
     )
     return _constrain_invalid_manager_fallback(ctx, discovered_files, subtasks)
+
+
+def _append_deferred_repair_subtasks(ctx: RunContext, subtasks: list[dict[str, Any]]) -> None:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else None
+    if not isinstance(repair, dict):
+        repair = ctx.status.get("repair") if isinstance(ctx.status, dict) else None
+    if not isinstance(repair, dict):
+        return
+    raw_deferred = repair.get("deferred_subtasks")
+    if not isinstance(raw_deferred, list) or not raw_deferred:
+        return
+    existing_ids = {str(subtask.get("id") or "").strip() for subtask in subtasks}
+    appended = 0
+    for item in raw_deferred:
+        if not isinstance(item, dict):
+            continue
+        subtask = dict(item)
+        subtask_id = str(subtask.get("id") or "").strip()
+        if not subtask_id or subtask_id in existing_ids:
+            continue
+        scope_note = str(subtask.get("scope_note") or "").strip()
+        continuation_note = (
+            "ACA deferred this serial subtask while repairing an earlier failed slice; "
+            "resume it after the repair slice completes."
+        )
+        if continuation_note not in scope_note:
+            subtask["scope_note"] = f"{scope_note}\n{continuation_note}".strip()
+        subtasks.append(subtask)
+        existing_ids.add(subtask_id)
+        appended += 1
+    if appended:
+        repair["deferred_subtasks_appended"] = appended
+
+
+def _serial_subtask_limit(cfg: Any) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_SERIAL_SUBTASK_LIMIT", "") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_SERIAL_SUBTASK_LIMIT=%r", raw)
+    return 4
 
 
 def _safe_repo_context_path(rel_path: Any, repo_path: Path) -> str:
@@ -629,7 +821,12 @@ def _deterministic_invalid_manager_subtasks(
     if not fallback_files:
         return []
 
-    max_workers = max(1, int(getattr(getattr(ctx.cfg, "swarm", None), "max_workers", 1) or 1))
+    swarm_cfg = getattr(ctx.cfg, "swarm", None)
+    max_workers = (
+        max(1, int(getattr(swarm_cfg, "max_workers", 1) or 1))
+        if bool(getattr(swarm_cfg, "enabled", False))
+        else _serial_subtask_limit(ctx.cfg)
+    )
     title = str(ctx.task.get("title") or ctx.task.get("local_goal") or "ACA fallback plan").strip()
     acceptance_criteria = _all_task_acceptance_criteria(ctx)
     by_name = {Path(path).name: path for path in fallback_files}
@@ -695,6 +892,156 @@ def _deterministic_invalid_manager_subtasks(
             }
         )
 
+    config_types_file = by_name.get("config_types.py")
+    config_loader_file = by_name.get("config_loader.py")
+    config_loader_test_file = by_name.get("config_loader_test.py")
+    if config_types_file:
+        planned.append(
+            {
+                "id": "fallback-throughput-config-types",
+                "title": f"{title} - scheduler budget config fields",
+                "goal": "Add the explicit scheduler budget, concurrency, rate-limit, CI, and merge queue backpressure config fields.",
+                "files": [config_types_file],
+                "target_files": [config_types_file],
+                "acceptance_criteria": [
+                    "In src/tandem_agents/config/config_types.py, extend SchedulerConfig with max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure. Use max_concurrent_worker_runs=4, max_daily_model_spend_cents=0, and True for each backpressure toggle as defaults.",
+                    "Add those exact scheduler fields to ResolvedConfig.as_dict() under the scheduler payload if the scheduler payload enumerates fields explicitly.",
+                    "Do not add alias helpers, legacy scheduler key translation, config.aca fields, an ACAConfig type, or new scheduler field names such as max_parallel_workers, max_pending_tasks, worker_start_interval_seconds, max_run_cost_usd, max_worker_cost_usd, max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
+                ],
+                "scope_note": (
+                    "Mechanical slice 1 of 3 for throughput config controls. Edit only config_types.py. "
+                    "Do not touch config_loader.py or config_loader_test.py in this slice."
+                ),
+            }
+        )
+    if config_loader_file:
+        planned.append(
+            {
+                "id": "fallback-throughput-config-loader",
+                "title": f"{title} - scheduler budget config loader",
+                "goal": "Wire exact scheduler budget and backpressure config fields from YAML and environment into SchedulerConfig.",
+                "files": [config_loader_file],
+                "target_files": [config_loader_file],
+                "acceptance_criteria": [
+                    "In src/tandem_agents/config/config_loader.py, load those fields from scheduler YAML keys and ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS, ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS, ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE, ACA_SCHEDULER_CI_BACKPRESSURE, and ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE env vars.",
+                    "Use the existing int and bool config loader helpers directly in the SchedulerConfig(...) construction.",
+                    "Do not add alias helpers, legacy scheduler key translation, config.aca fields, an ACAConfig type, or new scheduler field names such as max_parallel_workers, max_pending_tasks, worker_start_interval_seconds, max_run_cost_usd, max_worker_cost_usd, max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
+                ],
+                "scope_note": (
+                    "Mechanical slice 2 of 3 for throughput config controls. Edit only config_loader.py. "
+                    "Assume SchedulerConfig already has the exact fields; do not add tests in this slice."
+                ),
+            }
+        )
+    if config_loader_test_file:
+        planned.append(
+            {
+                "id": "fallback-throughput-config-loader-tests",
+                "title": f"{title} - scheduler budget config loader tests",
+                "goal": "Add focused config loader coverage for exact scheduler budget and backpressure fields.",
+                "files": [config_loader_test_file],
+                "target_files": [config_loader_test_file],
+                "acceptance_criteria": [
+                    "In src/tandem_agents/config/config_loader_test.py, add one focused test covering defaults plus env overrides for those exact config.scheduler fields: max_concurrent_worker_runs, max_daily_model_spend_cents, rate_limit_backpressure, ci_backpressure, and merge_queue_backpressure.",
+                    "The test must call resolve_config(root, env={...}) and assert only config.scheduler.max_concurrent_worker_runs, config.scheduler.max_daily_model_spend_cents, config.scheduler.rate_limit_backpressure, config.scheduler.ci_backpressure, and config.scheduler.merge_queue_backpressure.",
+                    "Do not add alias helpers, legacy scheduler key translation, config.aca fields, an ACAConfig type, or new scheduler field names such as max_parallel_workers, max_pending_tasks, worker_start_interval_seconds, max_run_cost_usd, max_worker_cost_usd, max_concurrent_workers, max_queued_tasks, worker_start_rate_per_minute, cost_budget_usd, max_active_runs, or max_active_workers.",
+                ],
+                "scope_note": (
+                    "Mechanical slice 3 of 3 for throughput config controls. Edit only config_loader_test.py. "
+                    "This is a test-only slice after the config fields and loader wiring slices; do not edit production files here."
+                ),
+            }
+        )
+
+    throughput_scheduler_files = [
+        path
+        for path in (
+            by_name.get("scheduler.py"),
+            by_name.get("scheduler_test.py"),
+        )
+        if path
+    ]
+    if throughput_scheduler_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-scheduler-controls",
+                "title": f"{title} - scheduler backpressure and caps",
+                "goal": "Apply scheduler admission caps and backpressure decisions to queued task planning.",
+                "files": throughput_scheduler_files,
+                "target_files": throughput_scheduler_files,
+                "acceptance_criteria": [
+                    "In src/tandem_agents/core/scheduling/scheduler.py, make plan_task_admissions enforce cfg.scheduler.max_concurrent_worker_runs by subtracting currently active work before admitting new tasks.",
+                    "Include max_concurrent_worker_runs and remaining worker slots in the plan_task_admissions limits payload so the operator can see which worker cap was applied.",
+                    "When queued work remains because active-plus-admitted work reaches max_concurrent_worker_runs, append blocked entries for those remaining candidates with reason worker_concurrency_reached, preserving task_key, project_key, repo_key, scope_mode, and scope_paths.",
+                    "In src/tandem_agents/core/scheduling/scheduler_test.py, add a focused test with max_active_tasks above max_concurrent_worker_runs that proves otherwise-admissible work is blocked with worker_concurrency_reached.",
+                    "Update any existing scheduler test that intentionally admits six tasks so it sets max_concurrent_worker_runs high enough for that scenario.",
+                    "Keep the change limited to scheduler behavior and its direct tests; config parsing is handled by the config-control slice.",
+                ],
+                "scope_note": (
+                    "Suggested edit order: read only plan_task_admissions in scheduler.py, then add the max_concurrent_worker_runs cap and remaining-queue blocked entries; "
+                    "next read the existing scheduler concurrency tests and add one focused worker-cap regression. "
+                    "Do not add unrelated spend, CI, or merge queue plumbing in this slice."
+                ),
+            }
+        )
+
+    throughput_worker_files = [
+        path
+        for path in (by_name.get("worker_dispatch.py"), by_name.get("runner_core.py"))
+        if path
+    ]
+    if throughput_worker_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-worker-metrics",
+                "title": f"{title} - worker and run metrics",
+                "goal": "Track worker/run timing, retry, token/cost, tool-call, test, and failure metrics in ACA run state.",
+                "files": throughput_worker_files,
+                "target_files": throughput_worker_files,
+                "acceptance_criteria": _criteria_matching(
+                    acceptance_criteria,
+                    (
+                        "cycle time",
+                        "queue wait",
+                        "active time",
+                        "pr time",
+                        "repair",
+                        "merge time",
+                        "token",
+                        "tool calls",
+                        "test time",
+                        "failure rate",
+                    ),
+                )
+                or acceptance_criteria,
+            }
+        )
+
+    throughput_operator_files = [
+        path
+        for path in (
+            by_name.get("operator_view.py"),
+            by_name.get("operator_dashboard.py"),
+            by_name.get("operator_dashboard_test.py"),
+        )
+        if path
+    ]
+    if throughput_operator_files:
+        planned.append(
+            {
+                "id": "fallback-throughput-operator-cockpit",
+                "title": f"{title} - operator cockpit visibility",
+                "goal": "Expose active workers, queued issues, blocked issues, costs, failures, and scheduler state in the operator cockpit.",
+                "files": throughput_operator_files,
+                "target_files": throughput_operator_files,
+                "acceptance_criteria": _criteria_matching(
+                    acceptance_criteria,
+                    ("operator", "active workers", "queued issues", "blocked issues", "costs", "failures", "cockpit"),
+                )
+                or acceptance_criteria,
+            }
+        )
+
     covered = {path for subtask in planned for path in subtask.get("files", [])}
     remaining = [path for path in fallback_files if path not in covered]
     if remaining:
@@ -750,6 +1097,147 @@ def _constrain_invalid_manager_fallback(
     return fallback_files, fallback_subtasks
 
 
+def _should_use_deterministic_repo_context_plan(ctx: RunContext) -> bool:
+    repo_context = ctx.blackboard.get("repo_context") if isinstance(ctx.blackboard, dict) else {}
+    if not isinstance(repo_context, dict) or not bool(repo_context.get("required_files_applied_as_target_files")):
+        return False
+    if "manager_invalid_plan" not in ctx.blackboard and not getattr(ctx, "_manager_fallback_required", False):
+        return False
+    source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
+    source_type = str(source.get("type") or "").strip() if isinstance(source, dict) else ""
+    execution_kind = str(ctx.task.get("execution_kind") or "").strip()
+    return execution_kind == "code_edit" and source_type in {"linear", "github_project", "manual"}
+
+
+def _deterministic_repo_context_manager_result(ctx: RunContext) -> dict[str, Any] | None:
+    if not _should_use_deterministic_repo_context_plan(ctx):
+        return None
+    fallback_files = _repo_context_fallback_files(ctx)
+    subtasks = _deterministic_invalid_manager_subtasks(ctx, fallback_files, [])
+    if not fallback_files or not subtasks:
+        return None
+    ctx.manager_plan = {
+        "summary": (
+            "ACA used graph-required repo-context files to build a deterministic worker plan after "
+            "manager planning failed."
+        ),
+        "subtasks": subtasks,
+        "risks": [
+            "Manager engine planning previously failed; deterministic repo-context fallback is scoped to required files."
+        ],
+        "tests": [],
+    }
+    ctx.blackboard["manager_plan"] = ctx.manager_plan
+    ctx.blackboard["manager_deterministic_repo_context_plan"] = {
+        "reason": "repo_context_required_files_after_manager_failure",
+        "planned_workers": len(subtasks),
+        "required_files": fallback_files,
+    }
+    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+    from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
+
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    append_event(
+        ctx.layout["events"],
+        "manager.deterministic_repo_context_plan",
+        ctx.run_id,
+        ctx.blackboard["manager_deterministic_repo_context_plan"],
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    return {
+        "role": "manager",
+        "returncode": 0,
+        "stdout": json.dumps(ctx.manager_plan),
+        "stderr": "",
+        "engine": {"skipped": True, "reason": "repo_context_required_files_after_manager_failure"},
+    }
+
+
+def _deterministic_repo_context_repair_manager_result(ctx: RunContext) -> dict[str, Any] | None:
+    if "manager_deterministic_repo_context_plan" not in ctx.blackboard:
+        return None
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    if not isinstance(repair, dict):
+        return None
+    attempt = _repair_int(repair.get("attempt"))
+    if attempt <= 1:
+        return None
+
+    completed_ids = {
+        str(subtask_id or "").strip()
+        for subtask_id in repair.get("completed_subtask_ids") or []
+        if str(subtask_id or "").strip()
+    }
+    subtasks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_subtask(raw_subtask: Any, note: str) -> None:
+        if not isinstance(raw_subtask, dict):
+            return
+        subtask = dict(raw_subtask)
+        subtask_id = str(subtask.get("id") or "").strip()
+        if not subtask_id or subtask_id in completed_ids or subtask_id in seen:
+            return
+        scope_note = str(subtask.get("scope_note") or "").strip()
+        if note not in scope_note:
+            subtask["scope_note"] = f"{scope_note}\n{note}".strip()
+        subtasks.append(subtask)
+        seen.add(subtask_id)
+
+    add_subtask(
+        repair.get("failed_subtask"),
+        "ACA is retrying this deterministic repo-context slice exactly after the previous worker failed.",
+    )
+    for item in repair.get("deferred_subtasks") or []:
+        add_subtask(
+            item,
+            "ACA deferred this deterministic repo-context slice while retrying an earlier failed slice.",
+        )
+    if not subtasks:
+        return None
+
+    ctx.manager_plan = {
+        "summary": "ACA reused the deterministic repo-context repair queue instead of broad replanning.",
+        "subtasks": subtasks,
+        "risks": [
+            "Repair planning was constrained to the failed deterministic slice plus deferred deterministic slices."
+        ],
+        "tests": [],
+    }
+    ctx.blackboard["manager_plan"] = ctx.manager_plan
+    ctx.blackboard["manager_deterministic_repo_context_repair_plan"] = {
+        "reason": "deterministic_repo_context_repair_queue",
+        "attempt": attempt,
+        "completed_subtask_ids": sorted(completed_ids),
+        "planned_workers": len(subtasks),
+        "subtask_ids": [str(subtask.get("id") or "").strip() for subtask in subtasks],
+    }
+    from src.tandem_agents.runtime.runstate import append_event, save_blackboard
+    from src.tandem_agents.runtime.run_output import write_blackboard_snapshot
+
+    save_blackboard(ctx.layout["blackboard"], ctx.blackboard)
+    write_blackboard_snapshot(ctx.run_dir, ctx.blackboard)
+    append_event(
+        ctx.layout["events"],
+        "manager.deterministic_repo_context_repair_plan",
+        ctx.run_id,
+        ctx.blackboard["manager_deterministic_repo_context_repair_plan"],
+        task_id=ctx.task.get("task_id"),
+        role="manager",
+        repo={"path": ctx.repo.get("path")},
+    )
+    return {
+        "role": "manager",
+        "returncode": 0,
+        "stdout": json.dumps(ctx.manager_plan),
+        "stderr": "",
+        "engine": {"skipped": True, "reason": "deterministic_repo_context_repair_queue"},
+    }
+
+
 def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[str, Any]]) -> None:
     repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
     artifacts = repair.get("partial_diff_artifacts") if isinstance(repair, dict) else []
@@ -767,6 +1255,8 @@ def _carry_forward_partial_diff_artifacts(ctx: RunContext, subtasks: list[dict[s
         changed_files = _partial_diff_changed_files(artifact)
         worker_output_excerpt = str(artifact.get("worker_output_excerpt") or "").strip()
         should_reapply_patch = _partial_diff_patch_is_reusable(worker_output_excerpt)
+        if artifact.get("patch_reusable") is False:
+            should_reapply_patch = False
         excerpt_limit = 1200 if should_reapply_patch else 360
         if len(worker_output_excerpt) > excerpt_limit:
             worker_output_excerpt = worker_output_excerpt[:excerpt_limit].rstrip() + "\n..."
@@ -899,6 +1389,10 @@ def _partial_diff_rejected_failure_summary(worker_output_excerpt: str) -> str:
         reasons.append("the worker drifted off the required test-first path")
     if "verification not run" in text:
         reasons.append("verification did not run")
+    if "focused tests failed" in text or "focused verification" in text:
+        reasons.append("focused verification failed")
+    if "config.aca" in text:
+        reasons.append("the diff used the wrong config namespace")
     if any(marker in text for marker in ("helper-only", "test-only helper", "local oracle", "self-referential")):
         reasons.append("the diff appeared helper-only or self-referential")
     if any(marker in text for marker in ("unproductive partial diff", "unproductive diff")):
@@ -936,6 +1430,8 @@ def _partial_diff_patch_is_reusable(worker_output_excerpt: str) -> bool:
         "does not show this readiness error being wired",
         "not covered by the added test",
         "verification not run",
+        "focused tests failed",
+        "focused verification",
         "unproductive partial diff",
         "unproductive diff",
         "runaway guard",
@@ -949,8 +1445,15 @@ def _partial_diff_patch_is_reusable(worker_output_excerpt: str) -> bool:
         "redundant",
         "worker_off_track_testless_diff",
         "changed only non-test files",
+        "changed only required test files",
         "required test files",
         "worker drifted off the required regression/test coverage path",
+        "config.aca",
+        "aca.throughput",
+        "metrics_window_seconds",
+        "backpressure_queue_limit",
+        "max_concurrent_workers",
+        "max_active_cost_usd",
     )
     return not any(marker in text for marker in rejected_markers)
 
@@ -984,11 +1487,30 @@ def _sanitize_partial_diff_artifact_paths_in_plan(plan: dict[str, Any]) -> None:
         subtask["acceptance_criteria"] = sanitized
 
 
+def _active_partial_diff_artifacts_for_repair(ctx: RunContext, artifacts: list[Any]) -> list[Any]:
+    repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
+    completed_ids = {
+        str(subtask_id or "").strip()
+        for subtask_id in ((repair or {}).get("completed_subtask_ids") or [])
+        if str(subtask_id or "").strip()
+    } if isinstance(repair, dict) else set()
+    if not completed_ids:
+        return artifacts
+    active = [
+        artifact
+        for artifact in artifacts
+        if not isinstance(artifact, dict)
+        or str(artifact.get("subtask_id") or "").strip() not in completed_ids
+    ]
+    return active or artifacts
+
+
 def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[str, Any] | None:
     repair = ctx.blackboard.get("repair") if isinstance(ctx.blackboard, dict) else {}
     artifacts = repair.get("partial_diff_artifacts") if isinstance(repair, dict) else []
     if not isinstance(artifacts, list) or not artifacts:
         return None
+    artifacts = _active_partial_diff_artifacts_for_repair(ctx, artifacts)
     parent_contract = task_contract_payload(ctx.task) if isinstance(ctx.task, dict) else {}
     parent_targets = [
         rel_path
@@ -998,6 +1520,9 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         )
         if rel_path
     ] if isinstance(ctx.task, dict) else []
+    complementary_plan = _deterministic_complementary_partial_diff_repair_plan(ctx, artifacts, parent_targets)
+    if complementary_plan is not None:
+        return complementary_plan
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
@@ -1008,8 +1533,174 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         changed_files = _partial_diff_changed_files(artifact)
         patch_path = str(artifact.get("patch_path") or "").strip()
         failure_summary = _partial_diff_rejected_failure_summary(excerpt)
+        artifact_targets = [
+            rel_path
+            for rel_path in (
+                _normalize_repo_relative_path(raw_path)
+                for raw_path in (
+                    artifact.get("subtask_target_files")
+                    or artifact.get("subtask_files")
+                    or parent_targets
+                )
+            )
+            if rel_path
+        ]
+        if (
+            changed_files
+            and all(_repo_path_looks_like_production_source_file(path) for path in changed_files)
+            and any(
+                marker in lowered
+                for marker in (
+                    "unproductive partial diff",
+                    "worker_unproductive_diff",
+                    "comment-only",
+                    "tautological",
+                    "changes only string wording",
+                )
+            )
+        ):
+            source_files = list(dict.fromkeys(changed_files))
+            parent_target_set = set(artifact_targets)
+            if parent_target_set:
+                source_files = [path for path in source_files if path in parent_target_set] or source_files
+            required_test_files = [
+                path
+                for path in artifact_targets
+                if _repo_path_looks_like_test_file(path)
+            ]
+            active_files = list(dict.fromkeys([*source_files, *required_test_files]))
+            if source_files and required_test_files:
+                source_text = ", ".join(source_files)
+                test_text = ", ".join(required_test_files)
+                subtask = {
+                    "id": str(artifact.get("subtask_id") or "unproductive-diff-repair").strip()
+                    or "unproductive-diff-repair",
+                    "title": "Repair unproductive partial diff",
+                    "goal": (
+                        "Replace the rejected comment-only partial diff with a production-backed repair for "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                    "files": active_files,
+                    "target_files": active_files,
+                    "acceptance_criteria": [
+                        "Do not apply or copy the rejected comment-only partial patch.",
+                        "Make the first new repair edit in the required test file(s): " + test_text + ".",
+                        "Then make only the minimal semantic production change needed in: " + source_text + ".",
+                        "Do not mark this repair complete until the diff includes real coverage in "
+                        + test_text
+                        + " plus a non-comment production behavior change.",
+                    ],
+                    "discarded_partial_diff_patch": patch_path,
+                    "repair_source_subtask_id": str(artifact.get("subtask_id") or "").strip(),
+                    "repair_source_worker_id": str(artifact.get("worker_id") or "").strip(),
+                    "repair_changed_files": changed_files,
+                    "repair_requires_test_followup": required_test_files,
+                    "repair_worker_output_excerpt": excerpt[:1200],
+                    "repair_failure_summary": failure_summary,
+                    "repair_parent_target_files": artifact_targets,
+                    "deterministic_partial_diff_repair": True,
+                    "write_required": True,
+                    "scope_note": (
+                        "ACA generated this repair plan deterministically after rejecting a comment-only or "
+                        "unproductive partial diff. Active repair targets are the changed source file(s) plus "
+                        "required test file(s): "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                }
+                return {
+                    "summary": (
+                        "Deterministic repair for an unproductive source-only partial diff; ACA discarded the "
+                        "patch and narrowed the retry to the source files plus required tests."
+                    ),
+                    "subtasks": [subtask],
+                    "risks": [
+                        "The rejected comment-only patch is intentionally not replayed."
+                    ],
+                    "tests": [
+                        "Run the narrowest deterministic verification for " + test_text + "."
+                    ],
+                }
+        if (
+            "engine_prompt_timeout" in lowered
+            and changed_files
+            and all(_repo_path_looks_like_production_source_file(path) for path in changed_files)
+        ):
+            source_files = list(dict.fromkeys(changed_files))
+            declared_tests = [
+                path
+                for path in artifact_targets
+                if _repo_path_looks_like_test_file(path)
+            ]
+            required_test_files = _source_partial_declared_test_followup_files(
+                {
+                    "repair_changed_files": changed_files,
+                    "files": artifact_targets,
+                    "target_files": artifact_targets,
+                    "acceptance_criteria": [
+                        "Retry the engine timeout with required regression coverage."
+                    ],
+                }
+            ) or declared_tests
+            active_files = list(dict.fromkeys([*source_files, *required_test_files]))
+            if source_files and required_test_files:
+                source_text = ", ".join(source_files)
+                test_text = ", ".join(required_test_files)
+                subtask = {
+                    "id": str(artifact.get("subtask_id") or "source-timeout-diff-repair").strip()
+                    or "source-timeout-diff-repair",
+                    "title": "Repair source-only engine timeout partial diff",
+                    "goal": (
+                        "Finish the timed-out source partial diff with required test coverage for "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                    "files": active_files,
+                    "target_files": active_files,
+                    "acceptance_criteria": [
+                        "Read the timed-out source change in: " + source_text + ".",
+                        "Make the first new repair edit in the required test file(s): " + test_text + ".",
+                        "Do not mark this repair complete until the diff includes both the source behavior and real coverage in "
+                        + test_text
+                        + ".",
+                        "Run the narrowest deterministic verification for "
+                        + test_text
+                        + ", or record the exact unavailable command/blocker.",
+                    ],
+                    "carry_forward_patch": patch_path,
+                    "repair_source_subtask_id": str(artifact.get("subtask_id") or "").strip(),
+                    "repair_source_worker_id": str(artifact.get("worker_id") or "").strip(),
+                    "repair_changed_files": changed_files,
+                    "repair_requires_test_followup": required_test_files,
+                    "repair_worker_output_excerpt": excerpt[:1200],
+                    "repair_failure_summary": failure_summary,
+                    "repair_parent_target_files": artifact_targets,
+                    "deterministic_partial_diff_repair": True,
+                    "write_required": True,
+                    "scope_note": (
+                        "ACA generated this repair plan deterministically after an engine prompt timeout left a "
+                        "source-only partial diff. The preserved source patch is applied before this worker starts; "
+                        "active repair targets are the source file(s) plus required test file(s): "
+                        + ", ".join(active_files)
+                        + "."
+                    ),
+                }
+                return {
+                    "summary": (
+                        "Deterministic repair for a source-only engine timeout partial diff; ACA narrowed the retry "
+                        "to the timed-out source files plus required tests."
+                    ),
+                    "subtasks": [subtask],
+                    "risks": [
+                        "The preserved patch may need adjustment after required coverage is added."
+                    ],
+                    "tests": [
+                        "Run the narrowest deterministic verification for " + test_text + "."
+                    ],
+                }
         if "changed only non-test files" in lowered and "required test files" in lowered:
-            parent_target_set = set(parent_targets)
+            parent_target_set = set(artifact_targets)
             source_files = [path for path in changed_files if _repo_path_looks_like_production_source_file(path)]
             if parent_target_set:
                 source_files = [path for path in source_files if path in parent_target_set]
@@ -1020,11 +1711,11 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
             if not required_test_files:
                 required_test_files = [
                     path
-                    for path in parent_targets
+                    for path in artifact_targets
                     if _repo_path_looks_like_test_file(path)
                 ]
-            if parent_targets:
-                active_files = list(dict.fromkeys([*required_test_files, *parent_targets]))
+            if artifact_targets:
+                active_files = list(dict.fromkeys([*required_test_files, *artifact_targets]))
                 source_files = [
                     path
                     for path in active_files
@@ -1066,7 +1757,7 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
                 "repair_requires_test_followup": required_test_files,
                 "repair_worker_output_excerpt": excerpt[:1200],
                 "repair_failure_summary": failure_summary,
-                "repair_parent_target_files": parent_targets,
+                "repair_parent_target_files": artifact_targets,
                 "deterministic_testless_repair": True,
                 "deterministic_partial_diff_repair": True,
                 "write_required": True,
@@ -1104,11 +1795,13 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
         production_followup_files = _test_only_partial_production_followup_files(
             {
                 "repair_changed_files": changed_files,
-                "files": parent_targets,
-                "target_files": parent_targets,
+                "files": artifact_targets,
+                "target_files": artifact_targets,
             },
-            parent_targets,
+            artifact_targets,
         )
+        if not production_followup_files:
+            production_followup_files = _test_only_partial_existing_sibling_production_files(ctx, test_files)
         active_files = list(dict.fromkeys([*production_followup_files, *test_files]))
         if not test_files or not production_followup_files or not active_files:
             continue
@@ -1164,6 +1857,106 @@ def _deterministic_testless_partial_diff_repair_plan(ctx: RunContext) -> dict[st
     return None
 
 
+def _deterministic_complementary_partial_diff_repair_plan(
+    ctx: RunContext,
+    artifacts: list[Any],
+    parent_targets: list[str],
+) -> dict[str, Any] | None:
+    test_artifacts: list[dict[str, Any]] = []
+    source_artifacts: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("patch_reusable") is False:
+            continue
+        changed_files = _partial_diff_changed_files(artifact)
+        excerpt = str(artifact.get("worker_output_excerpt") or "").lower()
+        if _all_changed_files_are_tests(changed_files) and (
+            "changed only required test files" in excerpt or "test-only" in excerpt
+        ):
+            test_artifacts.append(artifact)
+        elif changed_files and all(_repo_path_looks_like_production_source_file(path) for path in changed_files) and (
+            "changed only non-test files" in excerpt or "worker_off_track_testless_diff" in excerpt
+        ):
+            source_artifacts.append(artifact)
+    if not test_artifacts or not source_artifacts:
+        return None
+    for test_artifact in test_artifacts:
+        test_files = [path for path in _partial_diff_changed_files(test_artifact) if _repo_path_looks_like_test_file(path)]
+        for source_artifact in source_artifacts:
+            source_files = [
+                path
+                for path in _partial_diff_changed_files(source_artifact)
+                if _repo_path_looks_like_production_source_file(path)
+            ]
+            paired_source_files = [
+                source_file
+                for source_file in source_files
+                if any(_paired_production_path_for_test_file(test_file, source_files) == source_file for test_file in test_files)
+            ] or source_files[:1]
+            if parent_targets:
+                paired_source_files = [path for path in paired_source_files if path in parent_targets] or paired_source_files
+                test_files = [path for path in test_files if path in parent_targets] or test_files
+            active_files = list(dict.fromkeys([*paired_source_files, *test_files]))
+            patches = [
+                str(source_artifact.get("patch_path") or "").strip(),
+                str(test_artifact.get("patch_path") or "").strip(),
+            ]
+            patches = [patch for patch in dict.fromkeys(patches) if patch]
+            if not paired_source_files or not test_files or len(patches) < 2:
+                continue
+            source_text = ", ".join(paired_source_files)
+            test_text = ", ".join(test_files)
+            return {
+                "summary": (
+                    "Deterministic repair for complementary source-only and test-only partial diffs; "
+                    "ACA will apply both saved patches before asking the worker to verify and fix the combined diff."
+                ),
+                "subtasks": [
+                    {
+                        "id": str(test_artifact.get("subtask_id") or "complementary-diff-repair").strip()
+                        or "complementary-diff-repair",
+                        "title": "Verify complementary source and test partial diffs",
+                        "goal": "Verify and minimally fix the combined source+test repair for " + ", ".join(active_files) + ".",
+                        "files": active_files,
+                        "target_files": active_files,
+                        "acceptance_criteria": [
+                            "ACA applied the preserved production patch and test patch before this worker starts; inspect the combined diff in "
+                            + ", ".join(active_files)
+                            + ".",
+                            "Run the narrowest deterministic verification for "
+                            + test_text
+                            + "; if it fails, fix only the paired production/test behavior in "
+                            + ", ".join(active_files)
+                            + ".",
+                            "Do not expand into broader manager scope unless a direct import, compile, or test failure in the active files requires it.",
+                        ],
+                        "carry_forward_patches": patches,
+                        "repair_source_subtask_id": str(test_artifact.get("subtask_id") or "").strip(),
+                        "repair_source_worker_id": str(test_artifact.get("worker_id") or "").strip(),
+                        "repair_changed_files": active_files,
+                        "repair_requires_production_followup": paired_source_files,
+                        "repair_requires_test_followup": test_files,
+                        "repair_verification_first": True,
+                        "deterministic_partial_diff_repair": True,
+                        "write_required": False,
+                        "scope_note": (
+                            "ACA detected complementary partial diffs: one production-only patch for "
+                            + source_text
+                            + " and one test-only patch for "
+                            + test_text
+                            + ". Both patches are applied before this worker starts; verify/fix the combined source+test diff."
+                        ),
+                    }
+                ],
+                "risks": [
+                    "If either preserved patch no longer applies, ACA will fail closed and retry with fresh repair evidence."
+                ],
+                "tests": ["Run the narrowest deterministic verification for " + test_text + "."],
+            }
+    return None
+
+
 def _mark_manager_planning_started(ctx: RunContext) -> None:
     from src.tandem_agents.runtime.run_output import set_status
 
@@ -1175,6 +1968,16 @@ def _mark_manager_planning_started(ctx: RunContext) -> None:
         phase_role="manager",
         run_status="running",
     )
+
+
+def _manager_prompt_timeout_seconds(cfg: Any) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_MANAGER_PROMPT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_MANAGER_PROMPT_TIMEOUT_SECONDS=%r", raw)
+    return 90.0
 
 
 def _deterministic_testless_repair_active(subtasks: list[dict[str, Any]]) -> bool:
@@ -1371,7 +2174,7 @@ def _constrain_extra_partial_diff_repair_subtasks(
     base_max_loops = _repair_int(repair.get("base_max_loops"))
     if not attempt or not base_max_loops or attempt <= base_max_loops:
         return
-    carried = [subtask for subtask in subtasks if subtask.get("carry_forward_patch")]
+    carried = [subtask for subtask in subtasks if subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches")]
     rejected = [
         subtask
         for subtask in subtasks
@@ -1456,7 +2259,7 @@ def _merge_or_defer_sticky_expected_files(
     if not sticky_missing_from_plan or not subtasks:
         return
     first = subtasks[0]
-    partial_diff_repair = bool(first.get("carry_forward_patch"))
+    partial_diff_repair = bool(first.get("carry_forward_patch") or first.get("carry_forward_patches"))
     rejected_partial_diff_repair = bool(
         first.get("discarded_partial_diff_patch") or first.get("repair_parent_target_files")
     )
@@ -1534,7 +2337,7 @@ def _merge_or_defer_sticky_expected_files(
         + "."
     )
     first["scope_note"] = f"{existing_scope_note}\n{sticky_note}".strip()
-    if production_followup_files and first.get("carry_forward_patch"):
+    if production_followup_files and (first.get("carry_forward_patch") or first.get("carry_forward_patches")):
         _narrow_carried_partial_diff_subtask(first)
 
 
@@ -1670,6 +2473,14 @@ def run_manager_prompt(ctx: RunContext) -> None:
     write_blackboard_snapshot(ctx.layout["run_dir"], ctx.blackboard)
     write_status(ctx.layout["status"], ctx.status)
 
+    deterministic_repo_context_repair_result = _deterministic_repo_context_repair_manager_result(ctx)
+    if deterministic_repo_context_repair_result is not None:
+        return deterministic_repo_context_repair_result
+
+    deterministic_repo_context_result = _deterministic_repo_context_manager_result(ctx)
+    if deterministic_repo_context_result is not None:
+        return deterministic_repo_context_result
+
     manager_prompt = build_manager_prompt(
         ctx.run_id,
         ctx.task,
@@ -1718,8 +2529,10 @@ def run_manager_prompt(ctx: RunContext) -> None:
         }
 
     logger.info("Running manager prompt (run_id=%s)", ctx.run_id)
-    with _rc._coordination_heartbeat(ctx, phase="planning"):
-        manager_result = stream_tandem_prompt(
+    timeout_seconds = _manager_prompt_timeout_seconds(ctx.cfg)
+
+    def _stream_manager_prompt() -> dict[str, Any]:
+        return stream_tandem_prompt(
             ctx.cfg,
             role="manager",
             prompt=manager_prompt,
@@ -1730,6 +2543,44 @@ def run_manager_prompt(ctx: RunContext) -> None:
             log_path=ctx.layout["logs"] / "manager.log",
             config_path=None,
         )
+
+    with _rc._coordination_heartbeat(ctx, phase="planning"):
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aca-manager")
+        future = executor.submit(_stream_manager_prompt)
+        try:
+            manager_result = future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            _cancel_active_manager_engine_session(ctx, "manager_prompt_timeout")
+            message = (
+                "ENGINE_PROMPT_TIMEOUT: ACA manager planning prompt exceeded "
+                f"{timeout_seconds:.0f}s without producing a plan. The run will use "
+                "contract-based fallback planning instead of remaining stuck in planning."
+            )
+            try:
+                log_path = ctx.layout["logs"] / "manager.log"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(message + "\n")
+            except Exception:
+                logger.debug("Failed to append manager watchdog message", exc_info=True)
+            manager_result = {
+                "role": "manager",
+                "returncode": 1,
+                "stdout": message,
+                "stderr": "",
+                "log_path": str(ctx.layout["logs"] / "manager.log"),
+                "failure_reason": message,
+                "blocker_kind": "manager_prompt_timeout",
+                "recovery_action": (
+                    "Use ACA's contract-based fallback planner for this attempt; inspect manager.log "
+                    "and engine run state if manager prompts repeatedly time out."
+                ),
+                "engine": {
+                    "stream_reason": "manager_prompt_timeout",
+                    "timeout_seconds": timeout_seconds,
+                },
+            }
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     parsed_plan, invalid_plan_reason = _manager_plan_from_stdout(str(manager_result.get("stdout") or ""))
     if invalid_plan_reason:
@@ -1815,6 +2666,7 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
     discovered_files, subtasks = _prepare_subtasks(ctx)
     _carry_forward_partial_diff_artifacts(ctx, subtasks)
     _constrain_extra_partial_diff_repair_subtasks(ctx, subtasks)
+    _append_deferred_repair_subtasks(ctx, subtasks)
     _namespace_repair_retry_subtask_ids(ctx, subtasks)
     _align_python_test_targets_to_repo_conventions(repo_path, subtasks)
     _split_dense_serial_subtasks(ctx, subtasks)
@@ -1876,7 +2728,11 @@ def pre_screen_subtasks(ctx: RunContext) -> bool:
             str(subtask.get("id") or "").strip() in completed_repair_subtask_ids
             and subtask_satisfied(repo_path, subtask)
         )
-        repair_requires_worker = bool(subtask.get("carry_forward_patch") or subtask.get("discarded_partial_diff_patch"))
+        repair_requires_worker = bool(
+            subtask.get("carry_forward_patch")
+            or subtask.get("carry_forward_patches")
+            or subtask.get("discarded_partial_diff_patch")
+        )
         subtask["pre_satisfied"] = (
             False
             if repair_requires_worker

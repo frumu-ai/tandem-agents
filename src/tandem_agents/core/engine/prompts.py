@@ -141,6 +141,7 @@ def _is_test_target_path(path: str) -> bool:
 def _subtask_mentions_test_work(subtask: dict[str, Any]) -> bool:
     parts: list[Any] = [subtask.get("title"), subtask.get("goal"), subtask.get("scope_note")]
     parts.extend(_as_list(subtask.get("deliverables")))
+    parts.extend(_as_list(subtask.get("acceptance_criteria")))
     text = "\n".join(str(part or "") for part in parts).lower()
     return any(word in text for word in ("test", "tests", "coverage", "regression"))
 
@@ -198,6 +199,7 @@ def _subtask_contract_for_worker(subtask: dict[str, Any], target_files: list[str
 def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) -> str:
     if not subtask.get("discarded_partial_diff_patch"):
         return ""
+    carries_preserved_patch = bool(subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches"))
     summary = _clip_prompt_text(subtask.get("repair_failure_summary"), 300)
     changed_files = [
         str(entry).strip()
@@ -207,6 +209,19 @@ def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) ->
     target_line = json.dumps(target_files)
     changed_line = json.dumps(changed_files)
     summary_line = f"\n- Failure summary: {summary}" if summary else ""
+    if carries_preserved_patch:
+        return (
+            "\nCarry-forward repair directive:\n"
+            "- ACA already applied the preserved partial patch data into this worker worktree before the prompt started.\n"
+            f"- Inspect the current target files and working diff only: {target_line}.\n"
+            f"- Previous incomplete diff evidence touched: {changed_line}.\n"
+            "- Do not read, apply, or copy patch artifact paths; treat artifacts only as historical failure evidence.\n"
+            "- First actions: read the target files and combined diff, then run the narrowest relevant verification or "
+            "make only the minimal focused fix needed for that verification.\n"
+            "- Valid coverage must call production code or an existing exported behavior; a helper-only or local-oracle "
+            "test fails this repair."
+            f"{summary_line}\n"
+        )
     return (
         "\nRepair directive:\n"
         "- The previous partial diff was rejected; do not apply or copy it as-is.\n"
@@ -557,6 +572,16 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], WORKER_JSON_CHAR_LIMIT)
     scope_note = _clip_prompt_text(subtask.get("scope_note"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
     scope_note_block = f"\nACA scope note: {scope_note}\n" if scope_note else ""
+    deterministic_fast_path_block = ""
+    if "mechanical slice" in scope_note.lower() and substantive_target_files:
+        deterministic_fast_path_block = (
+            "\nMechanical deterministic slice fast path:\n"
+            f"- First read only the smallest relevant part of {json.dumps(substantive_target_files[:1])}.\n"
+            "- Then make the first semantic edit in that target before inspecting unrelated files.\n"
+            "- Stay inside the listed target files and acceptance criteria; do not explore the parent task surface until after a real diff exists.\n"
+            "- Do not stop after imports, constants, or scaffolding. If the slice wires config/env fields, the first diff must also update the read path or config construction that consumes those fields.\n"
+            "- Once the diff exists, run one lightweight readback or syntax check and return the completion note.\n"
+        )
     repair_directive_block = _repair_directive_block(subtask, target_files)
     tracked_target_guidance = ""
     write_required_guidance = ""
@@ -604,12 +629,31 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
                 f"{json.dumps(production_followup_targets)}. A test-only diff fails this repair unless you report a concrete blocker "
                 "explaining why no production edit is safe.\n"
             )
-        elif required_test_targets and (_repair_requires_test_first(subtask) or _subtask_mentions_test_work(subtask)):
+        elif required_test_targets and _repair_requires_test_first(subtask):
             write_required_guidance += (
                 "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
                 f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
                 "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
             )
+        elif required_test_targets and _subtask_mentions_test_work(subtask):
+            paired_production_targets = [
+                path
+                for path in substantive_target_files
+                if not _is_test_target_path(path)
+            ]
+            if paired_production_targets:
+                write_required_guidance += (
+                    "\nThis worker must keep test coverage paired with production behavior. Read at least one required test target early: "
+                    f"{json.dumps(required_test_targets)}, then read and make the first behavioral edit in a paired production target before "
+                    f"expanding tests: {json.dumps(paired_production_targets)}. Do not spend the attempt building a test-only diff; "
+                    "a test-only diff fails unless you report a concrete blocker explaining why no production edit is safe.\n"
+                )
+            else:
+                write_required_guidance += (
+                    "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
+                    f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
+                    "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
+                )
     no_target_guidance = ""
     if not target_files:
         pr_numbers = _referenced_pr_numbers(task, subtask)
@@ -701,6 +745,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         f"Subtask title: {subtask_title}\n"
         f"Subtask goal: {subtask_goal}\n"
         f"{scope_note_block}"
+        f"{deterministic_fast_path_block}"
         f"{repair_directive_block}"
         f"Subtask contract:\n{subtask_contract}\n\n"
         f"Acceptance criteria: {acceptance_criteria}\n"
@@ -769,6 +814,10 @@ def build_review_prompt(
         "This review happens before final handoff/publish. Do not require a PR branch, PR URL, merge, or branch deletion in this phase; those are finalized later if verification passes.\n"
         "If the task asks for lint/typecheck but the touched package exposes no matching script, accept the available deterministic build/test commands as verification and note the missing script instead of requiring an impossible command.\n"
         "For PR-candidate consolidation tasks, worker applicability notes that name skipped candidates and reasons count as handoff documentation; require extra documentation only if those reasons are missing or unsafe.\n"
+        "Review only against the explicit task contract, enumerated acceptance criteria, and declared target files. "
+        "Do not expand scope from the title, broad summary wording, or adjacent product ideas. "
+        "If broad wording conflicts with a narrower numbered checklist, treat the numbered checklist as controlling. "
+        "Set `repair_needed` only for a concrete unmet criterion, regression, unsafe change, or broken verification visible in the actual diff.\n"
         "Return JSON only with keys: next_action, findings, required_fixes, notes.\n"
         "Set next_action to one of `pass`, `repair_needed`, `blocked`, or `human_review_needed`.\n"
         "CRITICAL: You MUST use ONLY relative paths (e.g., `package.json` or `src/app.js`) for ALL tool calls.\n"

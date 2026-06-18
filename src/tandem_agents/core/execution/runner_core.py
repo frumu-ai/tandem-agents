@@ -135,7 +135,6 @@ _RETRYABLE_WORKER_BLOCKER_KINDS = {
     "worker_incomplete_diff",
     "worker_no_progress",
     "worker_off_track",
-    "worker_runaway_diff",
     "worker_unproductive_diff",
     "worker_corrupt_diff",
     "carry_forward_patch_apply_failed",
@@ -150,8 +149,6 @@ _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS = {
     "worker_corrupt_diff",
     "worker_no_progress",
     "worker_off_track",
-    "worker_runaway_diff",
-    "worker_unproductive_diff",
     "carry_forward_patch_apply_failed",
     "engine_tool_loop_stalled",
     "engine_prompt_timeout",
@@ -456,7 +453,7 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
         phase_detail = f"{worker_id} tripped the runaway diff guard"
         recovery_action = (
             first.get("recovery_action")
-            or "Retry with a smaller scoped prompt and inspect diff stats before continuing."
+            or "Inspect the clipped diff evidence and fix the edit path before resetting this task for another run."
         )
     elif kind == "worker_unproductive_diff":
         message = failure_reason or "Worker produced a placeholder or comment-only diff."
@@ -609,7 +606,7 @@ def _worker_incomplete_diff_extra_retries(cfg: ResolvedConfig) -> int:
             return max(0, int(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES=%r", raw)
-    return 2
+    return 3
 
 
 def _worker_failure_can_retry(
@@ -618,16 +615,22 @@ def _worker_failure_can_retry(
     attempt: int,
     base_max_loops: int,
 ) -> bool:
+    kind = str(blocker.get("kind") or "").strip()
+    if kind not in _RETRYABLE_WORKER_BLOCKER_KINDS:
+        return False
     worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
     if (
-        str(blocker.get("kind") or "").strip() == "worker_no_progress"
+        kind == "worker_no_progress"
         and isinstance(worker, dict)
         and worker.get("worker_abandoned_after_timeout")
     ):
         return False
+    if kind == "worker_no_progress" and isinstance(worker, dict):
+        failure_reason = str(worker.get("failure_reason") or "").strip()
+        if failure_reason in {"WORKER_NO_CHANGE", "WORKER_REPAIR_NO_CHANGE"}:
+            return False
     if attempt < base_max_loops - 1:
         return True
-    kind = str(blocker.get("kind") or "").strip()
     if kind not in _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS:
         return False
     if kind in {"engine_tool_loop_stalled", "engine_prompt_timeout"} and not _worker_failure_has_partial_diff(blocker):
@@ -690,6 +693,16 @@ def _integration_can_retry(
     return attempt < base_max_loops + worker_extra_retries + extra_retries - 1
 
 
+def _integration_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS=%r", raw)
+    return 300.0
+
+
 def _discard_partial_diff_repair_artifacts(ctx: "_PhaseRunContext", *, reason: str) -> None:
     for source in (getattr(ctx, "status", None), getattr(ctx, "blackboard", None)):
         if not isinstance(source, dict):
@@ -726,12 +739,68 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
             "worker_id": worker_id,
             "patch_path": patch_path,
         }
+        failure_reason = str(result.get("failure_reason") or "").strip()
+        blocker_kind = str(result.get("blocker_kind") or "").strip()
+        recovery_action = str(result.get("recovery_action") or "").strip()
+        if failure_reason:
+            entry["failure_reason"] = failure_reason
+        if blocker_kind:
+            entry["blocker_kind"] = blocker_kind
+        if recovery_action:
+            entry["recovery_action"] = recovery_action
+        if failure_reason in {
+            "WORKER_OFF_TRACK_TESTLESS_DIFF",
+            "WORKER_TEST_ONLY_DIFF",
+            "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+            "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+        }:
+            entry["patch_reusable"] = False
         if changed_files:
             entry["changed_files"] = changed_files
         if output_excerpt:
             entry["worker_output_excerpt"] = output_excerpt
+        for metadata_key in ("subtask_files", "subtask_target_files"):
+            metadata_value = result.get(metadata_key)
+            if isinstance(metadata_value, list):
+                paths = [str(path or "").strip() for path in metadata_value if str(path or "").strip()]
+                if paths:
+                    entry[metadata_key] = list(dict.fromkeys(paths))
         if entry not in artifacts:
             artifacts.append(entry)
+    return artifacts
+
+
+def _merge_partial_diff_artifacts_for_retry(
+    existing: Any,
+    new_artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def artifact_key(artifact: dict[str, Any]) -> str:
+        patch_path = str(artifact.get("patch_path") or "").strip()
+        if patch_path:
+            return f"patch:{patch_path}"
+        changed_files = ",".join(str(path).strip() for path in artifact.get("changed_files") or [])
+        return ":".join(
+            [
+                str(artifact.get("subtask_id") or "").strip(),
+                str(artifact.get("worker_id") or "").strip(),
+                changed_files,
+            ]
+        )
+
+    for raw_artifact in [
+        *(existing if isinstance(existing, list) else []),
+        *new_artifacts,
+    ]:
+        if not isinstance(raw_artifact, dict):
+            continue
+        key = artifact_key(raw_artifact)
+        if not key or key in seen:
+            continue
+        artifacts.append(dict(raw_artifact))
+        seen.add(key)
     return artifacts
 
 
@@ -745,6 +814,45 @@ def _completed_subtask_ids_for_retry(worker_results: list[dict[str, Any]]) -> li
         if subtask_id and subtask_id not in completed:
             completed.append(subtask_id)
     return completed
+
+
+def _deferred_subtasks_for_retry(
+    pending_subtasks: list[dict[str, Any]],
+    worker_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failed_subtask_id = ""
+    for result in worker_results:
+        if int(result.get("returncode") or 0) == 0:
+            continue
+        failed_subtask_id = str(result.get("subtask_id") or "").strip()
+        if failed_subtask_id:
+            break
+    if not failed_subtask_id:
+        return []
+    for index, subtask in enumerate(pending_subtasks):
+        if str(subtask.get("id") or "").strip() != failed_subtask_id:
+            continue
+        return [dict(item) for item in pending_subtasks[index + 1 :]]
+    return []
+
+
+def _failed_subtask_for_retry(
+    pending_subtasks: list[dict[str, Any]],
+    worker_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    failed_subtask_id = ""
+    for result in worker_results:
+        if int(result.get("returncode") or 0) == 0:
+            continue
+        failed_subtask_id = str(result.get("subtask_id") or "").strip()
+        if failed_subtask_id:
+            break
+    if not failed_subtask_id:
+        return None
+    for subtask in pending_subtasks:
+        if str(subtask.get("id") or "").strip() == failed_subtask_id:
+            return dict(subtask)
+    return None
 
 
 def _prepare_pr_candidate_context(ctx: "_PhaseRunContext") -> dict[str, Any] | None:
@@ -1079,9 +1187,18 @@ def _run_start_preflight(
             "artifact": str(artifact_path),
             "repo_path": str(repo_path),
             "engine_visible_repo_path": str(engine_repo_path),
-            "git_status_ok": result.returncode == 0,
+            "git_status_ok": result.returncode == 0
+            and not re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout),
         },
     )
+    if result.returncode == 0 and re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout):
+        return preflight, {
+            "kind": "repository_base_not_synced",
+            "message": result.stdout.strip(),
+            "recovery_action": (
+                "Fetch GitHub and make the ACA default branch match origin before starting a run."
+            ),
+        }
     if result.returncode == 0:
         return preflight, None
     kind = "repo_safe_directory" if "dubious ownership" in detail.lower() else "engine_workspace_unreachable"
@@ -1729,6 +1846,7 @@ def _normalize_manager_subtasks(
             scope_note = f"{scope_note}\n{extra}".strip()
         repair_scoped = bool(
             item.get("carry_forward_patch")
+            or item.get("carry_forward_patches")
             or item.get("discarded_partial_diff_patch")
             or item.get("deterministic_testless_repair")
             or item.get("deterministic_partial_diff_repair")
@@ -1769,6 +1887,7 @@ def _normalize_manager_subtasks(
         }
         for key in (
             "carry_forward_patch",
+            "carry_forward_patches",
             "discarded_partial_diff_patch",
             "deterministic_testless_repair",
             "deterministic_partial_diff_repair",
@@ -1846,8 +1965,6 @@ def _prepare_subtasks_with_discovery(
         ]
     elif max_workers <= 1 and merge_manager_subtasks and has_manager_subtasks and len(subtasks) > 1:
         subtasks = _merge_manager_subtasks_for_single_worker(task, subtasks)
-    if has_manager_subtasks:
-        return discovered_files, subtasks
     return discovered_files, subtasks[: max(1, max_workers)]
 
 
@@ -2040,6 +2157,7 @@ def _execute_local_worker_pool(
     on_start: Callable[[str, dict[str, Any]], None] | None = None,
     on_result: Callable[[dict[str, Any]], None] | None = None,
     abort_result: Callable[[int, dict[str, Any], str], dict[str, Any] | None] | None = None,
+    cancel_worker: Callable[[str, str], None] | None = None,
     worker_timeout_seconds: float | None = None,
 ) -> list[dict[str, Any]]:
     if not pending_subtasks:
@@ -2223,6 +2341,11 @@ def _execute_local_worker_pool(
         terminal_event_result = _terminal_worker_event_result(index, subtask, worker_id)
         if terminal_event_result is not None:
             return terminal_event_result
+        if cancel_worker is not None:
+            try:
+                cancel_worker(worker_id, "worker_pool_timeout")
+            except Exception:
+                logger.exception("Worker cancellation callback failed for %s after pool timeout.", worker_id)
         if future.cancel():
             return _timeout_result(index, subtask, worker_id)
         logger.warning(
@@ -2240,16 +2363,21 @@ def _execute_local_worker_pool(
         return result
 
     if worker_limit <= 1:
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            for index, subtask in enumerate(pending_subtasks, start=1):
-                worker_id = f"worker-{index}"
+        for index, subtask in enumerate(pending_subtasks, start=1):
+            worker_id = f"worker-{index}"
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
                 future = executor.submit(_run_one, index, subtask, worker_id)
                 deadline = time.monotonic() + timeout if timeout > 0 else None
                 while True:
                     if abort_result is not None:
                         aborted = abort_result(index, subtask, worker_id)
                         if aborted:
+                            if cancel_worker is not None:
+                                try:
+                                    cancel_worker(worker_id, str(aborted.get("blocker_kind") or "worker_aborted"))
+                                except Exception:
+                                    logger.exception("Worker cancellation callback failed for %s after abort.", worker_id)
                             result = aborted
                             _record_result(result)
                             break
@@ -2267,10 +2395,10 @@ def _execute_local_worker_pool(
                         continue
                     _record_result(result)
                     break
-                if _has_unresolved_write_required_worker_failure([result]):
-                    break
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            if _has_unresolved_write_required_worker_failure([result]):
+                break
         return results
 
     executor = ThreadPoolExecutor(max_workers=max(1, worker_limit))
@@ -2328,6 +2456,11 @@ def _execute_local_worker_pool(
                     index, subtask, worker_id = futures[future]
                     aborted = abort_result(index, subtask, worker_id)
                     if aborted:
+                        if cancel_worker is not None:
+                            try:
+                                cancel_worker(worker_id, str(aborted.get("blocker_kind") or "worker_aborted"))
+                            except Exception:
+                                logger.exception("Worker cancellation callback failed for %s after abort.", worker_id)
                         future.cancel()
                         pending.remove(future)
                         _record_result(aborted)
@@ -3386,7 +3519,10 @@ def _linear_mcp_authorization_url(cfg: ResolvedConfig) -> str:
         return ""
     if not isinstance(payload, dict):
         return ""
-    server = payload.get(server_name)
+    servers = payload.get("servers")
+    if not isinstance(servers, dict):
+        servers = payload
+    server = servers.get(server_name)
     if not isinstance(server, dict):
         return ""
     challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
@@ -3398,6 +3534,18 @@ def _linear_mcp_authorization_url(cfg: ResolvedConfig) -> str:
         ).strip()
         if authorization_url:
             return authorization_url
+    pending_auth = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+    if isinstance(pending_auth, dict):
+        for challenge in pending_auth.values():
+            if not isinstance(challenge, dict):
+                continue
+            authorization_url = str(
+                challenge.get("authorization_url")
+                or challenge.get("authorizationUrl")
+                or ""
+            ).strip()
+            if authorization_url:
+                return authorization_url
     return str(server.get("authorizationUrl") or "").strip()
 
 
@@ -3412,6 +3560,12 @@ def _exception_is_linear_mcp_auth_required(cfg: ResolvedConfig, detail: str) -> 
         "invalid_grant",
         "client id mismatch",
     )
+    if (
+        "500 internal server error" in normalized
+        and "/tool/execute" in normalized
+        and "127.0.0.1" in normalized
+    ):
+        return True
     return any(marker in normalized for marker in auth_markers) and (
         "linear" in normalized or "mcp" in normalized or "oauth" in normalized
     )
@@ -3780,7 +3934,14 @@ def _run_once_internal_impl(
                 previous_feedback = retry_feedback
                 partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
                 completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
+                failed_subtask = _failed_subtask_for_retry(ctx.pending_subtasks, ctx.worker_results)
+                deferred_subtasks = _deferred_subtasks_for_retry(ctx.pending_subtasks, ctx.worker_results)
                 if partial_diff_artifacts:
+                    existing_artifacts = (ctx.blackboard.setdefault("repair", {})).get("partial_diff_artifacts")
+                    partial_diff_artifacts = _merge_partial_diff_artifacts_for_retry(
+                        existing_artifacts,
+                        partial_diff_artifacts,
+                    )
                     ctx.blackboard.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
                     ctx.blackboard.setdefault("repair", {})["partial_diff_state"] = "preserved_not_accepted"
                     ctx.status.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
@@ -3788,6 +3949,18 @@ def _run_once_internal_impl(
                 if completed_subtask_ids:
                     ctx.blackboard.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
                     ctx.status.setdefault("repair", {})["completed_subtask_ids"] = completed_subtask_ids
+                if failed_subtask:
+                    for repair_state in (
+                        ctx.blackboard.setdefault("repair", {}),
+                        ctx.status.setdefault("repair", {}),
+                    ):
+                        repair_state["failed_subtask"] = failed_subtask
+                if deferred_subtasks:
+                    for repair_state in (
+                        ctx.blackboard.setdefault("repair", {}),
+                        ctx.status.setdefault("repair", {}),
+                    ):
+                        repair_state["deferred_subtasks"] = deferred_subtasks
                 if partial_diff_artifacts:
                     for repair_state in (
                         ctx.blackboard.setdefault("repair", {}),
@@ -3813,6 +3986,7 @@ def _run_once_internal_impl(
                         "detail": worker_blocker.get("detail"),
                         "partial_diff_artifacts": partial_diff_artifacts,
                         "completed_subtask_ids": completed_subtask_ids,
+                        "deferred_subtask_count": len(deferred_subtasks),
                     },
                     task_id=ctx.task.get("task_id"),
                     role="worker",
@@ -4059,7 +4233,9 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
         provider=integration_cli_provider,
         model=integration_model,
     )
-    with _coordination_heartbeat(ctx, phase="integration"):
+    timeout_seconds = _integration_prompt_timeout_seconds(ctx.cfg)
+
+    def _stream() -> dict[str, Any]:
         return stream_tandem_prompt(
             ctx.cfg,
             role="integration",
@@ -4071,6 +4247,51 @@ def _run_integration_prompt(ctx: "_PhaseRunContext") -> dict[str, Any]:
             log_path=ctx.layout["logs"] / "manager-integration.log",
             config_path=None,
         )
+
+    with _coordination_heartbeat(ctx, phase="integration"):
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aca-integration")
+        future = executor.submit(_stream)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            message = (
+                "ENGINE_TOOL_LOOP_STALLED: ACA integration prompt exceeded "
+                f"{timeout_seconds:.1f}s without a terminal result. "
+                "The run orchestration watchdog abandoned integration so review and deterministic "
+                "verification can decide the recovered worker diff instead of leaving the run stuck.\n"
+            )
+            try:
+                log_path = ctx.layout["logs"] / "manager-integration.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(message)
+            except OSError:
+                logger.debug("Failed to append integration watchdog message", exc_info=True)
+            return {
+                "role": "integration",
+                "returncode": 1,
+                "stdout": message,
+                "log_path": str(ctx.layout["logs"] / "manager-integration.log"),
+                "cwd": str(ctx.repo_path),
+                "session_id": "",
+                "engine_run_id": "",
+                "engine": {
+                    "timeout_seconds": timeout_seconds,
+                    "stream_reason": "integration_prompt_timeout",
+                    "abandoned": True,
+                },
+                "failure_reason": "ENGINE_TOOL_LOOP_STALLED",
+                "blocker_kind": "engine_tool_loop_stalled",
+                "recovery_action": (
+                    "Inspect manager-integration.log and engine session snapshots; ACA deferred "
+                    "the stuck integration pass to review and deterministic verification."
+                ),
+            }
+        finally:
+            if future.done():
+                executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _integration_blocker_message(integration_result: dict[str, Any]) -> str | None:

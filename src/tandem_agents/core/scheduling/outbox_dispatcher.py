@@ -25,6 +25,14 @@ DEFAULT_OUTBOX_BATCH_LIMIT = 25
 DEFAULT_OUTBOX_MAX_ATTEMPTS = 5
 
 
+def _outbox_connector(kind: str) -> str:
+    if kind.startswith("github_"):
+        return "github"
+    if kind.startswith("linear_"):
+        return "linear"
+    return ""
+
+
 def outbox_dispatcher_interval(cfg: ResolvedConfig) -> float:
     heartbeat = max(1, int(cfg.coordination.heartbeat_interval_seconds or 1))
     return max(1.0, min(10.0, heartbeat / 2.0))
@@ -134,13 +142,18 @@ def _dispatch_pull_request_create(cfg: ResolvedConfig, outbox: dict[str, Any]) -
     pull_request = create_pull_request_metadata(cfg, task, head_branch=head_branch, title=title, body=body)
     pr_url = str(pull_request.get("url") or "").strip()
     if pr_url is None or str(pr_url).strip() == "":
+        detail = str(pull_request.get("error") or "").strip()
+        error = "Pull request creation returned no URL."
+        if detail:
+            error = f"{error} {detail}"
         return {
             "outbox_id": outbox.get("id"),
             "kind": outbox.get("kind"),
             "payload": payload,
             "status": "failed",
             "terminal": True,
-            "error": "Pull request creation returned no URL.",
+            "error": error,
+            "pull_request": pull_request,
         }
     return {
         "outbox_id": outbox.get("id"),
@@ -310,48 +323,55 @@ def dispatch_outbox_tick(
             "items": [],
         }
 
-    github_needed = any(str(outbox.get("kind") or "").startswith("github_") for outbox in claimed)
-    linear_needed = any(str(outbox.get("kind") or "").startswith("linear_") for outbox in claimed)
+    github_needed = any(_outbox_connector(str(outbox.get("kind") or "")) == "github" for outbox in claimed)
+    linear_needed = any(_outbox_connector(str(outbox.get("kind") or "")) == "linear" for outbox in claimed)
     github_connected = False
-    try:
-        if github_needed:
+    connector_errors: dict[str, str] = {}
+    if github_needed:
+        try:
             ensure_github_mcp_connected(cfg)
             github_connected = True
-        if linear_needed:
+        except Exception as exc:
+            connector_errors["github"] = str(exc).strip() or "Failed to connect GitHub MCP server"
+    if linear_needed:
+        try:
             ensure_linear_mcp_connected(cfg)
-    except Exception as exc:
-        error = str(exc).strip() or "Failed to connect MCP server"
-        for outbox in claimed:
-            outbox_id = int(outbox.get("id") or 0)
-            attempts = int(outbox.get("attempts") or 0)
-            terminal = attempts >= DEFAULT_OUTBOX_MAX_ATTEMPTS
-            store.retry_outbox(outbox_id, error=error, terminal=terminal)
-            items.append(
-                {
-                    "outbox_id": outbox_id,
-                    "kind": outbox.get("kind"),
-                    "payload": dict(outbox.get("payload") or {}),
-                    "status": "failed" if terminal else "retry",
-                    "terminal": terminal,
-                    "error": error,
-                }
-            )
-            if terminal:
-                failed += 1
-            else:
-                retried += 1
-        return {
-            "reaped": len(reaped),
-            "claimed": len(claimed),
-            "dispatched": dispatched,
-            "retried": retried,
-            "failed": failed,
-            "items": items,
-        }
+        except Exception as exc:
+            connector_errors["linear"] = str(exc).strip() or "Failed to connect Linear MCP server"
+
+    def retry_claimed_outbox(outbox: dict[str, Any], *, error: str) -> None:
+        nonlocal failed, retried
+        outbox_id = int(outbox.get("id") or 0)
+        attempts = int(outbox.get("attempts") or 0)
+        terminal = attempts >= DEFAULT_OUTBOX_MAX_ATTEMPTS
+        store.retry_outbox(outbox_id, error=error, terminal=terminal)
+        items.append(
+            {
+                "outbox_id": outbox_id,
+                "kind": outbox.get("kind"),
+                "payload": dict(outbox.get("payload") or {}),
+                "status": "failed" if terminal else "retry",
+                "terminal": terminal,
+                "error": error,
+            }
+        )
+        if terminal:
+            failed += 1
+        else:
+            retried += 1
 
     try:
         for outbox in claimed:
-            result = dispatch_outbox_item(cfg, outbox)
+            connector = _outbox_connector(str(outbox.get("kind") or ""))
+            connector_error = connector_errors.get(connector)
+            if connector_error:
+                retry_claimed_outbox(outbox, error=connector_error)
+                continue
+            try:
+                result = dispatch_outbox_item(cfg, outbox)
+            except Exception as exc:  # noqa: BLE001 - external MCP dispatch must not crash ACA
+                retry_claimed_outbox(outbox, error=str(exc).strip() or "outbox dispatch raised an exception")
+                continue
             outbox_id = int(result.get("outbox_id") or 0)
             status = str(result.get("status") or "").strip().lower()
             terminal = bool(result.get("terminal"))

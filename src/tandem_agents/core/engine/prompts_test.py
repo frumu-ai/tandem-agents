@@ -87,6 +87,13 @@ class ReviewTestPromptDiffTest(unittest.TestCase):
         self.assertIn("Do not require a PR branch", prompt)
         self.assertIn("worker applicability notes", prompt)
 
+    def test_review_prompt_limits_scope_to_explicit_acceptance_criteria(self) -> None:
+        prompt = build_review_prompt("run1", _TASK, _NOTES, repo_diff="diff --git a/app.py b/app.py\n")
+
+        self.assertIn("Review only against the explicit task contract", prompt)
+        self.assertIn("Do not expand scope from the title", prompt)
+        self.assertIn("numbered checklist as controlling", prompt)
+
 
 class CompactPrContextTest(unittest.TestCase):
     def test_drops_full_patch_keeps_excerpt_and_metadata(self) -> None:
@@ -387,6 +394,31 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("temporary files", prompt)
         self.assertIn("will fail review", prompt)
 
+    def test_worker_prompt_front_loads_mechanical_slice_edits(self) -> None:
+        subtask = self._subtask(
+            title="scheduler budget config loader",
+            goal="Wire exact scheduler budget and backpressure config fields.",
+            files=["src/tandem_agents/config/config_loader.py"],
+            target_files=["src/tandem_agents/config/config_loader.py"],
+            write_required=True,
+            scope_note=(
+                "Mechanical slice 2 of 3 for throughput config controls. "
+                "Edit only config_loader.py. Assume SchedulerConfig already has the exact fields."
+            ),
+            acceptance_criteria=[
+                "Load ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS env var.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Mechanical deterministic slice fast path", prompt)
+        self.assertIn('First read only the smallest relevant part of ["src/tandem_agents/config/config_loader.py"]', prompt)
+        self.assertIn("make the first semantic edit in that target before inspecting unrelated files", prompt)
+        self.assertIn("do not explore the parent task surface until after a real diff exists", prompt)
+        self.assertIn("Do not stop after imports, constants, or scaffolding", prompt)
+        self.assertIn("update the read path or config construction", prompt)
+
     def test_implementation_subtask_with_test_acceptance_does_not_force_test_first(self) -> None:
         subtask = self._subtask(
             title="Add repository worktree and branch lifecycle primitives",
@@ -411,6 +443,9 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("Required substantive write targets", prompt)
         self.assertNotIn("This is a test/regression coverage subtask", prompt)
         self.assertNotIn("Read and edit at least one required test target first", prompt)
+        self.assertIn("must keep test coverage paired with production behavior", prompt)
+        self.assertIn("first behavioral edit in a paired production target", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
 
     def test_testless_diff_repair_prompt_requires_test_first(self) -> None:
         subtask = self._subtask(
@@ -536,6 +571,37 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("First actions: read the target files", prompt)
         self.assertIn("verification did not run", prompt)
         self.assertNotIn("/runs/run-1/artifacts/worker-1.patch", prompt)
+
+    def test_worker_prompt_treats_applied_carry_forward_patch_as_current_diff(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            discarded_partial_diff_patch="/runs/run-1/artifacts/rejected.patch",
+            carry_forward_patches=[
+                "/runs/run-1/artifacts/source.patch",
+                "/runs/run-1/artifacts/test.patch",
+            ],
+            repair_changed_files=[
+                "src/tandem_agents/config/config_types.py",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+            repair_failure_summary="source and test partials were verified separately",
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Carry-forward repair directive:", prompt)
+        self.assertIn("already applied the preserved partial patch data", prompt)
+        self.assertIn("Inspect the current target files and working diff only", prompt)
+        self.assertNotIn("The previous partial diff was rejected; do not apply or copy it as-is", prompt)
+        self.assertNotIn("/runs/run-1/artifacts/source.patch", prompt)
+        self.assertNotIn("/runs/run-1/artifacts/test.patch", prompt)
 
 
 if __name__ == "__main__":

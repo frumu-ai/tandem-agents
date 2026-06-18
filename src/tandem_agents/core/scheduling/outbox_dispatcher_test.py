@@ -186,6 +186,112 @@ class OutboxDispatcherTest(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["dispatched_outbox"], 1)
             self.assertEqual(snapshot["summary"]["pending_outbox"], 0)
 
+    def test_linear_connection_failure_does_not_block_github_pr_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            github_task = {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "title": "Task One",
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "repo_name": "example",
+                },
+            }
+            linear_task = {
+                "task_id": "ENG-2",
+                "title": "Linear Task",
+                "source": {
+                    "type": "linear",
+                    "team": "ENG",
+                    "issue_id": "lin-2",
+                    "identifier": "ENG-2",
+                },
+            }
+            store.enqueue_outbox(
+                kind="github_pull_request.create",
+                aggregate_type="task",
+                aggregate_id="task-1",
+                payload={
+                    "run_id": "run-1",
+                    "task": github_task,
+                    "head_branch": "aca/task-1",
+                    "title": "aca: Task One",
+                    "body": "PR body",
+                },
+                dedupe_key="run-1:pr",
+            )
+            store.enqueue_outbox(
+                kind="linear_issue.status_update",
+                aggregate_type="task",
+                aggregate_id="ENG-2",
+                payload={"task": linear_task, "target_status": "In Progress"},
+                dedupe_key="run-1:linear-status",
+            )
+
+            pr_metadata = {
+                "url": "https://github.com/frumu-ai/example/pull/7",
+                "number": 7,
+                "head_branch": "aca/task-1",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+                "lifecycle_state": "waiting-for-review",
+                "terminal": False,
+            }
+            with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_github_mcp_connected", return_value=None):
+                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_github_mcp_disconnected", return_value=None):
+                    with patch(
+                        "src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_connected",
+                        side_effect=RuntimeError("Linear MCP server 'linear' is awaiting authorization."),
+                    ):
+                        with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.create_pull_request_metadata", return_value=pr_metadata) as pr_mock:
+                            summary = dispatch_outbox_tick(cfg, coordination=store)
+
+            self.assertEqual(summary["dispatched"], 1)
+            self.assertEqual(summary["retried"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(pr_mock.call_count, 1)
+            self.assertEqual(summary["items"][0]["status"], "dispatched")
+            self.assertEqual(summary["items"][1]["status"], "retry")
+            self.assertIn("awaiting authorization", summary["items"][1]["error"])
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["summary"]["dispatched_outbox"], 1)
+            self.assertEqual(snapshot["summary"]["pending_outbox"], 1)
+
+    def test_pull_request_create_failure_includes_metadata_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            store.enqueue_outbox(
+                kind="github_pull_request.create",
+                aggregate_type="task",
+                aggregate_id="task-1",
+                payload={
+                    "run_id": "run-1",
+                    "task": {"task_id": "task-1", "title": "Task One", "source": {"type": "manual"}},
+                    "head_branch": "aca/task-1",
+                    "title": "aca: Task One",
+                    "body": "PR body",
+                },
+                dedupe_key="run-1:pr",
+            )
+
+            with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_github_mcp_connected", return_value=None):
+                with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_github_mcp_disconnected", return_value=None):
+                    with patch(
+                        "src.tandem_agents.core.scheduling.outbox_dispatcher.create_pull_request_metadata",
+                        return_value={"error": "Missing repository owner/name for PR creation."},
+                    ):
+                        summary = dispatch_outbox_tick(cfg, coordination=store)
+
+            self.assertEqual(summary["failed"], 1)
+            self.assertIn("Missing repository owner/name", summary["items"][0]["error"])
+            self.assertEqual(summary["items"][0]["pull_request"]["error"], "Missing repository owner/name for PR creation.")
+
     def test_dispatches_linear_status_and_comment_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -234,6 +340,47 @@ class OutboxDispatcherTest(unittest.TestCase):
             snapshot = store.snapshot()
             self.assertEqual(snapshot["summary"]["dispatched_outbox"], 2)
             self.assertEqual(snapshot["summary"]["pending_outbox"], 0)
+
+    def test_linear_dispatch_exception_retries_outbox_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "ENG-2",
+                "title": "Linear Task",
+                "source": {
+                    "type": "linear",
+                    "team": "ENG",
+                    "issue_id": "lin-2",
+                    "identifier": "ENG-2",
+                },
+            }
+            store.enqueue_outbox(
+                kind="linear_issue.status_update",
+                aggregate_type="task",
+                aggregate_id="ENG-2",
+                payload={"task": task, "target_status": "Blocked"},
+                dedupe_key="run-1:linear-status",
+            )
+
+            with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_connected", return_value=None):
+                with patch(
+                    "src.tandem_agents.core.scheduling.outbox_dispatcher.linear_update_issue",
+                    side_effect=RuntimeError(
+                        "Server error '500 Internal Server Error' for url "
+                        "'http://127.0.0.1:39731/tool/execute'"
+                    ),
+                ):
+                    summary = dispatch_outbox_tick(cfg, coordination=store)
+
+            self.assertEqual(summary["dispatched"], 0)
+            self.assertEqual(summary["retried"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["items"][0]["status"], "retry")
+            self.assertIn("/tool/execute", summary["items"][0]["error"])
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["summary"]["pending_outbox"], 1)
 
     def test_linear_comment_requires_marker_readback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

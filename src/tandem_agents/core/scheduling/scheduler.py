@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import json
+import os
+import time
 from collections import defaultdict, deque
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
+from src.tandem_agents.core.integrations.linear_mcp import get_mcp_server, linear_mcp_server_name
 from src.tandem_agents.core.task_contract import classify_task_execution_kind
 from src.tandem_agents.core.scheduling.coder_supervisor import list_active_coder_task_refs
+
+
+LINEAR_AUTH_CHALLENGE_MAX_AGE_MS = 4 * 60 * 1000
 
 
 def _nonempty(value: Any) -> str:
@@ -137,6 +146,190 @@ def _active_state(task: dict[str, Any]) -> bool:
     return str(task.get("state") or task.get("status") or "").strip().lower() in {"claimed", "active", "review"}
 
 
+def _task_source_type(task: dict[str, Any]) -> str:
+    metadata = dict(task.get("metadata") or {})
+    source_task = dict(metadata.get("task") or {})
+    source = dict(task.get("source") or source_task.get("source") or {})
+    return (_nonempty(source.get("type")) or _nonempty(task.get("source_type"))).lower()
+
+
+def _server_auth_url(server: dict[str, Any]) -> str:
+    challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
+    if isinstance(challenge, dict):
+        authorization_url = _nonempty(challenge.get("authorization_url") or challenge.get("authorizationUrl"))
+        if authorization_url:
+            return authorization_url
+    pending = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+    if isinstance(pending, dict):
+        for value in pending.values():
+            if not isinstance(value, dict):
+                continue
+            authorization_url = _nonempty(value.get("authorization_url") or value.get("authorizationUrl"))
+            if authorization_url:
+                return authorization_url
+    return _nonempty(server.get("authorization_url") or server.get("authorizationUrl"))
+
+
+def _server_auth_challenge_age_ms(server: dict[str, Any]) -> int | None:
+    challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
+    candidates: list[Any] = []
+    if isinstance(challenge, dict):
+        candidates.extend(
+            [
+                challenge.get("requested_at_ms"),
+                challenge.get("requestedAtMs"),
+                challenge.get("first_seen_ms"),
+                challenge.get("firstSeenMs"),
+            ]
+        )
+    pending = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+    if isinstance(pending, dict):
+        for value in pending.values():
+            if not isinstance(value, dict):
+                continue
+            candidates.extend(
+                [
+                    value.get("requested_at_ms"),
+                    value.get("requestedAtMs"),
+                    value.get("first_seen_ms"),
+                    value.get("firstSeenMs"),
+                    value.get("last_probe_ms"),
+                    value.get("lastProbeMs"),
+                ]
+            )
+    timestamps = []
+    for raw in candidates:
+        try:
+            timestamp = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if timestamp > 0:
+            timestamps.append(timestamp)
+    if not timestamps:
+        return None
+    return max(0, int(time.time() * 1000) - max(timestamps))
+
+
+def _linear_auth_challenge_max_age_ms() -> int:
+    raw = os.environ.get("ACA_LINEAR_AUTH_CHALLENGE_MAX_AGE_MS", "")
+    if raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return LINEAR_AUTH_CHALLENGE_MAX_AGE_MS
+    return LINEAR_AUTH_CHALLENGE_MAX_AGE_MS
+
+
+def _control_panel_public_origin(cfg: ResolvedConfig) -> str:
+    env = cfg.env if isinstance(getattr(cfg, "env", None), dict) else {}
+    for key in ("TANDEM_CONTROL_PANEL_PUBLIC_URL", "HOSTED_CONTROL_PANEL_PUBLIC_URL", "HOSTED_PUBLIC_URL"):
+        value = _nonempty(env.get(key) or os.environ.get(key)).rstrip("/")
+        if value:
+            return value
+    return ""
+
+
+def _request_linear_auth_url(cfg: ResolvedConfig, server_name: str, *, refresh: bool = False) -> str:
+    headers: dict[str, str] = {}
+    token = cfg.tandem_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-Tandem-Token"] = token
+    public_origin = _control_panel_public_origin(cfg)
+    if public_origin:
+        parsed = urlparse(public_origin)
+        headers["Origin"] = public_origin
+        headers["X-Forwarded-Proto"] = parsed.scheme or "https"
+        headers["X-Forwarded-Host"] = parsed.netloc
+
+    action = "refresh" if refresh else "auth"
+    request = Request(
+        f"{cfg.tandem.base_url.rstrip('/')}/mcp/{quote(server_name)}/{action}",
+        headers=headers,
+        method="POST",
+    )
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if isinstance(payload, dict):
+        return _server_auth_url(payload)
+    return ""
+
+
+def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
+    if not cfg.linear_mcp.enabled:
+        return None
+    server_name = linear_mcp_server_name(cfg)
+    try:
+        server = get_mcp_server(cfg, server_name)
+    except Exception as exc:
+        return {
+            "reason": "linear_mcp_status_unavailable",
+            "blocked_reason": f"Could not inspect Linear MCP server '{server_name}': {exc}",
+        }
+    if not isinstance(server, dict):
+        return {
+            "reason": "linear_mcp_not_configured",
+            "blocked_reason": f"Linear MCP server '{server_name}' is not configured.",
+        }
+    if bool(server.get("connected")):
+        return None
+    last_error = _nonempty(server.get("last_error") or server.get("lastError"))
+    blocked_reason = last_error or f"Linear MCP server '{server_name}' is not connected."
+    authorization_url = _server_auth_url(server)
+    auth_kind = _nonempty(server.get("auth_kind") or server.get("authKind")).lower()
+    challenge_age_ms = _server_auth_challenge_age_ms(server)
+    refresh_auth_url = not authorization_url
+    force_refresh = False
+    if (
+        auth_kind == "oauth"
+        and authorization_url
+        and challenge_age_ms is not None
+        and challenge_age_ms > _linear_auth_challenge_max_age_ms()
+    ):
+        refresh_auth_url = True
+        force_refresh = True
+    if auth_kind == "oauth" and refresh_auth_url:
+        try:
+            authorization_url = _request_linear_auth_url(cfg, server_name, refresh=force_refresh)
+        except Exception:
+            authorization_url = ""
+    return {
+        "reason": "linear_mcp_auth_required",
+        "blocked_reason": blocked_reason,
+        "authorization_url": authorization_url,
+    }
+
+
+def _linear_mcp_admission_blocker(cfg: ResolvedConfig, queued: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not any(_task_source_type(task) == "linear" for task in queued):
+        return None
+    return _linear_mcp_status_blocker(cfg)
+
+
+def scheduler_integration_blockers(cfg: ResolvedConfig, *, project_key: str = "") -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if str(cfg.task_source.type or "").strip().lower() == "linear":
+        blocker = _linear_mcp_status_blocker(cfg)
+        if blocker is not None:
+            blockers.append(
+                {
+                    "source_type": "linear",
+                    "project_key": _nonempty(project_key)
+                    or task_project_key(
+                        {
+                            "source": {
+                                "type": "linear",
+                                "team": cfg.task_source.team,
+                                "project": cfg.task_source.project,
+                            }
+                        }
+                    ),
+                    **blocker,
+                }
+            )
+    return blockers
+
+
 def scheduler_snapshot(
     cfg: ResolvedConfig,
     *,
@@ -216,6 +409,7 @@ def plan_task_admissions(
 
     grouped: dict[str, deque[dict[str, Any]]] = {}
     blocked: list[dict[str, Any]] = []
+    linear_mcp_blocker = _linear_mcp_admission_blocker(cfg, queued)
     active_coder_runs = list_active_coder_task_refs(cfg)
     active_coder_task_keys = {
         _nonempty(item.get("task_key"))
@@ -230,6 +424,20 @@ def plan_task_admissions(
     for task in queued:
         blocked_reason = None
         dependency_status = task.get("dependency_status") or {}
+        if linear_mcp_blocker is not None and _task_source_type(task) == "linear":
+            blocked.append(
+                {
+                    "task_key": task.get("task_key"),
+                    "project_key": task_project_key(task),
+                    "repo_key": task_repo_key(task),
+                    "reason": linear_mcp_blocker["reason"],
+                    "blocked_reason": linear_mcp_blocker.get("blocked_reason"),
+                    "authorization_url": linear_mcp_blocker.get("authorization_url"),
+                    "scope_mode": _scope_mode(task),
+                    "task": task,
+                }
+            )
+            continue
         if dependency_status.get("blocked"):
             blocked_reason = {
                 "reason": "dependency_blocked",
@@ -265,7 +473,17 @@ def plan_task_admissions(
         grouped.setdefault(task_project_key(task), deque()).append(task)
 
     admitted: list[dict[str, Any]] = []
-    max_total = max(1, int(cfg.scheduler.max_active_tasks))
+    max_active_total = max(1, int(cfg.scheduler.max_active_tasks))
+    max_worker_runs = max(0, int(cfg.scheduler.max_concurrent_worker_runs))
+    active_total_count = len(active_for_capacity)
+    active_worker_count = max(len(active_for_capacity), len(active_coder_runs))
+    remaining_active_slots = max(0, max_active_total - active_total_count)
+    remaining_worker_slots = (
+        max(0, max_worker_runs - active_worker_count)
+        if max_worker_runs > 0
+        else remaining_active_slots
+    )
+    max_total = min(remaining_active_slots, remaining_worker_slots)
     max_per_project = max(1, int(cfg.scheduler.max_active_tasks_per_project))
     max_per_repo = max(1, int(cfg.scheduler.max_active_tasks_per_repo))
     ordered_projects = sorted(grouped.keys())
@@ -373,10 +591,34 @@ def plan_task_admissions(
         if not progressed:
             break
 
+    capacity_reason = ""
+    if max_worker_runs > 0 and active_worker_count + len(admitted) >= max_worker_runs:
+        capacity_reason = "worker_concurrency_reached"
+    elif active_total_count + len(admitted) >= max_active_total:
+        capacity_reason = "active_capacity_reached"
+    if capacity_reason:
+        for queue in grouped.values():
+            for task in list(queue):
+                task_scopes = task_file_scopes(task)
+                blocked.append(
+                    {
+                        "task_key": task.get("task_key"),
+                        "project_key": task_project_key(task),
+                        "repo_key": task_repo_key(task),
+                        "reason": capacity_reason,
+                        "scope_mode": _scope_mode(task),
+                        "scope_paths": ["/".join(parts) for parts in task_scopes],
+                    }
+                )
+            queue.clear()
+
     snapshot = {
         "policy": cfg.scheduler.policy,
         "limits": {
-            "max_active_tasks": max_total,
+            "max_active_tasks": max_active_total,
+            "max_concurrent_worker_runs": max_worker_runs,
+            "remaining_active_slots": remaining_active_slots,
+            "remaining_worker_slots": remaining_worker_slots,
             "max_active_tasks_per_project": max_per_project,
             "max_active_tasks_per_repo": max_per_repo,
             "queue_depth_limit": cfg.scheduler.queue_depth_limit,

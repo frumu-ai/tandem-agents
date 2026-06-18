@@ -1239,6 +1239,10 @@ def _linear_task_contract_ok(task: dict[str, Any]) -> bool:
 
 
 LINEAR_REPO_ROUTING_BLOCKERS = {"repo_hint_required", "repo_binding_mismatch"}
+LINEAR_TRUNCATED_BODY_MARKERS = (
+    "truncated, use `get_issue`",
+    "truncated, use get_issue",
+)
 
 
 def _truthy_config(value: Any) -> bool:
@@ -1304,6 +1308,24 @@ def _linear_issue_repo_hints(issue: dict[str, Any]) -> list[str]:
                 continue
             hints.extend(_split_repo_hint_values(line))
     return list(dict.fromkeys(hints))
+
+
+def _linear_issue_body_may_be_truncated(issue: dict[str, Any]) -> bool:
+    body = _linear_issue_body(issue).strip()
+    if not body:
+        return True
+    lowered = body.lower()
+    return any(marker in lowered for marker in LINEAR_TRUNCATED_BODY_MARKERS)
+
+
+def _linear_issue_for_contract_projection(cfg: ResolvedConfig, issue: dict[str, Any]) -> dict[str, Any]:
+    if not _linear_requires_explicit_repo_hint(cfg):
+        return issue
+    if _linear_issue_repo_hints(issue):
+        return issue
+    if not _linear_issue_body_may_be_truncated(issue):
+        return issue
+    return _hydrate_linear_issue_for_task(cfg, issue)
 
 
 def _repo_reference_aliases(value: Any) -> set[str]:
@@ -1698,26 +1720,27 @@ def _select_linear_issue(
         for issue in issues:
             if not _linear_issue_matches_selector(issue, selector):
                 continue
-            status_name = _linear_issue_status(issue)
-            state_type = _linear_issue_state_type(issue)
+            projected_issue = _linear_issue_for_contract_projection(cfg, issue)
+            status_name = _linear_issue_status(projected_issue)
+            state_type = _linear_issue_state_type(projected_issue)
             eligible = _linear_status_is_actionable(
                 cfg,
                 status_name,
                 state_type,
             ) or _linear_explicit_status_can_resume(status_name, state_type)
-            task_projection = _linear_issue_to_task(cfg, issue, coordination=None)
+            task_projection = _linear_issue_to_task(cfg, projected_issue, coordination=None)
             hard_blocker = _linear_contract_hard_blocker(task_projection)
             if hard_blocker:
                 if not allow_non_actionable:
                     raise RuntimeError(hard_blocker)
-                return issue, False, hard_blocker
+                return projected_issue, False, hard_blocker
             if not eligible and not allow_non_actionable:
                 raise RuntimeError(f"Selected Linear issue is not actionable: status is '{status_name}'.")
             warning = None if eligible else f"Selected Linear issue is not actionable: status is '{status_name}'."
-            return issue, eligible, warning
+            return projected_issue, eligible, warning
 
     actionable = [
-        issue
+        _linear_issue_for_contract_projection(cfg, issue)
         for issue in issues
         if _linear_status_is_actionable(cfg, _linear_issue_status(issue), _linear_issue_state_type(issue))
     ]
@@ -1811,32 +1834,33 @@ def linear_board_snapshot(
     board_items: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     for issue in issues:
-        issue_id = _linear_issue_id(issue)
-        identifier = _linear_issue_identifier(issue)
-        status_name = _linear_issue_status(issue)
+        projected_issue = _linear_issue_for_contract_projection(cfg, issue)
+        issue_id = _linear_issue_id(projected_issue)
+        identifier = _linear_issue_identifier(projected_issue)
+        status_name = _linear_issue_status(projected_issue)
         status_key = normalize_linear_key(status_name) or "unknown"
-        state_type = _linear_issue_state_type(issue)
+        state_type = _linear_issue_state_type(projected_issue)
         state_type_key = normalize_linear_key(state_type)
         if status_key not in seen_keys:
             seen_keys.add(status_key)
             columns.append({"id": status_key, "name": status_name, "key": status_key, "type": state_type})
         counts[status_key] = counts.get(status_key, 0) + 1
-        task_projection = _linear_issue_to_task(cfg, issue)
+        task_projection = _linear_issue_to_task(cfg, projected_issue)
         contract_completeness = task_projection.get("contract_completeness") or task_contract_completeness(task_projection)
         item = {
-            "id": identifier or issue_id or str(issue.get("title") or "linear-issue"),
+            "id": identifier or issue_id or str(projected_issue.get("title") or "linear-issue"),
             "project_item_id": issue_id,
             "issue_id": issue_id,
             "identifier": identifier,
-            "title": str(issue.get("title") or issue.get("name") or "Untitled issue").strip(),
-            "project_name": _linear_issue_project_name(issue, cfg.task_source.project),
+            "title": str(projected_issue.get("title") or projected_issue.get("name") or "Untitled issue").strip(),
+            "project_name": _linear_issue_project_name(projected_issue, cfg.task_source.project),
             "project_column": status_name,
             "status_name": status_name,
             "status_key": status_key,
             "state_type": state_type,
             "state_type_key": state_type_key,
             "issue_number": identifier,
-            "issue_url": _linear_issue_url(issue),
+            "issue_url": _linear_issue_url(projected_issue),
             "repo_name": str(cfg.repository.slug or ""),
             "content_type": "LinearIssue",
             "is_parent": False,
@@ -1848,8 +1872,8 @@ def linear_board_snapshot(
             "blocked_by": [],
             "launch_state": "candidate",
             "actionable": _linear_status_is_actionable(cfg, status_name, state_type),
-            "priority": _linear_issue_priority(issue),
-            "labels": _linear_issue_labels(issue),
+            "priority": _linear_issue_priority(projected_issue),
+            "labels": _linear_issue_labels(projected_issue),
             "execution_kind": task_projection.get("execution_kind"),
             "execution_backend": task_execution_backend(cfg, task_projection),
             "contract_completeness": contract_completeness,

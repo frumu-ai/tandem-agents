@@ -861,6 +861,61 @@ class LinearTaskSourceTest(unittest.TestCase):
             self.assertEqual(preview["task"]["contract_completeness"]["blocker_kind"], "repo_hint_required")
             self.assertTrue(preview["task"]["repo_routing"]["require_explicit_repo_hint"])
 
+    def test_linear_board_snapshot_hydrates_truncated_issue_for_repo_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp), require_repo_hint=True)
+            listed_issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "short ... (truncated, use `get_issue` for full description)",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+            full_issue = {
+                **listed_issue,
+                "description": "Full body\n\n## Repo\n`frumu-ai/tandem`\n\nAcceptance:\n- Add tests",
+            }
+
+            with (
+                patch(
+                    "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                    return_value=([{"name": "Todo", "type": "unstarted"}], [], [listed_issue]),
+                ),
+                patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=full_issue) as fetch_issue,
+            ):
+                snapshot = linear_board_snapshot(cfg, force_refresh=True)
+
+            by_identifier = {item["identifier"]: item for item in snapshot["items"]}
+            self.assertEqual(snapshot["scheduler"]["next_issue_numbers"], ["ENG-2"])
+            self.assertEqual(by_identifier["ENG-2"]["launch_state"], "next")
+            self.assertTrue(by_identifier["ENG-2"]["actionable"])
+            self.assertEqual(by_identifier["ENG-2"]["contract_completeness"]["ok"], True)
+            self.assertEqual(by_identifier["ENG-2"]["repo_routing"]["repo_hints"], ["frumu-ai/tandem"])
+            fetch_issue.assert_called_once_with(cfg, "ENG-2")
+
+    def test_linear_selection_hydrates_truncated_issue_before_repo_hint_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp), require_repo_hint=True)
+            listed_issue = {
+                "id": "lin-2",
+                "identifier": "ENG-2",
+                "title": "Fix runtime",
+                "description": "short ... (truncated, use `get_issue` for full description)",
+                "state": {"name": "Todo", "type": "unstarted"},
+            }
+            full_issue = {
+                **listed_issue,
+                "description": "Full body\n\n## Repo\n`frumu-ai/tandem`\n\nAcceptance:\n- Add tests",
+            }
+
+            with patch("src.tandem_agents.runtime.task_sources.linear_fetch_issue", return_value=full_issue) as fetch_issue:
+                chosen, eligible, warning = _select_linear_issue(cfg, issues=[listed_issue])
+
+            self.assertTrue(eligible)
+            self.assertIsNone(warning)
+            self.assertEqual(chosen["description"], full_issue["description"])
+            fetch_issue.assert_called_once_with(cfg, "ENG-2")
+
     def test_linear_task_hydrates_selected_issue_before_planning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))

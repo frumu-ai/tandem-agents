@@ -272,6 +272,29 @@ class RepoContextForTaskTest(unittest.TestCase):
         self.assertIn("run_task_intake", hints["task"])
         self.assertIn("checkout_run_branch", hints["task"])
 
+    def test_aca_throughput_controls_task_routes_to_scheduler_and_operator_files(self) -> None:
+        task = {
+            "task_id": "TAN-173",
+            "identifier": "TAN-173",
+            "title": "LACA-15 Add ACA throughput metrics, backpressure, and cost controls",
+            "description": (
+                "Track issue cycle time, queue wait, active time, PR time, repair loops, merge time, "
+                "token cost, tool calls, test time, and failure rate. Add global and per-repo "
+                "budget/concurrency caps. Add backpressure when tests, rate limits, model spend, CI, "
+                "or merge queue are saturated. Expose worker pool status in the agent cockpit."
+            ),
+            "labels": ["Operator UX", "Coder Runtime", "Workflow Reliability"],
+        }
+
+        hints = repo_context_hints_for_task(task)
+
+        self.assertEqual(hints["path_scope"], "src/tandem_agents")
+        self.assertIn("src/tandem_agents/core/scheduling/scheduler.py", hints["required_files"])
+        self.assertIn("src/tandem_agents/core/phases/worker_dispatch.py", hints["required_files"])
+        self.assertIn("src/tandem_agents/runtime/operator_dashboard.py", hints["required_files"])
+        self.assertIn("scheduler_snapshot", hints["task"])
+        self.assertIn("operator_dashboard", hints["task"])
+
     def test_falls_back_when_repo_context_bundle_tool_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -25,7 +25,12 @@ from src.tandem_agents.config.config import resolve_config, validate_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.coordination.coordination_reaper import coordination_reaper_interval, coordination_reaper_tick
 from src.tandem_agents.core.execution.runtime_entrypoints import run_coordinator
-from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot, task_project_key
+from src.tandem_agents.core.scheduling.scheduler import (
+    plan_task_admissions,
+    scheduler_integration_blockers,
+    scheduler_snapshot,
+    task_project_key,
+)
 from src.tandem_agents.core.scheduling.scheduler_dispatcher import dispatch_scheduled_runs
 from src.tandem_agents.core.scheduling.coder_supervisor import (
     list_active_coder_runs,
@@ -304,13 +309,7 @@ def _all_projects(root: Path) -> Dict[str, Any]:
 
 
 def _active_scheduler_project_keys(root: Path, cfg=None) -> set[str]:
-    workspace = _workspace_view(root, cfg)
-    active_project_id = str((workspace.get("workspace") or {}).get("active_project_id") or "").strip()
-    projects = workspace.get("projects") or []
-    active_project = next(
-        (project for project in projects if str(project.get("id") or "").strip() == active_project_id),
-        None,
-    )
+    active_project = _active_scheduler_project(root, cfg)
     if not isinstance(active_project, dict):
         return set()
     source = active_project.get("source") if isinstance(active_project.get("source"), dict) else active_project.get("task_source")
@@ -318,6 +317,75 @@ def _active_scheduler_project_keys(root: Path, cfg=None) -> set[str]:
         return set()
     key = task_project_key({"source": source})
     return {key} if key else set()
+
+
+def _active_scheduler_project(root: Path, cfg=None) -> dict[str, Any] | None:
+    workspace = _workspace_view(root, cfg)
+    active_project_id = str((workspace.get("workspace") or {}).get("active_project_id") or "").strip()
+    projects = workspace.get("projects") or []
+    active_project = next(
+        (project for project in projects if str(project.get("id") or "").strip() == active_project_id),
+        None,
+    )
+    return active_project if isinstance(active_project, dict) else None
+
+
+def _active_scheduler_integration_blockers(root: Path, cfg=None) -> list[dict[str, Any]]:
+    active_project = _active_scheduler_project(root, cfg)
+    if not isinstance(active_project, dict):
+        return []
+    project_id = str(active_project.get("id") or active_project.get("slug") or "").strip()
+    source = active_project.get("source") if isinstance(active_project.get("source"), dict) else active_project.get("task_source")
+    project_key = task_project_key({"source": source}) if isinstance(source, dict) else ""
+    try:
+        _, project_cfg = _project_config(root, project_id)
+    except Exception:
+        logger.debug("Failed to resolve active scheduler project config for integration blockers", exc_info=True)
+        return []
+    return scheduler_integration_blockers(project_cfg, project_key=project_key)
+
+
+def _start_run_integration_blockers(
+    root: Path,
+    project_slug: Optional[str],
+    task_source_type: Optional[str],
+    overrides: Optional[Dict[str, str]],
+) -> list[dict[str, Any]]:
+    run_env: Dict[str, str] = {}
+    project_key = ""
+    if project_slug:
+        projects = _all_projects(root)
+        if project_slug in projects:
+            project = projects[project_slug]
+            run_env.update(_project_runtime_env(root, project, fallback_slug=project_slug))
+            source = project.get("source") if isinstance(project.get("source"), dict) else project.get("task_source")
+            project_key = task_project_key({"source": source}) if isinstance(source, dict) else ""
+        else:
+            run_env["ACA_REPO_SLUG"] = project_slug
+    if task_source_type:
+        run_env["ACA_TASK_SOURCE_TYPE"] = task_source_type
+    run_env.update(overrides or {})
+    cfg = resolve_config(root, env=run_env)
+    return scheduler_integration_blockers(cfg, project_key=project_key)
+
+
+def _raise_if_integration_blocked(blockers: list[dict[str, Any]], *, message: str) -> None:
+    if not blockers:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": message,
+            "integration_blockers": blockers,
+        },
+    )
+
+
+def _raise_if_start_blocked(blockers: list[dict[str, Any]]) -> None:
+    _raise_if_integration_blocked(
+        blockers,
+        message="ACA cannot start this run while a required integration is blocked.",
+    )
 
 
 def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: str = "") -> Dict[str, str]:
@@ -1651,6 +1719,11 @@ async def sync_project_repo(slug: str, token: str = Depends(get_token)):
 async def get_project_board(slug: str, refresh: bool = False, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     _, cfg = _project_config(root, slug)
+    blockers = await asyncio.to_thread(_start_run_integration_blockers, root, slug, None, None)
+    _raise_if_integration_blocked(
+        blockers,
+        message="ACA cannot refresh this project board while a required integration is blocked.",
+    )
     from src.tandem_agents.runtime.task_sources import task_source_board_snapshot
 
     try:
@@ -1726,6 +1799,14 @@ def _scheduler_filtered_source_items(root: Path, project_slug: Optional[str], it
 @app.post("/runs/trigger")
 async def trigger_run(project_slug: Optional[str] = None, task_source_type: Optional[str] = None, item: Optional[str] = None, overrides: Dict[str, str] = {}, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
+    blockers = await asyncio.to_thread(
+        _start_run_integration_blockers,
+        root,
+        project_slug,
+        task_source_type,
+        overrides,
+    )
+    _raise_if_start_blocked(blockers)
     if item:
         try:
             item = (
@@ -1766,6 +1847,15 @@ async def trigger_runs_batch(
     items = [str(item or "").strip() for item in raw_items if str(item or "").strip()]
     if not items:
         raise HTTPException(status_code=400, detail="At least one item is required")
+
+    blockers = await asyncio.to_thread(
+        _start_run_integration_blockers,
+        root,
+        project_slug,
+        task_source_type,
+        overrides,
+    )
+    _raise_if_start_blocked(blockers)
 
     if respect_scheduler:
         try:
@@ -2367,10 +2457,16 @@ async def get_scheduler_plan(limit: int = 25, token: str = Depends(get_token)):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
+    integration_blockers = await asyncio.to_thread(_active_scheduler_integration_blockers, root, cfg)
     bounded_limit = max(1, min(limit, 100))
     snapshot = scheduler_snapshot(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
     plan = plan_task_admissions(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
-    return {"snapshot": snapshot, "plan": plan, "project_filter": sorted(project_keys)}
+    return {
+        "snapshot": snapshot,
+        "plan": plan,
+        "project_filter": sorted(project_keys),
+        "integration_blockers": integration_blockers,
+    }
 
 
 @app.post("/scheduler/dispatch")
@@ -2387,6 +2483,7 @@ async def dispatch_scheduler_batch(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
+    integration_blockers = await asyncio.to_thread(_active_scheduler_integration_blockers, root, cfg)
     result = dispatch_scheduled_runs(
         cfg,
         coordination=store,
@@ -2395,6 +2492,7 @@ async def dispatch_scheduler_batch(
         project_keys=project_keys,
     )
     result["project_filter"] = sorted(project_keys)
+    result["integration_blockers"] = integration_blockers
     return result
 
 if __name__ == "__main__":

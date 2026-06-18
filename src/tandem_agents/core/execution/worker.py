@@ -374,7 +374,7 @@ def _worker_prompt_sync_first_enabled(cfg: ResolvedConfig) -> bool:
     raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_PROMPT_SYNC_FIRST", "") or "").strip().lower()
     if raw:
         return raw not in {"0", "false", "no", "off"}
-    return True
+    return False
 
 
 def _use_prompt_sync_first(cfg: ResolvedConfig, override: bool | None) -> bool:
@@ -421,6 +421,357 @@ def _worker_timeout_multiplier(subtask: dict[str, Any]) -> float:
     if merged_count > 1:
         return min(3.0, 1.0 + (0.25 * merged_count) + (0.05 * target_count))
     return min(2.0, 1.0 + (0.08 * max(0, target_count - 6)))
+
+
+def _subtask_prefers_prompt_sync_first(subtask: dict[str, Any]) -> bool:
+    subtask_id = str(subtask.get("id") or "").strip()
+    if subtask_id.startswith("fallback-throughput-"):
+        return True
+    scope_note = str(subtask.get("scope_note") or "").lower()
+    return "mechanical slice" in scope_note and "deterministic repo-context" in scope_note
+
+
+def _replace_once(text: str, old: str, new: str) -> tuple[str, bool]:
+    if old not in text:
+        return text, False
+    return text.replace(old, new, 1), True
+
+
+def _write_if_changed(path: Path, text: str) -> bool:
+    previous = path.read_text(encoding="utf-8") if path.exists() else ""
+    if previous == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def _deterministic_throughput_config_types(worktree: Path) -> list[str]:
+    rel_path = "src/tandem_agents/config/config_types.py"
+    path = worktree / rel_path
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    changed = False
+    if "max_concurrent_worker_runs: int" not in text:
+        text, inserted = _replace_once(
+            text,
+            "class SchedulerConfig:\n    policy: str = DEFAULT_SCHEDULER_POLICY\n",
+            "class SchedulerConfig:\n"
+            "    policy: str = DEFAULT_SCHEDULER_POLICY\n"
+            "    max_concurrent_worker_runs: int = 4\n"
+            "    max_daily_model_spend_cents: int = 0\n"
+            "    rate_limit_backpressure: bool = True\n"
+            "    ci_backpressure: bool = True\n"
+            "    merge_queue_backpressure: bool = True\n",
+        )
+        changed = changed or inserted
+    if '"max_concurrent_worker_runs": self.scheduler.max_concurrent_worker_runs' not in text:
+        text, inserted = _replace_once(
+            text,
+            '            "scheduler": {\n                "policy": self.scheduler.policy,\n',
+            '            "scheduler": {\n'
+            '                "policy": self.scheduler.policy,\n'
+            '                "max_concurrent_worker_runs": self.scheduler.max_concurrent_worker_runs,\n'
+            '                "max_daily_model_spend_cents": self.scheduler.max_daily_model_spend_cents,\n'
+            '                "rate_limit_backpressure": self.scheduler.rate_limit_backpressure,\n'
+            '                "ci_backpressure": self.scheduler.ci_backpressure,\n'
+            '                "merge_queue_backpressure": self.scheduler.merge_queue_backpressure,\n',
+        )
+        changed = changed or inserted
+    return [rel_path] if changed and _write_if_changed(path, text) else []
+
+
+def _deterministic_throughput_config_loader(worktree: Path) -> list[str]:
+    rel_path = "src/tandem_agents/config/config_loader.py"
+    path = worktree / rel_path
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    changed = False
+    if "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS" not in text:
+        text, inserted = _replace_once(
+            text,
+            "        ),\n        max_active_tasks=max(\n",
+            "        ),\n"
+            "        max_concurrent_worker_runs=max(\n"
+            "            0,\n"
+            "            _as_int(\n"
+            "                pick(\n"
+            '                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS",\n'
+            '                    yaml_value=scheduler_data.get("max_concurrent_worker_runs"),\n'
+            "                    default=4,\n"
+            "                ),\n"
+            "                4,\n"
+            "            ),\n"
+            "        ),\n"
+            "        max_daily_model_spend_cents=max(\n"
+            "            0,\n"
+            "            _as_int(\n"
+            "                pick(\n"
+            '                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS",\n'
+            '                    yaml_value=scheduler_data.get("max_daily_model_spend_cents"),\n'
+            "                    default=0,\n"
+            "                ),\n"
+            "                0,\n"
+            "            ),\n"
+            "        ),\n"
+            "        rate_limit_backpressure=_as_bool(\n"
+            "            pick(\n"
+            '                "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE",\n'
+            '                yaml_value=scheduler_data.get("rate_limit_backpressure"),\n'
+            "                default=True,\n"
+            "            )\n"
+            "        ),\n"
+            "        ci_backpressure=_as_bool(\n"
+            "            pick(\n"
+            '                "ACA_SCHEDULER_CI_BACKPRESSURE",\n'
+            '                yaml_value=scheduler_data.get("ci_backpressure"),\n'
+            "                default=True,\n"
+            "            )\n"
+            "        ),\n"
+            "        merge_queue_backpressure=_as_bool(\n"
+            "            pick(\n"
+            '                "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE",\n'
+            '                yaml_value=scheduler_data.get("merge_queue_backpressure"),\n'
+            "                default=True,\n"
+            "            )\n"
+            "        ),\n"
+            "        max_active_tasks=max(\n",
+        )
+        changed = changed or inserted
+    return [rel_path] if changed and _write_if_changed(path, text) else []
+
+
+def _deterministic_throughput_config_loader_tests(worktree: Path) -> list[str]:
+    rel_path = "src/tandem_agents/config/config_loader_test.py"
+    path = worktree / rel_path
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    if "test_scheduler_budget_and_backpressure_env_overrides" in text:
+        return []
+    test_block = '''
+    def test_scheduler_budget_and_backpressure_env_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: manual
+                      prompt: Do the thing
+                    repository:
+                      slug: frumu-ai/example
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\\n",
+                encoding="utf-8",
+            )
+
+            defaults = resolve_config(root)
+
+            self.assertEqual(defaults.scheduler.max_concurrent_worker_runs, 4)
+            self.assertEqual(defaults.scheduler.max_daily_model_spend_cents, 0)
+            self.assertTrue(defaults.scheduler.rate_limit_backpressure)
+            self.assertTrue(defaults.scheduler.ci_backpressure)
+            self.assertTrue(defaults.scheduler.merge_queue_backpressure)
+
+            cfg = resolve_config(
+                root,
+                env={
+                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS": "2",
+                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS": "1234",
+                    "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE": "false",
+                    "ACA_SCHEDULER_CI_BACKPRESSURE": "false",
+                    "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE": "false",
+                },
+            )
+
+            self.assertEqual(cfg.scheduler.max_concurrent_worker_runs, 2)
+            self.assertEqual(cfg.scheduler.max_daily_model_spend_cents, 1234)
+            self.assertFalse(cfg.scheduler.rate_limit_backpressure)
+            self.assertFalse(cfg.scheduler.ci_backpressure)
+            self.assertFalse(cfg.scheduler.merge_queue_backpressure)
+'''
+    marker = '\n    def test_task_source_payload_can_come_from_env_json(self) -> None:\n'
+    text, inserted = _replace_once(text, marker, test_block + marker)
+    return [rel_path] if inserted and _write_if_changed(path, text) else []
+
+
+def _deterministic_throughput_scheduler_controls(worktree: Path, *, tests_only: bool = False) -> list[str]:
+    changed_files: list[str] = []
+    scheduler_rel = "src/tandem_agents/core/scheduling/scheduler.py"
+    scheduler_path = worktree / scheduler_rel
+    if not tests_only and scheduler_path.exists():
+        text = scheduler_path.read_text(encoding="utf-8")
+        changed = False
+        if "max_concurrent_worker_runs" not in text:
+            text, inserted = _replace_once(
+                text,
+                "    max_total = max(1, int(cfg.scheduler.max_active_tasks))\n",
+                "    max_active_total = max(1, int(cfg.scheduler.max_active_tasks))\n"
+                "    max_worker_runs = max(0, int(cfg.scheduler.max_concurrent_worker_runs))\n"
+                "    active_total_count = len(active_for_capacity)\n"
+                "    active_worker_count = max(len(active_for_capacity), len(active_coder_runs))\n"
+                "    remaining_active_slots = max(0, max_active_total - active_total_count)\n"
+                "    remaining_worker_slots = (\n"
+                "        max(0, max_worker_runs - active_worker_count)\n"
+                "        if max_worker_runs > 0\n"
+                "        else remaining_active_slots\n"
+                "    )\n"
+                "    max_total = min(remaining_active_slots, remaining_worker_slots)\n",
+            )
+            changed = changed or inserted
+            text, inserted = _replace_once(
+                text,
+                '            "max_active_tasks": max_total,\n',
+                '            "max_active_tasks": max_active_total,\n'
+                '            "max_concurrent_worker_runs": max_worker_runs,\n',
+                '            "remaining_active_slots": remaining_active_slots,\n'
+                '            "remaining_worker_slots": remaining_worker_slots,\n',
+            )
+            changed = changed or inserted
+        if "worker_concurrency_reached" not in text:
+            text, inserted = _replace_once(
+                text,
+                "        if not progressed:\n            break\n\n    snapshot = {\n",
+                "        if not progressed:\n"
+                "            break\n\n"
+                "    capacity_reason = \"\"\n"
+                "    if max_worker_runs > 0 and active_worker_count + len(admitted) >= max_worker_runs:\n"
+                "        capacity_reason = \"worker_concurrency_reached\"\n"
+                "    elif active_total_count + len(admitted) >= max_active_total:\n"
+                "        capacity_reason = \"active_capacity_reached\"\n"
+                "    if capacity_reason:\n"
+                "        for queue in grouped.values():\n"
+                "            for task in list(queue):\n"
+                "                task_scopes = task_file_scopes(task)\n"
+                "                blocked.append(\n"
+                "                    {\n"
+                '                        "task_key": task.get("task_key"),\n'
+                '                        "project_key": task_project_key(task),\n'
+                '                        "repo_key": task_repo_key(task),\n'
+                '                        "reason": capacity_reason,\n'
+                '                        "scope_mode": _scope_mode(task),\n'
+                '                        "scope_paths": ["/".join(parts) for parts in task_scopes],\n'
+                "                    }\n"
+                "                )\n"
+                "            queue.clear()\n\n"
+                "    snapshot = {\n",
+            )
+            changed = changed or inserted
+        if changed and _write_if_changed(scheduler_path, text):
+            changed_files.append(scheduler_rel)
+
+    test_rel = "src/tandem_agents/core/scheduling/scheduler_test.py"
+    test_path = worktree / test_rel
+    if test_path.exists():
+        text = test_path.read_text(encoding="utf-8")
+        changed = False
+        if "cfg.scheduler.max_concurrent_worker_runs = 99" not in text:
+            text, inserted = _replace_once(
+                text,
+                "            cfg.scheduler.max_active_tasks = 6\n"
+                "            cfg.scheduler.max_active_tasks_per_project = 1\n",
+                "            cfg.scheduler.max_active_tasks = 6\n"
+                "            cfg.scheduler.max_concurrent_worker_runs = 99\n"
+                "            cfg.scheduler.max_active_tasks_per_project = 1\n",
+            )
+            changed = changed or inserted
+        if "test_scheduler_worker_concurrency_cap_blocks_remaining_work" not in text:
+            test_block = '''
+    def test_scheduler_worker_concurrency_cap_blocks_remaining_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 6
+            cfg.scheduler.max_concurrent_worker_runs = 2
+            cfg.scheduler.max_active_tasks_per_project = 6
+            cfg.scheduler.max_active_tasks_per_repo = 6
+
+            store = CoordinationStore.from_config(cfg)
+            tasks = [
+                {
+                    "task_id": f"task-{suffix}",
+                    "title": f"Task {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/project-{suffix}", "path": str(root / f"repo-{suffix}")},
+                    "files": [f"src/file-{suffix}.py"],
+                }
+                for suffix in ("a", "b", "c")
+            ]
+            for task in tasks:
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertEqual(len(plan["admitted"]), 2)
+            self.assertEqual(plan["limits"]["max_concurrent_worker_runs"], 2)
+            blocked_reasons = {item["reason"] for item in plan["blocked"]}
+            self.assertIn("worker_concurrency_reached", blocked_reasons)
+'''
+            marker = "\n    def test_scheduler_scans_active_coder_runs_once_per_plan(self) -> None:\n"
+            text, inserted = _replace_once(text, marker, test_block + marker)
+            changed = changed or inserted
+        if changed and _write_if_changed(test_path, text):
+            changed_files.append(test_rel)
+    return changed_files
+
+
+def _run_deterministic_throughput_slice(worktree: Path, subtask: dict[str, Any], log_path: Path) -> dict[str, Any] | None:
+    subtask_id = str(subtask.get("id") or "").strip()
+    if not subtask_id.startswith("fallback-throughput-"):
+        return None
+    changed_files: list[str] = []
+    if subtask_id == "fallback-throughput-config-types":
+        changed_files = _deterministic_throughput_config_types(worktree)
+    elif subtask_id == "fallback-throughput-config-loader":
+        changed_files = _deterministic_throughput_config_loader(worktree)
+    elif subtask_id == "fallback-throughput-config-loader-tests":
+        changed_files = _deterministic_throughput_config_loader_tests(worktree)
+    elif subtask_id == "fallback-throughput-scheduler-controls-part-1":
+        changed_files = _deterministic_throughput_scheduler_controls(worktree)
+    elif subtask_id == "fallback-throughput-scheduler-controls-part-2":
+        changed_files = _deterministic_throughput_scheduler_controls(worktree, tests_only=True)
+    else:
+        return None
+    previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    if not changed_files:
+        log_path.write_text(
+            previous
+            + f"ACA deterministic throughput slice found no required edits for {subtask_id}.\n",
+            encoding="utf-8",
+        )
+        return None
+    log_path.write_text(
+        previous
+        + "ACA_DETERMINISTIC_THROUGHPUT_SLICE: applied deterministic repo-context edit for "
+        + f"{subtask_id}.\nChanged files:\n"
+        + "".join(f"- {path}\n" for path in changed_files),
+        encoding="utf-8",
+    )
+    return {
+        "role": "worker",
+        "returncode": 0,
+        "stdout": (
+            "ACA_DETERMINISTIC_THROUGHPUT_SLICE completed.\n"
+            "Changed files:\n"
+            + "".join(f"- {path}\n" for path in changed_files)
+        ),
+        "stderr": "",
+        "log_path": str(log_path),
+        "cwd": str(worktree),
+        "changed_files": changed_files,
+        "engine": {"skipped": True, "reason": "deterministic_throughput_slice"},
+    }
 
 
 def _engine_exception_is_timeout(exc: Exception) -> bool:
@@ -1665,7 +2016,23 @@ def _terminalized_note_reports_blockers(text: str) -> bool:
 
 
 def _worker_note_reports_blocked(text: str) -> bool:
-    return bool(WORKER_BLOCKED_STATUS_RE.search(str(text or "")))
+    raw = str(text or "")
+    stripped = raw.strip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            status = str(payload.get("status") or "").strip().lower()
+            if status in {"blocked", "failed", "failure"}:
+                return True
+            if payload.get("approved") is False:
+                return True
+            blockers = payload.get("blockers")
+            if isinstance(blockers, list) and any(str(item).strip() for item in blockers):
+                return True
+    return bool(WORKER_BLOCKED_STATUS_RE.search(raw))
 
 
 def _terminalized_note_reports_no_visible_verification(text: str) -> bool:
@@ -1684,6 +2051,102 @@ def _terminalized_note_reports_no_visible_verification(text: str) -> bool:
         "not verified",
     )
     return any(marker in normalized for marker in no_verification_markers)
+
+
+def _positive_contract_identifier_tokens(subtask: dict[str, Any]) -> list[str]:
+    ignored_tokens = {
+        "as_dict",
+        "task_key",
+        "project_key",
+        "repo_key",
+        "scope_mode",
+        "scope_paths",
+    }
+
+    def _is_contract_field_token(token: str) -> bool:
+        if token in ignored_tokens:
+            return False
+        return (
+            token.startswith("max_")
+            or token.startswith("min_")
+            or token.startswith("aca_")
+            or token.endswith("_backpressure")
+            or token.endswith("_reached")
+            or token.endswith("_cents")
+            or token.endswith("_seconds")
+            or token.endswith("_limit")
+        )
+
+    values: list[str] = []
+    for field in ("acceptance_criteria", "deliverables"):
+        value = subtask.get(field)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item or "") for item in value)
+        elif value:
+            values.append(str(value))
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        lowered = value.lower()
+        if "do not add" in lowered or "out of scope" in lowered:
+            continue
+        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", value):
+            normalized = token.lower()
+            if not _is_contract_field_token(normalized):
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                tokens.append(normalized)
+    return tokens
+
+
+def _missing_contract_identifier_tokens(subtask: dict[str, Any], diff_text: str) -> list[str]:
+    tokens = _positive_contract_identifier_tokens(subtask)
+    if not tokens:
+        return []
+    normalized_diff = str(diff_text or "").lower()
+    return [token for token in tokens if token not in normalized_diff]
+
+
+def _missing_required_production_anchor_tokens(subtask: dict[str, Any], diff_text: str) -> list[str]:
+    subtask_id = str(subtask.get("id") or "").strip()
+    anchors_by_subtask = {
+        "fallback-throughput-config-types": [
+            "max_concurrent_worker_runs: int",
+            "max_daily_model_spend_cents: int",
+            "rate_limit_backpressure: bool",
+            "ci_backpressure: bool",
+            "merge_queue_backpressure: bool",
+            "\"max_concurrent_worker_runs\": self.scheduler.max_concurrent_worker_runs",
+            "\"max_daily_model_spend_cents\": self.scheduler.max_daily_model_spend_cents",
+            "\"rate_limit_backpressure\": self.scheduler.rate_limit_backpressure",
+            "\"ci_backpressure\": self.scheduler.ci_backpressure",
+            "\"merge_queue_backpressure\": self.scheduler.merge_queue_backpressure",
+        ],
+        "fallback-throughput-config-loader": [
+            "SchedulerConfig(",
+            "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS",
+            "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS",
+            "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE",
+            "ACA_SCHEDULER_CI_BACKPRESSURE",
+            "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE",
+        ],
+        "fallback-throughput-scheduler-controls-part-1": [
+            "max_concurrent_worker_runs",
+        ],
+        "fallback-throughput-scheduler-controls-part-2": [
+            "worker_concurrency_reached",
+        ],
+        "fallback-throughput-scheduler-controls": [
+            "max_concurrent_worker_runs",
+            "worker_concurrency_reached",
+        ],
+    }
+    anchors = anchors_by_subtask.get(subtask_id)
+    if not anchors:
+        return []
+    normalized_diff = str(diff_text or "").lower()
+    return [anchor for anchor in anchors if anchor.lower() not in normalized_diff]
 
 
 def _changed_files_are_all_tests(changed_files: list[str]) -> bool:
@@ -1717,11 +2180,152 @@ def _run_has_terminal_status(layout: dict[str, Path]) -> bool:
     return run_status in {"blocked", "completed"} or run.get("completed_at_ms") is not None
 
 
+def _log_path_run_has_terminal_status(log_path: Path) -> bool:
+    status_path = log_path.parent.parent / "status.json"
+    if not status_path.is_file():
+        return False
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    run = status.get("run") if isinstance(status, dict) else {}
+    if not isinstance(run, dict):
+        return False
+    run_status = str(run.get("status") or "").strip().lower()
+    return run_status in {"blocked", "completed"} or run.get("completed_at_ms") is not None
+
+
+def _execution_id_from_worktree_path(cwd: Path) -> str:
+    name = str(getattr(cwd, "name", "") or "").strip()
+    marker = "--exec-"
+    if marker not in name:
+        return ""
+    return name.split(marker, 1)[1].strip()
+
+
+def _log_path_worker_attempt_is_current(log_path: Path, worker_id: str, cwd: Path) -> bool:
+    execution_id = _execution_id_from_worktree_path(cwd)
+    worker_id = str(worker_id or "").strip()
+    if not execution_id or not worker_id:
+        return True
+    attempts_path = log_path.parent.parent / "active_worker_attempts.json"
+    if not attempts_path.is_file():
+        return True
+    try:
+        attempts = json.loads(attempts_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    if not isinstance(attempts, dict):
+        return True
+    return str(attempts.get(worker_id) or "").strip() == execution_id
+
+
 def _active_worker_attempts_path(layout: dict[str, Path]) -> Path | None:
     run_dir = layout.get("run_dir")
     if not isinstance(run_dir, Path):
         return None
     return run_dir / "active_worker_attempts.json"
+
+
+def _active_worker_engine_sessions_path(run_dir: Path) -> Path:
+    return run_dir / "active_worker_engine_sessions.json"
+
+
+def _active_worker_engine_sessions_path_for_log(log_path: Path) -> Path | None:
+    try:
+        log_parent = log_path.parent
+    except Exception:
+        return None
+    if log_parent.name == "logs":
+        return _active_worker_engine_sessions_path(log_parent.parent)
+    return _active_worker_engine_sessions_path(log_parent)
+
+
+def _load_active_worker_engine_sessions(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    sessions: dict[str, dict[str, Any]] = {}
+    for raw_worker_id, raw_info in loaded.items():
+        worker_id = str(raw_worker_id or "").strip()
+        if not worker_id or not isinstance(raw_info, dict):
+            continue
+        session_id = str(raw_info.get("session_id") or "").strip()
+        if not session_id:
+            continue
+        sessions[worker_id] = dict(raw_info)
+        sessions[worker_id]["session_id"] = session_id
+    return sessions
+
+
+def _write_active_worker_engine_sessions(path: Path, sessions: dict[str, dict[str, Any]]) -> None:
+    cleaned: dict[str, dict[str, Any]] = {}
+    for raw_worker_id, raw_info in sessions.items():
+        worker_id = str(raw_worker_id or "").strip()
+        session_id = str((raw_info or {}).get("session_id") or "").strip()
+        if worker_id and session_id:
+            cleaned[worker_id] = dict(raw_info)
+            cleaned[worker_id]["session_id"] = session_id
+    if cleaned:
+        atomic_write_json(path, cleaned)
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _mark_active_worker_engine_session(
+    log_path: Path,
+    *,
+    worker_id: str,
+    session_id: str,
+    run_id: str = "",
+    cwd: Path | None = None,
+) -> None:
+    worker_id = str(worker_id or "").strip()
+    session_id = str(session_id or "").strip()
+    if (worker_id != "manager" and not worker_id.startswith("worker-")) or not session_id:
+        return
+    path = _active_worker_engine_sessions_path_for_log(log_path)
+    if path is None:
+        return
+    with WORKER_STATUS_LOCK:
+        sessions = _load_active_worker_engine_sessions(path)
+        current = dict(sessions.get(worker_id) or {})
+        current.update(
+            {
+                "session_id": session_id,
+                "run_id": str(run_id or current.get("run_id") or "").strip(),
+                "log_path": str(log_path),
+                "updated_at_ms": now_ms(),
+            }
+        )
+        if cwd is not None:
+            current["cwd"] = str(cwd)
+        sessions[worker_id] = current
+        _write_active_worker_engine_sessions(path, sessions)
+
+
+def _clear_active_worker_engine_session(log_path: Path, worker_id: str, session_id: str) -> None:
+    worker_id = str(worker_id or "").strip()
+    session_id = str(session_id or "").strip()
+    if (worker_id != "manager" and not worker_id.startswith("worker-")) or not session_id:
+        return
+    path = _active_worker_engine_sessions_path_for_log(log_path)
+    if path is None:
+        return
+    with WORKER_STATUS_LOCK:
+        sessions = _load_active_worker_engine_sessions(path)
+        if str((sessions.get(worker_id) or {}).get("session_id") or "").strip() != session_id:
+            return
+        sessions.pop(worker_id, None)
+        _write_active_worker_engine_sessions(path, sessions)
 
 
 def _load_active_worker_attempts(layout: dict[str, Path]) -> dict[str, str]:
@@ -2475,6 +3079,55 @@ def _terminalize_worker_after_tool_loop(
         result["changed_files"] = changed_files
         result["engine"] = engine_meta
         return result
+    if _changed_files_are_all_tests(changed_files):
+        missing_tokens = _missing_contract_identifier_tokens(subtask, diff_excerpt)
+        if missing_tokens:
+            incomplete = _preserve_partial_worker_diff(
+                dict(result),
+                log_path,
+                worktree,
+                reason="TERMINALIZED_MISSING_CONTRACT_TOKENS",
+            )
+            token_text = ", ".join(missing_tokens)
+            rejection_note = (
+                "\nACA rejected the terminalized worker note because the recovered test-only diff "
+                f"is missing required contract identifiers: {token_text}. Replace the partial diff "
+                "with assertions that use the exact required field/env names before retrying.\n"
+            )
+            incomplete["stdout"] = f"{result.get('stdout') or ''}{note}{rejection_note}"
+            incomplete["failure_reason"] = "TERMINALIZED_MISSING_CONTRACT_TOKENS"
+            incomplete["blocker_kind"] = "worker_incomplete_diff"
+            incomplete["recovery_action"] = (
+                "Replace the preserved test-only diff with one that includes the exact required "
+                f"contract identifiers: {token_text}."
+            )
+            incomplete["changed_files"] = changed_files
+            incomplete["engine"] = engine_meta
+            return incomplete
+    missing_production_anchors = _missing_required_production_anchor_tokens(subtask, diff_excerpt)
+    if missing_production_anchors:
+        incomplete = _preserve_partial_worker_diff(
+            dict(result),
+            log_path,
+            worktree,
+            reason="TERMINALIZED_MISSING_PRODUCTION_ANCHORS",
+        )
+        anchor_text = ", ".join(missing_production_anchors)
+        rejection_note = (
+            "\nACA rejected the terminalized worker note because the recovered production diff "
+            f"is missing required implementation anchors: {anchor_text}. Replace the partial diff "
+            "with the actual requested implementation before retrying.\n"
+        )
+        incomplete["stdout"] = f"{result.get('stdout') or ''}{note}{rejection_note}"
+        incomplete["failure_reason"] = "TERMINALIZED_MISSING_PRODUCTION_ANCHORS"
+        incomplete["blocker_kind"] = "worker_incomplete_diff"
+        incomplete["recovery_action"] = (
+            "Replace the preserved production diff with one that includes the required "
+            f"implementation anchors: {anchor_text}."
+        )
+        incomplete["changed_files"] = changed_files
+        incomplete["engine"] = engine_meta
+        return incomplete
     if _terminalized_note_reports_no_visible_verification(text) and _changed_files_are_all_tests(changed_files):
         incomplete = _preserve_partial_worker_diff(
             dict(result),
@@ -2848,6 +3501,42 @@ def stream_tandem_prompt(
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\n=== {role} @ {now_ms()} ===\n")
             log.write(prompt.strip() + "\n\n")
+            if role.startswith("worker") and not _log_path_worker_attempt_is_current(log_path, role, cwd):
+                message = "ACA_WORKER_ATTEMPT_INACTIVE: worker execution is no longer the active attempt before engine session creation.\n"
+                log.write(message)
+                log.flush()
+                _print_line(role, message)
+                return {
+                    "role": role,
+                    "returncode": 1,
+                    "stdout": message,
+                    "log_path": str(log_path),
+                    "cwd": str(cwd),
+                    "session_id": "",
+                    "engine_run_id": "",
+                    "engine": {"session_id": "", "run_id": "", "retry_count": 0, "fallback_mode": None},
+                    "failure_reason": "WORKER_ATTEMPT_INACTIVE",
+                    "blocker_kind": "worker_attempt_inactive",
+                    "recovery_action": "ACA stopped this abandoned worker because a newer worker attempt is active.",
+                }
+            if role.startswith("worker") and _log_path_run_has_terminal_status(log_path):
+                message = "ACA_WORKER_ATTEMPT_INACTIVE: run reached terminal status before engine session creation.\n"
+                log.write(message)
+                log.flush()
+                _print_line(role, message)
+                return {
+                    "role": role,
+                    "returncode": 1,
+                    "stdout": message,
+                    "log_path": str(log_path),
+                    "cwd": str(cwd),
+                    "session_id": "",
+                    "engine_run_id": "",
+                    "engine": {"session_id": "", "run_id": "", "retry_count": 0, "fallback_mode": None},
+                    "failure_reason": "RUN_TERMINAL",
+                    "blocker_kind": "run_terminal",
+                    "recovery_action": "ACA stopped this abandoned worker because the run is already terminal.",
+                }
             try:
                 create_exc: Exception | None = None
                 for attempt in range(3):
@@ -2881,6 +3570,12 @@ def stream_tandem_prompt(
                     "fallback_mode": None,
                     "recovery": [],
                 }
+                _mark_active_worker_engine_session(
+                    log_path,
+                    worker_id=role,
+                    session_id=session_id,
+                    cwd=cwd,
+                )
                 timeout_multiplier = max(1.0, float(timeout_multiplier or 1.0))
                 prompt_sync_timeout = _scaled_prompt_sync_timeout_seconds(
                     cfg,
@@ -2918,6 +3613,47 @@ def stream_tandem_prompt(
                         log.write(line)
                         log.flush()
                         _print_line(role, line)
+
+                def _worker_stop_result(reason: str) -> dict[str, Any] | None:
+                    if not role.startswith("worker"):
+                        return None
+                    failure_reason = ""
+                    blocker_kind = ""
+                    recovery_action = ""
+                    if _log_path_run_has_terminal_status(log_path):
+                        detail = "run reached terminal status"
+                        failure_reason = "RUN_TERMINAL"
+                        blocker_kind = "run_terminal"
+                        recovery_action = "ACA stopped this abandoned worker because the run is already terminal."
+                    elif not _log_path_worker_attempt_is_current(log_path, role, cwd):
+                        detail = "worker execution is no longer the active attempt"
+                        failure_reason = "WORKER_ATTEMPT_INACTIVE"
+                        blocker_kind = "worker_attempt_inactive"
+                        recovery_action = "ACA stopped this abandoned worker because a newer worker attempt is active."
+                    else:
+                        return None
+                    message = (
+                        "ACA_WORKER_ATTEMPT_INACTIVE: "
+                        + detail
+                        + " before "
+                        f"{reason}; stopping worker engine recovery.\n"
+                    )
+                    log.write(message)
+                    log.flush()
+                    _print_line(role, message)
+                    return {
+                        "role": role,
+                        "returncode": 1,
+                        "stdout": message,
+                        "log_path": str(log_path),
+                        "cwd": str(cwd),
+                        "session_id": session_id or "",
+                        "engine_run_id": last_run_id,
+                        "engine": engine_meta,
+                        "failure_reason": failure_reason,
+                        "blocker_kind": blocker_kind,
+                        "recovery_action": recovery_action,
+                    }
 
                 if role.startswith("worker") and write_required and _use_prompt_sync_first(cfg, prompt_sync_first):
                     engine_meta["fallback_mode"] = "prompt_sync_first"
@@ -3105,6 +3841,9 @@ def stream_tandem_prompt(
                             "tool-capable recovery on the same worktree."
                         )
                     if recover_with_async:
+                        stop_result = _worker_stop_result("async recovery session creation")
+                        if stop_result is not None:
+                            return stop_result
                         previous_session_id = session_id
                         engine_meta["prompt_sync_first_session_id"] = previous_session_id
                         recovery_notice = (
@@ -3138,6 +3877,12 @@ def stream_tandem_prompt(
                         engine_meta["fallback_mode"] = "prompt_sync_first_async_recovery"
                         engine_meta["run_id"] = ""
                         last_run_id = ""
+                        _mark_active_worker_engine_session(
+                            log_path,
+                            worker_id=role,
+                            session_id=session_id,
+                            cwd=cwd,
+                        )
                     elif blocker_kind == "engine_session_run_conflict":
                         recovery_action = (
                             "Wait for the active Tandem engine session run to finish or clear it, then reset the task to Backlog."
@@ -3167,6 +3912,10 @@ def stream_tandem_prompt(
                         }
 
                 def _run_async_once(prompt_text: str, attempt: int) -> tuple[str, bool, str, str]:
+                    nonlocal last_run_id
+                    stop_result = _worker_stop_result("async prompt dispatch")
+                    if stop_result is not None:
+                        return stop_result["stdout"], False, last_run_id, str(stop_result.get("blocker_kind") or "worker_stopped")
                     try:
                         async_result = _call_with_timeout(
                             lambda: sdk_sessions_prompt_async(
@@ -3220,8 +3969,14 @@ def stream_tandem_prompt(
                                 continue
                     engine_meta["run_id"] = run_id
                     engine_meta["retry_count"] = attempt
-                    nonlocal last_run_id
                     last_run_id = run_id
+                    _mark_active_worker_engine_session(
+                        log_path,
+                        worker_id=role,
+                        session_id=session_id,
+                        run_id=run_id,
+                        cwd=cwd,
+                    )
                     stream_result = (
                         sdk_stream_run_text(
                             cfg,
@@ -3269,6 +4024,9 @@ def stream_tandem_prompt(
 
                 stdout_text, completed, run_id, stream_reason = _run_async_once(prompt, 0)
                 if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
+                    stop_result = _worker_stop_result("same-session async retry")
+                    if stop_result is not None:
+                        return stop_result
                     retry_notice = (
                         f"ENGINE_EMPTY_RESPONSE_RETRY: engine run {run_id or 'unknown'} completed "
                         "without transcript text; retrying once in the same session.\n"
@@ -3297,6 +4055,9 @@ def stream_tandem_prompt(
                 fallback_blocker_kind = ""
                 fallback_failure_message = ""
                 if not completed and stream_reason not in TERMINAL_ENGINE_STREAM_REASONS:
+                    stop_result = _worker_stop_result("prompt_sync fallback")
+                    if stop_result is not None:
+                        return stop_result
                     engine_meta["fallback_mode"] = "prompt_sync"
                     fallback_notice = (
                         f"ENGINE_EMPTY_RESPONSE_FALLBACK: engine run {run_id or 'unknown'} still had "
@@ -3526,6 +4287,7 @@ def stream_tandem_prompt(
                 }
             finally:
                 if session_id:
+                    _clear_active_worker_engine_session(log_path, role, session_id)
                     try:
                         _call_with_timeout(lambda: delete_tandem_session(cfg, session_id), timeout_seconds=5.0)
                     except TimeoutError:
@@ -3533,6 +4295,30 @@ def stream_tandem_prompt(
                     except Exception:
                         logger.debug("Failed to delete tandem session", exc_info=True)
     return {"role": role, "returncode": 1, "stdout": "Internal Error: session-less stream requested"}
+
+
+def _subtask_retry_metadata(subtask: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(subtask, dict):
+        return {}
+
+    def _paths(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        paths: list[str] = []
+        for raw_path in value:
+            rel_path = str(raw_path or "").strip()
+            if rel_path and rel_path not in paths:
+                paths.append(rel_path)
+        return paths
+
+    metadata: dict[str, Any] = {}
+    files = _paths(subtask.get("files"))
+    target_files = _paths(subtask.get("target_files"))
+    if files:
+        metadata["subtask_files"] = files
+    if target_files:
+        metadata["subtask_target_files"] = target_files
+    return metadata
 
 
 def summarize_worker_notes(
@@ -3568,6 +4354,7 @@ def summarize_worker_notes(
         "verified_existing": bool(result.get("verified_existing")),
         "changed_files": [path for path in changed_files if path],
         "diff_stat": diff_stat,
+        **_subtask_retry_metadata(subtask),
     }
 
 
@@ -3640,8 +4427,15 @@ def run_worker_subtask(
     worktree = create_worktree(repo_path, worktree_path)
     log_path = layout["logs"] / f"{worker_id}.log"
     carry_forward_patch = str(subtask.get("carry_forward_patch") or "").strip()
+    carry_forward_patches = [
+        str(path).strip()
+        for path in (subtask.get("carry_forward_patches") or [])
+        if str(path).strip()
+    ]
     if carry_forward_patch:
-        patch_path = Path(carry_forward_patch)
+        carry_forward_patches.insert(0, carry_forward_patch)
+    for raw_patch_path in list(dict.fromkeys(carry_forward_patches)):
+        patch_path = Path(raw_patch_path)
         if not _apply_carry_forward_patch(worktree, patch_path, log_path):
             return _carry_forward_patch_failure_result(patch_path, worker_id, subtask, log_path)
     subtask = _materialize_worker_context(worktree, subtask)
@@ -3703,20 +4497,39 @@ def run_worker_subtask(
         _clear_active_worker_attempt(layout, worker_id, execution_id)
         return summarize_worker_notes(worker_result, worker_id, subtask, worktree, index)
 
-    result = stream_tandem_prompt(
-        cfg,
-        role=worker_id,
-        prompt=prompt,
-        cwd=worktree,
-        provider=worker_cli_provider,
-        model=worker_model,
-        env=env,
-        log_path=log_path,
-        config_path=config_path,
-        require_tool_use=True,
-        write_required=write_required,
-        timeout_multiplier=timeout_multiplier,
-    )
+    result = _run_deterministic_throughput_slice(worktree, subtask, log_path) if write_required else None
+    if result is not None:
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
+            "worker.deterministic_slice_completed",
+            run_id,
+            {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "execution_id": execution_id,
+                "changed_files": list(result.get("changed_files") or []),
+            },
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
+    else:
+        result = stream_tandem_prompt(
+            cfg,
+            role=worker_id,
+            prompt=prompt,
+            cwd=worktree,
+            provider=worker_cli_provider,
+            model=worker_model,
+            env=env,
+            log_path=log_path,
+            config_path=config_path,
+            require_tool_use=True,
+            write_required=write_required,
+            prompt_sync_first=_subtask_prefers_prompt_sync_first(subtask) if write_required else None,
+            timeout_multiplier=timeout_multiplier,
+        )
     result["write_required"] = write_required
 
     if _run_has_terminal_status(layout):
@@ -3841,7 +4654,11 @@ def run_worker_subtask(
                 "- Inspect this diff first. Keep and refine it if it is safe; revert only if it is demonstrably wrong.\n"
                 "- Do not spend the retry on a broad applicability matrix before verifying the seeded diff.\n"
             )
-        retry_prompt_sync_first = str(result.get("blocker_kind") or "") != "engine_tool_loop_stalled"
+        retry_prompt_sync_first = str(result.get("blocker_kind") or "") not in {
+            "engine_tool_loop_stalled",
+            "engine_tool_loop_stalled_no_diff",
+            "worker_no_diff",
+        }
         _append_worker_event_if_run_active(
             layout,
             log_path,

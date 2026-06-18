@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import tempfile
 import threading
@@ -17,23 +18,27 @@ from src.tandem_agents.core.engine.prompts import build_manager_prompt
 from src.tandem_agents.core.execution.run_lifecycle import block_run
 from src.tandem_agents.core.execution.runner_core import (
     _completed_subtask_ids_for_retry,
+    _deferred_subtasks_for_retry,
     _all_subtasks_verified_existing,
     _annotate_pr_candidate_current_layout,
     _auto_approve_loop,
     _collect_worker_changed_files,
     _crash_blocker_for_exception,
     _execute_local_worker_pool,
+    _failed_subtask_for_retry,
     _final_lease_release_decision,
     _has_unresolved_write_required_worker_failure,
     _integration_blocker_message,
     _integration_can_retry,
     _integration_failure_can_defer_to_review,
     _integration_event_type,
+    _integration_prompt_timeout_seconds,
     _integration_semantic_blocker_can_defer_to_review,
     _linear_mcp_authorization_url,
     _linear_comment_task_summary,
     _permission_requests_from_payload,
     _partial_diff_artifacts_for_retry,
+    _merge_partial_diff_artifacts_for_retry,
     _preserve_and_reset_blocked_worktree,
     _prepare_subtasks_with_discovery,
     _pr_candidate_edit_goal,
@@ -51,6 +56,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
+    _run_integration_prompt,
     _sticky_expected_repo_files,
     _validation_expected_repo_files,
 )
@@ -101,6 +107,22 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(blocker["kind"], "linear_mcp_auth_required")
             self.assertIn("Reconnect the Linear MCP server", blocker["message"])
             self.assertIn("invalid_grant", blocker["phase_detail"])
+
+    def test_crash_blocker_classifies_stripped_linear_tool_execute_500(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.type = "linear"
+
+            blocker = _crash_blocker_for_exception(
+                cfg,
+                RuntimeError(
+                    "Server error '500 Internal Server Error' for url "
+                    "'http://127.0.0.1:39731/tool/execute'"
+                ),
+            )
+
+            self.assertEqual(blocker["kind"], "linear_mcp_auth_required")
+            self.assertIn("Reconnect the Linear MCP server", blocker["message"])
 
     def test_crash_blocker_classifies_linear_mcp_pending_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,6 +201,46 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "linear": {
                         "last_auth_challenge": {
                             "authorization_url": "https://linear.example.test/authorize"
+                        }
+                    }
+                },
+            ):
+                self.assertEqual(
+                    _linear_mcp_authorization_url(cfg),
+                    "https://linear.example.test/authorize",
+                )
+
+    def test_linear_mcp_authorization_url_reads_nested_engine_challenge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._engine_request_json",
+                return_value={
+                    "servers": {
+                        "linear": {
+                            "lastAuthChallenge": {
+                                "authorizationUrl": "https://linear.example.test/authorize"
+                            }
+                        }
+                    }
+                },
+            ):
+                self.assertEqual(
+                    _linear_mcp_authorization_url(cfg),
+                    "https://linear.example.test/authorize",
+                )
+
+    def test_linear_mcp_authorization_url_reads_pending_auth_challenge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            with patch(
+                "src.tandem_agents.core.execution.runner_core._engine_request_json",
+                return_value={
+                    "linear": {
+                        "pending_auth_by_tool": {
+                            "linear": {
+                                "authorization_url": "https://linear.example.test/authorize"
+                            }
                         }
                     }
                 },
@@ -482,6 +544,52 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual(results[0]["changed_files"], ["src/app.py"])
         self.assertNotEqual(results[0].get("blocker_kind"), "worker_no_progress")
         self.assertIn("terminal event", results[0].get("output_excerpt", ""))
+
+    def test_serial_worker_pool_continues_after_abandoned_completed_result(self) -> None:
+        def slow_runner(_cfg, _run_id, _repo_path, _run_dir, _task, subtask, worker_id, _index):
+            if worker_id == "worker-1":
+                time.sleep(0.2)
+            return {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "status": "completed",
+                "returncode": 0,
+                "changed_files": [f"src/{worker_id}.py"],
+            }
+
+        def abort_first(index, subtask, worker_id):
+            if index != 1:
+                return None
+            return {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "status": "completed",
+                "returncode": 0,
+                "changed_files": ["src/worker-1.py"],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            started = time.monotonic()
+            results = _execute_local_worker_pool(
+                self._config(root),
+                "run-1",
+                root,
+                root / "runs" / "run-1",
+                {"task_id": "TAN-1"},
+                [
+                    {"id": "subtask-1", "title": "One", "write_required": True},
+                    {"id": "subtask-2", "title": "Two", "write_required": True},
+                ],
+                1,
+                worker_runner=slow_runner,
+                abort_result=abort_first,
+                worker_timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual([result["subtask_id"] for result in results], ["subtask-1", "subtask-2"])
+        self.assertLess(elapsed, 0.15)
 
     def test_abandoned_no_progress_worker_does_not_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1032,7 +1140,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertEqual(subtasks[0]["files"], [])
             self.assertEqual(subtasks[0]["target_files"], [])
 
-    def test_manager_subtasks_are_preserved_for_serial_dispatch(self) -> None:
+    def test_manager_subtasks_are_capped_by_worker_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)
             raw_subtasks = [
@@ -1049,7 +1157,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
             self.assertEqual(
                 [subtask["id"] for subtask in subtasks],
-                ["subtask-1", "subtask-2", "subtask-3", "subtask-4", "subtask-5"],
+                ["subtask-1", "subtask-2", "subtask-3"],
             )
 
     def test_manager_subtasks_merge_for_single_worker_dispatch(self) -> None:
@@ -1123,7 +1231,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertIn("ACA merged multiple manager subtasks", subtasks[0]["scope_note"])
             self.assertEqual([item["id"] for item in subtasks[0]["merged_subtasks"]], ["crate", "trace", "scoring"])
 
-    def test_manager_subtasks_can_run_serially_without_merge_when_swarm_disabled(self) -> None:
+    def test_manager_subtasks_without_merge_are_still_capped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp)
             manager_plan = {
@@ -1160,13 +1268,11 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 merge_manager_subtasks=False,
             )
 
-            self.assertEqual([subtask["id"] for subtask in subtasks], ["registry", "sandbox", "approval"])
+            self.assertEqual([subtask["id"] for subtask in subtasks], ["registry"])
             self.assertEqual(
                 [subtask["files"] for subtask in subtasks],
                 [
                     ["crates/tandem-tools/src/lib.rs"],
-                    ["crates/tandem-tools/src/builtin_tools.rs"],
-                    ["crates/tandem-tools/src/approval_classifier.rs"],
                 ],
             )
             self.assertTrue(all("merged_subtasks" not in subtask for subtask in subtasks))
@@ -1768,6 +1874,125 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(artifacts[0]["changed_files"], ["crates/eval/src/scoring.rs"])
 
+    def test_failed_verifiable_diff_artifact_is_not_marked_reusable(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/config/config_types.py",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                    "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": "Worker produced source plus required-test changes, but focused tests failed.",
+                    "recovery_action": "Retry from clean target files.",
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertFalse(artifacts[0]["patch_reusable"])
+        self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_TEST_FAILED")
+        self.assertIn("focused tests failed", artifacts[0]["worker_output_excerpt"])
+
+    def test_guard_rejected_source_and_test_only_artifacts_are_not_marked_reusable(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/source.patch",
+                    "changed_files": ["src/tandem_agents/config/config_types.py"],
+                    "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                    "blocker_kind": "worker_off_track",
+                    "output_excerpt": "Worker changed only non-test files.",
+                },
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/test.patch",
+                    "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                    "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": "Worker changed only required test files.",
+                },
+            ]
+        )
+
+        self.assertEqual([artifact["patch_reusable"] for artifact in artifacts], [False, False])
+
+    def test_partial_diff_artifact_preserves_failed_subtask_targets(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-2.patch",
+                    "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+                    "subtask_files": [
+                        "scripts/bootstrap_config.js",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                    "subtask_target_files": [
+                        "scripts/bootstrap_config.js",
+                        "src/tandem_agents/config/config_loader_test.py",
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            artifacts[0]["subtask_target_files"],
+            [
+                "scripts/bootstrap_config.js",
+                "src/tandem_agents/config/config_loader_test.py",
+            ],
+        )
+
+    def test_partial_diff_retry_artifacts_accumulate_across_attempts(self) -> None:
+        existing = [
+            {
+                "subtask_id": "subtask-1",
+                "worker_id": "worker-1",
+                "patch_path": "/runs/run-1/artifacts/source-only.patch",
+                "changed_files": ["src/tandem_agents/config/config_loader.py"],
+            }
+        ]
+        new_artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "worker_id": "worker-1",
+                "patch_path": "/runs/run-1/artifacts/test-only.patch",
+                "changed_files": ["src/tandem_agents/config/config_loader_test.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "worker_id": "worker-1",
+                "patch_path": "/runs/run-1/artifacts/source-only.patch",
+                "changed_files": ["src/tandem_agents/config/config_loader.py"],
+            },
+        ]
+
+        artifacts = _merge_partial_diff_artifacts_for_retry(existing, new_artifacts)
+
+        self.assertEqual(
+            [artifact["patch_path"] for artifact in artifacts],
+            [
+                "/runs/run-1/artifacts/source-only.patch",
+                "/runs/run-1/artifacts/test-only.patch",
+            ],
+        )
+        self.assertEqual(
+            [artifact["changed_files"] for artifact in artifacts],
+            [
+                ["src/tandem_agents/config/config_loader.py"],
+                ["src/tandem_agents/config/config_loader_test.py"],
+            ],
+        )
+
     def test_worker_no_progress_builds_base_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
             worker_results=[
@@ -1804,7 +2029,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 base_max_loops=2,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             _worker_failure_can_retry(
                 SimpleNamespace(env={}),
                 blocker,
@@ -1812,6 +2037,73 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 base_max_loops=2,
             )
         )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=4,
+                base_max_loops=2,
+            )
+        )
+
+    def test_worker_no_change_guard_failure_is_not_retryable(self) -> None:
+        cfg = SimpleNamespace(env={})
+        for failure_reason in ("WORKER_NO_CHANGE", "WORKER_REPAIR_NO_CHANGE"):
+            blocker = {
+                "kind": "worker_no_progress",
+                "worker": {
+                    "failure_reason": failure_reason,
+                },
+            }
+
+            self.assertFalse(
+                _worker_failure_can_retry(
+                    cfg,
+                    blocker,
+                    attempt=0,
+                    base_max_loops=2,
+                )
+            )
+
+    def test_deferred_subtasks_for_retry_keeps_unstarted_serial_tail(self) -> None:
+        pending = [
+            {"id": "subtask-1", "title": "One"},
+            {"id": "subtask-2", "title": "Two"},
+            {"id": "subtask-3", "title": "Three"},
+        ]
+        results = [{"subtask_id": "subtask-1", "returncode": 1}]
+
+        deferred = _deferred_subtasks_for_retry(pending, results)
+
+        self.assertEqual([item["id"] for item in deferred], ["subtask-2", "subtask-3"])
+        self.assertIsNot(deferred[0], pending[1])
+
+    def test_failed_subtask_for_retry_keeps_failed_serial_slice(self) -> None:
+        pending = [
+            {"id": "subtask-1", "title": "One"},
+            {"id": "subtask-2", "title": "Two"},
+            {"id": "subtask-3", "title": "Three"},
+        ]
+        results = [{"subtask_id": "subtask-2", "returncode": 1}]
+
+        failed = _failed_subtask_for_retry(pending, results)
+
+        self.assertIsNotNone(failed)
+        assert failed is not None
+        self.assertEqual(failed["id"], "subtask-2")
+        self.assertIsNot(failed, pending[1])
+
+    def test_unproductive_diff_does_not_get_extra_partial_diff_retries(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_unproductive_diff",
+            "worker": {
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
 
     def test_carry_forward_patch_apply_failure_is_retryable_with_discard_feedback(self) -> None:
         ctx = SimpleNamespace(
@@ -1839,15 +2131,16 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("Discard this preserved patch", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
-    def test_incomplete_diff_gets_two_extra_worker_repair_loops_by_default(self) -> None:
+    def test_incomplete_diff_gets_three_extra_worker_repair_loops_by_default(self) -> None:
         cfg = SimpleNamespace(env={})
         blocker = {"kind": "worker_incomplete_diff"}
 
-        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 2)
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 3)
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
 
     def test_engine_timeout_with_partial_diff_gets_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -1861,7 +2154,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
         self.assertFalse(
             _worker_failure_can_retry(
                 cfg,
@@ -1926,7 +2220,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("retryable blocker `worker_off_track`", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
-    def test_worker_runaway_diff_builds_retry_feedback(self) -> None:
+    def test_worker_runaway_diff_blocks_without_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
             worker_results=[
                 {
@@ -1946,10 +2240,9 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
 
-        self.assertIsNotNone(feedback)
+        self.assertIsNone(feedback)
         self.assertEqual(blocker["kind"], "worker_runaway_diff")
-        self.assertIn("retryable blocker `worker_runaway_diff`", feedback or "")
-        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
     def test_worker_unproductive_diff_builds_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
@@ -1994,7 +2287,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
 
     def test_incomplete_diff_extra_retry_budget_can_be_disabled(self) -> None:
         cfg = SimpleNamespace(env={"ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES": "0"})
@@ -2024,7 +2318,8 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
-        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
 
     def test_integration_can_use_incomplete_diff_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2042,7 +2337,57 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
-        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=5, base_max_loops=2))
+
+    def test_integration_prompt_timeout_uses_watchdog_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs = root / "logs"
+            ctx = SimpleNamespace(
+                cfg=SimpleNamespace(env={"ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS": "0.1"}),
+                run_id="run-1",
+                task={"title": "Task", "description": "Task description"},
+                worker_results=[],
+                repo_path=root,
+                layout={"logs": logs},
+            )
+
+            @contextmanager
+            def heartbeat(*_args, **_kwargs):
+                yield
+
+            def slow_stream(*_args, **_kwargs):
+                time.sleep(0.5)
+                return {"returncode": 0, "stdout": '{"approved":true}'}
+
+            with patch(
+                "src.tandem_agents.core.execution.runner_core.engine_session_provider_model",
+                return_value={"provider": "openai-codex", "model": "gpt-5.5"},
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core._role_provider_override_config",
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core.engine_env",
+                return_value={},
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core._coordination_heartbeat",
+                side_effect=heartbeat,
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core.stream_tandem_prompt",
+                side_effect=slow_stream,
+            ):
+                result = _run_integration_prompt(ctx)
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["blocker_kind"], "engine_tool_loop_stalled")
+            self.assertTrue(_integration_failure_can_defer_to_review(result))
+            self.assertIn("ACA integration prompt exceeded 0.1s", result["stdout"])
+            self.assertIn("ACA integration prompt exceeded 0.1s", (logs / "manager-integration.log").read_text())
+
+    def test_integration_prompt_timeout_ignores_invalid_env(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS": "not-a-number"})
+
+        self.assertEqual(_integration_prompt_timeout_seconds(cfg), 300.0)
 
     def test_verification_extra_repair_budget_requires_incomplete_diff_state(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2469,6 +2814,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 {"id": "subtask-2", "title": "second", "goal": "second", "write_required": True},
             ]
             abort_calls: list[str] = []
+            cancel_calls: list[tuple[str, str]] = []
 
             def fake_worker_runner(
                 _cfg,
@@ -2523,6 +2869,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 2,
                 worker_runner=fake_worker_runner,
                 abort_result=abort_result,
+                cancel_worker=lambda worker_id, reason: cancel_calls.append((worker_id, reason)),
                 worker_timeout_seconds=5,
             )
             elapsed = time.monotonic() - started
@@ -2532,6 +2879,10 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertCountEqual([result["worker_id"] for result in results], ["worker-1", "worker-2"])
             self.assertTrue(all(result["blocker_kind"] == "worker_unproductive" for result in results))
             self.assertCountEqual(abort_calls, ["worker-1", "worker-2"])
+            self.assertCountEqual(
+                cancel_calls,
+                [("worker-1", "worker_unproductive"), ("worker-2", "worker_unproductive")],
+            )
 
     def test_serial_worker_pool_stops_after_write_required_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

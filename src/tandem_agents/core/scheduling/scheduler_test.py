@@ -7,7 +7,13 @@ from unittest.mock import patch
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
-from src.tandem_agents.core.scheduling.scheduler import plan_task_admissions, scheduler_snapshot, task_project_key, task_repo_key
+from src.tandem_agents.core.scheduling.scheduler import (
+    plan_task_admissions,
+    scheduler_integration_blockers,
+    scheduler_snapshot,
+    task_project_key,
+    task_repo_key,
+)
 from src.tandem_agents.runtime.runstate import initial_blackboard, initial_status, save_blackboard, write_status
 
 
@@ -207,6 +213,7 @@ class SchedulerTest(unittest.TestCase):
             root = Path(tmp)
             cfg = self._config(root)
             cfg.scheduler.max_active_tasks = 6
+            cfg.scheduler.max_concurrent_worker_runs = 99
             cfg.scheduler.max_active_tasks_per_project = 1
             cfg.scheduler.max_active_tasks_per_repo = 1
 
@@ -230,6 +237,71 @@ class SchedulerTest(unittest.TestCase):
             self.assertFalse(plan["blocked"])
             self.assertTrue(all(item["scope_mode"] == "files" for item in plan["admitted"]))
             self.assertEqual({item["repo_key"] for item in plan["admitted"]}, {task["repo"]["slug"] for task in tasks})
+
+    def test_scheduler_worker_concurrency_cap_blocks_remaining_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 6
+            cfg.scheduler.max_concurrent_worker_runs = 2
+            cfg.scheduler.max_active_tasks_per_project = 6
+            cfg.scheduler.max_active_tasks_per_repo = 6
+
+            store = CoordinationStore.from_config(cfg)
+            tasks = [
+                {
+                    "task_id": f"task-{suffix}",
+                    "title": f"Task {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/project-{suffix}", "path": str(root / f"repo-{suffix}")},
+                    "files": [f"src/file-{suffix}.py"],
+                }
+                for suffix in ("a", "b", "c")
+            ]
+            for task in tasks:
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertEqual(len(plan["admitted"]), 2)
+            self.assertEqual(plan["limits"]["max_concurrent_worker_runs"], 2)
+            blocked_reasons = {item["reason"] for item in plan["blocked"]}
+            self.assertIn("worker_concurrency_reached", blocked_reasons)
+
+    def test_scheduler_worker_concurrency_cap_counts_active_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 10
+            cfg.scheduler.max_concurrent_worker_runs = 4
+            cfg.scheduler.max_active_tasks_per_project = 10
+            cfg.scheduler.max_active_tasks_per_repo = 10
+
+            store = CoordinationStore.from_config(cfg)
+            for suffix in ("a", "b", "c", "d"):
+                active = {
+                    "task_id": f"active-{suffix}",
+                    "title": f"Active {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/active-{suffix}", "path": str(root / f"active-{suffix}")},
+                    "files": [f"src/active-{suffix}.py"],
+                }
+                store.register_task(active, repo=active["repo"], status="active")
+            for suffix in ("e", "f", "g"):
+                queued = {
+                    "task_id": f"queued-{suffix}",
+                    "title": f"Queued {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/queued-{suffix}", "path": str(root / f"queued-{suffix}")},
+                    "files": [f"src/queued-{suffix}.py"],
+                }
+                store.register_task(queued, repo=queued["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertFalse(plan["admitted"])
+            self.assertEqual(plan["limits"]["remaining_worker_slots"], 0)
+            self.assertEqual({item["reason"] for item in plan["blocked"]}, {"worker_concurrency_reached"})
 
     def test_scheduler_scans_active_coder_runs_once_per_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +356,134 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(len(plan["admitted"]), 1)
             self.assertEqual(plan["admitted"][0]["task_key"], snapshot["queued"][0]["task_key"])
             self.assertFalse(plan["blocked"])
+
+    def test_scheduler_blocks_linear_admission_when_mcp_auth_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.linear_mcp.enabled = True
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "linear-task",
+                "title": "Linear task",
+                "source": {"type": "linear", "team": "team-1", "project": "project-target"},
+                "repo": {"slug": "frumu-ai/target", "path": str(root / "target")},
+            }
+            registered = store.register_task(task, repo=task["repo"], status="queued")
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_auth_challenge": {
+                        "authorization_url": "https://linear.example.test/authorize"
+                    },
+                    "last_error": "Authorization required.",
+                },
+            ):
+                plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertFalse(plan["admitted"])
+            self.assertEqual(plan["blocked"][0]["task_key"], registered["task_key"])
+            self.assertEqual(plan["blocked"][0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(
+                plan["blocked"][0]["authorization_url"],
+                "https://linear.example.test/authorize",
+            )
+
+    def test_scheduler_reports_linear_integration_blocker_without_queued_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.task_source.type = "linear"
+            cfg.task_source.team = "team-1"
+            cfg.task_source.project = "project-target"
+            cfg.linear_mcp.enabled = True
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_auth_challenge": {
+                        "authorization_url": "https://linear.example.test/authorize"
+                    },
+                    "last_error": "Authorization required.",
+                },
+            ):
+                blockers = scheduler_integration_blockers(cfg)
+
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(blockers[0]["project_key"], "linear:team-1/project-target")
+
+    def test_scheduler_requests_linear_auth_url_when_server_list_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.task_source.type = "linear"
+            cfg.task_source.team = "team-1"
+            cfg.task_source.project = "project-target"
+            cfg.linear_mcp.enabled = True
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_error": (
+                        'MCP endpoint returned HTTP 401: {"error":"invalid_token",'
+                        '"error_description":"Missing or invalid access token"}'
+                    ),
+                },
+            ), patch(
+                "src.tandem_agents.core.scheduling.scheduler._request_linear_auth_url",
+                return_value="https://linear.example.test/authorize",
+            ) as request_auth:
+                blockers = scheduler_integration_blockers(cfg)
+
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(blockers[0]["authorization_url"], "https://linear.example.test/authorize")
+            request_auth.assert_called_once_with(cfg, "linear", refresh=False)
+
+    def test_scheduler_refreshes_stale_linear_auth_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.task_source.type = "linear"
+            cfg.task_source.team = "team-1"
+            cfg.task_source.project = "project-target"
+            cfg.linear_mcp.enabled = True
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_auth_challenge": {
+                        "authorization_url": "https://linear.example.test/old-authorize",
+                        "requested_at_ms": 1_000,
+                    },
+                    "last_error": "Authorization required.",
+                },
+            ), patch(
+                "src.tandem_agents.core.scheduling.scheduler.time.time",
+                return_value=400.0,
+            ), patch(
+                "src.tandem_agents.core.scheduling.scheduler._request_linear_auth_url",
+                return_value="https://linear.example.test/new-authorize",
+            ) as request_auth:
+                blockers = scheduler_integration_blockers(cfg)
+
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["authorization_url"], "https://linear.example.test/new-authorize")
+            request_auth.assert_called_once_with(cfg, "linear", refresh=True)
 
     def test_scheduler_project_filter_keeps_global_active_repo_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
