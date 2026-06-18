@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -258,6 +260,32 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                 {"run_id": run_id, "lease_id": "lease-orphan"},
             )
 
+    def test_recent_run_dirs_prefers_state_file_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "runs"
+            output_root.mkdir(parents=True)
+            base_ns = 1_700_000_000_000_000_000
+
+            def seed_run(name: str, *, status_offset: int, dir_offset: int) -> None:
+                run_dir = output_root / name
+                run_dir.mkdir()
+                status_path = run_dir / "status.json"
+                status_path.write_text(
+                    json.dumps({"run": {"run_id": name, "status": "running", "updated_at_ms": status_offset}}),
+                    encoding="utf-8",
+                )
+                os.utime(status_path, ns=(base_ns + status_offset, base_ns + status_offset))
+                os.utime(run_dir, ns=(base_ns + dir_offset, base_ns + dir_offset))
+
+            seed_run("run-target", status_offset=10_000, dir_offset=1)
+            for index in range(100):
+                seed_run(f"run-other-{index:03d}", status_offset=index + 1, dir_offset=20_000 + index)
+
+            recent = api_main._recent_run_dirs(output_root, limit=1)
+
+            self.assertIn(output_root / "run-target", recent)
+            self.assertEqual(recent[0], output_root / "run-target")
+
     def test_coder_supervisor_reconcile_is_serialized(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -294,6 +322,33 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertTrue(second_done.is_set())
         self.assertEqual(calls, ["start", "end", "start", "end"])
+
+    def test_coder_supervisor_startup_reconcile_is_opt_in(self) -> None:
+        async def exercise() -> None:
+            await api_main._start_coder_supervisor()
+            task = api_main._coder_supervisor_task
+            self.assertIsNotNone(task)
+            api_main._coder_supervisor_stop.set()
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            api_main._coder_supervisor_task = None
+
+        cfg = SimpleNamespace(
+            execution=SimpleNamespace(
+                coder_supervisor_enabled=True,
+                coder_supervisor_interval_seconds=3600,
+            )
+        )
+        with (
+            patch.object(api_main, "resolve_config", return_value=cfg),
+            patch.object(api_main, "_coder_supervisor_startup_reconcile_enabled", return_value=False),
+            patch.object(api_main, "reconcile_active_coder_runs", return_value={"count": 0}) as reconcile,
+        ):
+            asyncio.run(exercise())
+
+        reconcile.assert_not_called()
 
     def test_approvals_status_query_filters_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

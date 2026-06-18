@@ -134,9 +134,27 @@ _coordination_reaper_stop = threading.Event()
 _coder_supervisor_task: Optional[asyncio.Task[None]] = None
 _coder_supervisor_stop = threading.Event()
 _coder_supervisor_reconcile_lock = threading.Lock()
+_health_monitor_task: Optional[asyncio.Task[None]] = None
+_health_monitor_stop = threading.Event()
+_event_loop_lag_lock = threading.Lock()
+_event_loop_lag_ms = 0.0
+_event_loop_lag_updated_at_ms = 0
 DEFAULT_READY_ENGINE_TIMEOUT_SECONDS = 5.0
 DEFAULT_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS = 10.0
+DEFAULT_CODER_SUPERVISOR_STARTUP_RECONCILE = False
 _start_time = time.monotonic()
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    logger.warning("Ignoring invalid %s=%r", name, raw)
+    return default
 
 
 def _coder_supervisor_startup_timeout_seconds() -> float:
@@ -147,6 +165,13 @@ def _coder_supervisor_startup_timeout_seconds() -> float:
         except ValueError:
             logger.warning("Ignoring invalid ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS=%r", raw)
     return DEFAULT_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS
+
+
+def _coder_supervisor_startup_reconcile_enabled() -> bool:
+    return _env_bool(
+        "ACA_CODER_SUPERVISOR_STARTUP_RECONCILE",
+        default=DEFAULT_CODER_SUPERVISOR_STARTUP_RECONCILE,
+    )
 
 
 def _reconcile_active_coder_runs_serialized(cfg):
@@ -160,6 +185,7 @@ async def _attach_run_manager_loop():
     # in strict mode. See src/tandem_agents/api/auth.py:assert_api_token_configured.
     assert_api_token_configured()
     run_manager.attach_loop(asyncio.get_running_loop())
+    await _start_health_monitor()
     await _start_coder_supervisor()
     await _start_coordination_reaper()
 
@@ -168,6 +194,12 @@ async def _attach_run_manager_loop():
 async def _shutdown_background_tasks():
     _coordination_reaper_stop.set()
     _coder_supervisor_stop.set()
+    _health_monitor_stop.set()
+    global _health_monitor_task
+    if _health_monitor_task and not _health_monitor_task.done():
+        _health_monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _health_monitor_task
     global _coordination_reaper_task
     if _coordination_reaper_task and not _coordination_reaper_task.done():
         _coordination_reaper_task.cancel()
@@ -180,9 +212,50 @@ async def _shutdown_background_tasks():
             await _coder_supervisor_task
 
 
+async def _health_monitor_loop(interval_seconds: float = 1.0) -> None:
+    global _event_loop_lag_ms, _event_loop_lag_updated_at_ms
+    loop = asyncio.get_running_loop()
+    expected = loop.time() + interval_seconds
+    while not _health_monitor_stop.is_set():
+        try:
+            await asyncio.sleep(max(0.05, expected - loop.time()))
+        except asyncio.CancelledError:
+            raise
+        now = loop.time()
+        lag_ms = max(0.0, (now - expected) * 1000.0)
+        with _event_loop_lag_lock:
+            _event_loop_lag_ms = lag_ms
+            _event_loop_lag_updated_at_ms = int(time.time() * 1000)
+        expected = now + interval_seconds
+
+
+async def _start_health_monitor() -> None:
+    global _health_monitor_task
+    if _health_monitor_task and not _health_monitor_task.done():
+        return
+    _health_monitor_stop.clear()
+    _health_monitor_task = asyncio.create_task(_health_monitor_loop())
+
+
+def _event_loop_health_snapshot() -> dict[str, Any]:
+    with _event_loop_lag_lock:
+        lag_ms = _event_loop_lag_ms
+        updated_at_ms = _event_loop_lag_updated_at_ms
+    degraded_threshold_ms = 1000.0
+    return {
+        "lag_ms": round(lag_ms, 1),
+        "updated_at_ms": updated_at_ms,
+        "degraded": lag_ms >= degraded_threshold_ms,
+        "degraded_threshold_ms": int(degraded_threshold_ms),
+    }
+
+
 async def _coder_supervisor_loop(cfg) -> None:
     interval = max(1, int(getattr(cfg.execution, "coder_supervisor_interval_seconds", 30) or 30))
     logger.info("Starting coder supervisor loop with %ss interval.", interval)
+    stopped = await asyncio.to_thread(_coder_supervisor_stop.wait, interval)
+    if stopped:
+        return
     while not _coder_supervisor_stop.is_set():
         try:
             summary = await asyncio.to_thread(_reconcile_active_coder_runs_serialized, cfg)
@@ -209,16 +282,19 @@ async def _start_coder_supervisor() -> None:
     if _coder_supervisor_task and not _coder_supervisor_task.done():
         return
     _coder_supervisor_stop.clear()
-    try:
-        timeout = _coder_supervisor_startup_timeout_seconds()
-        await asyncio.wait_for(asyncio.to_thread(_reconcile_active_coder_runs_serialized, cfg), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Initial coder supervisor reconciliation did not finish within startup timeout; "
-            "continuing API startup and leaving periodic reconciliation enabled."
-        )
-    except Exception:
-        logger.debug("Initial coder supervisor reconciliation failed.", exc_info=True)
+    if _coder_supervisor_startup_reconcile_enabled():
+        try:
+            timeout = _coder_supervisor_startup_timeout_seconds()
+            await asyncio.wait_for(asyncio.to_thread(_reconcile_active_coder_runs_serialized, cfg), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Initial coder supervisor reconciliation did not finish within startup timeout; "
+                "continuing API startup and leaving periodic reconciliation enabled."
+            )
+        except Exception:
+            logger.debug("Initial coder supervisor reconciliation failed.", exc_info=True)
+    else:
+        logger.info("Skipping initial coder supervisor reconciliation; periodic reconciliation remains enabled.")
     _coder_supervisor_task = asyncio.create_task(_coder_supervisor_loop(cfg))
 
 async def _coordination_reaper_loop(cfg) -> None:
@@ -480,16 +556,31 @@ def _run_summary(run_dir: Path) -> Optional[str]:
         return None
 
 
+def _tail_text_lines(path: Path, *, max_lines: int, max_bytes: int = 256_000) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            if end <= 0:
+                return []
+            size = min(max_bytes, end)
+            handle.seek(end - size)
+            data = handle.read(size)
+    except Exception:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if end > size and lines:
+        lines = lines[1:]
+    return lines[-max(1, max_lines):]
+
+
 def _run_events(run_dir: Path, tail: int = 80) -> list[dict[str, Any]]:
     events_path = run_dir / "events.jsonl"
     if not events_path.exists():
         return []
-    try:
-        lines = events_path.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return []
+    lines = _tail_text_lines(events_path, max_lines=max(1, min(tail, 500)))
     events: list[dict[str, Any]] = []
-    for line in lines[-max(1, min(tail, 500)):]:
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -656,6 +747,20 @@ def _run_diff_snapshot(run_dir: Path) -> dict[str, Any]:
     }
 
 
+def _run_diff_summary(run_dir: Path) -> dict[str, Any]:
+    after_path = run_dir / "diffs" / "after.txt"
+    try:
+        available = after_path.is_file() and after_path.stat().st_size > 0
+    except OSError:
+        available = False
+    return {
+        "before": "",
+        "after": "",
+        "changed_files": [],
+        "available": available,
+    }
+
+
 def _persisted_run_status(status_payload: dict[str, Any] | None) -> str:
     run_meta = status_payload.get("run") if isinstance(status_payload, dict) else None
     if not isinstance(run_meta, dict):
@@ -733,9 +838,9 @@ def _build_run_snapshot(
         "is_running": is_running,
         "has_error": bool(error),
         "error": error,
-        "summary_available": _run_summary(run_dir) is not None,
+        "summary_available": (run_dir / "summary.md").exists(),
         "events": _run_events(run_dir) if include_details else _run_event_summaries(run_dir),
-        "diff": _run_diff_snapshot(run_dir),
+        "diff": _run_diff_snapshot(run_dir) if include_details else _run_diff_summary(run_dir),
         "repo_context": status_payload.get("repo_context") if isinstance(status_payload.get("repo_context"), dict) else {},
         "repair": status_payload.get("repair") if isinstance(status_payload.get("repair"), dict) else {},
         "artifacts": {
@@ -763,13 +868,39 @@ def _is_run_directory(run_dir: Path) -> bool:
     return (run_dir / "status.json").exists() or (run_dir / "blackboard.yaml").exists()
 
 
+def _run_state_mtime_ns(run_dir: Path) -> int:
+    mtimes: list[int] = []
+    for state_file in (run_dir / "status.json", run_dir / "blackboard.yaml"):
+        try:
+            mtimes.append(state_file.stat().st_mtime_ns)
+        except OSError:
+            pass
+    if mtimes:
+        return max(mtimes)
+    try:
+        return run_dir.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _recent_run_dirs(output_root: Path, *, limit: int) -> list[Path]:
+    candidates: list[tuple[int, str, Path]] = []
+    if not output_root.exists():
+        return []
+    for run_dir in output_root.iterdir():
+        if not _is_run_directory(run_dir):
+            continue
+        candidates.append((_run_state_mtime_ns(run_dir), run_dir.name, run_dir))
+    candidates.sort(reverse=True)
+    scan_limit = max(100, min(1000, max(1, limit) * 4))
+    return [run_dir for _, _, run_dir in candidates[:scan_limit]]
+
+
 def _list_run_snapshots(cfg, *, limit: int = 50) -> List[Dict[str, Any]]:
     output_root = cfg.output_root()
     snapshots: Dict[str, Dict[str, Any]] = {}
     if output_root.exists():
-        for run_dir in output_root.iterdir():
-            if not _is_run_directory(run_dir):
-                continue
+        for run_dir in _recent_run_dirs(output_root, limit=max(1, limit)):
             snapshots[run_dir.name] = _build_run_snapshot(run_dir.name, run_dir)
 
     for run_id, state in run_manager.runs.items():
@@ -808,10 +939,13 @@ def _list_run_snapshots(cfg, *, limit: int = 50) -> List[Dict[str, Any]]:
 
 @app.get("/health")
 async def health():
+    loop_health = _event_loop_health_snapshot()
     return {
         "status": "healthy",
         "version": "0.1.0",
         "uptime_seconds": round(time.monotonic() - _start_time, 1),
+        "event_loop": loop_health,
+        "degraded": bool(loop_health.get("degraded")),
     }
 
 
@@ -1257,8 +1391,32 @@ async def add_project(
 async def get_project_tasks(slug: str, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     _, cfg = _project_config(root, slug)
-    from src.tandem_agents.runtime.task_sources import preview_task
+    from src.tandem_agents.runtime.task_sources import (
+        linear_preview_from_board_snapshot,
+        preview_task,
+        read_cached_linear_board_snapshot,
+    )
     try:
+        if str(cfg.task_source.type or "").strip() == "linear":
+            snapshot = await asyncio.to_thread(read_cached_linear_board_snapshot, cfg)
+            if snapshot:
+                return linear_preview_from_board_snapshot(cfg, snapshot)
+            return {
+                "eligible": False,
+                "task": {
+                    "title": "Linear board sync pending",
+                    "id": None,
+                    "project_name": cfg.task_source.project or cfg.task_source.team,
+                    "project_column": None,
+                    "source": {"type": "linear", "team": cfg.task_source.team, "project": cfg.task_source.project},
+                    "lane": "syncing",
+                    "labels": [],
+                },
+                "source_type": "linear",
+                "board_path": None,
+                "board_summary": {},
+                "warning": "No cached Linear board snapshot yet. Refresh the project board to load the latest task preview.",
+            }
         return await asyncio.to_thread(preview_task, cfg)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1753,7 +1911,9 @@ async def get_run_artifact(run_id: str, file_path: str, token: str = Depends(get
 async def list_runs(limit: int = 50, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     cfg = resolve_config(root)
-    return {"runs": _list_run_snapshots(cfg, limit=max(1, min(limit, 200)))}
+    bounded_limit = max(1, min(limit, 200))
+    runs = await asyncio.to_thread(_list_run_snapshots, cfg, limit=bounded_limit)
+    return {"runs": runs}
 
 
 def _scheduler_filtered_source_items(root: Path, project_slug: Optional[str], items: list[str]) -> list[str]:
@@ -1909,20 +2069,23 @@ async def get_run(run_id: str, token: str = Depends(get_token)):
                 "error": active_state.error,
             }
         raise HTTPException(status_code=404, detail="Run not found")
-    status_payload = load_status(run_dir / "status.json")
-    snapshot = _build_run_snapshot(run_id, run_dir, active_state, include_details=True)
-    return {
-        "run_id": run_id,
-        "project_slug": snapshot.get("project_slug", "unknown"),
-        "is_running": snapshot.get("is_running", False),
-        "status": status_payload,
-        "blackboard": load_blackboard(run_dir / "blackboard.yaml"),
-        "events": _run_events(run_dir),
-        "diff": _run_diff_snapshot(run_dir),
-        "error": snapshot.get("error"),
-        "summary": _run_summary(run_dir),
-        "snapshot": snapshot,
-    }
+    def _payload() -> dict[str, Any]:
+        status_payload = load_status(run_dir / "status.json")
+        snapshot = _build_run_snapshot(run_id, run_dir, active_state, include_details=True)
+        return {
+            "run_id": run_id,
+            "project_slug": snapshot.get("project_slug", "unknown"),
+            "is_running": snapshot.get("is_running", False),
+            "status": status_payload,
+            "blackboard": load_blackboard(run_dir / "blackboard.yaml"),
+            "events": _run_events(run_dir),
+            "diff": _run_diff_snapshot(run_dir),
+            "error": snapshot.get("error"),
+            "summary": _run_summary(run_dir),
+            "snapshot": snapshot,
+        }
+
+    return await asyncio.to_thread(_payload)
 
 
 def _external_action_linear_fields(target_status: str, labels: list[str] | None = None) -> dict[str, Any]:
@@ -2389,15 +2552,19 @@ async def get_operator_summary(limit: int = 25, token: str = Depends(get_token))
         store = CoordinationStore.from_config(cfg)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
-    store.ensure_schema()
-    return build_operator_summary(cfg, coordination=store, limit=max(1, min(limit, 100)))
+    def _summary() -> dict[str, Any]:
+        store.ensure_schema()
+        return build_operator_summary(cfg, coordination=store, limit=max(1, min(limit, 100)))
+
+    return await asyncio.to_thread(_summary)
 
 
 @app.get("/operator/coder-runs")
 async def get_operator_coder_runs(limit: int = 100, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     cfg = resolve_config(root)
-    return {"coder_runs": list_active_coder_runs(cfg, limit=max(1, min(limit, 500)))}
+    coder_runs = await asyncio.to_thread(list_active_coder_runs, cfg, limit=max(1, min(limit, 500)))
+    return {"coder_runs": coder_runs}
 
 
 @app.post("/operator/coder-runs/{run_id}/reconcile")
@@ -2442,8 +2609,11 @@ async def get_operator_dashboard(limit: int = 25, token: str = Depends(get_token
         store = CoordinationStore.from_config(cfg)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
-    store.ensure_schema()
-    summary = build_operator_summary(cfg, coordination=store, limit=max(1, min(limit, 100)))
+    def _summary() -> dict[str, Any]:
+        store.ensure_schema()
+        return build_operator_summary(cfg, coordination=store, limit=max(1, min(limit, 100)))
+
+    summary = await asyncio.to_thread(_summary)
     return render_operator_dashboard(summary)
 
 

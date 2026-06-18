@@ -45,6 +45,13 @@ logger = logging.getLogger("aca.coder_supervisor")
 
 TERMINAL_CODER_STATUSES = {"completed", "failed", "blocked", "cancelled", "canceled"}
 NON_TERMINAL_RUN_STATUSES = {"created", "running"}
+BLACKBOARD_SUPERVISION_MARKERS = (
+    "coder_run:",
+    "execution_backend: coder",
+    "execution_backend: 'coder'",
+    'execution_backend: "coder"',
+    "pull_request_lifecycle:",
+)
 
 
 def _normalize_status(value: Any) -> str:
@@ -65,6 +72,47 @@ def _is_run_directory(run_dir: Path) -> bool:
     if not (name.startswith("run-") or name.startswith("sched-") or name.startswith("qa-") or name.startswith("bak-run-")):
         return False
     return (run_dir / "status.json").exists() or (run_dir / "blackboard.yaml").exists()
+
+
+def _load_status_safe(path: Path) -> dict[str, Any]:
+    try:
+        loaded = load_status(path)
+    except Exception:
+        logger.debug("Skipping run with unreadable status file: %s", path, exc_info=True)
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _blackboard_has_supervision_marker(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        logger.debug("Skipping run with unreadable blackboard marker scan: %s", path, exc_info=True)
+        return False
+    return any(marker in text for marker in BLACKBOARD_SUPERVISION_MARKERS)
+
+
+def _load_blackboard_for_supervision(run_dir: Path, status: dict[str, Any]) -> dict[str, Any]:
+    blackboard_path = run_dir / "blackboard.yaml"
+    if not blackboard_path.exists():
+        return {}
+    run = status.get("run") if isinstance(status, dict) else {}
+    phase = status.get("phase") if isinstance(status, dict) else {}
+    run_status = _normalize_status(run.get("status")) if isinstance(run, dict) else ""
+    phase_name = str(phase.get("name") or "").strip() if isinstance(phase, dict) else ""
+    if not (
+        (run_status in NON_TERMINAL_RUN_STATUSES and phase_name == "coder_execution")
+        or (run_status in {"completed", "running"} and _blackboard_has_supervision_marker(blackboard_path))
+    ):
+        return {}
+    try:
+        loaded = load_blackboard(blackboard_path)
+    except Exception:
+        logger.debug("Skipping run with unreadable blackboard file: %s", blackboard_path, exc_info=True)
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _coder_run_id(run_id: str, blackboard: dict[str, Any]) -> str:
@@ -1023,8 +1071,8 @@ def list_active_coder_runs(cfg: ResolvedConfig, *, limit: int | None = None) -> 
             break
         if not _is_run_directory(run_dir):
             continue
-        status_payload = load_status(run_dir / "status.json")
-        blackboard = load_blackboard(run_dir / "blackboard.yaml")
+        status_payload = _load_status_safe(run_dir / "status.json")
+        blackboard = _load_blackboard_for_supervision(run_dir, status_payload)
         if not _is_coder_execution(status_payload, blackboard) and not _is_pr_lifecycle_supervisable(status_payload, blackboard):
             continue
         run_meta = status_payload.get("run") if isinstance(status_payload, dict) else {}
@@ -1060,7 +1108,7 @@ def list_active_coder_task_refs(cfg: ResolvedConfig, *, limit: int | None = None
             break
         if not _is_run_directory(run_dir):
             continue
-        status_payload = load_status(run_dir / "status.json")
+        status_payload = _load_status_safe(run_dir / "status.json")
         run = status_payload.get("run") if isinstance(status_payload, dict) else {}
         phase = status_payload.get("phase") if isinstance(status_payload, dict) else {}
         if not (

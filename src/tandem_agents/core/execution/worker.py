@@ -1455,7 +1455,7 @@ def _engine_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
     coordination = getattr(cfg, "coordination", None)
     lease_ttl = float(getattr(coordination, "lease_ttl_seconds", 300) or 300)
     heartbeat = float(getattr(coordination, "heartbeat_interval_seconds", 30) or 30)
-    return max(60.0, min(240.0, lease_ttl - heartbeat))
+    return max(120.0, min(360.0, (lease_ttl * 2.0) - heartbeat))
 
 
 def _engine_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -1475,7 +1475,7 @@ def _worker_async_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
             return max(30.0, float(raw))
         except ValueError:
             logger.debug("Invalid ACA_WORKER_ASYNC_PROMPT_TIMEOUT_SECONDS=%s", raw)
-    return 120.0
+    return 360.0
 
 
 def _worker_async_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -1485,7 +1485,7 @@ def _worker_async_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
             return max(15.0, float(raw))
         except ValueError:
             logger.debug("Invalid ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS=%s", raw)
-    return 60.0
+    return 180.0
 
 
 def _engine_async_dispatch_timeout_seconds(cfg: ResolvedConfig) -> float:

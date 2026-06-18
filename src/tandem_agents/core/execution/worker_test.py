@@ -1329,19 +1329,19 @@ diff --git a/src/repository_test.py b/src/repository_test.py
     def test_write_required_worker_async_timeouts_are_capped(self) -> None:
         cfg = SimpleNamespace(env={})
 
-        self.assertEqual(_async_prompt_timeout_seconds(cfg, "worker-1", True), 120.0)
-        self.assertEqual(_async_no_text_timeout_seconds(cfg, "worker-1", True), 60.0)
-        self.assertEqual(_async_prompt_timeout_seconds(cfg, "manager", False), 240.0)
+        self.assertEqual(_async_prompt_timeout_seconds(cfg, "worker-1", True), 360.0)
+        self.assertEqual(_async_no_text_timeout_seconds(cfg, "worker-1", True), 180.0)
+        self.assertEqual(_async_prompt_timeout_seconds(cfg, "manager", False), 360.0)
         self.assertEqual(_async_no_text_timeout_seconds(cfg, "manager", False), 210.0)
 
     def test_write_required_worker_prompt_sync_timeout_is_capped(self) -> None:
         cfg = SimpleNamespace(env={})
 
         self.assertEqual(_scaled_prompt_sync_timeout_seconds(cfg, "worker-1", True, 2.85), 480.0)
-        self.assertEqual(_scaled_async_prompt_timeout_seconds(cfg, "worker-1", True, 2.85), 120.0)
-        self.assertEqual(_scaled_async_no_text_timeout_seconds(cfg, "worker-1", True, 2.85), 60.0)
+        self.assertEqual(_scaled_async_prompt_timeout_seconds(cfg, "worker-1", True, 2.85), 360.0)
+        self.assertEqual(_scaled_async_no_text_timeout_seconds(cfg, "worker-1", True, 2.85), 180.0)
         self.assertEqual(_scaled_prompt_sync_timeout_seconds(cfg, "manager", False, 2.0), 180.0)
-        self.assertEqual(_scaled_async_prompt_timeout_seconds(cfg, "manager", False, 2.0), 480.0)
+        self.assertEqual(_scaled_async_prompt_timeout_seconds(cfg, "manager", False, 2.0), 600.0)
         self.assertEqual(_scaled_async_no_text_timeout_seconds(cfg, "manager", False, 2.0), 420.0)
 
     def test_merged_worker_timeout_multiplier_scales_with_contract_size(self) -> None:

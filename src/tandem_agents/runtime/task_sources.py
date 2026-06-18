@@ -10,6 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger("aca.task_sources")
+DEFAULT_LINEAR_BOARD_HYDRATION_LIMIT = 5
 
 from src.tandem_agents.core.repository.board import card_to_task, default_board, ensure_board_template, task_to_card
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
@@ -103,8 +104,28 @@ def _github_project_board_cache_path(cfg: ResolvedConfig) -> Path:
     return cfg.output_root() / "state" / "github_project_boards.json"
 
 
+def _linear_board_cache_path(cfg: ResolvedConfig) -> Path:
+    return cfg.output_root() / "state" / "linear_boards.json"
+
+
 def _github_project_board_cache_key(owner: str, project: int | str) -> str:
     return f"{str(owner).strip().lower()}:{int(project)}"
+
+
+def _linear_board_cache_key(cfg: ResolvedConfig) -> str:
+    parts = [
+        str(cfg.task_source.team or "").strip().lower(),
+        str(cfg.task_source.project or "").strip().lower(),
+        str(cfg.task_source.statuses or "").strip().lower(),
+        str(cfg.task_source.labels or "").strip().lower(),
+        str(cfg.task_source.query or "").strip().lower(),
+        str(cfg.repository.slug or "").strip().lower(),
+        str(cfg.repository.clone_url or "").strip().lower(),
+        str(cfg.repository.path or "").strip().lower(),
+        str(cfg.repository.default_branch or "").strip().lower(),
+        str(cfg.repository.remote_name or "").strip().lower(),
+    ]
+    return "|".join(parts)
 
 
 def _load_board_cache(cfg: ResolvedConfig) -> dict[str, Any]:
@@ -132,6 +153,33 @@ def _write_cached_board_snapshot(cfg: ResolvedConfig, owner: str, project: int, 
     cache = _load_board_cache(cfg)
     cache[_github_project_board_cache_key(owner, project)] = snapshot
     _save_board_cache(cfg, cache)
+
+
+def _load_linear_board_cache(cfg: ResolvedConfig) -> dict[str, Any]:
+    path = _linear_board_cache_path(cfg)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _save_linear_board_cache(cfg: ResolvedConfig, cache: dict[str, Any]) -> None:
+    path = _linear_board_cache_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def read_cached_linear_board_snapshot(cfg: ResolvedConfig) -> dict[str, Any] | None:
+    cache = _load_linear_board_cache(cfg)
+    record = cache.get(_linear_board_cache_key(cfg))
+    return record if isinstance(record, dict) else None
+
+
+def _write_cached_linear_board_snapshot(cfg: ResolvedConfig, snapshot: dict[str, Any]) -> None:
+    cache = _load_linear_board_cache(cfg)
+    cache[_linear_board_cache_key(cfg)] = snapshot
+    _save_linear_board_cache(cfg, cache)
 
 
 def invalidate_cached_github_project_board_snapshot(cfg: ResolvedConfig, owner: str, project: int) -> None:
@@ -1318,12 +1366,23 @@ def _linear_issue_body_may_be_truncated(issue: dict[str, Any]) -> bool:
     return any(marker in lowered for marker in LINEAR_TRUNCATED_BODY_MARKERS)
 
 
-def _linear_issue_for_contract_projection(cfg: ResolvedConfig, issue: dict[str, Any]) -> dict[str, Any]:
+def _linear_issue_needs_contract_hydration(cfg: ResolvedConfig, issue: dict[str, Any]) -> bool:
     if not _linear_requires_explicit_repo_hint(cfg):
-        return issue
+        return False
     if _linear_issue_repo_hints(issue):
+        return False
+    return _linear_issue_body_may_be_truncated(issue)
+
+
+def _linear_issue_for_contract_projection(
+    cfg: ResolvedConfig,
+    issue: dict[str, Any],
+    *,
+    hydrate_truncated: bool = True,
+) -> dict[str, Any]:
+    if not _linear_issue_needs_contract_hydration(cfg, issue):
         return issue
-    if not _linear_issue_body_may_be_truncated(issue):
+    if not hydrate_truncated:
         return issue
     return _hydrate_linear_issue_for_task(cfg, issue)
 
@@ -1709,6 +1768,15 @@ def _linear_scheduler_projection(cfg: ResolvedConfig, board_items: list[dict[str
     }
 
 
+def _linear_issue_sort_key(issue: dict[str, Any]) -> tuple[int, str, str]:
+    priority = _linear_issue_priority(issue)
+    return (
+        priority if priority is not None else 99,
+        _linear_issue_identifier(issue).lower(),
+        str(issue.get("title") or "").lower(),
+    )
+
+
 def _select_linear_issue(
     cfg: ResolvedConfig,
     *,
@@ -1805,15 +1873,46 @@ def linear_board_snapshot(
     cfg: ResolvedConfig,
     *,
     force_refresh: bool = False,
+    cache_ttl_seconds: int = 90,
 ) -> dict[str, Any]:
     from src.tandem_agents.core.scheduling.scheduler import task_execution_backend
 
     now_ms = int(time.time() * 1000)
-    statuses, _labels, issues = _load_linear_live_data(
-        cfg,
-        refresh_server=force_refresh,
-        include_all_project_statuses=True,
-    )
+    cached = read_cached_linear_board_snapshot(cfg)
+    if not force_refresh and cached:
+        last_synced_at_ms = int(cached.get("last_synced_at_ms") or 0)
+        if last_synced_at_ms and now_ms - last_synced_at_ms <= cache_ttl_seconds * 1000:
+            snapshot = dict(cached)
+            snapshot["source"] = "cached"
+            snapshot["is_stale"] = False
+            snapshot["cache_age_ms"] = now_ms - last_synced_at_ms
+            return snapshot
+    try:
+        statuses, _labels, issues = _load_linear_live_data(
+            cfg,
+            refresh_server=force_refresh,
+            include_all_project_statuses=True,
+        )
+    except Exception as exc:
+        if cached:
+            snapshot = dict(cached)
+            snapshot["source"] = "cached"
+            snapshot["is_stale"] = True
+            snapshot["warning"] = str(exc)
+            snapshot["cache_age_ms"] = now_ms - int(snapshot.get("last_synced_at_ms") or 0)
+            return snapshot
+        raise
+    hydration_candidates = [
+        issue
+        for issue in issues
+        if _linear_status_is_actionable(cfg, _linear_issue_status(issue), _linear_issue_state_type(issue))
+        and _linear_issue_needs_contract_hydration(cfg, issue)
+    ]
+    hydration_candidates.sort(key=_linear_issue_sort_key)
+    hydrate_ids = {
+        _linear_issue_identifier(issue) or _linear_issue_id(issue) or str(issue.get("title") or "")
+        for issue in hydration_candidates[:DEFAULT_LINEAR_BOARD_HYDRATION_LIMIT]
+    }
     columns: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
     for status in statuses:
@@ -1834,7 +1933,12 @@ def linear_board_snapshot(
     board_items: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     for issue in issues:
-        projected_issue = _linear_issue_for_contract_projection(cfg, issue)
+        identity = _linear_issue_identifier(issue) or _linear_issue_id(issue) or str(issue.get("title") or "")
+        projected_issue = _linear_issue_for_contract_projection(
+            cfg,
+            issue,
+            hydrate_truncated=identity in hydrate_ids,
+        )
         issue_id = _linear_issue_id(projected_issue)
         identifier = _linear_issue_identifier(projected_issue)
         status_name = _linear_issue_status(projected_issue)
@@ -1890,7 +1994,7 @@ def linear_board_snapshot(
     )
     for column in columns:
         column["item_count"] = counts.get(str(column.get("key") or ""), 0)
-    return {
+    snapshot = {
         "project": {
             "team": cfg.task_source.team,
             "project": cfg.task_source.project,
@@ -1904,6 +2008,79 @@ def linear_board_snapshot(
         "warning": "",
         "last_synced_at_ms": now_ms,
         "cache_age_ms": 0,
+    }
+    _write_cached_linear_board_snapshot(cfg, snapshot)
+    return snapshot
+
+
+def linear_preview_from_board_snapshot(cfg: ResolvedConfig, snapshot: dict[str, Any]) -> dict[str, Any]:
+    items = snapshot.get("items") if isinstance(snapshot.get("items"), list) else []
+    scheduler = snapshot.get("scheduler") if isinstance(snapshot.get("scheduler"), dict) else {}
+    next_ids = {str(value) for value in scheduler.get("next_item_ids") or []}
+    selected = next((item for item in items if str(item.get("id") or "") in next_ids), None)
+    if selected is None:
+        selected = next((item for item in items if item.get("actionable")), None)
+    if selected is None and items:
+        selected = items[0]
+    if selected is None:
+        raise RuntimeError("No Linear issues are available for preview.")
+    columns = snapshot.get("columns") if isinstance(snapshot.get("columns"), list) else []
+    board_summary = {
+        str(column.get("key") or column.get("name") or "unknown"): int(column.get("item_count") or 0)
+        for column in columns
+        if isinstance(column, dict)
+    }
+    if not board_summary:
+        for item in items:
+            status_key = str(item.get("status_key") or "unknown")
+            board_summary[status_key] = board_summary.get(status_key, 0) + 1
+    identifier = str(selected.get("identifier") or selected.get("id") or "").strip()
+    status_name = str(selected.get("status_name") or selected.get("project_column") or "").strip()
+    warning = str(snapshot.get("warning") or "").strip()
+    if snapshot.get("is_stale") and not warning:
+        warning = "Showing cached Linear task preview because live Linear refresh is currently unavailable."
+    return {
+        "eligible": bool(selected.get("actionable")),
+        "task": {
+            "title": selected.get("title"),
+            "id": identifier or selected.get("issue_id") or selected.get("id"),
+            "project_name": selected.get("project_name"),
+            "project_column": status_name or None,
+            "source": {
+                "type": "linear",
+                "team": cfg.task_source.team,
+                "project": cfg.task_source.project,
+                "item": identifier,
+                "identifier": identifier,
+                "issue_id": selected.get("issue_id") or identifier,
+                "url": selected.get("issue_url") or "",
+                "status": status_name,
+            },
+            "lane": selected.get("status_key") or normalize_linear_key(status_name) or "ready",
+            "labels": selected.get("labels", []),
+            "description": "",
+            "task_contract": None,
+            "program_goal": None,
+            "local_goal": None,
+            "in_scope": [],
+            "out_of_scope": [],
+            "dependencies": [],
+            "deliverables": [],
+            "target_files": [],
+            "verification_commands": [],
+            "acceptance_criteria": [],
+            "notes_for_agent": [],
+            "execution_kind": selected.get("execution_kind"),
+            "dependency_status": {},
+            "contract_completeness": selected.get("contract_completeness") or {},
+            "raw_issue_body": "",
+            "task_id": identifier,
+            "repo_routing": selected.get("repo_routing") or {},
+        },
+        "source_type": "linear",
+        "board_path": None,
+        "board_summary": board_summary,
+        **({"warning": warning} if warning else {}),
     }
 
 
