@@ -345,6 +345,42 @@ def _active_scheduler_integration_blockers(root: Path, cfg=None) -> list[dict[st
     return scheduler_integration_blockers(project_cfg, project_key=project_key)
 
 
+def _start_run_integration_blockers(
+    root: Path,
+    project_slug: Optional[str],
+    task_source_type: Optional[str],
+    overrides: Optional[Dict[str, str]],
+) -> list[dict[str, Any]]:
+    run_env: Dict[str, str] = {}
+    project_key = ""
+    if project_slug:
+        projects = _all_projects(root)
+        if project_slug in projects:
+            project = projects[project_slug]
+            run_env.update(_project_runtime_env(root, project, fallback_slug=project_slug))
+            source = project.get("source") if isinstance(project.get("source"), dict) else project.get("task_source")
+            project_key = task_project_key({"source": source}) if isinstance(source, dict) else ""
+        else:
+            run_env["ACA_REPO_SLUG"] = project_slug
+    if task_source_type:
+        run_env["ACA_TASK_SOURCE_TYPE"] = task_source_type
+    run_env.update(overrides or {})
+    cfg = resolve_config(root, env=run_env)
+    return scheduler_integration_blockers(cfg, project_key=project_key)
+
+
+def _raise_if_start_blocked(blockers: list[dict[str, Any]]) -> None:
+    if not blockers:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": "ACA cannot start this run while a required integration is blocked.",
+            "integration_blockers": blockers,
+        },
+    )
+
+
 def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: str = "") -> Dict[str, str]:
     env: Dict[str, str] = {}
     repo = project.get("repo") if isinstance(project.get("repo"), dict) else {}
@@ -1751,6 +1787,14 @@ def _scheduler_filtered_source_items(root: Path, project_slug: Optional[str], it
 @app.post("/runs/trigger")
 async def trigger_run(project_slug: Optional[str] = None, task_source_type: Optional[str] = None, item: Optional[str] = None, overrides: Dict[str, str] = {}, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
+    blockers = await asyncio.to_thread(
+        _start_run_integration_blockers,
+        root,
+        project_slug,
+        task_source_type,
+        overrides,
+    )
+    _raise_if_start_blocked(blockers)
     if item:
         try:
             item = (
@@ -1791,6 +1835,15 @@ async def trigger_runs_batch(
     items = [str(item or "").strip() for item in raw_items if str(item or "").strip()]
     if not items:
         raise HTTPException(status_code=400, detail="At least one item is required")
+
+    blockers = await asyncio.to_thread(
+        _start_run_integration_blockers,
+        root,
+        project_slug,
+        task_source_type,
+        overrides,
+    )
+    _raise_if_start_blocked(blockers)
 
     if respect_scheduler:
         try:
