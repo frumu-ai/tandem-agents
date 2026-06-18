@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -461,6 +462,9 @@ def _pull_request_number(pr: dict[str, Any]) -> int | None:
             return int(value)
         except (TypeError, ValueError):
             continue
+    match = re.search(r"/pull/(\d+)(?:\D*$|$)", _pull_request_url(pr))
+    if match:
+        return int(match.group(1))
     return None
 
 
@@ -1085,6 +1089,73 @@ def _existing_pull_request_metadata(
     return {}
 
 
+def _github_slug_from_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$", text):
+        return text.removesuffix(".git")
+    ssh_match = re.match(r"^git@github\.com:([^/]+)/(.+?)(?:\.git)?$", text)
+    if ssh_match:
+        return f"{ssh_match.group(1)}/{ssh_match.group(2).removesuffix('.git')}"
+    parsed = urlparse(text)
+    if parsed.netloc.lower() != "github.com":
+        return ""
+    path = parsed.path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return ""
+
+
+def _git_remote_slug(repo_path: Any, remote_name: str, env: dict[str, str]) -> str:
+    path_text = str(repo_path or "").strip()
+    if not path_text:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", path_text, "remote", "get-url", remote_name or "origin"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return _github_slug_from_url(result.stdout.strip())
+
+
+def _pull_request_repo_slug(cfg: ResolvedConfig, task: dict[str, Any]) -> str:
+    source = dict(task.get("source") or {})
+    owner = str(source.get("owner") or "").strip()
+    repo_name = str(source.get("repo_name") or source.get("repo") or "").strip()
+    if owner and repo_name:
+        return f"{owner}/{repo_name}"
+    repo = dict(task.get("repo") or {})
+    for value in (
+        repo.get("slug"),
+        repo.get("clone_url"),
+        task.get("repo_slug"),
+        task.get("repo_url"),
+        cfg.repository.slug,
+        cfg.repository.clone_url,
+    ):
+        slug = _github_slug_from_url(value)
+        if slug:
+            return slug
+    remote_name = str(repo.get("remote_name") or cfg.repository.remote_name or "origin")
+    for repo_path in (repo.get("path"), cfg.repository.path):
+        slug = _git_remote_slug(repo_path, remote_name, cfg.env)
+        if slug:
+            return slug
+    return ""
+
+
 def create_pull_request_metadata(
     cfg: ResolvedConfig,
     task: dict[str, Any],
@@ -1092,17 +1163,10 @@ def create_pull_request_metadata(
     title: str,
     body: str,
 ) -> dict[str, Any]:
-    source = dict(task.get("source") or {})
-    owner = str(source.get("owner") or "").strip()
-    repo_name = str(source.get("repo_name") or "").strip()
-
-    if not owner or not repo_name:
-        slug = cfg.repository.slug
-        if slug and "/" in slug:
-            owner, repo_name = slug.split("/", 1)
-
-    if not owner or not repo_name:
+    slug = _pull_request_repo_slug(cfg, task)
+    if "/" not in slug:
         return {"error": "Missing repository owner/name for PR creation."}
+    owner, repo_name = slug.split("/", 1)
 
     base_branch = cfg.repository.default_branch or "main"
     base_repo = f"{owner}/{repo_name}"

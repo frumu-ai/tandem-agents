@@ -184,7 +184,48 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertEqual(metadata["lifecycle_state"], "waiting-for-review")
             tool_mock.assert_not_called()
 
+    def test_create_pull_request_metadata_falls_back_to_task_repo_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.repository.slug = ""
+            cfg.repository.clone_url = ""
+            task = {
+                "run_id": "run-123",
+                "title": "Task",
+                "source": {"type": "manual"},
+                "repo": {"path": str(root / "repo")},
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp._git_remote_slug", return_value="acme/demo"):
+                with patch("src.tandem_agents.core.integrations.github_mcp.list_pull_requests", return_value=[]):
+                    with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                        tool_mock.return_value = {
+                            "output": '{"id":"3887993462","url":"https://github.com/acme/demo/pull/44"}',
+                            "metadata": {},
+                        }
+                        metadata = create_pull_request_metadata(
+                            cfg,
+                            task,
+                            head_branch="aca/task-123",
+                            title="aca: Task",
+                            body="PR body",
+                        )
+
+            self.assertEqual(metadata["url"], "https://github.com/acme/demo/pull/44")
+            self.assertEqual(metadata["number"], 44)
+            self.assertEqual(tool_mock.call_args.args[1], "mcp.github.create_pull_request")
+            self.assertEqual(tool_mock.call_args.args[2]["owner"], "acme")
+            self.assertEqual(tool_mock.call_args.args[2]["repo"], "demo")
+
     def test_pull_request_lifecycle_state_transitions(self) -> None:
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {"url": "https://github.com/frumu-ai/example/pull/44"},
+                head_branch="aca/task",
+                base_repo="frumu-ai/example",
+            )["number"],
+            44,
+        )
         self.assertEqual(
             normalize_pull_request_metadata(
                 {"state": "open", "draft": True, "number": 1, "checks_status": "pending"},
