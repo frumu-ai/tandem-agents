@@ -868,6 +868,21 @@ def _is_run_directory(run_dir: Path) -> bool:
     return (run_dir / "status.json").exists() or (run_dir / "blackboard.yaml").exists()
 
 
+def _run_state_mtime_ns(run_dir: Path) -> int:
+    mtimes: list[int] = []
+    for state_file in (run_dir / "status.json", run_dir / "blackboard.yaml"):
+        try:
+            mtimes.append(state_file.stat().st_mtime_ns)
+        except OSError:
+            pass
+    if mtimes:
+        return max(mtimes)
+    try:
+        return run_dir.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def _recent_run_dirs(output_root: Path, *, limit: int) -> list[Path]:
     candidates: list[tuple[int, str, Path]] = []
     if not output_root.exists():
@@ -875,11 +890,7 @@ def _recent_run_dirs(output_root: Path, *, limit: int) -> list[Path]:
     for run_dir in output_root.iterdir():
         if not _is_run_directory(run_dir):
             continue
-        try:
-            mtime_ns = run_dir.stat().st_mtime_ns
-        except OSError:
-            mtime_ns = 0
-        candidates.append((mtime_ns, run_dir.name, run_dir))
+        candidates.append((_run_state_mtime_ns(run_dir), run_dir.name, run_dir))
     candidates.sort(reverse=True)
     scan_limit = max(100, min(1000, max(1, limit) * 4))
     return [run_dir for _, _, run_dir in candidates[:scan_limit]]

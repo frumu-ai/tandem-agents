@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -258,6 +259,32 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                 _active_run_claim_for_task(cfg, "TAN-170"),
                 {"run_id": run_id, "lease_id": "lease-orphan"},
             )
+
+    def test_recent_run_dirs_prefers_state_file_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "runs"
+            output_root.mkdir(parents=True)
+            base_ns = 1_700_000_000_000_000_000
+
+            def seed_run(name: str, *, status_offset: int, dir_offset: int) -> None:
+                run_dir = output_root / name
+                run_dir.mkdir()
+                status_path = run_dir / "status.json"
+                status_path.write_text(
+                    json.dumps({"run": {"run_id": name, "status": "running", "updated_at_ms": status_offset}}),
+                    encoding="utf-8",
+                )
+                os.utime(status_path, ns=(base_ns + status_offset, base_ns + status_offset))
+                os.utime(run_dir, ns=(base_ns + dir_offset, base_ns + dir_offset))
+
+            seed_run("run-target", status_offset=10_000, dir_offset=1)
+            for index in range(100):
+                seed_run(f"run-other-{index:03d}", status_offset=index + 1, dir_offset=20_000 + index)
+
+            recent = api_main._recent_run_dirs(output_root, limit=1)
+
+            self.assertIn(output_root / "run-target", recent)
+            self.assertEqual(recent[0], output_root / "run-target")
 
     def test_coder_supervisor_reconcile_is_serialized(self) -> None:
         entered = threading.Event()

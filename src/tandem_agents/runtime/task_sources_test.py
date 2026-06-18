@@ -10,6 +10,7 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
     _collect_project_items,
     _hydrate_project_item_statuses_from_graphql,
+    _linear_board_cache_key,
     _linear_status_is_actionable,
     _load_github_project_live_data,
     _select_github_project_item,
@@ -551,6 +552,16 @@ class LinearTaskSourceTest(unittest.TestCase):
             encoding="utf-8",
         )
         return resolve_config(root)
+
+    def test_linear_board_cache_key_includes_repo_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            cfg_a = self._config(Path(tmp_a))
+            cfg_b = self._config(Path(tmp_b))
+            cfg_b.repository.slug = "frumu-ai/tandem-agents"
+            cfg_b.repository.clone_url = "https://github.com/frumu-ai/tandem-agents"
+            cfg_b.repository.path = "/workspace/repos/tandem-agents"
+
+            self.assertNotEqual(_linear_board_cache_key(cfg_a), _linear_board_cache_key(cfg_b))
 
     def test_linear_selection_prefers_configured_actionable_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

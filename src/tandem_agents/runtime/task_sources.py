@@ -119,6 +119,11 @@ def _linear_board_cache_key(cfg: ResolvedConfig) -> str:
         str(cfg.task_source.statuses or "").strip().lower(),
         str(cfg.task_source.labels or "").strip().lower(),
         str(cfg.task_source.query or "").strip().lower(),
+        str(cfg.repository.slug or "").strip().lower(),
+        str(cfg.repository.clone_url or "").strip().lower(),
+        str(cfg.repository.path or "").strip().lower(),
+        str(cfg.repository.default_branch or "").strip().lower(),
+        str(cfg.repository.remote_name or "").strip().lower(),
     ]
     return "|".join(parts)
 
