@@ -410,6 +410,55 @@ def _subtask_requires_content_changes(subtask: dict[str, Any]) -> bool:
     return any(token in text for token in strong_change_signals)
 
 
+def _positive_contract_identifier_tokens(subtask: dict[str, Any]) -> list[str]:
+    ignored_tokens = {
+        "as_dict",
+        "task_key",
+        "project_key",
+        "repo_key",
+        "scope_mode",
+        "scope_paths",
+    }
+
+    def _is_contract_identifier(token: str) -> bool:
+        if token in ignored_tokens:
+            return False
+        return (
+            token.startswith("max_")
+            or token.startswith("min_")
+            or token.startswith("aca_")
+            or token.endswith("_backpressure")
+            or token.endswith("_reached")
+            or token.endswith("_cents")
+            or token.endswith("_seconds")
+            or token.endswith("_limit")
+        )
+
+    values: list[str] = []
+    for field in ("goal", "description", "acceptance_criteria", "deliverables"):
+        value = subtask.get(field)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item or "") for item in value)
+        elif value:
+            values.append(str(value))
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        lowered = value.lower()
+        if "do not add" in lowered or "out of scope" in lowered:
+            continue
+        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", value):
+            normalized = token.lower()
+            if not _is_contract_identifier(normalized):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            tokens.append(normalized)
+    return tokens
+
+
 def subtask_satisfied(repo_path: Path, subtask: dict[str, Any]) -> bool:
     files = [
         str(raw_path or "").strip().lstrip("./")
@@ -431,6 +480,10 @@ def subtask_satisfied(repo_path: Path, subtask: dict[str, Any]) -> bool:
             continue
     repo_text = "\n".join(repo_text_parts)
     if not repo_text:
+        return False
+
+    required_identifiers = _positive_contract_identifier_tokens(subtask)
+    if required_identifiers and any(token not in repo_text for token in required_identifiers):
         return False
 
     subtask_like = {
