@@ -644,6 +644,33 @@ class WorkerDispatchTest(unittest.TestCase):
             )
         )
 
+    def test_test_only_diff_guard_allows_explicit_test_only_repair_scope(self) -> None:
+        subtask = {
+            "files": [
+                "src/tandem_agents/config/config_loader_test.py",
+                "src/tandem_agents/config/config_loader.py",
+            ],
+            "target_files": [
+                "src/tandem_agents/config/config_loader_test.py",
+                "src/tandem_agents/config/config_loader.py",
+            ],
+            "scope_note": (
+                "Mechanical slice 3 of 3 for throughput config controls. "
+                "Edit only config_loader_test.py. This is a test-only slice after "
+                "the config fields and loader wiring slices; do not edit production files here."
+            ),
+            "acceptance_criteria": [
+                "Add focused config loader test coverage for exact scheduler fields.",
+            ],
+        }
+
+        self.assertFalse(
+            _subtask_has_required_test_only_diff(
+                subtask,
+                ["src/tandem_agents/config/config_loader_test.py"],
+            )
+        )
+
     def test_test_only_diff_guard_rejects_required_production_followup(self) -> None:
         subtask = {
             "files": [

@@ -844,6 +844,13 @@ def _subtask_requires_production_followup_for_test_only_diff(subtask: dict[str, 
         elif value:
             text_parts.append(value)
     text = "\n".join(str(part or "").lower() for part in text_parts)
+    if (
+        "test-only slice" in text
+        or "test only slice" in text
+        or "do not edit production" in text
+        or "do not edit production files" in text
+    ):
+        return False
     return any(
         marker in text
         for marker in (
