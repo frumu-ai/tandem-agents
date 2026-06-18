@@ -317,12 +317,12 @@ def _tool_error_message(result: dict[str, Any]) -> str:
     return "unknown GitHub MCP error"
 
 
-def _parse_json_output(result: dict[str, Any]) -> dict[str, Any]:
+def _parse_json_output(result: dict[str, Any]) -> Any:
     output = result.get("output")
     if isinstance(output, str) and output.strip():
         try:
             parsed = json.loads(output)
-            if isinstance(parsed, dict):
+            if isinstance(parsed, (dict, list)):
                 return parsed
         except Exception:
             pass
@@ -342,7 +342,7 @@ def _parse_json_output(result: dict[str, Any]) -> dict[str, Any]:
                         parsed = json.loads(text)
                     except Exception:
                         continue
-                    if isinstance(parsed, dict):
+                    if isinstance(parsed, (dict, list)):
                         return parsed
     return {}
 

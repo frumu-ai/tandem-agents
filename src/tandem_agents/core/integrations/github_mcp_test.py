@@ -18,6 +18,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     github_project_status_name_for_outcome,
     github_project_status_name_for_task_state,
     guarded_auto_merge,
+    list_pull_requests,
     normalize_pull_request_metadata,
     update_project_item_status,
 )
@@ -183,6 +184,19 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertEqual(metadata["base_repo"], "frumu-ai/example")
             self.assertEqual(metadata["lifecycle_state"], "waiting-for-review")
             tool_mock.assert_not_called()
+
+    def test_list_pull_requests_accepts_list_tool_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                tool_mock.return_value = {
+                    "output": '[{"number":44,"html_url":"https://github.com/acme/demo/pull/44"}]',
+                    "metadata": {},
+                }
+                pulls = list_pull_requests(cfg, "acme", "demo", state="open")
+
+            self.assertEqual(pulls[0]["number"], 44)
 
     def test_create_pull_request_metadata_falls_back_to_task_repo_remote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
