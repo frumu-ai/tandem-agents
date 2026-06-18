@@ -108,6 +108,22 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertIn("Reconnect the Linear MCP server", blocker["message"])
             self.assertIn("invalid_grant", blocker["phase_detail"])
 
+    def test_crash_blocker_classifies_stripped_linear_tool_execute_500(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.task_source.type = "linear"
+
+            blocker = _crash_blocker_for_exception(
+                cfg,
+                RuntimeError(
+                    "Server error '500 Internal Server Error' for url "
+                    "'http://127.0.0.1:39731/tool/execute'"
+                ),
+            )
+
+            self.assertEqual(blocker["kind"], "linear_mcp_auth_required")
+            self.assertIn("Reconnect the Linear MCP server", blocker["message"])
+
     def test_crash_blocker_classifies_linear_mcp_pending_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))

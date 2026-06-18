@@ -235,6 +235,47 @@ class OutboxDispatcherTest(unittest.TestCase):
             self.assertEqual(snapshot["summary"]["dispatched_outbox"], 2)
             self.assertEqual(snapshot["summary"]["pending_outbox"], 0)
 
+    def test_linear_dispatch_exception_retries_outbox_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "ENG-2",
+                "title": "Linear Task",
+                "source": {
+                    "type": "linear",
+                    "team": "ENG",
+                    "issue_id": "lin-2",
+                    "identifier": "ENG-2",
+                },
+            }
+            store.enqueue_outbox(
+                kind="linear_issue.status_update",
+                aggregate_type="task",
+                aggregate_id="ENG-2",
+                payload={"task": task, "target_status": "Blocked"},
+                dedupe_key="run-1:linear-status",
+            )
+
+            with patch("src.tandem_agents.core.scheduling.outbox_dispatcher.ensure_linear_mcp_connected", return_value=None):
+                with patch(
+                    "src.tandem_agents.core.scheduling.outbox_dispatcher.linear_update_issue",
+                    side_effect=RuntimeError(
+                        "Server error '500 Internal Server Error' for url "
+                        "'http://127.0.0.1:39731/tool/execute'"
+                    ),
+                ):
+                    summary = dispatch_outbox_tick(cfg, coordination=store)
+
+            self.assertEqual(summary["dispatched"], 0)
+            self.assertEqual(summary["retried"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["items"][0]["status"], "retry")
+            self.assertIn("/tool/execute", summary["items"][0]["error"])
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["summary"]["pending_outbox"], 1)
+
     def test_linear_comment_requires_marker_readback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

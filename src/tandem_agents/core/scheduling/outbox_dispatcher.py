@@ -351,7 +351,29 @@ def dispatch_outbox_tick(
 
     try:
         for outbox in claimed:
-            result = dispatch_outbox_item(cfg, outbox)
+            try:
+                result = dispatch_outbox_item(cfg, outbox)
+            except Exception as exc:  # noqa: BLE001 - external MCP dispatch must not crash ACA
+                outbox_id = int(outbox.get("id") or 0)
+                attempts = int(outbox.get("attempts") or 0)
+                error = str(exc).strip() or "outbox dispatch raised an exception"
+                terminal = attempts >= DEFAULT_OUTBOX_MAX_ATTEMPTS
+                store.retry_outbox(outbox_id, error=error, terminal=terminal)
+                if terminal:
+                    failed += 1
+                else:
+                    retried += 1
+                items.append(
+                    {
+                        "outbox_id": outbox_id,
+                        "kind": outbox.get("kind"),
+                        "payload": dict(outbox.get("payload") or {}),
+                        "status": "failed" if terminal else "retry",
+                        "terminal": terminal,
+                        "error": error,
+                    }
+                )
+                continue
             outbox_id = int(result.get("outbox_id") or 0)
             status = str(result.get("status") or "").strip().lower()
             terminal = bool(result.get("terminal"))

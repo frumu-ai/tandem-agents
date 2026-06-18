@@ -3536,6 +3536,12 @@ def _exception_is_linear_mcp_auth_required(cfg: ResolvedConfig, detail: str) -> 
         "invalid_grant",
         "client id mismatch",
     )
+    if (
+        "500 internal server error" in normalized
+        and "/tool/execute" in normalized
+        and "127.0.0.1" in normalized
+    ):
+        return True
     return any(marker in normalized for marker in auth_markers) and (
         "linear" in normalized or "mcp" in normalized or "oauth" in normalized
     )
