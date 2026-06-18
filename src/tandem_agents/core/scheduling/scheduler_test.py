@@ -207,6 +207,7 @@ class SchedulerTest(unittest.TestCase):
             root = Path(tmp)
             cfg = self._config(root)
             cfg.scheduler.max_active_tasks = 6
+            cfg.scheduler.max_concurrent_worker_runs = 99
             cfg.scheduler.max_active_tasks_per_project = 1
             cfg.scheduler.max_active_tasks_per_repo = 1
 
@@ -230,6 +231,36 @@ class SchedulerTest(unittest.TestCase):
             self.assertFalse(plan["blocked"])
             self.assertTrue(all(item["scope_mode"] == "files" for item in plan["admitted"]))
             self.assertEqual({item["repo_key"] for item in plan["admitted"]}, {task["repo"]["slug"] for task in tasks})
+
+    def test_scheduler_worker_concurrency_cap_blocks_remaining_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 6
+            cfg.scheduler.max_concurrent_worker_runs = 2
+            cfg.scheduler.max_active_tasks_per_project = 6
+            cfg.scheduler.max_active_tasks_per_repo = 6
+
+            store = CoordinationStore.from_config(cfg)
+            tasks = [
+                {
+                    "task_id": f"task-{suffix}",
+                    "title": f"Task {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/project-{suffix}", "path": str(root / f"repo-{suffix}")},
+                    "files": [f"src/file-{suffix}.py"],
+                }
+                for suffix in ("a", "b", "c")
+            ]
+            for task in tasks:
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertEqual(len(plan["admitted"]), 2)
+            self.assertEqual(plan["limits"]["max_concurrent_worker_runs"], 2)
+            blocked_reasons = {item["reason"] for item in plan["blocked"]}
+            self.assertIn("worker_concurrency_reached", blocked_reasons)
 
     def test_scheduler_scans_active_coder_runs_once_per_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

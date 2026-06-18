@@ -325,6 +325,11 @@ class CoordinationConfig:
 @dataclass
 class SchedulerConfig:
     policy: str = DEFAULT_SCHEDULER_POLICY
+    max_concurrent_worker_runs: int = 4
+    max_daily_model_spend_cents: int = 0
+    rate_limit_backpressure: bool = True
+    ci_backpressure: bool = True
+    merge_queue_backpressure: bool = True
     max_active_tasks: int = DEFAULT_SCHEDULER_MAX_ACTIVE_TASKS
     max_active_tasks_per_project: int = DEFAULT_SCHEDULER_MAX_ACTIVE_TASKS_PER_PROJECT
     max_active_tasks_per_repo: int = DEFAULT_SCHEDULER_MAX_ACTIVE_TASKS_PER_REPO
@@ -561,6 +566,11 @@ class ResolvedConfig:
             },
             "scheduler": {
                 "policy": self.scheduler.policy,
+                "max_concurrent_worker_runs": self.scheduler.max_concurrent_worker_runs,
+                "max_daily_model_spend_cents": self.scheduler.max_daily_model_spend_cents,
+                "rate_limit_backpressure": self.scheduler.rate_limit_backpressure,
+                "ci_backpressure": self.scheduler.ci_backpressure,
+                "merge_queue_backpressure": self.scheduler.merge_queue_backpressure,
                 "max_active_tasks": self.scheduler.max_active_tasks,
                 "max_active_tasks_per_project": self.scheduler.max_active_tasks_per_project,
                 "max_active_tasks_per_repo": self.scheduler.max_active_tasks_per_repo,
