@@ -494,6 +494,63 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             self.assertEqual(detail["integration_blockers"][0]["reason"], "linear_mcp_auth_required")
             start_run.assert_not_called()
 
+    def test_project_board_refresh_reports_linear_integration_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/workspace/projects",
+                        params={
+                            "slug": "linear-target",
+                            "repo_path": "repos/tandem",
+                            "name": "Linear Target",
+                        },
+                        json={
+                            "type": "linear",
+                            "team": "team-1",
+                            "project": "project-1",
+                        },
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+
+                    with patch(
+                        "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                        return_value={
+                            "name": "linear",
+                            "auth_kind": "oauth",
+                            "connected": False,
+                            "last_auth_challenge": {
+                                "authorization_url": "https://linear.example.test/authorize"
+                            },
+                            "last_error": "Authorization required.",
+                        },
+                    ):
+                        blocked = client.get(
+                            "/projects/linear-target/board",
+                            params={"refresh": "true"},
+                            headers={"Authorization": "Bearer secret-token"},
+                        )
+
+            self.assertEqual(blocked.status_code, 409, blocked.text)
+            detail = blocked.json()["detail"]
+            self.assertEqual(
+                detail["message"],
+                "ACA cannot refresh this project board while a required integration is blocked.",
+            )
+            self.assertEqual(detail["integration_blockers"][0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(
+                detail["integration_blockers"][0]["authorization_url"],
+                "https://linear.example.test/authorize",
+            )
+
     def test_trigger_batch_blocks_scheduler_bypass_when_linear_integration_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

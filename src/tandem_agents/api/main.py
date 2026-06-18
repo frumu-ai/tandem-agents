@@ -369,15 +369,22 @@ def _start_run_integration_blockers(
     return scheduler_integration_blockers(cfg, project_key=project_key)
 
 
-def _raise_if_start_blocked(blockers: list[dict[str, Any]]) -> None:
+def _raise_if_integration_blocked(blockers: list[dict[str, Any]], *, message: str) -> None:
     if not blockers:
         return
     raise HTTPException(
         status_code=409,
         detail={
-            "message": "ACA cannot start this run while a required integration is blocked.",
+            "message": message,
             "integration_blockers": blockers,
         },
+    )
+
+
+def _raise_if_start_blocked(blockers: list[dict[str, Any]]) -> None:
+    _raise_if_integration_blocked(
+        blockers,
+        message="ACA cannot start this run while a required integration is blocked.",
     )
 
 
@@ -1712,6 +1719,11 @@ async def sync_project_repo(slug: str, token: str = Depends(get_token)):
 async def get_project_board(slug: str, refresh: bool = False, token: str = Depends(get_token)):
     root = Path(os.environ.get("ACA_ROOT", "."))
     _, cfg = _project_config(root, slug)
+    blockers = await asyncio.to_thread(_start_run_integration_blockers, root, slug, None, None)
+    _raise_if_integration_blocked(
+        blockers,
+        message="ACA cannot refresh this project board while a required integration is blocked.",
+    )
     from src.tandem_agents.runtime.task_sources import task_source_board_snapshot
 
     try:
