@@ -285,6 +285,42 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(plan["admitted"][0]["task_key"], snapshot["queued"][0]["task_key"])
             self.assertFalse(plan["blocked"])
 
+    def test_scheduler_blocks_linear_admission_when_mcp_auth_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.linear_mcp.enabled = True
+            store = CoordinationStore.from_config(cfg)
+            task = {
+                "task_id": "linear-task",
+                "title": "Linear task",
+                "source": {"type": "linear", "team": "team-1", "project": "project-target"},
+                "repo": {"slug": "frumu-ai/target", "path": str(root / "target")},
+            }
+            registered = store.register_task(task, repo=task["repo"], status="queued")
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_auth_challenge": {
+                        "authorization_url": "https://linear.example.test/authorize"
+                    },
+                    "last_error": "Authorization required.",
+                },
+            ):
+                plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertFalse(plan["admitted"])
+            self.assertEqual(plan["blocked"][0]["task_key"], registered["task_key"])
+            self.assertEqual(plan["blocked"][0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(
+                plan["blocked"][0]["authorization_url"],
+                "https://linear.example.test/authorize",
+            )
+
     def test_scheduler_project_filter_keeps_global_active_repo_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

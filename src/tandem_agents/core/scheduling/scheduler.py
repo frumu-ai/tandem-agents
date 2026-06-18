@@ -7,6 +7,7 @@ from typing import Any
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
+from src.tandem_agents.core.integrations.linear_mcp import get_mcp_server, linear_mcp_server_name
 from src.tandem_agents.core.task_contract import classify_task_execution_kind
 from src.tandem_agents.core.scheduling.coder_supervisor import list_active_coder_task_refs
 
@@ -137,6 +138,57 @@ def _active_state(task: dict[str, Any]) -> bool:
     return str(task.get("state") or task.get("status") or "").strip().lower() in {"claimed", "active", "review"}
 
 
+def _task_source_type(task: dict[str, Any]) -> str:
+    metadata = dict(task.get("metadata") or {})
+    source_task = dict(metadata.get("task") or {})
+    source = dict(task.get("source") or source_task.get("source") or {})
+    return (_nonempty(source.get("type")) or _nonempty(task.get("source_type"))).lower()
+
+
+def _server_auth_url(server: dict[str, Any]) -> str:
+    challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
+    if isinstance(challenge, dict):
+        authorization_url = _nonempty(challenge.get("authorization_url") or challenge.get("authorizationUrl"))
+        if authorization_url:
+            return authorization_url
+    pending = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+    if isinstance(pending, dict):
+        for value in pending.values():
+            if not isinstance(value, dict):
+                continue
+            authorization_url = _nonempty(value.get("authorization_url") or value.get("authorizationUrl"))
+            if authorization_url:
+                return authorization_url
+    return _nonempty(server.get("authorization_url") or server.get("authorizationUrl"))
+
+
+def _linear_mcp_admission_blocker(cfg: ResolvedConfig, queued: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not cfg.linear_mcp.enabled or not any(_task_source_type(task) == "linear" for task in queued):
+        return None
+    server_name = linear_mcp_server_name(cfg)
+    try:
+        server = get_mcp_server(cfg, server_name)
+    except Exception as exc:
+        return {
+            "reason": "linear_mcp_status_unavailable",
+            "blocked_reason": f"Could not inspect Linear MCP server '{server_name}': {exc}",
+        }
+    if not isinstance(server, dict):
+        return {
+            "reason": "linear_mcp_not_configured",
+            "blocked_reason": f"Linear MCP server '{server_name}' is not configured.",
+        }
+    if bool(server.get("connected")):
+        return None
+    last_error = _nonempty(server.get("last_error") or server.get("lastError"))
+    blocked_reason = last_error or f"Linear MCP server '{server_name}' is not connected."
+    return {
+        "reason": "linear_mcp_auth_required",
+        "blocked_reason": blocked_reason,
+        "authorization_url": _server_auth_url(server),
+    }
+
+
 def scheduler_snapshot(
     cfg: ResolvedConfig,
     *,
@@ -216,6 +268,7 @@ def plan_task_admissions(
 
     grouped: dict[str, deque[dict[str, Any]]] = {}
     blocked: list[dict[str, Any]] = []
+    linear_mcp_blocker = _linear_mcp_admission_blocker(cfg, queued)
     active_coder_runs = list_active_coder_task_refs(cfg)
     active_coder_task_keys = {
         _nonempty(item.get("task_key"))
@@ -230,6 +283,20 @@ def plan_task_admissions(
     for task in queued:
         blocked_reason = None
         dependency_status = task.get("dependency_status") or {}
+        if linear_mcp_blocker is not None and _task_source_type(task) == "linear":
+            blocked.append(
+                {
+                    "task_key": task.get("task_key"),
+                    "project_key": task_project_key(task),
+                    "repo_key": task_repo_key(task),
+                    "reason": linear_mcp_blocker["reason"],
+                    "blocked_reason": linear_mcp_blocker.get("blocked_reason"),
+                    "authorization_url": linear_mcp_blocker.get("authorization_url"),
+                    "scope_mode": _scope_mode(task),
+                    "task": task,
+                }
+            )
+            continue
         if dependency_status.get("blocked"):
             blocked_reason = {
                 "reason": "dependency_blocked",
