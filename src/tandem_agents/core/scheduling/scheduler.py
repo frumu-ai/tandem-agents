@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import defaultdict, deque
 from pathlib import PurePosixPath
 from typing import Any
@@ -14,6 +15,9 @@ from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
 from src.tandem_agents.core.integrations.linear_mcp import get_mcp_server, linear_mcp_server_name
 from src.tandem_agents.core.task_contract import classify_task_execution_kind
 from src.tandem_agents.core.scheduling.coder_supervisor import list_active_coder_task_refs
+
+
+LINEAR_AUTH_CHALLENGE_MAX_AGE_MS = 4 * 60 * 1000
 
 
 def _nonempty(value: Any) -> str:
@@ -166,6 +170,56 @@ def _server_auth_url(server: dict[str, Any]) -> str:
     return _nonempty(server.get("authorization_url") or server.get("authorizationUrl"))
 
 
+def _server_auth_challenge_age_ms(server: dict[str, Any]) -> int | None:
+    challenge = server.get("last_auth_challenge") or server.get("lastAuthChallenge")
+    candidates: list[Any] = []
+    if isinstance(challenge, dict):
+        candidates.extend(
+            [
+                challenge.get("requested_at_ms"),
+                challenge.get("requestedAtMs"),
+                challenge.get("first_seen_ms"),
+                challenge.get("firstSeenMs"),
+            ]
+        )
+    pending = server.get("pending_auth_by_tool") or server.get("pendingAuthByTool")
+    if isinstance(pending, dict):
+        for value in pending.values():
+            if not isinstance(value, dict):
+                continue
+            candidates.extend(
+                [
+                    value.get("requested_at_ms"),
+                    value.get("requestedAtMs"),
+                    value.get("first_seen_ms"),
+                    value.get("firstSeenMs"),
+                    value.get("last_probe_ms"),
+                    value.get("lastProbeMs"),
+                ]
+            )
+    timestamps = []
+    for raw in candidates:
+        try:
+            timestamp = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if timestamp > 0:
+            timestamps.append(timestamp)
+    if not timestamps:
+        return None
+    return max(0, int(time.time() * 1000) - max(timestamps))
+
+
+def _linear_auth_challenge_max_age_ms() -> int:
+    raw = os.environ.get("ACA_LINEAR_AUTH_CHALLENGE_MAX_AGE_MS", "")
+    if raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return LINEAR_AUTH_CHALLENGE_MAX_AGE_MS
+    return LINEAR_AUTH_CHALLENGE_MAX_AGE_MS
+
+
 def _control_panel_public_origin(cfg: ResolvedConfig) -> str:
     env = cfg.env if isinstance(getattr(cfg, "env", None), dict) else {}
     for key in ("TANDEM_CONTROL_PANEL_PUBLIC_URL", "HOSTED_CONTROL_PANEL_PUBLIC_URL", "HOSTED_PUBLIC_URL"):
@@ -221,7 +275,17 @@ def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
     last_error = _nonempty(server.get("last_error") or server.get("lastError"))
     blocked_reason = last_error or f"Linear MCP server '{server_name}' is not connected."
     authorization_url = _server_auth_url(server)
-    if not authorization_url and _nonempty(server.get("auth_kind") or server.get("authKind")).lower() == "oauth":
+    auth_kind = _nonempty(server.get("auth_kind") or server.get("authKind")).lower()
+    challenge_age_ms = _server_auth_challenge_age_ms(server)
+    refresh_auth_url = not authorization_url
+    if (
+        auth_kind == "oauth"
+        and authorization_url
+        and challenge_age_ms is not None
+        and challenge_age_ms > _linear_auth_challenge_max_age_ms()
+    ):
+        refresh_auth_url = True
+    if auth_kind == "oauth" and refresh_auth_url:
         try:
             authorization_url = _request_linear_auth_url(cfg, server_name)
         except Exception:
