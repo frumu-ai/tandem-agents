@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import os
 import re
 import shutil
@@ -268,16 +269,11 @@ def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
     if checkout_result.returncode != 0:
         raise RuntimeError(checkout_result.stderr.strip() or checkout_result.stdout.strip())
 
-    pull_result = run_command(
-        _git_repo_args(repo_path, "pull", "--ff-only", remote_name, default_branch, prefix=args),
-        env=env,
-    )
-    if pull_result.returncode != 0:
-        raise RuntimeError(pull_result.stderr.strip() or pull_result.stdout.strip())
+    _heal_or_fast_forward_default_branch(cfg, repo_path, remote_name, default_branch, prefix=args, env=env)
     _ensure_default_branch_matches_remote(repo_path, remote_name, default_branch)
 
 
-def _ensure_default_branch_matches_remote(repo_path: Path, remote_name: str, default_branch: str) -> None:
+def _default_branch_divergence(repo_path: Path, remote_name: str, default_branch: str) -> tuple[int, int]:
     remote = _validate_remote_name(remote_name)
     branch = str(default_branch or "main").strip() or "main"
     remote_ref = f"{remote}/{branch}"
@@ -291,6 +287,128 @@ def _ensure_default_branch_matches_remote(repo_path: Path, remote_name: str, def
     parts = counts.stdout.strip().split()
     behind = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
     ahead = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return behind, ahead
+
+
+def _is_managed_repository_cache(cfg: ResolvedConfig, repo_path: Path) -> bool:
+    if not _path_is_within(repo_path, cfg.repository_worktree_root()):
+        return False
+    raw_path = str(cfg.repository.path or "").strip().replace("\\", "/").rstrip("/")
+    if not raw_path:
+        return True
+    if raw_path == "/workspace/repos" or raw_path.startswith("/workspace/repos/"):
+        return True
+    if raw_path == "workspace/repos" or raw_path.startswith("workspace/repos/"):
+        return True
+    return False
+
+
+def _archive_branch_name(default_branch: str, short_head: str) -> str:
+    branch_part = slugify(str(default_branch or "main"), limit=40)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    suffix = slugify(short_head or "head", limit=16)
+    return f"aca/archive/{branch_part}/{timestamp}-{suffix}"
+
+
+def _archive_local_default_branch(repo_path: Path, default_branch: str, *, env: dict[str, str] | None = None) -> str:
+    short_head = run_command(_git_repo_args(repo_path, "rev-parse", "--short=12", "HEAD"), env=env)
+    if short_head.returncode != 0:
+        raise RuntimeError(short_head.stderr.strip() or short_head.stdout.strip())
+    backup_branch = _archive_branch_name(default_branch, short_head.stdout.strip())
+    backup_ref = f"refs/heads/{backup_branch}"
+    result = run_command(_git_repo_args(repo_path, "update-ref", backup_ref, "HEAD"), env=env)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    return backup_branch
+
+
+def _archive_and_reset_managed_default_branch(
+    cfg: ResolvedConfig,
+    repo_path: Path,
+    default_branch: str,
+    remote_ref: str,
+    *,
+    ahead: int,
+    env: dict[str, str] | None = None,
+) -> None:
+    branch = str(default_branch or "main").strip() or "main"
+    if not _is_managed_repository_cache(cfg, repo_path):
+        raise RuntimeError(
+            f"Default branch `{branch}` is ahead of `{remote_ref}` by {ahead} commits; "
+            "ACA refuses to base work on local-only commits outside its managed repository cache."
+        )
+    _archive_local_default_branch(repo_path, branch, env=env)
+    reset_result = run_command(_git_repo_args(repo_path, "reset", "--hard", remote_ref), env=env)
+    if reset_result.returncode != 0:
+        raise RuntimeError(reset_result.stderr.strip() or reset_result.stdout.strip())
+
+
+def _heal_or_fast_forward_default_branch(
+    cfg: ResolvedConfig,
+    repo_path: Path,
+    remote_name: str,
+    default_branch: str,
+    *,
+    prefix: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    remote = _validate_remote_name(remote_name)
+    branch = str(default_branch or "main").strip() or "main"
+    remote_ref = f"{remote}/{branch}"
+    behind, ahead = _default_branch_divergence(repo_path, remote, branch)
+    if ahead:
+        _archive_and_reset_managed_default_branch(
+            cfg,
+            repo_path,
+            branch,
+            remote_ref,
+            ahead=ahead,
+            env=env,
+        )
+        return
+    if not behind:
+        return
+    pull_result = run_command(
+        _git_repo_args(repo_path, "pull", "--ff-only", remote, branch, prefix=prefix),
+        env=env,
+    )
+    if pull_result.returncode != 0:
+        raise RuntimeError(pull_result.stderr.strip() or pull_result.stdout.strip())
+
+
+def _heal_managed_default_branch_ahead(
+    cfg: ResolvedConfig,
+    repo_path: Path,
+    remote_name: str,
+    default_branch: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    remote = _validate_remote_name(remote_name)
+    branch = str(default_branch or "main").strip() or "main"
+    remote_ref = f"{remote}/{branch}"
+    behind, ahead = _default_branch_divergence(repo_path, remote, branch)
+    if ahead:
+        _archive_and_reset_managed_default_branch(
+            cfg,
+            repo_path,
+            branch,
+            remote_ref,
+            ahead=ahead,
+            env=env,
+        )
+        return
+    if behind:
+        raise RuntimeError(
+            f"Default branch `{branch}` is behind `{remote_ref}` by {behind} commits after sync."
+        )
+
+
+def _ensure_default_branch_matches_remote(repo_path: Path, remote_name: str, default_branch: str) -> None:
+    remote = _validate_remote_name(remote_name)
+    branch = str(default_branch or "main").strip() or "main"
+    remote_ref = f"{remote}/{branch}"
+    behind, ahead = _default_branch_divergence(repo_path, remote, branch)
     if ahead:
         raise RuntimeError(
             f"Default branch `{branch}` is ahead of `{remote_ref}` by {ahead} commits; "
@@ -587,7 +705,7 @@ def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) 
         raise RuntimeError(
             f"Remote default branch `{base_ref}` is not available for ACA run branch checkout."
         )
-    _ensure_default_branch_matches_remote(repo_path, remote_name, default_branch)
+    _heal_managed_default_branch_ahead(cfg, repo_path, remote_name, default_branch, env=cfg.env)
 
     branch_exists = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", branch_name), env=cfg.env)
     if branch_exists.returncode == 0:

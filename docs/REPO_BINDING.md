@@ -63,6 +63,20 @@ If `ACA_REPO_PATH` points at an empty directory and a clone source is configured
 - Do not let different tasks share the same mutable checkout unless the task is very small.
 - In Docker, the clone base is `ACA_WORKSPACE_ROOT`; on the host, use `ACA_WORKTREE_ROOT` for local worktrees.
 
+## Managed Checkout Sync
+
+ACA treats project checkouts under `workspace/repos/...` or `/workspace/repos/...` as
+its own managed cache. Before a run starts, ACA fetches the configured remote and
+makes the default branch match the remote default branch. If the managed default
+branch contains local-only commits, ACA preserves the old tip as a local branch
+under `aca/archive/<default-branch>/...` and resets the default branch to the
+remote. This lets Linear queue runs continue from GitHub `main` instead of
+reusing a dirty local base.
+
+Explicit local repository paths outside the managed cache remain fail-closed:
+ACA refuses to reset local-only commits there. Uncommitted changes always block
+sync because there is no commit object to archive safely.
+
 ## Validation Checklist
 
 Before starting work, verify:
