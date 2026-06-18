@@ -32,6 +32,7 @@ from src.tandem_agents.core.execution.worker import (
     _recover_nonzero_result_with_diff,
     _recover_nonzero_result_if_diff_satisfies_subtask,
     _recover_seeded_pr_candidate_diff,
+    _run_deterministic_throughput_slice,
     _seed_pr_candidate_diff,
     _seedable_pr_candidate_specs,
     _scaled_async_no_text_timeout_seconds,
@@ -1972,6 +1973,98 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(output["returncode"], 0)
             self.assertTrue(stream_prompt.call_args.kwargs["write_required"])
             self.assertTrue(stream_prompt.call_args.kwargs["prompt_sync_first"])
+
+    def test_deterministic_throughput_config_loader_slice_writes_expected_env_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "src/tandem_agents/config/config_loader.py"
+            target.parent.mkdir(parents=True)
+            source = Path("src/tandem_agents/config/config_loader.py")
+            target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+            log_path = root / "worker.log"
+
+            result = _run_deterministic_throughput_slice(
+                root,
+                {"id": "fallback-throughput-config-loader"},
+                log_path,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["returncode"], 0)
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS", text)
+            self.assertIn("ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS", text)
+            self.assertIn("ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE", text)
+            self.assertIn("ACA_SCHEDULER_CI_BACKPRESSURE", text)
+            self.assertIn("ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE", text)
+            self.assertIn("max_concurrent_worker_runs=max(", text)
+            self.assertEqual(result["changed_files"], ["src/tandem_agents/config/config_loader.py"])
+
+    def test_run_worker_subtask_uses_deterministic_throughput_slice_without_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            repo_path.mkdir()
+            worktree.mkdir()
+            target = worktree / "src/tandem_agents/config/config_loader.py"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                Path("src/tandem_agents/config/config_loader.py").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace()
+
+            def summarize(result: dict[str, object], *_args: object) -> dict[str, object]:
+                return dict(result)
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt") as stream_prompt, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._terminalize_worker_after_tool_loop",
+                    side_effect=lambda _cfg, result, *_args, **_kwargs: result,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._coerce_worker_failure",
+                    side_effect=lambda result, *_args, **_kwargs: result,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._recover_nonzero_result_if_diff_satisfies_subtask",
+                    side_effect=lambda result, *_args, **_kwargs: result,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sync_worktree_changes",
+                    return_value=["src/tandem_agents/config/config_loader.py"],
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", side_effect=summarize):
+                output = run_worker_subtask(
+                    cfg,
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-173", "source": {"type": "manual"}, "title": "Task"},
+                    {
+                        "id": "fallback-throughput-config-loader",
+                        "title": "Config loader",
+                        "goal": "Add exact scheduler env wiring",
+                        "files": ["src/tandem_agents/config/config_loader.py"],
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 0)
+            self.assertEqual(output["engine"], {"skipped": True, "reason": "deterministic_throughput_slice"})
+            self.assertIn("src/tandem_agents/config/config_loader.py", output["changed_files"])
+            stream_prompt.assert_not_called()
 
     def test_worker_incomplete_diff_defers_retry_to_outer_repair_loop(self) -> None:
         self.assertFalse(

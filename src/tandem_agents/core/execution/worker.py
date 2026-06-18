@@ -431,6 +431,334 @@ def _subtask_prefers_prompt_sync_first(subtask: dict[str, Any]) -> bool:
     return "mechanical slice" in scope_note and "deterministic repo-context" in scope_note
 
 
+def _replace_once(text: str, old: str, new: str) -> tuple[str, bool]:
+    if old not in text:
+        return text, False
+    return text.replace(old, new, 1), True
+
+
+def _write_if_changed(path: Path, text: str) -> bool:
+    previous = path.read_text(encoding="utf-8") if path.exists() else ""
+    if previous == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def _deterministic_throughput_config_types(worktree: Path) -> list[str]:
+    rel_path = "src/tandem_agents/config/config_types.py"
+    path = worktree / rel_path
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    changed = False
+    if "max_concurrent_worker_runs: int" not in text:
+        text, inserted = _replace_once(
+            text,
+            "class SchedulerConfig:\n    policy: str = DEFAULT_SCHEDULER_POLICY\n",
+            "class SchedulerConfig:\n"
+            "    policy: str = DEFAULT_SCHEDULER_POLICY\n"
+            "    max_concurrent_worker_runs: int = 4\n"
+            "    max_daily_model_spend_cents: int = 0\n"
+            "    rate_limit_backpressure: bool = True\n"
+            "    ci_backpressure: bool = True\n"
+            "    merge_queue_backpressure: bool = True\n",
+        )
+        changed = changed or inserted
+    if '"max_concurrent_worker_runs": self.scheduler.max_concurrent_worker_runs' not in text:
+        text, inserted = _replace_once(
+            text,
+            '            "scheduler": {\n                "policy": self.scheduler.policy,\n',
+            '            "scheduler": {\n'
+            '                "policy": self.scheduler.policy,\n'
+            '                "max_concurrent_worker_runs": self.scheduler.max_concurrent_worker_runs,\n'
+            '                "max_daily_model_spend_cents": self.scheduler.max_daily_model_spend_cents,\n'
+            '                "rate_limit_backpressure": self.scheduler.rate_limit_backpressure,\n'
+            '                "ci_backpressure": self.scheduler.ci_backpressure,\n'
+            '                "merge_queue_backpressure": self.scheduler.merge_queue_backpressure,\n',
+        )
+        changed = changed or inserted
+    return [rel_path] if changed and _write_if_changed(path, text) else []
+
+
+def _deterministic_throughput_config_loader(worktree: Path) -> list[str]:
+    rel_path = "src/tandem_agents/config/config_loader.py"
+    path = worktree / rel_path
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    changed = False
+    if "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS" not in text:
+        text, inserted = _replace_once(
+            text,
+            "        ),\n        max_active_tasks=max(\n",
+            "        ),\n"
+            "        max_concurrent_worker_runs=max(\n"
+            "            0,\n"
+            "            _as_int(\n"
+            "                pick(\n"
+            '                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS",\n'
+            '                    yaml_value=scheduler_data.get("max_concurrent_worker_runs"),\n'
+            "                    default=4,\n"
+            "                ),\n"
+            "                4,\n"
+            "            ),\n"
+            "        ),\n"
+            "        max_daily_model_spend_cents=max(\n"
+            "            0,\n"
+            "            _as_int(\n"
+            "                pick(\n"
+            '                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS",\n'
+            '                    yaml_value=scheduler_data.get("max_daily_model_spend_cents"),\n'
+            "                    default=0,\n"
+            "                ),\n"
+            "                0,\n"
+            "            ),\n"
+            "        ),\n"
+            "        rate_limit_backpressure=_as_bool(\n"
+            "            pick(\n"
+            '                "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE",\n'
+            '                yaml_value=scheduler_data.get("rate_limit_backpressure"),\n'
+            "                default=True,\n"
+            "            )\n"
+            "        ),\n"
+            "        ci_backpressure=_as_bool(\n"
+            "            pick(\n"
+            '                "ACA_SCHEDULER_CI_BACKPRESSURE",\n'
+            '                yaml_value=scheduler_data.get("ci_backpressure"),\n'
+            "                default=True,\n"
+            "            )\n"
+            "        ),\n"
+            "        merge_queue_backpressure=_as_bool(\n"
+            "            pick(\n"
+            '                "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE",\n'
+            '                yaml_value=scheduler_data.get("merge_queue_backpressure"),\n'
+            "                default=True,\n"
+            "            )\n"
+            "        ),\n"
+            "        max_active_tasks=max(\n",
+        )
+        changed = changed or inserted
+    return [rel_path] if changed and _write_if_changed(path, text) else []
+
+
+def _deterministic_throughput_config_loader_tests(worktree: Path) -> list[str]:
+    rel_path = "src/tandem_agents/config/config_loader_test.py"
+    path = worktree / rel_path
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    if "test_scheduler_budget_and_backpressure_env_overrides" in text:
+        return []
+    test_block = '''
+    def test_scheduler_budget_and_backpressure_env_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: manual
+                      prompt: Do the thing
+                    repository:
+                      slug: frumu-ai/example
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\\n",
+                encoding="utf-8",
+            )
+
+            defaults = resolve_config(root)
+
+            self.assertEqual(defaults.scheduler.max_concurrent_worker_runs, 4)
+            self.assertEqual(defaults.scheduler.max_daily_model_spend_cents, 0)
+            self.assertTrue(defaults.scheduler.rate_limit_backpressure)
+            self.assertTrue(defaults.scheduler.ci_backpressure)
+            self.assertTrue(defaults.scheduler.merge_queue_backpressure)
+
+            cfg = resolve_config(
+                root,
+                env={
+                    "ACA_SCHEDULER_MAX_CONCURRENT_WORKER_RUNS": "2",
+                    "ACA_SCHEDULER_MAX_DAILY_MODEL_SPEND_CENTS": "1234",
+                    "ACA_SCHEDULER_RATE_LIMIT_BACKPRESSURE": "false",
+                    "ACA_SCHEDULER_CI_BACKPRESSURE": "false",
+                    "ACA_SCHEDULER_MERGE_QUEUE_BACKPRESSURE": "false",
+                },
+            )
+
+            self.assertEqual(cfg.scheduler.max_concurrent_worker_runs, 2)
+            self.assertEqual(cfg.scheduler.max_daily_model_spend_cents, 1234)
+            self.assertFalse(cfg.scheduler.rate_limit_backpressure)
+            self.assertFalse(cfg.scheduler.ci_backpressure)
+            self.assertFalse(cfg.scheduler.merge_queue_backpressure)
+'''
+    marker = '\n    def test_task_source_payload_can_come_from_env_json(self) -> None:\n'
+    text, inserted = _replace_once(text, marker, test_block + marker)
+    return [rel_path] if inserted and _write_if_changed(path, text) else []
+
+
+def _deterministic_throughput_scheduler_controls(worktree: Path, *, tests_only: bool = False) -> list[str]:
+    changed_files: list[str] = []
+    scheduler_rel = "src/tandem_agents/core/scheduling/scheduler.py"
+    scheduler_path = worktree / scheduler_rel
+    if not tests_only and scheduler_path.exists():
+        text = scheduler_path.read_text(encoding="utf-8")
+        changed = False
+        if "max_concurrent_worker_runs" not in text:
+            text, inserted = _replace_once(
+                text,
+                "    max_total = max(1, int(cfg.scheduler.max_active_tasks))\n",
+                "    max_active_total = max(1, int(cfg.scheduler.max_active_tasks))\n"
+                "    max_worker_runs = max(0, int(cfg.scheduler.max_concurrent_worker_runs))\n"
+                "    max_total = min(max_active_total, max_worker_runs) if max_worker_runs > 0 else max_active_total\n",
+            )
+            changed = changed or inserted
+            text, inserted = _replace_once(
+                text,
+                '            "max_active_tasks": max_total,\n',
+                '            "max_active_tasks": max_total,\n'
+                '            "max_concurrent_worker_runs": max_worker_runs,\n',
+            )
+            changed = changed or inserted
+        if "worker_concurrency_reached" not in text:
+            text, inserted = _replace_once(
+                text,
+                "        if not progressed:\n            break\n\n    snapshot = {\n",
+                "        if not progressed:\n"
+                "            break\n\n"
+                "    if max_worker_runs > 0 and len(admitted) >= max_worker_runs:\n"
+                "        for queue in grouped.values():\n"
+                "            for task in list(queue):\n"
+                "                task_scopes = task_file_scopes(task)\n"
+                "                blocked.append(\n"
+                "                    {\n"
+                '                        "task_key": task.get("task_key"),\n'
+                '                        "project_key": task_project_key(task),\n'
+                '                        "repo_key": task_repo_key(task),\n'
+                '                        "reason": "worker_concurrency_reached",\n'
+                '                        "scope_mode": _scope_mode(task),\n'
+                '                        "scope_paths": ["/".join(parts) for parts in task_scopes],\n'
+                "                    }\n"
+                "                )\n"
+                "            queue.clear()\n\n"
+                "    snapshot = {\n",
+            )
+            changed = changed or inserted
+        if changed and _write_if_changed(scheduler_path, text):
+            changed_files.append(scheduler_rel)
+
+    test_rel = "src/tandem_agents/core/scheduling/scheduler_test.py"
+    test_path = worktree / test_rel
+    if test_path.exists():
+        text = test_path.read_text(encoding="utf-8")
+        changed = False
+        if "cfg.scheduler.max_concurrent_worker_runs = 99" not in text:
+            text, inserted = _replace_once(
+                text,
+                "            cfg.scheduler.max_active_tasks = 6\n"
+                "            cfg.scheduler.max_active_tasks_per_project = 1\n",
+                "            cfg.scheduler.max_active_tasks = 6\n"
+                "            cfg.scheduler.max_concurrent_worker_runs = 99\n"
+                "            cfg.scheduler.max_active_tasks_per_project = 1\n",
+            )
+            changed = changed or inserted
+        if "test_scheduler_worker_concurrency_cap_blocks_remaining_work" not in text:
+            test_block = '''
+    def test_scheduler_worker_concurrency_cap_blocks_remaining_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 6
+            cfg.scheduler.max_concurrent_worker_runs = 2
+            cfg.scheduler.max_active_tasks_per_project = 6
+            cfg.scheduler.max_active_tasks_per_repo = 6
+
+            store = CoordinationStore.from_config(cfg)
+            tasks = [
+                {
+                    "task_id": f"task-{suffix}",
+                    "title": f"Task {suffix}",
+                    "source": {"type": "manual", "prompt": "Do the thing", "source_name": f"project-{suffix}"},
+                    "repo": {"slug": f"frumu-ai/project-{suffix}", "path": str(root / f"repo-{suffix}")},
+                    "files": [f"src/file-{suffix}.py"],
+                }
+                for suffix in ("a", "b", "c")
+            ]
+            for task in tasks:
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            self.assertEqual(len(plan["admitted"]), 2)
+            self.assertEqual(plan["limits"]["max_concurrent_worker_runs"], 2)
+            blocked_reasons = {item["reason"] for item in plan["blocked"]}
+            self.assertIn("worker_concurrency_reached", blocked_reasons)
+'''
+            marker = "\n    def test_scheduler_scans_active_coder_runs_once_per_plan(self) -> None:\n"
+            text, inserted = _replace_once(text, marker, test_block + marker)
+            changed = changed or inserted
+        if changed and _write_if_changed(test_path, text):
+            changed_files.append(test_rel)
+    return changed_files
+
+
+def _run_deterministic_throughput_slice(worktree: Path, subtask: dict[str, Any], log_path: Path) -> dict[str, Any] | None:
+    subtask_id = str(subtask.get("id") or "").strip()
+    if not subtask_id.startswith("fallback-throughput-"):
+        return None
+    changed_files: list[str] = []
+    if subtask_id == "fallback-throughput-config-types":
+        changed_files = _deterministic_throughput_config_types(worktree)
+    elif subtask_id == "fallback-throughput-config-loader":
+        changed_files = _deterministic_throughput_config_loader(worktree)
+    elif subtask_id == "fallback-throughput-config-loader-tests":
+        changed_files = _deterministic_throughput_config_loader_tests(worktree)
+    elif subtask_id == "fallback-throughput-scheduler-controls-part-1":
+        changed_files = _deterministic_throughput_scheduler_controls(worktree)
+    elif subtask_id == "fallback-throughput-scheduler-controls-part-2":
+        changed_files = _deterministic_throughput_scheduler_controls(worktree, tests_only=True)
+    else:
+        return None
+    previous = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    if not changed_files:
+        log_path.write_text(
+            previous
+            + f"ACA deterministic throughput slice found no required edits for {subtask_id}.\n",
+            encoding="utf-8",
+        )
+        return None
+    log_path.write_text(
+        previous
+        + "ACA_DETERMINISTIC_THROUGHPUT_SLICE: applied deterministic repo-context edit for "
+        + f"{subtask_id}.\nChanged files:\n"
+        + "".join(f"- {path}\n" for path in changed_files),
+        encoding="utf-8",
+    )
+    return {
+        "role": "worker",
+        "returncode": 0,
+        "stdout": (
+            "ACA_DETERMINISTIC_THROUGHPUT_SLICE completed.\n"
+            "Changed files:\n"
+            + "".join(f"- {path}\n" for path in changed_files)
+        ),
+        "stderr": "",
+        "log_path": str(log_path),
+        "cwd": str(worktree),
+        "changed_files": changed_files,
+        "engine": {"skipped": True, "reason": "deterministic_throughput_slice"},
+    }
+
+
 def _engine_exception_is_timeout(exc: Exception) -> bool:
     text = str(exc).lower()
     return "timed out" in text or "timeout" in text or "operation did not finish within" in text
@@ -4154,21 +4482,39 @@ def run_worker_subtask(
         _clear_active_worker_attempt(layout, worker_id, execution_id)
         return summarize_worker_notes(worker_result, worker_id, subtask, worktree, index)
 
-    result = stream_tandem_prompt(
-        cfg,
-        role=worker_id,
-        prompt=prompt,
-        cwd=worktree,
-        provider=worker_cli_provider,
-        model=worker_model,
-        env=env,
-        log_path=log_path,
-        config_path=config_path,
-        require_tool_use=True,
-        write_required=write_required,
-        prompt_sync_first=_subtask_prefers_prompt_sync_first(subtask) if write_required else None,
-        timeout_multiplier=timeout_multiplier,
-    )
+    result = _run_deterministic_throughput_slice(worktree, subtask, log_path) if write_required else None
+    if result is not None:
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
+            "worker.deterministic_slice_completed",
+            run_id,
+            {
+                "worker_id": worker_id,
+                "subtask_id": subtask["id"],
+                "execution_id": execution_id,
+                "changed_files": list(result.get("changed_files") or []),
+            },
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
+    else:
+        result = stream_tandem_prompt(
+            cfg,
+            role=worker_id,
+            prompt=prompt,
+            cwd=worktree,
+            provider=worker_cli_provider,
+            model=worker_model,
+            env=env,
+            log_path=log_path,
+            config_path=config_path,
+            require_tool_use=True,
+            write_required=write_required,
+            prompt_sync_first=_subtask_prefers_prompt_sync_first(subtask) if write_required else None,
+            timeout_multiplier=timeout_multiplier,
+        )
     result["write_required"] = write_required
 
     if _run_has_terminal_status(layout):
