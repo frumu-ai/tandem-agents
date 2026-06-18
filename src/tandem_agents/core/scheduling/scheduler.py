@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
 from collections import defaultdict, deque
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
@@ -162,6 +166,40 @@ def _server_auth_url(server: dict[str, Any]) -> str:
     return _nonempty(server.get("authorization_url") or server.get("authorizationUrl"))
 
 
+def _control_panel_public_origin(cfg: ResolvedConfig) -> str:
+    env = cfg.env if isinstance(getattr(cfg, "env", None), dict) else {}
+    for key in ("TANDEM_CONTROL_PANEL_PUBLIC_URL", "HOSTED_CONTROL_PANEL_PUBLIC_URL", "HOSTED_PUBLIC_URL"):
+        value = _nonempty(env.get(key) or os.environ.get(key)).rstrip("/")
+        if value:
+            return value
+    return ""
+
+
+def _request_linear_auth_url(cfg: ResolvedConfig, server_name: str) -> str:
+    headers: dict[str, str] = {}
+    token = cfg.tandem_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-Tandem-Token"] = token
+    public_origin = _control_panel_public_origin(cfg)
+    if public_origin:
+        parsed = urlparse(public_origin)
+        headers["Origin"] = public_origin
+        headers["X-Forwarded-Proto"] = parsed.scheme or "https"
+        headers["X-Forwarded-Host"] = parsed.netloc
+
+    request = Request(
+        f"{cfg.tandem.base_url.rstrip('/')}/mcp/{quote(server_name)}/auth",
+        headers=headers,
+        method="POST",
+    )
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if isinstance(payload, dict):
+        return _server_auth_url(payload)
+    return ""
+
+
 def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
     if not cfg.linear_mcp.enabled:
         return None
@@ -182,10 +220,16 @@ def _linear_mcp_status_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
         return None
     last_error = _nonempty(server.get("last_error") or server.get("lastError"))
     blocked_reason = last_error or f"Linear MCP server '{server_name}' is not connected."
+    authorization_url = _server_auth_url(server)
+    if not authorization_url and _nonempty(server.get("auth_kind") or server.get("authKind")).lower() == "oauth":
+        try:
+            authorization_url = _request_linear_auth_url(cfg, server_name)
+        except Exception:
+            authorization_url = ""
     return {
         "reason": "linear_mcp_auth_required",
         "blocked_reason": blocked_reason,
-        "authorization_url": _server_auth_url(server),
+        "authorization_url": authorization_url,
     }
 
 

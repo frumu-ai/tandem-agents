@@ -354,6 +354,37 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
             self.assertEqual(blockers[0]["project_key"], "linear:team-1/project-target")
 
+    def test_scheduler_requests_linear_auth_url_when_server_list_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.task_source.type = "linear"
+            cfg.task_source.team = "team-1"
+            cfg.task_source.project = "project-target"
+            cfg.linear_mcp.enabled = True
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.get_mcp_server",
+                return_value={
+                    "name": "linear",
+                    "auth_kind": "oauth",
+                    "connected": False,
+                    "last_error": (
+                        'MCP endpoint returned HTTP 401: {"error":"invalid_token",'
+                        '"error_description":"Missing or invalid access token"}'
+                    ),
+                },
+            ), patch(
+                "src.tandem_agents.core.scheduling.scheduler._request_linear_auth_url",
+                return_value="https://linear.example.test/authorize",
+            ) as request_auth:
+                blockers = scheduler_integration_blockers(cfg)
+
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
+            self.assertEqual(blockers[0]["authorization_url"], "https://linear.example.test/authorize")
+            request_auth.assert_called_once_with(cfg, "linear")
+
     def test_scheduler_project_filter_keeps_global_active_repo_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
