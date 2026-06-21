@@ -13,6 +13,12 @@ from .calculator import add, describe_operation, multiply, subtract
 
 
 class CalculatorTest(unittest.TestCase):
+    def test_available_operations_returns_sorted_registry_names(self):
+        self.assertEqual(
+            calculator.available_operations(),
+            ("add", "divide", "multiply", "subtract"),
+        )
+
     def test_package_exports_calculator_helpers(self):
         self.assertIs(exported_add, add)
         self.assertIs(exported_subtract, subtract)

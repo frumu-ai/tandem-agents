@@ -27,6 +27,19 @@ def divide(left, right):
     return left / right
 
 
+_OPERATION_REGISTRY = {
+    "add": (add, "+"),
+    "divide": (divide, "/"),
+    "multiply": (multiply, "*"),
+    "subtract": (subtract, "-"),
+}
+
+
+def available_operations():
+    """Return a sorted tuple of supported operation names."""
+    return tuple(sorted(_OPERATION_REGISTRY))
+
+
 def describe_operation(name, left, right):
     """Describe and execute a supported calculator operation.
 
@@ -34,16 +47,9 @@ def describe_operation(name, left, right):
     and ``"divide"``. Unknown operation names raise ``ValueError`` so callers
     can reliably detect unsupported requests.
     """
-    if name == "add":
-        result = add(left, right)
-        return f"{left} + {right} = {result}"
-    if name == "subtract":
-        result = subtract(left, right)
-        return f"{left} - {right} = {result}"
-    if name == "multiply":
-        result = multiply(left, right)
-        return f"{left} * {right} = {result}"
-    if name == "divide":
-        result = divide(left, right)
-        return f"{left} / {right} = {result}"
-    raise ValueError(f"unknown operation: {name}")
+    try:
+        operation, symbol = _OPERATION_REGISTRY[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown operation: {name}") from exc
+    result = operation(left, right)
+    return f"{left} {symbol} {right} = {result}"
