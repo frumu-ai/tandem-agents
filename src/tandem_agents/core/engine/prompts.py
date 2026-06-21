@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from pathlib import Path
 from typing import Any
 
 from src.tandem_agents.config.config_types import ResolvedConfig
@@ -32,6 +33,10 @@ WORKER_SUBTASK_CONTRACT_CHAR_LIMIT = 2_500
 WORKER_SUBTASK_TEXT_CHAR_LIMIT = 1_600
 WORKER_JSON_CHAR_LIMIT = 2_000
 WORKER_PR_SUMMARY_CHAR_LIMIT = 2_500
+WORKER_REPAIR_PARENT_SCOPE_CHAR_LIMIT = 900
+WORKER_REPAIR_SUBTASK_CONTRACT_CHAR_LIMIT = 1_400
+WORKER_REPAIR_SUBTASK_TEXT_CHAR_LIMIT = 900
+WORKER_REPAIR_JSON_CHAR_LIMIT = 1_200
 
 
 def _partial_diff_repair_prompt_mode(previous_feedback: str | None) -> str:
@@ -146,6 +151,17 @@ def _subtask_mentions_test_work(subtask: dict[str, Any]) -> bool:
     return any(word in text for word in ("test", "tests", "coverage", "regression"))
 
 
+def _task_requires_code_edit_write(task: dict[str, Any], target_files: list[str], subtask: dict[str, Any]) -> bool:
+    if subtask.get("pre_satisfied"):
+        return False
+    if not any(_is_source_or_test_target_path(path) for path in target_files):
+        return False
+    source = task.get("source") if isinstance(task.get("source"), dict) else {}
+    source_type = str(source.get("type") or task.get("source_type") or "").strip()
+    execution_kind = str(task.get("execution_kind") or "").strip()
+    return execution_kind == "code_edit" and source_type in {"linear", "github_project", "manual"}
+
+
 def _is_support_only_target_path(path: str) -> bool:
     rel_path = str(path or "").strip().replace("\\", "/").rstrip("/")
     if not rel_path:
@@ -159,6 +175,8 @@ def _is_support_only_target_path(path: str) -> bool:
 
 
 def _repair_requires_test_first(subtask: dict[str, Any]) -> bool:
+    if _as_list(subtask.get("repair_requires_test_followup")):
+        return True
     text = " ".join(
         str(subtask.get(key) or "")
         for key in (
@@ -168,8 +186,12 @@ def _repair_requires_test_first(subtask: dict[str, Any]) -> bool:
             "blocker_kind",
         )
     ).lower()
-    return "worker_off_track_testless_diff" in text or (
-        "changed only non-test files" in text and "required test files" in text
+    return (
+        "worker_off_track_testless_diff" in text
+        or ("changed only non-test files" in text and "required test files" in text)
+        or "worker_verifiable_diff_weak_test" in text
+        or "did not add a test method or assertion" in text
+        or "weak test" in text
     )
 
 
@@ -197,10 +219,19 @@ def _subtask_contract_for_worker(subtask: dict[str, Any], target_files: list[str
 
 
 def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) -> str:
-    if not subtask.get("discarded_partial_diff_patch"):
-        return ""
     carries_preserved_patch = bool(subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches"))
+    if not subtask.get("discarded_partial_diff_patch") and not carries_preserved_patch:
+        return ""
     summary = _clip_prompt_text(subtask.get("repair_failure_summary"), 300)
+    focus_instructions = [
+        clipped
+        for raw in [
+            *_as_list(subtask.get("repair_focus_instructions")),
+            subtask.get("repair_focus_instruction"),
+        ]
+        if (clipped := _clip_prompt_text(raw, 500))
+    ]
+    focus_instructions = list(dict.fromkeys(focus_instructions))
     changed_files = [
         str(entry).strip()
         for entry in _as_list(subtask.get("repair_changed_files"))
@@ -209,6 +240,46 @@ def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) ->
     target_line = json.dumps(target_files)
     changed_line = json.dumps(changed_files)
     summary_line = f"\n- Failure summary: {summary}" if summary else ""
+    focus_line = "".join(f"\n- Immediate repair focus: {instruction}" for instruction in focus_instructions)
+    raw_diff_line_budget = str(subtask.get("repair_diff_line_budget") or "").strip()
+    precision_line = ""
+    if subtask.get("repair_precision_edit") or raw_diff_line_budget:
+        budget_text = raw_diff_line_budget or "80"
+        precision_line = (
+            "\n- Precision repair budget: keep the final diff under about "
+            + budget_text
+            + " changed lines, preserve existing file structure, avoid whole-file rewrites, and stop with a blocker instead of broadening scope if the exact paired edit is not clear."
+            " Do not use whole-file write/overwrite tools on existing target files for this repair; use patch/edit-style changes against the existing file contents."
+        )
+    focused_verification_text = "\n".join(
+        str(entry or "")
+        for entry in [
+            subtask.get("repair_failure_summary"),
+            subtask.get("repair_worker_output_excerpt"),
+            *list(_as_list(subtask.get("acceptance_criteria"))),
+        ]
+    ).lower()
+    focused_verification_failed = bool(subtask.get("repair_verification_first")) or any(
+        marker in focused_verification_text
+        for marker in (
+            "focused verification",
+            "focused tests failed",
+            "nameerror:",
+            "typeerror:",
+            "attributeerror:",
+            "assertionerror:",
+            "failed (failures=",
+        )
+    )
+    focused_repair_line = ""
+    if focused_verification_failed:
+        focused_repair_line = (
+            "\n- Failed-test repair rule: inspect the current production function definitions and existing call sites "
+            "before changing signatures or expectations. If the failed test calls an API shape production does not "
+            "currently support, fix that newly added test/caller unless the parent issue explicitly requires the new "
+            "public API. Derive assertion expectations from existing production behavior or callers; do not invent a "
+            "new branch/worktree/name format just to satisfy the failed patch."
+        )
     if carries_preserved_patch:
         return (
             "\nCarry-forward repair directive:\n"
@@ -218,8 +289,11 @@ def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) ->
             "- Do not read, apply, or copy patch artifact paths; treat artifacts only as historical failure evidence.\n"
             "- First actions: read the target files and combined diff, then run the narrowest relevant verification or "
             "make only the minimal focused fix needed for that verification.\n"
+            f"{focus_line}"
+            f"{precision_line}\n"
             "- Valid coverage must call production code or an existing exported behavior; a helper-only or local-oracle "
             "test fails this repair."
+            f"{focused_repair_line}"
             f"{summary_line}\n"
         )
     return (
@@ -229,8 +303,11 @@ def _repair_directive_block(subtask: dict[str, Any], target_files: list[str]) ->
         f"- Rejected diff touched: {changed_line}.\n"
         "- First actions: read the target files, identify the existing production path, make one focused edit/test, "
         "then run the narrowest relevant verification.\n"
+        f"{focus_line}"
+        f"{precision_line}\n"
         "- Valid coverage must call production code or an existing exported behavior; a helper-only or local-oracle "
         "test fails this repair."
+        f"{focused_repair_line}"
         f"{summary_line}\n"
     )
 
@@ -543,8 +620,110 @@ def _bounded_prompt_json(value: Any, limit: int) -> str:
     return _clip_prompt_text(rendered, limit)
 
 
+def _subtask_is_repair_prompt(subtask: dict[str, Any]) -> bool:
+    repair_prefixes = ("repair_", "discarded_partial_diff", "carry_forward")
+    return bool(
+        subtask.get("deterministic_testless_repair")
+        or subtask.get("deterministic_partial_diff_repair")
+        or any(str(key).startswith(repair_prefixes) for key in subtask)
+    )
+
+
+def _worker_immediate_action_block(
+    target_files: list[str],
+    substantive_target_files: list[str],
+    required_test_targets: list[str],
+    write_required: bool,
+) -> str:
+    production_targets = [path for path in substantive_target_files if not _is_test_target_path(path)]
+    lines = ["Immediate worker action order:"]
+    if target_files:
+        lines.append(f"1. Read the declared target files first: {json.dumps(target_files)}.")
+    else:
+        lines.append("1. Discover and read the smallest relevant tracked source or test file first.")
+    if write_required and required_test_targets and production_targets:
+        lines.append(
+            "2. Make one focused production edit and one paired test edit back-to-back before broad searches: "
+            f"production={json.dumps(production_targets)}, tests={json.dumps(required_test_targets)}."
+        )
+    elif write_required and substantive_target_files:
+        lines.append(
+            "2. Make the smallest semantic edit in one declared substantive target before broad searches: "
+            f"{json.dumps(substantive_target_files)}."
+        )
+    elif write_required:
+        lines.append("2. Make the smallest semantic edit in a tracked source or test file that directly satisfies the subtask.")
+    else:
+        lines.append("2. If no edit is needed, prove the subtask is already satisfied with tool output before finishing.")
+    lines.append("3. Run one narrow verification command or readback for the changed files.")
+    lines.append("4. Stop expanding scope and return changed files, validation, and blockers.")
+    return "\n".join(lines) + "\n"
+
+
+def _docs_only_target_files(paths: list[str]) -> bool:
+    if not paths:
+        return False
+    return all(path.startswith("docs/") and Path(path).suffix.lower() in {".md", ".mdx"} for path in paths)
+
+
+def _build_docs_only_worker_prompt(
+    run_id: str,
+    worker_id: str,
+    subtask: dict[str, Any],
+    task: dict[str, Any],
+    target_files: list[str],
+    existing_files: str,
+    write_required: bool,
+) -> str:
+    parent_title = _clip_prompt_text(task.get("title"), 300)
+    subtask_title = _clip_prompt_text(subtask.get("title") or parent_title, 300)
+    subtask_goal = _clip_prompt_text(subtask.get("goal") or subtask_title, 700)
+    acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], 1600)
+    target_json = json.dumps(target_files)
+    write_line = (
+        "This worker is write-required; do not finish without a real diff in the target docs unless editing them is unsafe.\n"
+        if write_required
+        else "If the docs already satisfy the task, prove that with tool output before finishing without edits.\n"
+    )
+    carries_preserved_patch = bool(subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches"))
+    repair_context = _clip_prompt_text(subtask.get("repair_worker_output_excerpt"), 900)
+    repair_block = ""
+    if carries_preserved_patch:
+        repair_block = (
+            "Preserved docs patch status: ACA has already applied the previous partial docs diff before this worker starts.\n"
+            "Continue from the current worktree state; do not recreate the carried doc from scratch.\n"
+        )
+        if repair_context:
+            repair_block += f"Recovered blocker context: {repair_context}\n"
+        repair_block += "\n"
+    return (
+        f"You are ACA worker {worker_id} in run {run_id}.\n"
+        "Your isolated git worktree is the current directory. Edit only this worktree.\n"
+        "Use only repository-relative paths in every tool call; never use /workspace or other absolute paths.\n"
+        "Use tools immediately. Do not answer from memory.\n\n"
+        f"Task: {parent_title}\n"
+        f"Subtask: {subtask_title}\n"
+        f"Goal: {subtask_goal}\n"
+        f"Target docs: {target_json}\n"
+        f"Existing readable target files before this worker: {existing_files}\n"
+        f"Acceptance criteria: {acceptance_criteria}\n\n"
+        f"{repair_block}"
+        "Required action order:\n"
+        f"1. Read each existing target doc first, and check missing targets by exact path: {target_json}.\n"
+        "2. Make the smallest documentation edit that satisfies the criteria. Create missing parent directories if needed.\n"
+        "3. Keep the diff limited to the target docs. Do not edit source, test, runtime, config, lock, or temporary files.\n"
+        "4. Verify with a narrow readback or grep of the changed docs. If the task names a verification command, run or attempt it and report the result.\n"
+        "5. Stop after the docs diff and verification. Return changed files, commands/results, and blockers only.\n\n"
+        f"{write_line}"
+        "Do not create marker files, scratch notes, screenshots, or placeholder files.\n"
+        "Do not merely describe intended changes; leave a real git diff or report the concrete safety blocker.\n"
+    )
+
+
 def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], task: dict[str, Any], worktree: str) -> str:
-    deliverables = _bounded_prompt_json(subtask.get("deliverables") or [], WORKER_JSON_CHAR_LIMIT)
+    repair_prompt = _subtask_is_repair_prompt(subtask)
+    json_limit = WORKER_REPAIR_JSON_CHAR_LIMIT if repair_prompt else WORKER_JSON_CHAR_LIMIT
+    deliverables = _bounded_prompt_json(subtask.get("deliverables") or [], json_limit)
     target_files = [
         str(entry).strip()
         for entry in _as_list(subtask.get("files") or subtask.get("target_files") or [])
@@ -560,17 +739,52 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
     ]
     required_test_targets = [path for path in substantive_target_files if _is_test_target_path(path)]
     write_required = bool(subtask.get("write_required", True))
-    parent_scope = _clip_prompt_text(_task_scope_block(task), WORKER_PARENT_SCOPE_CHAR_LIMIT)
+    if not write_required and _task_requires_code_edit_write(task, target_files, subtask):
+        write_required = True
+    docs_only_carried_repair = repair_prompt and _docs_only_target_files(target_files) and bool(
+        subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches")
+    )
+    if (not repair_prompt and _docs_only_target_files(target_files)) or docs_only_carried_repair:
+        return _build_docs_only_worker_prompt(
+            run_id,
+            worker_id,
+            subtask,
+            task,
+            target_files,
+            existing_files,
+            write_required,
+        )
+    immediate_action_block = _worker_immediate_action_block(
+        target_files,
+        substantive_target_files,
+        required_test_targets,
+        write_required,
+    )
+    no_edit_policy_block = (
+        "Because this worker is write-required, do not finish without a real diff unless editing the "
+        "tracked target files would be unsafe; report that concrete safety blocker instead.\n\n"
+        if write_required
+        else (
+            "If the target files already exist and satisfy the subtask, you may finish without editing them, "
+            "but only after proving that with real tool calls.\n"
+            "If you do not need to change a file, say that it was already satisfied and describe the verification you performed.\n\n"
+        )
+    )
+    parent_scope = _clip_prompt_text(
+        _task_scope_block(task),
+        WORKER_REPAIR_PARENT_SCOPE_CHAR_LIMIT if repair_prompt else WORKER_PARENT_SCOPE_CHAR_LIMIT,
+    )
     subtask_contract_payload = _subtask_contract_for_worker(subtask, target_files)
     subtask_contract = _clip_prompt_text(
         _task_contract_block(subtask_contract_payload),
-        WORKER_SUBTASK_CONTRACT_CHAR_LIMIT,
+        WORKER_REPAIR_SUBTASK_CONTRACT_CHAR_LIMIT if repair_prompt else WORKER_SUBTASK_CONTRACT_CHAR_LIMIT,
     )
     parent_title = _clip_prompt_text(task.get("title"), 500)
     subtask_title = _clip_prompt_text(subtask.get("title"), 500)
-    subtask_goal = _clip_prompt_text(subtask.get("goal"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
-    acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], WORKER_JSON_CHAR_LIMIT)
-    scope_note = _clip_prompt_text(subtask.get("scope_note"), WORKER_SUBTASK_TEXT_CHAR_LIMIT)
+    text_limit = WORKER_REPAIR_SUBTASK_TEXT_CHAR_LIMIT if repair_prompt else WORKER_SUBTASK_TEXT_CHAR_LIMIT
+    subtask_goal = _clip_prompt_text(subtask.get("goal"), text_limit)
+    acceptance_criteria = _bounded_prompt_json(subtask.get("acceptance_criteria") or [], json_limit)
+    scope_note = _clip_prompt_text(subtask.get("scope_note"), text_limit)
     scope_note_block = f"\nACA scope note: {scope_note}\n" if scope_note else ""
     deterministic_fast_path_block = ""
     if "mechanical slice" in scope_note.lower() and substantive_target_files:
@@ -617,12 +831,72 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "Do not stop with an analysis-only blocker unless editing the tracked target files would be unsafe, "
             "and name that concrete safety reason.\n"
         )
+        carries_preserved_patch = bool(subtask.get("carry_forward_patch") or subtask.get("carry_forward_patches"))
+        if subtask.get("repair_verification_first") and carries_preserved_patch:
+            write_required_guidance += (
+                "\nThis repair starts from an already-applied preserved diff. That carried diff counts as the required "
+                "working-tree change for this worker. Run the focused verification first; make a new edit only if "
+                "that verification fails or the carried diff is incomplete.\n"
+            )
         production_followup_targets = [
             str(path).strip()
             for path in _as_list(subtask.get("repair_requires_production_followup"))
             if str(path).strip()
         ]
-        if production_followup_targets:
+        test_followup_targets = [
+            str(path).strip()
+            for path in _as_list(subtask.get("repair_requires_test_followup"))
+            if str(path).strip()
+        ]
+        paired_test_targets = test_followup_targets or required_test_targets
+        repair_text = "\n".join(
+            str(value or "")
+            for value in (
+                subtask.get("title"),
+                subtask.get("goal"),
+                subtask.get("scope_note"),
+                subtask.get("repair_failure_summary"),
+                "\n".join(str(item or "") for item in _as_list(subtask.get("acceptance_criteria"))),
+            )
+        ).lower()
+        inferred_complementary_pair = (
+            "complementary" in repair_text
+            and "source" in repair_text
+            and "test" in repair_text
+            and "production-only" in repair_text
+            and "test-only" in repair_text
+        )
+        inferred_weak_source_test_pair = (
+            ("source+test" in repair_text or "source and test" in repair_text)
+            and ("weak" in repair_text or "test method or assertion" in repair_text)
+            and ("preserved" in repair_text or "partial diff" in repair_text)
+        )
+        paired_source_test_repair = bool(
+            subtask.get("repair_requires_paired_source_test")
+            or subtask.get("repair_requires_paired_source_test_diff")
+            or str(subtask.get("repair_mode") or "").strip()
+            in {"complementary_rejected_partial_diff", "weak_source_test_diff"}
+            or inferred_complementary_pair
+            or inferred_weak_source_test_pair
+        ) and bool(production_followup_targets and paired_test_targets)
+        if paired_source_test_repair:
+            write_required_guidance += (
+                "\nThis repair must rebuild one paired source+test diff in this single attempt. "
+                "First read both the required test target(s) and paired production target(s): "
+                f"tests={json.dumps(paired_test_targets)}, production={json.dumps(production_followup_targets)}. "
+                "Prefer one focused write step that edits both a required test target and its paired production target before any further exploration. "
+                "If your edit tool cannot change both files in one patch, make the test edit and the production edit back-to-back before running searches, adding more tests, or verifying. "
+                "Do not spend the attempt on only one side: a production-only diff fails and a test-only diff fails unless you report a concrete blocker explaining why the paired edit is unsafe. "
+                + (
+                    "Keep this precision repair under about "
+                    + str(subtask.get("repair_diff_line_budget") or "80").strip()
+                    + " changed diff lines; do not rewrite or duplicate whole files. "
+                    if subtask.get("repair_precision_edit") or subtask.get("repair_diff_line_budget")
+                    else ""
+                )
+                + "\n"
+            )
+        elif production_followup_targets:
             write_required_guidance += (
                 "\nThis repair carries a preserved test-only partial diff. Read the carried test patch for context, "
                 "then make the first new semantic edit in the paired production target before adding or changing more tests: "
@@ -630,11 +904,28 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
                 "explaining why no production edit is safe.\n"
             )
         elif required_test_targets and _repair_requires_test_first(subtask):
-            write_required_guidance += (
-                "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
-                f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
-                "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
-            )
+            if carries_preserved_patch:
+                write_required_guidance += (
+                    "\nThis repair starts from an already-applied preserved source diff. That carried source diff counts "
+                    "as the paired production edit for this worker. Read and edit at least one required test target first: "
+                    f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, run the narrow "
+                    "verification and adjust production only if the test proves the carried source behavior is wrong. "
+                    "Do not continue expanding tests or stop with a test-only diff; a test-only final diff fails unless "
+                    "you report a concrete blocker explaining why the carried source edit is unsafe.\n"
+                )
+            else:
+                paired_production_targets = [
+                    path
+                    for path in substantive_target_files
+                    if not _is_test_target_path(path)
+                ]
+                write_required_guidance += (
+                    "\nThis worker must replace a rejected production-only repair with one paired source+test diff. First read at least one required test target "
+                    f"{json.dumps(required_test_targets)} and one paired production target {json.dumps(paired_production_targets)}. "
+                    "Prefer one focused write step that edits both the required test target and paired production target before any further exploration. "
+                    "If your edit tool cannot change both files in one patch, make the test edit and production edit back-to-back before running searches, adding more tests, or verifying. "
+                    "Do not spend the attempt building a production-only or test-only diff; either one fails unless you report a concrete blocker explaining why the paired edit is unsafe.\n"
+                )
         elif required_test_targets and _subtask_mentions_test_work(subtask):
             paired_production_targets = [
                 path
@@ -643,16 +934,19 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             ]
             if paired_production_targets:
                 write_required_guidance += (
-                    "\nThis worker must keep test coverage paired with production behavior. Read at least one required test target early: "
-                    f"{json.dumps(required_test_targets)}, then read and make the first behavioral edit in a paired production target before "
-                    f"expanding tests: {json.dumps(paired_production_targets)}. Do not spend the attempt building a test-only diff; "
-                    "a test-only diff fails unless you report a concrete blocker explaining why no production edit is safe.\n"
+                    "\nThis worker must keep test coverage paired with production behavior. First read at least one required test target "
+                    f"{json.dumps(required_test_targets)} and one paired production target {json.dumps(paired_production_targets)}. "
+                    "Prefer one focused write step that edits both the required test target and paired production target before any further exploration. "
+                    "If your edit tool cannot change both files in one patch, make the production edit and test edit back-to-back before running searches, adding more tests, or verifying. "
+                    "Do not spend the attempt building a production-only or test-only diff; either one fails unless you report a concrete blocker explaining why the paired edit is unsafe.\n"
                 )
             else:
                 write_required_guidance += (
                     "\nThis worker must satisfy required test coverage before production-only continuation. Read and edit at least one required test target first: "
                     f"{json.dumps(required_test_targets)}. After adding or tightening the real assertion, make only the "
-                    "minimal production change needed for that assertion. A production-only diff fails this worker.\n"
+                    "minimal production change needed for that assertion. Do not continue expanding tests or stop with a test-only diff; "
+                    "a test-only final diff fails unless you report a concrete blocker explaining why no production edit is safe. "
+                    "A production-only diff fails this worker.\n"
                 )
     no_target_guidance = ""
     if not target_files:
@@ -673,23 +967,24 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
             "Otherwise choose tracked source, test, or public docs files that satisfy the task, or return a concrete blocker "
             "explaining that the task only names ignored/private files.\n"
         )
-    verification_path_guidance = (
-        "\nFor smoke, verification, quality-gate, or end-to-end tasks, exercise the existing production path, "
-        "server path, control-panel path, or deterministic repository fixture path that the product already uses. "
-        "Do not satisfy those tasks by inventing a standalone simulation unless the task explicitly asks for one. "
-        "Do not define the quality-gate rules inside the test or smoke script and then assert those same local rules; "
-        "drive existing product code, existing server/API behavior, or an existing exported implementation instead. "
-        "For regression coverage, each new assertion must exercise existing production functions, structs, API handlers, "
-        "fixtures, or exported behavior. A test-only enum, constant, local helper, or string table that merely restates "
-        "the expected behavior is not valid coverage, even if it uses realistic names. If the behavior is private, place "
-        "the test next to the implementation or make the smallest production helper change needed for the test to call "
-        "real code. "
-        "Preserve existing live smoke/API behavior such as dry-run modes and endpoint calls unless the task explicitly "
-        "requires replacing it. "
-        "If a script must export helpers for tests, make sure importing it does not execute its CLI main routine, "
-        "perform network calls, append runtime output, or mutate stable fixtures. Runtime smoke output should be "
-        "temporary or cleaned up, while tracked fixtures should stay deterministic.\n"
-    )
+    if repair_prompt:
+        verification_path_guidance = (
+            "\nCoverage/verification rule: use the existing production path or exported behavior, not a local oracle. "
+            "For regression coverage, assertions must call real production code or an existing fixture/API. "
+            "Run the narrowest relevant verification and report the exact command/result.\n"
+        )
+    else:
+        verification_path_guidance = (
+            "\nVerification/coverage guardrail: exercise the existing production path, server path, "
+            "control-panel path, deterministic repository fixture path, or existing exported behavior. "
+            "Do not satisfy smoke, verification, quality-gate, or end-to-end tasks by inventing a standalone simulation. "
+            "Do not define the quality-gate rules inside the test or smoke script and then assert those same local rules. "
+            "For regression coverage, each new assertion must exercise existing production functions, structs, API handlers, "
+            "fixtures, or exported behavior; a test-only enum, constant, local helper, or string table that merely restates "
+            "behavior is not valid coverage. Preserve existing live smoke/API behavior unless the task explicitly asks for "
+            "a replacement. If a script must export helpers for tests, importing it does not execute its CLI main routine; "
+            "runtime smoke output should be temporary or cleaned up, while tracked fixtures should stay deterministic.\n"
+        )
     pr_context_guidance = ""
     pr_context = subtask.get("pr_candidate_context")
     pr_context_artifact = str(subtask.get("pr_candidate_context_artifact") or "").strip()
@@ -726,10 +1021,13 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         "Only edit files in this worktree.\n"
         "CRITICAL: You MUST use ONLY relative paths (e.g., `package.json` or `src/app.js`) for ALL tool calls.\n"
         "The engine will fail with 'OS_MISMATCH' or 'No such file or directory' if you use absolute paths like `/workspace/...`.\n"
+        "Do not combine concrete target files into brace-glob patterns like `src/{a.py,b.py}`; read or glob each listed target file separately. "
+        "If a glob returns no matches for a target file, retry the exact target path before claiming it is missing.\n"
         "You must use tools to inspect the worktree, create or edit the required files, and verify the result.\n"
+        f"{immediate_action_block}"
         "Do not merely describe intended changes. If you did not actually change files, report a blocker instead.\n"
         "Before finishing, verify the changed files with read/glob/grep or bash commands in the worktree.\n"
-        "Once a substantive diff exists, stop expanding scope; run one lightweight verification or file readback, retry a narrower readback if a tool is skipped, then return the final completion note.\n"
+        "Once a substantive diff exists, stop expanding scope; for paired source+test repairs, the substantive diff exists only after both a required test target and its paired production target have changed. Run one lightweight verification or file readback, retry a narrower readback if a tool is skipped, then return the final completion note.\n"
         "For Python sibling test files under `src/`, prefer `python3 -m unittest <module.path>`; use `python3 -m py_compile <changed files>` as a fallback if dependencies needed by the test command are unavailable.\n"
         "Do not treat missing `pytest` as a blocker when an equivalent `python3 -m unittest ...` command can exercise the changed Python test module.\n"
         "When a subtask needs coverage for private helpers, add real tests inside the source module that defines those helpers; do not add placeholder integration or contract test files.\n"
@@ -738,8 +1036,7 @@ def build_worker_prompt(run_id: str, worker_id: str, subtask: dict[str, Any], ta
         "IMPORTANT: Save any browser screenshots to the `./screenshots/` directory so they can be displayed in the Control Panel.\n"
         "Your final response must describe the real files you changed and the verification you actually performed.\n"
         "Return a concise completion note with changed files, validation performed, and any blockers.\n\n"
-        "If the target files already exist and satisfy the subtask, you may finish without editing them, but only after proving that with real tool calls.\n"
-        "If you do not need to change a file, say that it was already satisfied and describe the verification you performed.\n\n"
+        f"{no_edit_policy_block}"
         f"Parent task: {parent_title}\n"
         f"Parent task scope:\n{parent_scope}\n\n"
         f"Subtask title: {subtask_title}\n"

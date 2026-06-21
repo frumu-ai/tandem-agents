@@ -42,6 +42,7 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                     "ACA_REPO_SLUG=frumu-ai/example",
                     "ACA_PROVIDER=openai",
                     "ACA_MODEL=gpt-5.5",
+                    "ACA_ENGINE_PROVIDER_SMOKE_ENABLED=false",
                 ]
             )
             + "\n",
@@ -663,6 +664,54 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             self.assertEqual(detail["integration_blockers"][0]["reason"], "linear_mcp_auth_required")
             start_run.assert_not_called()
 
+    def test_trigger_batch_blocks_when_engine_provider_smoke_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False), patch(
+                "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                return_value={"ok": True, "reason": "ok"},
+            ), patch(
+                "src.tandem_agents.api.main.engine_provider_smoke_report",
+                return_value={
+                    "ok": False,
+                    "reason": "empty_or_unexpected_transcript",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "source": "engine_default",
+                    "timeout_seconds": 30.0,
+                    "error": "ReadTimeout",
+                    "error_class": "ReadTimeout",
+                },
+            ) as smoke, patch(
+                "src.tandem_agents.api.main._start_run",
+                return_value={"run_id": "run-1", "status": "started"},
+            ) as start_run:
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/runs/trigger-batch",
+                        json={
+                            "items": ["TAN-1"],
+                            "respect_scheduler": False,
+                            "overrides": {"ACA_ENGINE_PROVIDER_SMOKE_ENABLED": "true"},
+                        },
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            detail = response.json()["detail"]
+            blocker = detail["integration_blockers"][0]
+            self.assertEqual(blocker["reason"], "engine_provider_smoke_failed")
+            self.assertEqual(blocker["provider"], "openai-codex")
+            self.assertEqual(blocker["error_class"], "ReadTimeout")
+            smoke.assert_called_once()
+            start_run.assert_not_called()
+
     def test_compact_event_payload_keeps_graph_and_partial_diff_diagnostics(self) -> None:
         payload = _compact_event_payload(
             {
@@ -859,6 +908,9 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                             },
                             "last_error": "Authorization required.",
                         },
+                    ), patch(
+                        "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                        return_value={"ok": True, "reason": "ok"},
                     ):
                         plan = client.get(
                             "/scheduler/plan",
@@ -874,6 +926,50 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
                 "https://linear.example.test/authorize",
             )
 
+    def test_scheduler_dispatch_skips_when_engine_session_api_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            env = {
+                "ACA_ROOT": str(root),
+                "ACA_API_TOKEN": "secret-token",
+            }
+
+            with patch.dict("os.environ", env, clear=False), patch(
+                "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                return_value={
+                    "ok": False,
+                    "reason": "exception",
+                    "base_url": "http://127.0.0.1:39731",
+                    "error": "ReadTimeout",
+                    "error_class": "ReadTimeout",
+                    "timeout_seconds": 2.0,
+                },
+            ), patch("src.tandem_agents.api.main.dispatch_scheduled_runs") as dispatch:
+                with TestClient(app) as client:
+                    plan_response = client.get(
+                        "/scheduler/plan",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+                    dispatch_response = client.post(
+                        "/scheduler/dispatch",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+
+            self.assertEqual(plan_response.status_code, 200, plan_response.text)
+            plan_payload = plan_response.json()
+            self.assertEqual(plan_payload["integration_blockers"][0]["reason"], "engine_session_api_unavailable")
+            self.assertEqual(plan_payload["integration_blockers"][0]["error_class"], "ReadTimeout")
+            self.assertEqual(dispatch_response.status_code, 200, dispatch_response.text)
+            dispatch_payload = dispatch_response.json()
+            self.assertTrue(dispatch_payload["skipped"])
+            self.assertEqual(dispatch_payload["skip_reason"], "integration_blocked")
+            self.assertEqual(
+                dispatch_payload["integration_blockers"][0]["reason"],
+                "engine_session_api_unavailable",
+            )
+            dispatch.assert_not_called()
+
     def test_linear_auth_redirect_origin_reads_redirect_uri(self) -> None:
         url = (
             "https://mcp.linear.app/authorize?"
@@ -883,31 +979,57 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertEqual(_linear_auth_redirect_origin(url), "https://tests.frumu.ai")
 
     def test_project_runtime_env_uses_managed_checkout_path_for_remote_project(self) -> None:
-        env = _project_runtime_env(
-            Path("/tmp/aca"),
-            {
-                "id": "frumu-ai/tandem",
-                "repo_url": "https://github.com/frumu-ai/tandem",
-                "repo": {
-                    "slug": "frumu-ai/tandem",
-                    "path": "",
-                    "default_branch": "main",
-                    "remote_name": "origin",
+        with patch.dict(os.environ, {"ACA_WORKTREE_ROOT": "", "AUTOCODER_WORKTREE_ROOT": ""}, clear=False):
+            env = _project_runtime_env(
+                Path("/tmp/aca"),
+                {
+                    "id": "frumu-ai/tandem",
+                    "repo_url": "https://github.com/frumu-ai/tandem",
+                    "repo": {
+                        "slug": "frumu-ai/tandem",
+                        "path": "",
+                        "default_branch": "main",
+                        "remote_name": "origin",
+                    },
+                    "task_source": {
+                        "type": "github_project",
+                        "owner": "frumu-ai",
+                        "repo": "tandem",
+                        "project": "1",
+                    },
                 },
-                "task_source": {
-                    "type": "github_project",
-                    "owner": "frumu-ai",
-                    "repo": "tandem",
-                    "project": "1",
-                },
-            },
-        )
+            )
 
         self.assertEqual(env["ACA_REPO_SLUG"], "frumu-ai/tandem")
         self.assertEqual(env["ACA_REPO_URL"], "https://github.com/frumu-ai/tandem")
         self.assertEqual(env["ACA_REPO_PATH"], "workspace/repos/tandem")
         self.assertEqual(env["ACA_WORKTREE_ROOT"], "workspace/repos")
         self.assertEqual(env["ACA_TASK_SOURCE_REPO"], "tandem")
+
+    def test_project_runtime_env_maps_managed_checkout_to_writable_runtime_mount(self) -> None:
+        with patch.dict(os.environ, {"AUTOCODER_WORKTREE_ROOT": "/workspace/repos"}, clear=False):
+            env = _project_runtime_env(
+                Path("/workspace/tandem-agents"),
+                {
+                    "id": "aca-smoke-harness",
+                    "repo_url": "https://github.com/frumu-ai/tandem-agents.git",
+                    "repo": {
+                        "slug": "frumu-ai/tandem-agents",
+                        "path": "workspace/repos/tandem-agents",
+                        "worktree_root": "workspace/repos",
+                        "default_branch": "main",
+                        "remote_name": "origin",
+                    },
+                    "task_source": {
+                        "type": "linear",
+                        "team": "Tandem",
+                        "project": "ACA Smoke Harness",
+                    },
+                },
+            )
+
+        self.assertEqual(env["ACA_REPO_PATH"], "/workspace/repos/tandem-agents")
+        self.assertEqual(env["ACA_WORKTREE_ROOT"], "/workspace/repos")
 
     def test_project_runtime_env_serializes_task_source_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,6 +27,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _execute_local_worker_pool,
     _failed_subtask_for_retry,
     _final_lease_release_decision,
+    _failed_verifiable_followup_one_sided_can_retry,
     _has_unresolved_write_required_worker_failure,
     _integration_blocker_message,
     _integration_can_retry,
@@ -36,6 +37,13 @@ from src.tandem_agents.core.execution.runner_core import (
     _integration_semantic_blocker_can_defer_to_review,
     _linear_mcp_authorization_url,
     _linear_comment_task_summary,
+    _merge_worker_partial_diff_artifacts_into_repair,
+    _one_sided_repair_cycle_should_block,
+    _partial_diff_artifacts_have_complementary_one_sided_pair,
+    _complementary_one_sided_partial_diff_can_retry,
+    _destructive_complementary_partial_diff_can_retry,
+    _destructive_complementary_retry_feedback,
+    _engine_empty_response_repair_can_retry,
     _permission_requests_from_payload,
     _partial_diff_artifacts_for_retry,
     _merge_partial_diff_artifacts_for_retry,
@@ -48,16 +56,27 @@ from src.tandem_agents.core.execution.runner_core import (
     _task_mentions_external_pr_candidates,
     _touch_coordination,
     _verification_can_retry,
+    _verifiable_diff_test_failed_partial_diff_can_retry,
     _worker_failure_blocker,
     _worker_failure_can_retry,
     _worker_failure_retry_feedback,
     _worker_incomplete_diff_extra_retries,
+    _verification_repair_extra_retries,
+    _worker_repair_loop_extra_retries,
+    _worker_off_track_extra_retries,
+    _worker_verifiable_diff_assertion_extra_retries,
+    _worker_verifiable_diff_exception_extra_retries,
+    _worker_verifiable_diff_import_error_extra_retries,
+    _worker_verifiable_diff_test_failed_extra_retries,
+    _worker_verifiable_diff_weak_test_extra_retries,
     _discard_partial_diff_repair_artifacts,
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
     _run_integration_prompt,
+    _run_start_preflight,
     _sticky_expected_repo_files,
+    _stalled_no_diff_repair_can_retry,
     _validation_expected_repo_files,
 )
 from src.tandem_agents.core.engine.process_utils import run_command
@@ -90,6 +109,57 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             encoding="utf-8",
         )
         return resolve_config(root)
+
+
+    def test_run_start_preflight_blocks_on_provider_smoke_failure_before_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            repo = root / "repo"
+            (repo / ".git").mkdir(parents=True)
+            run_dir = root / "runs" / "run-1"
+            layout = {
+                "run_dir": run_dir,
+                "logs": run_dir / "logs",
+                "artifacts": run_dir / "artifacts",
+                "events": run_dir / "events.jsonl",
+            }
+            layout["logs"].mkdir(parents=True)
+            layout["artifacts"].mkdir(parents=True)
+            with patch(
+                "src.tandem_agents.core.execution.runner_core.run_command",
+                return_value=SimpleNamespace(returncode=0, stdout="## main...origin/main\n", stderr=""),
+            ), patch(
+                "src.tandem_agents.core.execution.runner_core.engine_provider_smoke_report",
+                return_value={
+                    "ok": False,
+                    "reason": "empty_or_unexpected_transcript",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "source": "engine_default",
+                    "error": "ReadTimeout",
+                    "error_class": "ReadTimeout",
+                },
+            ) as smoke_report:
+                preflight, blocker = _run_start_preflight(
+                    cfg,
+                    run_id="run-1",
+                    layout=layout,
+                    repo={"path": str(repo), "branch": "main"},
+                )
+
+            smoke_report.assert_called_once_with(cfg, role="worker", directory=repo)
+            self.assertIsNotNone(blocker)
+            assert blocker is not None
+            self.assertEqual(blocker["kind"], "engine_provider_smoke_failed")
+            self.assertIn("visible assistant text", blocker["message"])
+            self.assertIn("ReadTimeout", blocker["message"])
+            self.assertEqual(preflight["provider_smoke"]["provider"], "openai-codex")
+            event_lines = layout["events"].read_text(encoding="utf-8").splitlines()
+            self.assertTrue(event_lines)
+            event_payload = json.loads(event_lines[-1])["payload"]
+            self.assertFalse(event_payload["provider_smoke_ok"])
+            self.assertEqual(event_payload["provider_smoke_error_class"], "ReadTimeout")
 
     def test_crash_blocker_classifies_linear_mcp_oauth_refresh_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -466,7 +536,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
     def test_execute_local_worker_pool_reports_no_progress_timeout(self) -> None:
         def stalled_runner(*_args):
-            time.sleep(0.05)
+            time.sleep(0.2)
             return {
                 "status": "completed",
                 "returncode": 0,
@@ -491,7 +561,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             elapsed = time.monotonic() - started
 
         self.assertEqual(len(results), 1)
-        self.assertLess(elapsed, 0.04)
+        self.assertLess(elapsed, 0.08)
         self.assertEqual(results[0]["status"], "failed")
         self.assertEqual(results[0]["blocker_kind"], "worker_no_progress")
         self.assertTrue(results[0]["worker_abandoned_after_timeout"])
@@ -516,7 +586,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 role="worker",
                 repo={"path": str(_repo_path)},
             )
-            time.sleep(0.05)
+            time.sleep(0.2)
             return {
                 "status": "completed",
                 "returncode": 0,
@@ -535,7 +605,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 [{"id": "subtask-1", "title": "Do work", "write_required": True}],
                 1,
                 worker_runner=event_then_stall,
-                worker_timeout_seconds=0.01,
+                worker_timeout_seconds=0.1,
             )
 
         self.assertEqual(len(results), 1)
@@ -544,6 +614,35 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual(results[0]["changed_files"], ["src/app.py"])
         self.assertNotEqual(results[0].get("blocker_kind"), "worker_no_progress")
         self.assertIn("terminal event", results[0].get("output_excerpt", ""))
+
+    def test_synced_reviewable_diff_tolerates_later_inherited_overlay_failure(self) -> None:
+        results = [
+            {
+                "worker_id": "worker-1",
+                "subtask_id": "subtask-1",
+                "status": "completed",
+                "returncode": 0,
+                "write_required": True,
+                "partial_diff_state": "reviewable_terminalized",
+                "synced_files": ["src/app.py", "src/app_test.py"],
+                "changed_files": ["src/app.py", "src/app_test.py"],
+            },
+            {
+                "worker_id": "worker-2",
+                "subtask_id": "subtask-2",
+                "status": "failed",
+                "returncode": 1,
+                "write_required": True,
+                "failure_reason": "WORKER_INHERITED_OVERLAY_NO_FRESH_CHANGES",
+                "blocker_kind": "worker_no_progress",
+                "changed_files": [],
+                "fresh_changed_files": [],
+                "inherited_overlay_changed_files": ["src/app.py", "src/app_test.py"],
+            },
+        ]
+
+        self.assertFalse(_has_unresolved_write_required_worker_failure(results))
+        self.assertTrue(_has_unresolved_write_required_worker_failure(results[1:]))
 
     def test_serial_worker_pool_continues_after_abandoned_completed_result(self) -> None:
         def slow_runner(_cfg, _run_id, _repo_path, _run_dir, _task, subtask, worker_id, _index):
@@ -851,6 +950,52 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             ["src/tandem_agents/core/repository/repository_test.py"],
         )
         self.assertIn("Only repair the rejected repository diff.", subtasks[0]["scope_note"])
+
+    def test_manager_subtask_preserves_paired_repair_metadata(self) -> None:
+        repair_files = [
+            "src/tandem_agents/core/repository/repository.py",
+            "src/tandem_agents/core/repository/repository_test.py",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            subtasks = _normalize_manager_subtasks(
+                {"title": "TAN-170", "target_files": repair_files},
+                [
+                    {
+                        "id": "weak-source-test-repair",
+                        "title": "Repair weak source+test partial diff",
+                        "goal": "Finish the preserved weak source+test diff with real coverage.",
+                        "files": repair_files,
+                        "target_files": repair_files,
+                        "acceptance_criteria": ["Add a real assertion for the carried source+test diff."],
+                        "carry_forward_patch": "/runs/run-1/artifacts/worker-1.patch",
+                        "deterministic_partial_diff_repair": True,
+                        "repair_requires_production_followup": [
+                            "src/tandem_agents/core/repository/repository.py",
+                        ],
+                        "repair_requires_test_followup": [
+                            "src/tandem_agents/core/repository/repository_test.py",
+                        ],
+                        "repair_requires_paired_source_test": True,
+                        "repair_requires_paired_source_test_diff": True,
+                        "repair_mode": "weak_source_test_diff",
+                        "repair_focus_instructions": ["Keep the patch small."],
+                        "repair_precision_edit": True,
+                        "repair_diff_line_budget": 80,
+                        "scope_note": "Preserved weak source+test patch is applied.",
+                    }
+                ],
+                str(Path(tmp)),
+            )
+
+        subtask = subtasks[0]
+        self.assertEqual(subtask["files"], repair_files)
+        self.assertEqual(subtask["target_files"], repair_files)
+        self.assertEqual(subtask["repair_mode"], "weak_source_test_diff")
+        self.assertTrue(subtask["repair_requires_paired_source_test"])
+        self.assertTrue(subtask["repair_requires_paired_source_test_diff"])
+        self.assertEqual(subtask["repair_focus_instructions"], ["Keep the patch small."])
+        self.assertTrue(subtask["repair_precision_edit"])
+        self.assertEqual(subtask["repair_diff_line_budget"], 80)
 
     def test_manager_subtask_keeps_worker_targets_narrow_with_task_targets(self) -> None:
         task_target_files = [
@@ -1350,6 +1495,93 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             self.assertIn("dropped non-existing manager file targets", subtasks[0]["scope_note"])
             self.assertIn("crates/tandem-tools/src/registry.rs", subtasks[0]["scope_note"])
 
+    def test_missing_public_docs_targets_are_kept_for_docs_creation_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            docs_readme = repo_path / "docs/README.md"
+            docs_readme.parent.mkdir(parents=True, exist_ok=True)
+            docs_readme.write_text("# Docs\n", encoding="utf-8")
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "id": "docs",
+                        "title": "Document smoke harness",
+                        "goal": "Add the smoke harness docs page and link it from the docs index.",
+                        "files": [
+                            "docs/README.md",
+                            "docs/ACA_SMOKE_HARNESS.md",
+                        ],
+                        "target_files": [
+                            "docs/README.md",
+                            "docs/ACA_SMOKE_HARNESS.md",
+                        ],
+                        "acceptance_criteria": ["Docs page exists and docs README links to it."],
+                    }
+                ]
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(
+                {"title": "Document smoke harness"},
+                manager_plan,
+                repo_path,
+                4,
+            )
+
+            self.assertEqual(
+                subtasks[0]["files"],
+                ["docs/README.md", "docs/ACA_SMOKE_HARNESS.md"],
+            )
+            self.assertEqual(subtasks[0]["target_files"], subtasks[0]["files"])
+            self.assertNotIn("dropped non-existing manager file targets", subtasks[0].get("scope_note", ""))
+
+    def test_explicit_task_mentions_keep_missing_public_docs_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            docs_readme = repo_path / "docs/README.md"
+            docs_readme.parent.mkdir(parents=True, exist_ok=True)
+            docs_readme.write_text("# Docs\n", encoding="utf-8")
+            manager_plan = {
+                "subtasks": [
+                    {
+                        "id": "docs",
+                        "title": "Document smoke harness",
+                        "goal": "Add the smoke harness docs page and link it from the docs index.",
+                        "files": [
+                            "docs/README.md",
+                            "docs/ACA_SMOKE_HARNESS.md",
+                        ],
+                        "target_files": [
+                            "docs/README.md",
+                            "docs/ACA_SMOKE_HARNESS.md",
+                        ],
+                        "acceptance_criteria": ["Docs page exists and docs README links to it."],
+                    }
+                ]
+            }
+            task = {
+                "title": "ACA smoke 05: document the smoke harness contract",
+                "raw_issue_body": (
+                    "Source files:\n\n"
+                    "* docs/ACA_SMOKE_HARNESS.md\n"
+                    "* docs/README.md\n\n"
+                    "Add `docs/ACA_SMOKE_HARNESS.md` and link it from `docs/README.md`."
+                ),
+            }
+
+            _, subtasks = _prepare_subtasks_with_discovery(
+                task,
+                manager_plan,
+                repo_path,
+                4,
+            )
+
+            self.assertEqual(
+                subtasks[0]["target_files"],
+                ["docs/README.md", "docs/ACA_SMOKE_HARNESS.md"],
+            )
+            self.assertEqual(subtasks[0]["files"], subtasks[0]["target_files"])
+            self.assertNotIn("dropped non-existing manager file targets", subtasks[0].get("scope_note", ""))
+
     def test_expected_repo_files_are_sticky_across_retries(self) -> None:
         blackboard = {
             "repo_validation": {
@@ -1524,6 +1756,30 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertEqual(blocker["kind"], "engine_empty_response")
         self.assertIn("session_id=session-1", blocker["detail"])
         self.assertIn("fallback=prompt_sync", blocker["detail"])
+
+    def test_worker_failure_blocker_preserves_engine_no_activity_details(self) -> None:
+        blocker = _worker_failure_blocker(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "ENGINE_NO_ACTIVITY_RESPONSE",
+                    "blocker_kind": "engine_no_activity_response",
+                    "engine": {
+                        "session_id": "session-1",
+                        "run_id": "run-engine-1",
+                        "retry_count": 0,
+                        "fallback_mode": "no_activity_fail_fast",
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(blocker["kind"], "engine_no_activity_response")
+        self.assertIn("no visible assistant or tool activity", blocker["message"])
+        self.assertIn("session_id=session-1", blocker["detail"])
+        self.assertIn("fallback=no_activity_fail_fast", blocker["detail"])
 
     def test_github_project_contract_target_files_override_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1854,6 +2110,88 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("crates/tandem-tools/tests/registry_resolution.rs", feedback or "")
         self.assertIn("unmet acceptance criteria", feedback or "")
 
+    def test_failed_verifiable_diff_feedback_preserves_regression_tests(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/aca_harness/calculator.py",
+                        "src/tandem_agents/aca_harness/calculator_test.py",
+                    ],
+                    "verification_output_excerpt": (
+                        "ImportError: cannot import name 'multiply' from "
+                        "'src.tandem_agents.aca_harness'"
+                    ),
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 2)
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("preserve the regression assertions", feedback or "")
+        self.assertIn("Prefer fixing production, exports, imports, wiring, or setup", feedback or "")
+        self.assertIn("Do not make tests less strict", feedback or "")
+
+    def test_followup_one_sided_feedback_includes_prior_focused_test_failure(self) -> None:
+        ctx = SimpleNamespace(
+            blackboard={
+                "repair": {
+                    "partial_diff_artifacts": [
+                        {
+                            "subtask_id": "subtask-1",
+                            "patch_path": "/runs/run-1/artifacts/paired.patch",
+                            "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                            "changed_files": [
+                                "src/tandem_agents/aca_harness/calculator.py",
+                                "src/tandem_agents/aca_harness/calculator_test.py",
+                            ],
+                            "subtask_target_files": [
+                                "src/tandem_agents/aca_harness/calculator.py",
+                                "src/tandem_agents/aca_harness/calculator_test.py",
+                            ],
+                            "verification_command": [
+                                "python3",
+                                "-m",
+                                "unittest",
+                                "src.tandem_agents.aca_harness.calculator_test",
+                            ],
+                            "verification_output_excerpt": "NameError: name 'calculator' is not defined",
+                        }
+                    ]
+                }
+            },
+            status={},
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                    "blocker_kind": "worker_off_track",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/source-followup.patch",
+                    "changed_files": ["src/tandem_agents/aca_harness/calculator.py"],
+                }
+            ],
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 3)
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("previous paired source+test diff reached focused verification", feedback or "")
+        self.assertIn("src.tandem_agents.aca_harness.calculator_test", feedback or "")
+        self.assertIn("NameError: name 'calculator' is not defined", feedback or "")
+
     def test_partial_diff_artifact_keeps_worker_output_excerpt(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
             [
@@ -1874,7 +2212,37 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(artifacts[0]["changed_files"], ["crates/eval/src/scoring.rs"])
 
-    def test_failed_verifiable_diff_artifact_is_not_marked_reusable(self) -> None:
+    def test_reviewable_terminalized_diff_artifact_is_not_reused_for_repair(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "status": "completed",
+                    "returncode": 0,
+                    "partial_diff_state": "reviewable_terminalized",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/synced.patch",
+                    "changed_files": ["src/app.py", "src/app_test.py"],
+                    "synced_files": ["src/app.py", "src/app_test.py"],
+                },
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "status": "failed",
+                    "returncode": 1,
+                    "partial_diff_state": "preserved_not_accepted",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/failed.patch",
+                    "changed_files": ["src/other.py"],
+                    "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                    "blocker_kind": "worker_off_track",
+                },
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["patch_path"], "/runs/run-1/artifacts/failed.patch")
+
+    def test_failed_verifiable_diff_artifact_can_be_reused_for_repair(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
             [
                 {
@@ -1888,15 +2256,57 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                     "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
                     "blocker_kind": "worker_incomplete_diff",
                     "output_excerpt": "Worker produced source plus required-test changes, but focused tests failed.",
-                    "recovery_action": "Retry from clean target files.",
+                    "verification_command": [
+                        "python3",
+                        "-m",
+                        "unittest",
+                        "src.tandem_agents.config.config_loader_test",
+                    ],
+                    "verification_returncode": 1,
+                    "verification_timed_out": False,
+                    "verification_output_excerpt": "AttributeError: config.aca.throughput",
+                    "recovery_action": "Retry with the preserved source+test patch already applied.",
                 }
             ]
         )
 
         self.assertEqual(len(artifacts), 1)
-        self.assertFalse(artifacts[0]["patch_reusable"])
+        self.assertNotIn("patch_reusable", artifacts[0])
         self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_TEST_FAILED")
         self.assertIn("focused tests failed", artifacts[0]["worker_output_excerpt"])
+        self.assertEqual(
+            artifacts[0]["verification_command"],
+            ["python3", "-m", "unittest", "src.tandem_agents.config.config_loader_test"],
+        )
+        self.assertEqual(artifacts[0]["verification_returncode"], 1)
+        self.assertFalse(artifacts[0]["verification_timed_out"])
+        self.assertIn("config.aca.throughput", artifacts[0]["verification_output_excerpt"])
+
+    def test_repair_no_change_artifact_preserves_carried_failure_reason(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "failure_reason": "WORKER_REPAIR_NO_CHANGE",
+                    "preserved_failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                    "blocker_kind": "worker_no_progress",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/core/repository/repository.py",
+                        "src/tandem_agents/core/repository/repository_test.py",
+                    ],
+                    "output_excerpt": "Repair worker made no filesystem changes.",
+                    "verification_output_excerpt": "TypeError: worker_worktree_name() takes 2 positional arguments",
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_TEST_FAILED")
+        self.assertEqual(artifacts[0]["preserved_from_failure_reason"], "WORKER_REPAIR_NO_CHANGE")
+        self.assertEqual(artifacts[0]["blocker_kind"], "worker_no_progress")
+        self.assertIn("worker_worktree_name", artifacts[0]["verification_output_excerpt"])
 
     def test_guard_rejected_source_and_test_only_artifacts_are_not_marked_reusable(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
@@ -1923,6 +2333,95 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         )
 
         self.assertEqual([artifact["patch_reusable"] for artifact in artifacts], [False, False])
+        self.assertEqual(
+            [artifact["patch_reusable_reason"] for artifact in artifacts],
+            ["one_sided_guard", "one_sided_guard"],
+        )
+
+    def test_weak_test_artifact_can_be_reused_for_assertion_repair(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/core/repository/repository.py",
+                        "src/tandem_agents/core/repository/repository_test.py",
+                    ],
+                    "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": (
+                        "Worker produced source plus required-test file changes, but the test diff did not "
+                        "add a test method or assertion."
+                    ),
+                    "recovery_action": (
+                        "Retry with the preserved patch already applied. Add a meaningful regression assertion."
+                    ),
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertNotIn("patch_reusable", artifacts[0])
+        self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_WEAK_TEST")
+
+    def test_guarded_weak_test_artifact_is_not_reused(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/core/repository/repository.py",
+                        "src/tandem_agents/core/repository/repository_test.py",
+                    ],
+                    "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "patch_reusable": False,
+                    "output_excerpt": (
+                        "ACA already flagged this partial diff with a runaway/destructive guard. "
+                        "Worker produced source plus required-test file changes, but focused tests failed."
+                    ),
+                    "recovery_action": "Rebuild the repair from clean target files.",
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["patch_reusable"], False)
+        self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_WEAK_TEST")
+        self.assertIn("runaway/destructive guard", artifacts[0]["worker_output_excerpt"])
+
+    def test_misaligned_test_artifact_is_rebuilt_from_clean_targets(self) -> None:
+        artifacts = _partial_diff_artifacts_for_retry(
+            [
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                    "changed_files": [
+                        "src/tandem_agents/core/repository/repository.py",
+                        "src/tandem_agents/core/repository/repository_test.py",
+                    ],
+                    "failure_reason": "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": (
+                        "Worker produced source plus required-test file changes, but the required test additions "
+                        "did not exercise newly introduced production symbol(s): IsolatedRunCheckout"
+                    ),
+                }
+            ]
+        )
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["patch_reusable"], False)
+        self.assertEqual(
+            artifacts[0]["patch_reusable_reason"],
+            "worker_verifiable_diff_misaligned_test",
+        )
+        self.assertEqual(artifacts[0]["failure_reason"], "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST")
 
     def test_partial_diff_artifact_preserves_failed_subtask_targets(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(
@@ -1993,6 +2492,342 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             ],
         )
 
+    def test_terminal_worker_failure_merges_latest_partial_diff_artifact(self) -> None:
+        existing = {
+            "subtask_id": "subtask-1",
+            "worker_id": "worker-1",
+            "patch_path": "/runs/run-1/artifacts/source-only.patch",
+            "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+        }
+        ctx = SimpleNamespace(
+            status={"repair": {"partial_diff_artifacts": [dict(existing)]}},
+            blackboard={"repair": {"partial_diff_artifacts": [dict(existing)]}},
+            worker_results=[
+                {
+                    "worker_id": "worker-1",
+                    "subtask_id": "subtask-1",
+                    "partial_diff_artifact": "/runs/run-1/artifacts/test-only.patch",
+                    "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+                    "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                    "blocker_kind": "worker_incomplete_diff",
+                    "output_excerpt": "Worker changed only required test files.",
+                }
+            ],
+        )
+
+        merged = _merge_worker_partial_diff_artifacts_into_repair(
+            ctx,
+            blocker_kind="worker_incomplete_diff",
+        )
+
+        self.assertEqual(
+            [artifact["patch_path"] for artifact in merged],
+            [
+                "/runs/run-1/artifacts/source-only.patch",
+                "/runs/run-1/artifacts/test-only.patch",
+            ],
+        )
+        for repair in (ctx.status["repair"], ctx.blackboard["repair"]):
+            self.assertEqual(repair["partial_diff_artifacts"], merged)
+            self.assertEqual(repair["partial_diff_state"], "preserved_not_accepted")
+            self.assertIn("worker_incomplete_diff", repair["extra_retry_sources"])
+        self.assertFalse(merged[1]["patch_reusable"])
+
+    def test_one_sided_cycle_blocks_after_paired_rebuild_attempt(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+            {
+                "subtask_id": "subtask-2",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/other_test.py"],
+            },
+        ]
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+        }
+
+        self.assertTrue(_one_sided_repair_cycle_should_block(artifacts, blocker))
+
+    def test_one_sided_cycle_does_not_block_before_paired_rebuild_attempt(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+        ]
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+        }
+
+        self.assertFalse(_one_sided_repair_cycle_should_block(artifacts, blocker))
+
+    def test_one_sided_cycle_blocks_after_failed_complementary_repair_attempt(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+        ]
+        blocker = {
+            "kind": "worker_off_track",
+            "worker": {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+        }
+
+        self.assertTrue(_one_sided_repair_cycle_should_block(artifacts, blocker))
+
+    def test_one_sided_after_failed_verifiable_gets_one_guided_followup(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/aca_harness/calculator.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/aca_harness/calculator_test.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "changed_files": [
+                    "src/tandem_agents/aca_harness/calculator.py",
+                    "src/tandem_agents/aca_harness/calculator_test.py",
+                ],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/aca_harness/calculator.py"],
+            },
+        ]
+        blocker = {
+            "kind": "worker_off_track",
+            "worker": {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/aca_harness/calculator.py"],
+            },
+        }
+        cfg = SimpleNamespace(env={})
+
+        self.assertTrue(_one_sided_repair_cycle_should_block(artifacts, blocker))
+        self.assertTrue(_failed_verifiable_followup_one_sided_can_retry(cfg, artifacts, blocker))
+
+        artifacts.append(
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/aca_harness/calculator_test.py"],
+            }
+        )
+
+        self.assertFalse(_failed_verifiable_followup_one_sided_can_retry(cfg, artifacts, blocker))
+
+    def test_complementary_one_sided_artifacts_get_one_pair_repair_retry(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/source-only.patch",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+                "subtask_target_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/test-only.patch",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+                "subtask_target_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        ]
+        cfg = SimpleNamespace(env={})
+
+        self.assertTrue(_partial_diff_artifacts_have_complementary_one_sided_pair(artifacts))
+        self.assertTrue(
+            _complementary_one_sided_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                attempt=2,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _complementary_one_sided_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                attempt=3,
+                base_max_loops=2,
+            )
+        )
+
+    def test_later_serial_subtask_complementary_pair_gets_its_own_retry(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/subtask-1-source-only.patch",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/subtask-1-test-only.patch",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+            {
+                "subtask_id": "subtask-2",
+                "patch_path": "/runs/run-1/artifacts/subtask-2-test-only.patch",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+            {
+                "subtask_id": "subtask-2",
+                "patch_path": "/runs/run-1/artifacts/subtask-2-source-only.patch",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+        ]
+        cfg = SimpleNamespace(env={})
+
+        self.assertTrue(_partial_diff_artifacts_have_complementary_one_sided_pair(artifacts))
+        self.assertTrue(
+            _complementary_one_sided_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                attempt=4,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _complementary_one_sided_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                attempt=5,
+                base_max_loops=2,
+            )
+        )
+
+    def test_destructive_complementary_partial_diff_gets_one_safe_retry(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/source-only.patch",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/test-only.patch",
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/destructive.patch",
+                "failure_reason": "WORKER_DESTRUCTIVE_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+        ]
+        blocker = {
+            "kind": "worker_runaway_diff",
+            "message": "Worker diff exceeded ACA destructive guard.",
+            "detail": {"deletions": 1025, "max_deletions": 200},
+            "worker": {
+                "failure_reason": "WORKER_DESTRUCTIVE_DIFF",
+                "partial_diff_artifact": "/runs/run-1/artifacts/destructive.patch",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+        }
+        cfg = SimpleNamespace(env={})
+
+        self.assertTrue(
+            _destructive_complementary_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=2,
+                base_max_loops=2,
+            )
+        )
+        feedback = _destructive_complementary_retry_feedback(blocker, 2)
+        self.assertIn("destructive diff guard", feedback)
+        self.assertIn("keep deletions near zero", feedback)
+        self.assertIn("small additive edits", feedback)
+
+        artifacts.append(
+            {
+                "subtask_id": "subtask-1",
+                "patch_path": "/runs/run-1/artifacts/destructive-2.patch",
+                "failure_reason": "WORKER_DESTRUCTIVE_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            }
+        )
+        self.assertFalse(
+            _destructive_complementary_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=3,
+                base_max_loops=2,
+            )
+        )
+
     def test_worker_no_progress_builds_base_retry_feedback(self) -> None:
         ctx = SimpleNamespace(
             worker_results=[
@@ -2021,19 +2856,11 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 base_max_loops=2,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _worker_failure_can_retry(
                 SimpleNamespace(env={}),
                 blocker,
-                attempt=2,
-                base_max_loops=2,
-            )
-        )
-        self.assertTrue(
-            _worker_failure_can_retry(
-                SimpleNamespace(env={}),
-                blocker,
-                attempt=3,
+                attempt=1,
                 base_max_loops=2,
             )
         )
@@ -2041,29 +2868,341 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             _worker_failure_can_retry(
                 SimpleNamespace(env={}),
                 blocker,
-                attempt=4,
+                attempt=2,
                 base_max_loops=2,
             )
         )
 
-    def test_worker_no_change_guard_failure_is_not_retryable(self) -> None:
+    def test_worker_no_change_guard_failure_gets_one_base_retry(self) -> None:
         cfg = SimpleNamespace(env={})
-        for failure_reason in ("WORKER_NO_CHANGE", "WORKER_REPAIR_NO_CHANGE"):
-            blocker = {
-                "kind": "worker_no_progress",
-                "worker": {
-                    "failure_reason": failure_reason,
-                },
-            }
+        blocker = {
+            "kind": "worker_no_progress",
+            "worker": {
+                "failure_reason": "WORKER_NO_CHANGE",
+            },
+        }
 
-            self.assertFalse(
-                _worker_failure_can_retry(
-                    cfg,
-                    blocker,
-                    attempt=0,
-                    base_max_loops=2,
-                )
+        self.assertTrue(
+            _worker_failure_can_retry(
+                cfg,
+                blocker,
+                attempt=0,
+                base_max_loops=2,
             )
+        )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                cfg,
+                blocker,
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_repair_loop_extra_retries_include_off_track_and_engine_empty_response(self) -> None:
+        cfg = SimpleNamespace(
+            env={
+                "ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES": "0",
+                "ACA_WORKER_OFF_TRACK_EXTRA_RETRIES": "4",
+                "ACA_WORKER_ENGINE_EMPTY_RESPONSE_EXTRA_RETRIES": "3",
+                "ACA_WORKER_VERIFIABLE_DIFF_TEST_FAILED_EXTRA_RETRIES": "0",
+                "ACA_WORKER_VERIFIABLE_DIFF_WEAK_TEST_EXTRA_RETRIES": "0",
+                "ACA_WORKER_VERIFIABLE_DIFF_IMPORT_ERROR_EXTRA_RETRIES": "0",
+                "ACA_WORKER_VERIFIABLE_DIFF_EXCEPTION_EXTRA_RETRIES": "0",
+                "ACA_WORKER_VERIFIABLE_DIFF_ASSERTION_EXTRA_RETRIES": "0",
+            }
+        )
+
+        self.assertEqual(_worker_repair_loop_extra_retries(cfg), 4)
+
+        cfg.env["ACA_WORKER_OFF_TRACK_EXTRA_RETRIES"] = "0"
+        self.assertEqual(_worker_repair_loop_extra_retries(cfg), 3)
+
+    def test_engine_empty_response_gets_one_base_retry_without_partial_diff(self) -> None:
+        blocker = {
+            "kind": "engine_empty_response",
+            "worker": {
+                "failure_reason": "ENGINE_EMPTY_RESPONSE",
+            },
+        }
+
+        self.assertTrue(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=0,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_engine_no_activity_response_gets_one_base_retry_without_partial_diff(self) -> None:
+        blocker = {
+            "kind": "engine_no_activity_response",
+            "worker": {
+                "failure_reason": "ENGINE_NO_ACTIVITY_RESPONSE",
+            },
+        }
+
+        self.assertTrue(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=0,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={"ACA_WORKER_ENGINE_EMPTY_RESPONSE_EXTRA_RETRIES": "4"}),
+                blocker,
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_engine_empty_response_during_partial_repair_uses_remaining_loop_budget(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "worker_id": "worker-1",
+                "patch_path": "/runs/run-1/artifacts/source-test.patch",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            }
+        ]
+        blocker = {
+            "kind": "engine_empty_response",
+            "worker": {
+                "failure_reason": "ENGINE_EMPTY_RESPONSE",
+            },
+        }
+
+        self.assertTrue(
+            _engine_empty_response_repair_can_retry(
+                artifacts,
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+        self.assertFalse(
+            _engine_empty_response_repair_can_retry(
+                [],
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+        self.assertTrue(
+            _engine_empty_response_repair_can_retry(
+                [
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "patch_path": "/runs/run-1/artifacts/source-only.patch",
+                        "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                        "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+                    }
+                ],
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+        self.assertTrue(
+            _engine_empty_response_repair_can_retry(
+                [
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "patch_path": "/runs/run-1/artifacts/test-only.patch",
+                        "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                        "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+                    }
+                ],
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+        self.assertFalse(
+            _engine_empty_response_repair_can_retry(
+                [
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "patch_path": "/runs/run-1/artifacts/unrelated.patch",
+                        "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                        "changed_files": [
+                            "src/tandem_agents/core/repository/repository.py",
+                            "src/tandem_agents/core/repository/repository_test.py",
+                        ],
+                    }
+                ],
+                blocker,
+                attempt=5,
+                max_loops=6,
+            )
+        )
+        self.assertFalse(
+            _engine_empty_response_repair_can_retry(
+                artifacts,
+                blocker,
+                attempt=5,
+                max_loops=6,
+            )
+        )
+
+    def test_engine_prompt_timeout_during_partial_repair_uses_remaining_loop_budget(self) -> None:
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "worker_id": "worker-1",
+                "patch_path": "/runs/run-1/artifacts/source-only.patch",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            }
+        ]
+        blocker = {
+            "kind": "engine_prompt_timeout",
+            "worker": {
+                "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+            },
+        }
+
+        self.assertTrue(
+            _engine_empty_response_repair_can_retry(
+                artifacts,
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+        self.assertFalse(
+            _engine_empty_response_repair_can_retry(
+                artifacts,
+                blocker,
+                attempt=5,
+                max_loops=6,
+            )
+        )
+        blocker["worker"]["failure_reason"] = "WORKER_VERIFIABLE_DIFF_TEST_FAILED"
+        self.assertFalse(
+            _engine_empty_response_repair_can_retry(
+                artifacts,
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+
+    def test_worker_repair_no_change_guard_failure_is_not_retryable(self) -> None:
+        blocker = {
+            "kind": "worker_no_progress",
+            "worker": {
+                "failure_reason": "WORKER_REPAIR_NO_CHANGE",
+            },
+        }
+
+        self.assertFalse(
+            _worker_failure_can_retry(
+                SimpleNamespace(env={}),
+                blocker,
+                attempt=0,
+                base_max_loops=2,
+            )
+        )
+
+    def test_repair_no_change_with_preserved_verifiable_exception_can_retry(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_no_progress",
+            "worker": {
+                "failure_reason": "WORKER_REPAIR_NO_CHANGE",
+                "preserved_failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "TypeError: worker_worktree_name() takes from 1 to 2 positional arguments but 4 were given"
+                ),
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_repair_no_change_with_preserved_engine_timeout_partial_can_retry_once(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_no_progress",
+            "worker": {
+                "failure_reason": "WORKER_REPAIR_NO_CHANGE",
+                "preserved_failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-2.patch",
+                "changed_files": ["src/tandem_agents/core/phases/task_intake.py"],
+                "output_excerpt": "Repair worker made no filesystem changes.",
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_repair_no_change_without_preserved_partial_still_does_not_retry(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_no_progress",
+            "worker": {
+                "failure_reason": "WORKER_REPAIR_NO_CHANGE",
+                "preserved_failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "TypeError: worker_worktree_name() takes from 1 to 2 positional arguments but 4 were given"
+                ),
+            },
+        }
+
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_preserved_no_progress_partial_diff_is_retryable(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_NO_CHANGE",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-progress.patch",
+                "changed_files": ["src/tandem_agents/core/repository/repository_test.py"],
+                "progress_partial_diff_recovered": True,
+                "engine_blocker_kind": "worker_no_progress",
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
 
     def test_deferred_subtasks_for_retry_keeps_unstarted_serial_tail(self) -> None:
         pending = [
@@ -2131,16 +3270,598 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("Discard this preserved patch", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
-    def test_incomplete_diff_gets_three_extra_worker_repair_loops_by_default(self) -> None:
+    def test_incomplete_diff_gets_one_extra_worker_repair_loop_by_default(self) -> None:
         cfg = SimpleNamespace(env={})
-        blocker = {"kind": "worker_incomplete_diff"}
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_TEST_ONLY_DIFF",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+            },
+        }
 
-        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 3)
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 1)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_source_only_timeout_partial_gets_incomplete_diff_extra_worker_repair_loop(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": ["src/tandem_agents/core/phases/task_intake.py"],
+            },
+        }
+
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 1)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_stalled_no_diff_repair_retries_when_preserved_partial_evidence_exists(self) -> None:
+        cfg = SimpleNamespace(env={})
+        artifacts = [
+            {
+                "patch_path": "/runs/run-1/artifacts/worker-1.patch",
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            }
+        ]
+        blocker = {
+            "kind": "engine_tool_loop_stalled_no_diff",
+            "worker": {
+                "failure_reason": "ENGINE_TOOL_LOOP_STALLED_NO_DIFF",
+                "changed_files": [],
+            },
+        }
+
+        self.assertTrue(
+            _stalled_no_diff_repair_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+        self.assertFalse(
+            _stalled_no_diff_repair_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=2,
+                base_max_loops=2,
+            )
+        )
+
+    def test_stalled_no_diff_repair_does_not_retry_without_preserved_partial_evidence(self) -> None:
+        blocker = {
+            "kind": "engine_tool_loop_stalled_no_diff",
+            "worker": {
+                "failure_reason": "ENGINE_TOOL_LOOP_STALLED_NO_DIFF",
+                "changed_files": [],
+            },
+        }
+
+        self.assertFalse(
+            _stalled_no_diff_repair_can_retry(
+                SimpleNamespace(env={}),
+                [],
+                blocker,
+                attempt=1,
+                base_max_loops=2,
+            )
+        )
+
+    def test_off_track_gets_one_extra_clean_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_off_track",
+            "worker": {
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+            },
+        }
+
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 1)
+        self.assertEqual(_worker_off_track_extra_retries(cfg), 1)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_off_track_extra_clean_repair_loop_can_be_disabled(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_WORKER_OFF_TRACK_EXTRA_RETRIES": "0"})
+        blocker = {
+            "kind": "worker_off_track",
+            "worker": {
+                "failure_reason": "WORKER_OFF_TRACK_TESTLESS_DIFF",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+            },
+        }
+
+        self.assertEqual(_worker_off_track_extra_retries(cfg), 0)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+
+    def test_off_track_extra_clean_repair_loop_ignores_invalid_value(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_WORKER_OFF_TRACK_EXTRA_RETRIES": "bogus"})
+
+        self.assertEqual(_worker_off_track_extra_retries(cfg), 1)
+
+    def test_verification_retry_gets_one_extra_loop_after_worker_repair_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        ctx = SimpleNamespace(
+            status={"repair": {"extra_retry_sources": ["worker_incomplete_diff"]}},
+            blackboard={},
+        )
+
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 1)
+        self.assertEqual(_verification_repair_extra_retries(cfg), 1)
+        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
+
+    def test_verification_repair_extra_loop_can_be_disabled(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_VERIFICATION_REPAIR_EXTRA_RETRIES": "0"})
+        ctx = SimpleNamespace(
+            status={"repair": {"extra_retry_sources": ["worker_incomplete_diff"]}},
+            blackboard={},
+        )
+
+        self.assertEqual(_verification_repair_extra_retries(cfg), 0)
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
+
+    def test_verifiable_diff_test_failure_gets_one_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        }
+
+        self.assertEqual(_worker_incomplete_diff_extra_retries(cfg), 1)
+        self.assertEqual(_worker_verifiable_diff_test_failed_extra_retries(cfg), 1)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_unterminated_verifiable_diff_gets_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_UNTERMINATED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_misaligned_source_test_diff_gets_late_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "output_excerpt": (
+                    "required test additions did not exercise newly introduced production symbol(s): "
+                    "IsolatedRunCheckout"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_weak_test_extra_retries(cfg), 3)
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
         self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+
+    def test_misaligned_source_test_extra_repair_loop_can_be_disabled(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_WORKER_VERIFIABLE_DIFF_WEAK_TEST_EXTRA_RETRIES": "1"})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_weak_test_extra_retries(cfg), 1)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+
+    def test_weak_source_test_assertion_failure_gets_focused_repair_loop(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/aca_harness/calculator.py",
+                    "src/tandem_agents/aca_harness/calculator_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "FAIL: test_describe_operation_rejects_unknown_operation\n"
+                    "AssertionError: ValueError not raised\n"
+                    "FAILED (failures=1)"
+                ),
+            },
+        }
+
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=5, base_max_loops=2))
+
+    def test_verifiable_diff_import_error_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "output_excerpt": (
+                    "ImportError: cannot import name 'isolated_run_branch_name' "
+                    "from 'src.tandem_agents.core.repository.repository'"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_import_error_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_typeerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "output_excerpt": (
+                    "TypeError: task_run_branch_name() got an unexpected keyword argument 'issue_key'"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_nameerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": "NameError: name '_slug' is not defined",
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_positional_typeerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "TypeError: worker_worktree_name() takes from 1 to 2 positional arguments but 5 were given"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_missing_required_typeerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "TypeError: isolated_run_branch_name() missing 1 required positional argument: 'run_id'"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_attributeerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "output_excerpt": "AttributeError: 'str' object has no attribute 'get'",
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_nonetype_attributeerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": "AttributeError: 'NoneType' object has no attribute 'get'",
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_future_import_syntaxerror_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "SyntaxError: from __future__ imports must occur at the beginning of the file"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_exception_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_assertion_failure_gets_second_focused_repair_loop_by_default(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": (
+                    "FAIL: test_branch_name\n"
+                    "AssertionError: 'aca/generated-branch' != 'aca/LACA-12/run-1'\n"
+                    "FAILED (failures=1)"
+                ),
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_assertion_extra_retries(cfg), 2)
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
+        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+
+    def test_verifiable_diff_test_failure_extra_loop_requires_source_and_test_patch(self) -> None:
+        cfg = SimpleNamespace(env={})
+        source_only_blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": ["src/tandem_agents/core/repository/repository.py"],
+            },
+        }
+        no_patch_blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        }
+
+        self.assertFalse(_worker_failure_can_retry(cfg, source_only_blocker, attempt=1, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, no_patch_blocker, attempt=1, base_max_loops=2))
+
+    def test_verifiable_diff_test_failure_artifact_retry_ignores_prior_weak_repairs(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/test-failed.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        }
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+                "patch_path": "/runs/run-1/artifacts/weak.patch",
+                "changed_files": blocker["worker"]["changed_files"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+                "patch_path": "/runs/run-1/artifacts/misaligned.patch",
+                "changed_files": blocker["worker"]["changed_files"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "patch_path": "/runs/run-1/artifacts/test-failed.patch",
+                "changed_files": blocker["worker"]["changed_files"],
+            },
+        ]
+
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
+        self.assertTrue(
+            _verifiable_diff_test_failed_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=3,
+                max_loops=6,
+            )
+        )
+
+    def test_verifiable_diff_module_not_found_uses_import_error_retry_budget(self) -> None:
+        cfg = SimpleNamespace(env={})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/test-failed-2.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "verification_output_excerpt": "ModuleNotFoundError: No module named 'pytest'",
+            },
+        }
+        artifacts = [
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "patch_path": "/runs/run-1/artifacts/test-failed-1.patch",
+                "changed_files": blocker["worker"]["changed_files"],
+            },
+            {
+                "subtask_id": "subtask-1",
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "patch_path": "/runs/run-1/artifacts/test-failed-2.patch",
+                "changed_files": blocker["worker"]["changed_files"],
+            },
+        ]
+
+        self.assertTrue(
+            _verifiable_diff_test_failed_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=4,
+                max_loops=6,
+            )
+        )
+
+        cfg.env["ACA_WORKER_VERIFIABLE_DIFF_IMPORT_ERROR_EXTRA_RETRIES"] = "1"
+        self.assertFalse(
+            _verifiable_diff_test_failed_partial_diff_can_retry(
+                cfg,
+                artifacts,
+                blocker,
+                attempt=4,
+                max_loops=6,
+            )
+        )
+
+    def test_verifiable_diff_test_failure_extra_retry_budget_can_be_disabled(self) -> None:
+        cfg = SimpleNamespace(env={"ACA_WORKER_VERIFIABLE_DIFF_TEST_FAILED_EXTRA_RETRIES": "0"})
+        blocker = {
+            "kind": "worker_incomplete_diff",
+            "worker": {
+                "failure_reason": "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+                "partial_diff_artifact": "/runs/run-1/artifacts/worker-1.patch",
+                "changed_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+            },
+        }
+
+        self.assertEqual(_worker_verifiable_diff_test_failed_extra_retries(cfg), 0)
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
 
     def test_engine_timeout_with_partial_diff_gets_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2152,10 +3873,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         }
 
         self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=0, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
         self.assertFalse(
             _worker_failure_can_retry(
                 cfg,
@@ -2269,6 +3987,34 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         self.assertIn("retryable blocker `worker_unproductive_diff`", feedback or "")
         self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
 
+    def test_reported_blocker_from_false_missing_target_glob_is_retryable_once(self) -> None:
+        ctx = SimpleNamespace(
+            worker_results=[
+                {
+                    "worker_id": "worker-2",
+                    "subtask_id": "subtask-2",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "WORKER_REPORTED_BLOCKER",
+                    "blocker_kind": "worker_reported_blocker",
+                    "changed_files": [],
+                    "stdout": (
+                        "Observed `glob` for "
+                        "`src/tandem_agents/core/{phases/task_intake.py,repository/repository.py}` "
+                        "returned no matches for target files."
+                    ),
+                }
+            ]
+        )
+        blocker = _worker_failure_blocker(ctx.worker_results)
+
+        feedback = _worker_failure_retry_feedback(ctx, blocker, 0)
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("retryable blocker `worker_reported_blocker`", feedback or "")
+        self.assertTrue(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=0, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(SimpleNamespace(env={}), blocker, attempt=1, base_max_loops=2))
+
     def test_extra_worker_repair_loop_is_limited_to_incomplete_diffs(self) -> None:
         cfg = SimpleNamespace(env={})
 
@@ -2285,10 +4031,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
         cfg = SimpleNamespace(env={})
         blocker = {"kind": "worker_corrupt_diff"}
 
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=2, base_max_loops=2))
-        self.assertTrue(_worker_failure_can_retry(cfg, blocker, attempt=3, base_max_loops=2))
-        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=4, base_max_loops=2))
+        self.assertFalse(_worker_failure_can_retry(cfg, blocker, attempt=1, base_max_loops=2))
 
     def test_incomplete_diff_extra_retry_budget_can_be_disabled(self) -> None:
         cfg = SimpleNamespace(env={"ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES": "0"})
@@ -2318,8 +4061,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
         self.assertTrue(_verification_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
-        self.assertTrue(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
-        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
 
     def test_integration_can_use_incomplete_diff_extra_repair_budget(self) -> None:
         cfg = SimpleNamespace(env={})
@@ -2336,9 +4078,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
 
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=1, base_max_loops=2))
         self.assertTrue(_integration_can_retry(cfg, ctx, attempt=2, base_max_loops=2))
-        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
-        self.assertTrue(_integration_can_retry(cfg, ctx, attempt=4, base_max_loops=2))
-        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=5, base_max_loops=2))
+        self.assertFalse(_integration_can_retry(cfg, ctx, attempt=3, base_max_loops=2))
 
     def test_integration_prompt_timeout_uses_watchdog_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2424,7 +4164,7 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
                 repair["discarded_partial_diff_artifacts"][0]["patch_path"],
                 "/runs/run-1/artifacts/worker.patch",
             )
-        self.assertTrue(_verification_can_retry(SimpleNamespace(env={}), ctx, attempt=2, base_max_loops=2))
+        self.assertFalse(_verification_can_retry(SimpleNamespace(env={}), ctx, attempt=2, base_max_loops=2))
 
     def test_retryable_worker_failure_collects_partial_diff_artifact(self) -> None:
         artifacts = _partial_diff_artifacts_for_retry(

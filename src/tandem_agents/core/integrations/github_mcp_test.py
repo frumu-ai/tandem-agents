@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.core.integrations.github_mcp import (
@@ -20,6 +23,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     guarded_auto_merge,
     list_pull_requests,
     normalize_pull_request_metadata,
+    refresh_pull_request_lifecycle,
     update_project_item_status,
 )
 
@@ -466,6 +470,174 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
         self.assertFalse(github_project_status_key_is_actionable("Blocked"))
         self.assertFalse(github_project_status_key_is_actionable("In progress"))
         self.assertFalse(github_project_status_key_is_actionable("In review"))
+
+    def test_refresh_pull_request_lifecycle_falls_back_to_gh_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            pull_request = {
+                "number": 53,
+                "head_branch": "aca/task",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+            }
+            gh_payload = {
+                "number": 53,
+                "url": "https://github.com/frumu-ai/example/pull/53",
+                "headRefName": "aca/task",
+                "baseRefName": "main",
+                "state": "OPEN",
+                "isDraft": False,
+                "reviewDecision": "REVIEW_REQUIRED",
+                "statusCheckRollup": [],
+            }
+            completed = subprocess.CompletedProcess(
+                args=["gh"],
+                returncode=0,
+                stdout=json.dumps(gh_payload),
+                stderr="",
+            )
+            with (
+                patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool", return_value={"output": "unknown tool"}),
+                patch("src.tandem_agents.core.integrations.github_mcp.subprocess.run", return_value=completed) as run,
+            ):
+                refreshed = refresh_pull_request_lifecycle(cfg, pull_request)
+
+            self.assertEqual(refreshed["url"], "https://github.com/frumu-ai/example/pull/53")
+            self.assertEqual(refreshed["base_repo"], "frumu-ai/example")
+            self.assertEqual(refreshed["head_branch"], "aca/task")
+            self.assertEqual(refreshed["review_state"], "review_required")
+            self.assertEqual(refreshed["checks_state"], "unknown")
+            self.assertEqual(refreshed["lifecycle_state"], "waiting-for-review")
+            self.assertFalse(refreshed["terminal"])
+            self.assertIn("pr", run.call_args.args[0])
+
+    def test_refresh_pull_request_lifecycle_falls_back_to_github_graphql(self) -> None:
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequest": {
+                                    "number": 53,
+                                    "url": "https://github.com/frumu-ai/example/pull/53",
+                                    "headRefName": "aca/task",
+                                    "baseRefName": "main",
+                                    "state": "OPEN",
+                                    "isDraft": False,
+                                    "merged": False,
+                                    "reviewDecision": "APPROVED",
+                                    "statusCheckRollup": {
+                                        "contexts": {
+                                            "nodes": [
+                                                {
+                                                    "__typename": "CheckRun",
+                                                    "name": "Test Rust",
+                                                    "status": "COMPLETED",
+                                                    "conclusion": "FAILURE",
+                                                    "detailsUrl": "https://github.com/frumu-ai/example/actions/runs/1",
+                                                    "workflowName": "CI",
+                                                }
+                                            ]
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cfg.env["GITHUB_TOKEN"] = "token"
+            pull_request = {
+                "number": 53,
+                "head_branch": "aca/task",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+            }
+            with (
+                patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool", return_value={"output": "unknown tool"}),
+                patch("src.tandem_agents.core.integrations.github_mcp.urlopen", return_value=_Response()) as api,
+                patch("src.tandem_agents.core.integrations.github_mcp.subprocess.run") as run,
+            ):
+                refreshed = refresh_pull_request_lifecycle(cfg, pull_request)
+
+            self.assertEqual(refreshed["url"], "https://github.com/frumu-ai/example/pull/53")
+            self.assertEqual(refreshed["review_state"], "approved")
+            self.assertEqual(refreshed["checks_state"], "failure")
+            self.assertEqual(refreshed["lifecycle_state"], "needs-repair")
+            self.assertFalse(refreshed["terminal"])
+            api.assert_called_once()
+            run.assert_not_called()
+
+    def test_refresh_pull_request_lifecycle_tries_token_file_after_bad_env_token(self) -> None:
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequest": {
+                                    "number": 53,
+                                    "url": "https://github.com/frumu-ai/example/pull/53",
+                                    "headRefName": "aca/task",
+                                    "baseRefName": "main",
+                                    "state": "OPEN",
+                                    "isDraft": False,
+                                    "merged": False,
+                                    "reviewDecision": "REVIEW_REQUIRED",
+                                    "statusCheckRollup": {"contexts": {"nodes": []}},
+                                }
+                            }
+                        }
+                    }
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            token_file = root / "secrets" / "github_token"
+            token_file.parent.mkdir(parents=True)
+            token_file.write_text("good-token\n", encoding="utf-8")
+            cfg.env["GITHUB_TOKEN"] = "bad-token"
+            cfg.env["GITHUB_TOKEN_FILE"] = "secrets/github_token"
+            pull_request = {
+                "number": 53,
+                "head_branch": "aca/task",
+                "base_branch": "main",
+                "base_repo": "frumu-ai/example",
+            }
+            bad_credentials = HTTPError(
+                "https://api.github.com/graphql",
+                401,
+                "Unauthorized",
+                hdrs=None,
+                fp=None,
+            )
+            with (
+                patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool", return_value={"output": "unknown tool"}),
+                patch("src.tandem_agents.core.integrations.github_mcp.urlopen", side_effect=[bad_credentials, _Response()]) as api,
+                patch("src.tandem_agents.core.integrations.github_mcp.subprocess.run") as run,
+            ):
+                refreshed = refresh_pull_request_lifecycle(cfg, pull_request)
+
+            self.assertEqual(refreshed["url"], "https://github.com/frumu-ai/example/pull/53")
+            self.assertEqual(refreshed["lifecycle_state"], "waiting-for-review")
+            self.assertEqual(api.call_count, 2)
+            run.assert_not_called()
 
     def test_auto_merge_denies_when_policy_is_human_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

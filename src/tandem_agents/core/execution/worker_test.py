@@ -16,15 +16,22 @@ from src.tandem_agents.core.execution.worker import (
     _async_prompt_timeout_seconds,
     _active_worker_engine_sessions_path_for_log,
     _call_with_timeout,
+    _carried_diff_ready_for_verification_result,
     _clear_active_worker_attempt,
     _coerce_worker_failure,
     _diff_touches_nearby_test_files,
+    _engine_empty_stream_timeout_seconds,
+    _engine_no_activity_timeout_seconds,
     _engine_max_events_without_text,
     _empty_transcript_retry_prompt,
     _extract_partial_worker_diff_artifact,
     _extract_prompt_sync_text,
     _extract_session_reply,
+    _fresh_changed_files_since_worker_baseline,
     _git_ignored_paths,
+    _inherited_overlay_no_fresh_changes_result,
+    _is_aca_repo_artifact_path,
+    _log_path_worker_attempt_is_current,
     _manager_plan_stream_complete,
     _materialize_worker_context,
     _missing_required_production_anchor_tokens,
@@ -39,12 +46,14 @@ from src.tandem_agents.core.execution.worker import (
     _scaled_async_prompt_timeout_seconds,
     _scaled_prompt_sync_timeout_seconds,
     _substantive_target_files,
+    _subtask_allows_carried_diff_without_fresh_write,
     _subtask_requires_real_diff,
     _support_only_changed_files_for_subtask,
     _terminalized_note_reports_blockers,
     _terminalize_worker_after_tool_loop,
     _worktree_changed_files,
     _worker_result_should_retry,
+    _worker_start_baseline_metadata,
     _worker_execution_worktree_name,
     _worker_note_reports_blocked,
     _worker_timeout_multiplier,
@@ -183,6 +192,48 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             self.assertFalse(marker.exists())
             delete_session.assert_called_once()
 
+    def test_stream_keeps_active_worker_engine_session_when_delete_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            log_dir = run_dir / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / "worker-1.log"
+            marker = _active_worker_engine_sessions_path_for_log(log_path)
+            self.assertIsNotNone(marker)
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.delete_tandem_session",
+                    side_effect=RuntimeError("delete failed"),
+                ) as delete_session, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    return_value={"run_id": "run-1"},
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={"text": "done", "completed": True},
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "false"}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=run_dir,
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            delete_session.assert_called_once()
+            active = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(active["worker-1"]["session_id"], "session-1")
+            self.assertEqual(active["worker-1"]["cleanup_error"], "session_delete_failed")
+            self.assertIn("cleanup_failed_at_ms", active["worker-1"])
+
     def test_dispatch_abort_clears_active_worker_attempt_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
@@ -199,10 +250,33 @@ class WorkerFailureCoercionTest(unittest.TestCase):
                 json.loads(marker.read_text(encoding="utf-8")),
                 {"worker-2": "other-exec"},
             )
+            self.assertEqual(
+                json.loads((run_dir / "cancelled_worker_attempts.json").read_text(encoding="utf-8")),
+                {"worker-1": ["old-exec"]},
+            )
 
             _clear_active_worker_attempt_marker(ctx, "worker-2")
 
             self.assertFalse(marker.exists())
+            self.assertEqual(
+                json.loads((run_dir / "cancelled_worker_attempts.json").read_text(encoding="utf-8")),
+                {"worker-1": ["old-exec"], "worker-2": ["other-exec"]},
+            )
+
+    def test_cancelled_worker_attempt_is_not_current_for_late_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            log_dir = run_dir / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / "worker-1.log"
+            worktree = run_dir / "worktrees" / "worker-1--subtask--exec-1-123"
+            worktree.mkdir(parents=True)
+            (run_dir / "cancelled_worker_attempts.json").write_text(
+                json.dumps({"worker-1": ["1-123"]}),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(_log_path_worker_attempt_is_current(log_path, "worker-1", worktree))
 
     def test_worker_execution_worktree_name_uses_safe_internal_override(self) -> None:
         self.assertEqual(
@@ -258,7 +332,7 @@ class WorkerFailureCoercionTest(unittest.TestCase):
             [{"id": "subtask-1", "title": "Small task", "files": ["src/app.py"]}],
         )
 
-        self.assertEqual(timeout, 290.0)
+        self.assertEqual(timeout, 530.0)
 
     def test_worker_no_progress_timeout_scales_for_large_subtasks(self) -> None:
         ctx = SimpleNamespace(
@@ -885,6 +959,94 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             log_text = (run_dir / "logs" / "worker-1.log").read_text(encoding="utf-8")
             self.assertIn("carry-forward patch did not apply cleanly", log_text)
 
+    def test_run_worker_subtask_verifies_carried_patch_without_fresh_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            source = worktree / "src" / "calculator.py"
+            test_file = worktree / "src" / "calculator_test.py"
+            source.parent.mkdir()
+            source.write_text("def multiply(left, right):\n    return left + right\n", encoding="utf-8")
+            test_file.write_text(
+                "import unittest\n\n"
+                "from .calculator import multiply\n\n"
+                "class CalculatorTest(unittest.TestCase):\n"
+                "    def test_multiply(self):\n"
+                "        self.assertEqual(multiply(2, 3), 5)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "src/calculator.py", "src/calculator_test.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            source.write_text("def multiply(left, right):\n    return left * right\n", encoding="utf-8")
+            test_file.write_text(
+                "import unittest\n\n"
+                "from .calculator import multiply\n\n"
+                "class CalculatorTest(unittest.TestCase):\n"
+                "    def test_multiply(self):\n"
+                "        self.assertEqual(multiply(2, 3), 6)\n",
+                encoding="utf-8",
+            )
+            patch = root / "paired.patch"
+            diff_text = subprocess.run(
+                    ["git", "diff", "--binary"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            patch.write_text(diff_text if diff_text.endswith("\n") else diff_text + "\n", encoding="utf-8")
+            subprocess.run(["git", "checkout", "--", "src/calculator.py", "src/calculator_test.py"], cwd=worktree, check=True)
+            repo_path.mkdir()
+
+            result = {
+                "role": "worker",
+                "returncode": 0,
+                "stdout": "Verification passed for the carried source+test diff.",
+                "stderr": "",
+                "changed_files": ["src/calculator.py", "src/calculator_test.py"],
+            }
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt", return_value=dict(result)) as stream_prompt, \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", side_effect=lambda output, *_args: output):
+                output = run_worker_subtask(
+                    SimpleNamespace(env={}),
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-344", "source": {"type": "linear"}, "execution_kind": "code_edit", "title": "Task"},
+                    {
+                        "id": "subtask-1",
+                        "title": "Verify complementary source and test partial diffs",
+                        "goal": "Verify the carried source+test repair.",
+                        "files": ["src/calculator.py", "src/calculator_test.py"],
+                        "target_files": ["src/calculator.py", "src/calculator_test.py"],
+                        "carry_forward_patches": [str(patch)],
+                        "repair_verification_first": True,
+                        "write_required": False,
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 0)
+            self.assertFalse(output["write_required"])
+            self.assertEqual(source.read_text(encoding="utf-8"), "def multiply(left, right):\n    return left * right\n")
+            self.assertFalse(stream_prompt.call_args.kwargs["write_required"])
+
     def test_preserved_partial_diff_artifact_carries_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -922,6 +1084,25 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             new_test.unlink()
             self.assertTrue(_apply_carry_forward_patch(repo, artifact, log_path))
             self.assertIn("contract", new_test.read_text(encoding="utf-8"))
+
+    def test_docs_aca_markdown_file_is_not_filtered_as_internal_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "--initial-branch=main"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=repo, check=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+
+            (repo / "docs").mkdir()
+            (repo / "docs" / "ACA_SMOKE_HARNESS.md").write_text("# ACA Smoke Harness\n", encoding="utf-8")
+            (repo / "ACA_WORKER_NOTE.md").write_text("scratch\n", encoding="utf-8")
+
+            self.assertFalse(_is_aca_repo_artifact_path("docs/ACA_SMOKE_HARNESS.md"))
+            self.assertTrue(_is_aca_repo_artifact_path("ACA_WORKER_NOTE.md"))
+            self.assertEqual(_worktree_changed_files(repo), ["docs/ACA_SMOKE_HARNESS.md"])
 
     def test_aca_blocker_note_is_not_preserved_as_partial_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1330,6 +1511,8 @@ diff --git a/src/repository_test.py b/src/repository_test.py
         cfg = SimpleNamespace(env={})
 
         self.assertEqual(_async_prompt_timeout_seconds(cfg, "worker-1", True), 360.0)
+        self.assertEqual(_engine_empty_stream_timeout_seconds(cfg), 45.0)
+        self.assertEqual(_engine_no_activity_timeout_seconds(cfg), 90.0)
         self.assertEqual(_async_no_text_timeout_seconds(cfg, "worker-1", True), 180.0)
         self.assertEqual(_async_prompt_timeout_seconds(cfg, "manager", False), 360.0)
         self.assertEqual(_async_no_text_timeout_seconds(cfg, "manager", False), 210.0)
@@ -1402,8 +1585,8 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             )
         )
 
-    def test_verification_first_repair_does_not_require_new_real_diff(self) -> None:
-        self.assertFalse(
+    def test_verification_first_repair_requires_real_diff_budget(self) -> None:
+        self.assertTrue(
             _subtask_requires_real_diff(
                 {
                     "title": "Finish repository worktree isolation and conflict detection patch",
@@ -1421,12 +1604,38 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             )
         )
 
+    def test_verification_first_carried_patch_can_skip_fresh_write(self) -> None:
+        self.assertTrue(
+            _subtask_allows_carried_diff_without_fresh_write(
+                {
+                    "repair_verification_first": True,
+                    "write_required": False,
+                    "carry_forward_patches": ["/runs/run-1/artifacts/source.patch"],
+                }
+            )
+        )
+        self.assertTrue(
+            _subtask_allows_carried_diff_without_fresh_write(
+                {
+                    "repair_verification_first": True,
+                    "write_required": True,
+                    "carry_forward_patches": ["/runs/run-1/artifacts/source.patch"],
+                }
+            )
+        )
+
     def test_empty_transcript_retry_prompt_is_role_aware(self) -> None:
         manager_prompt = _empty_transcript_retry_prompt(role="manager", write_required=False)
-        worker_prompt = _empty_transcript_retry_prompt(role="worker-1", require_tool_use=True, write_required=True)
+        worker_prompt = _empty_transcript_retry_prompt(
+            role="worker-1",
+            require_tool_use=True,
+            write_required=True,
+            original_prompt="Subtask title: Edit repository.py",
+        )
 
         self.assertIn("Return JSON only", manager_prompt)
-        self.assertIn("Continue the original task using repository tools", worker_prompt)
+        self.assertIn("Continue the original task using the original prompt excerpt", worker_prompt)
+        self.assertIn("Subtask title: Edit repository.py", worker_prompt)
         self.assertIn("produced and verified filesystem changes", worker_prompt)
 
     def test_call_with_timeout_raises_for_stalled_operation(self) -> None:
@@ -1923,6 +2132,78 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 retry_result["partial_diff_artifact"],
             )
 
+    def test_linear_code_edit_existing_targets_still_write_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            repo_path.mkdir()
+            worktree.mkdir()
+            target = worktree / "src" / "lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            cfg = SimpleNamespace()
+            worker_result = {
+                "returncode": 0,
+                "stdout": "done",
+                "log_path": str(run_dir / "logs" / "worker-1.log"),
+            }
+
+            def summarize(result: dict[str, object], *_args: object) -> dict[str, object]:
+                return dict(result)
+
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.stream_tandem_prompt",
+                    return_value=worker_result,
+                ) as stream_prompt, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._terminalize_worker_after_tool_loop",
+                    side_effect=lambda _cfg, result, *_args, **_kwargs: result,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._coerce_worker_failure",
+                    side_effect=lambda result, *_args, **_kwargs: result,
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker._recover_nonzero_result_if_diff_satisfies_subtask",
+                    side_effect=lambda result, *_args, **_kwargs: result,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes"), \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", side_effect=summarize):
+                output = run_worker_subtask(
+                    cfg,
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {
+                        "task_id": "TAN-170",
+                        "source": {"type": "linear"},
+                        "execution_kind": "code_edit",
+                        "title": "Task",
+                    },
+                    {
+                        "id": "subtask-1",
+                        "title": "Subtask",
+                        "goal": "Change files",
+                        "files": ["src/lib.rs"],
+                        "target_files": ["src/lib.rs"],
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 0)
+            self.assertTrue(stream_prompt.call_args.kwargs["write_required"])
+
     def test_run_worker_subtask_uses_prompt_sync_first_for_deterministic_slice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2210,6 +2491,17 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual([event["type"] for event in events], ["worker.started"])
             self.assertEqual(events[0]["payload"]["execution_id"], "old-exec")
 
+    def test_engine_no_activity_response_is_internally_retryable(self) -> None:
+        self.assertTrue(
+            _worker_result_should_retry(
+                {
+                    "returncode": 1,
+                    "failure_reason": "ENGINE_NO_ACTIVITY_RESPONSE",
+                    "blocker_kind": "engine_no_activity_response",
+                }
+            )
+        )
+
     def test_engine_empty_response_failure_gets_actionable_blocker_kind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
@@ -2284,6 +2576,143 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertNotIn("blocker_kind", result)
             self.assertNotIn("partial_diff_artifact", result)
             self.assertIn("normal integration review", log_path.read_text(encoding="utf-8"))
+
+    def test_inherited_overlay_timeout_does_not_preserve_partial_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            target = worktree / "src" / "existing.ts"
+            target.parent.mkdir()
+            target.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/existing.ts"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            target.write_text("inherited overlay\n", encoding="utf-8")
+            baseline = _worker_start_baseline_metadata(worktree)
+
+            self.assertEqual(_fresh_changed_files_since_worker_baseline(worktree, baseline), [])
+
+            result = _inherited_overlay_no_fresh_changes_result(
+                {
+                    "returncode": 1,
+                    "stdout": "ENGINE_PROMPT_TIMEOUT\n",
+                    "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                    "blocker_kind": "engine_prompt_timeout",
+                    "partial_diff_artifact": "/tmp/stale.patch",
+                    "artifacts": {"partial_diff": "/tmp/stale.patch"},
+                    "changed_files": ["src/existing.ts"],
+                },
+                log_path,
+                worktree,
+                baseline,
+            )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_INHERITED_OVERLAY_NO_FRESH_CHANGES")
+            self.assertEqual(result["blocker_kind"], "worker_no_progress")
+            self.assertEqual(result["engine_failure_reason"], "ENGINE_PROMPT_TIMEOUT")
+            self.assertEqual(result["engine_blocker_kind"], "engine_prompt_timeout")
+            self.assertEqual(result["changed_files"], [])
+            self.assertEqual(result["inherited_overlay_changed_files"], ["src/existing.ts"])
+            self.assertEqual(result["fresh_changed_files"], [])
+            self.assertNotIn("partial_diff_artifact", result)
+            self.assertNotIn("artifacts", result)
+            self.assertIn("will not preserve", log_path.read_text(encoding="utf-8"))
+
+    def test_carried_source_test_diff_returns_reviewable_verification_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "repo"
+            logs = root / "run" / "logs"
+            logs.mkdir(parents=True)
+            log_path = logs / "worker-1.log"
+            log_path.write_text("", encoding="utf-8")
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            source = worktree / "src" / "calculator.py"
+            test = worktree / "src" / "calculator_test.py"
+            source.parent.mkdir()
+            source.write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            test.write_text(
+                "import unittest\n\n"
+                "from .calculator import add\n\n"
+                "class CalculatorTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "src/calculator.py", "src/calculator_test.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            source.write_text(
+                "def add(left, right):\n"
+                "    return left + right\n\n"
+                "def multiply(left, right):\n"
+                "    return left * right\n",
+                encoding="utf-8",
+            )
+            test.write_text(
+                "import unittest\n\n"
+                "from .calculator import add, multiply\n\n"
+                "class CalculatorTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n\n"
+                "    def test_multiply(self):\n"
+                "        self.assertEqual(multiply(2, 3), 6)\n",
+                encoding="utf-8",
+            )
+
+            result = _carried_diff_ready_for_verification_result(
+                "worker-1",
+                {
+                    "id": "subtask-1",
+                    "files": ["src/calculator.py", "src/calculator_test.py"],
+                    "target_files": ["src/calculator.py", "src/calculator_test.py"],
+                    "repair_verification_first": True,
+                    "write_required": False,
+                    "carry_forward_patches": ["/tmp/source.patch", "/tmp/test.patch"],
+                },
+                log_path,
+                worktree,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_CARRIED_DIFF_READY_FOR_VERIFICATION")
+            self.assertEqual(result["blocker_kind"], "worker_incomplete_diff")
+            self.assertFalse(result["write_required"])
+            self.assertEqual(result["changed_files"], ["src/calculator.py", "src/calculator_test.py"])
+            self.assertTrue(Path(result["partial_diff_artifact"]).is_file())
+            artifact_text = Path(result["partial_diff_artifact"]).read_text(encoding="utf-8")
+            self.assertIn("def multiply", artifact_text)
+            self.assertIn("test_multiply", artifact_text)
+
+    def test_focused_failed_carried_diff_requires_worker_edit_attempt(self) -> None:
+        subtask = {
+            "id": "subtask-1",
+            "files": ["src/calculator.py", "src/calculator_test.py"],
+            "target_files": ["src/calculator.py", "src/calculator_test.py"],
+            "repair_verification_first": True,
+            "carry_forward_patch": "/tmp/worker-1.patch",
+            "repair_focus_instructions": [
+                "Focused NameError repair: resolve undefined symbol(s) `calculator` before chasing later failures."
+            ],
+            "repair_worker_output_excerpt": (
+                "Focused verification command: python3 -m unittest src.calculator_test "
+                "Focused failure: NameError: name 'calculator' is not defined."
+            ),
+        }
+
+        self.assertFalse(_subtask_allows_carried_diff_without_fresh_write(subtask))
 
     def test_tool_loop_stall_with_diff_recovers_into_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4003,6 +4432,335 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(result["failure_reason"], "")
             self.assertEqual(result["blocker_kind"], "")
 
+    def test_no_activity_worker_response_fails_fast_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                return_value="session-1",
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session") as delete_session, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    return_value={"run_id": "run-1"},
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={
+                        "text": "",
+                        "completed": False,
+                        "reason": "no_activity_timeout",
+                        "event_count": 3,
+                        "meaningful_event_count": 0,
+                    },
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.prompt_tandem_session_sync") as prompt_sync:
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_NO_ACTIVITY_RESPONSE")
+            self.assertEqual(result["blocker_kind"], "engine_no_activity_response")
+            self.assertIn("ENGINE_NO_ACTIVITY_RESPONSE", result["stdout"])
+            self.assertEqual(create_session.call_count, 1)
+            prompt_async.assert_called_once()
+            delete_session.assert_called_once_with(mock.ANY, "session-1")
+            prompt_sync.assert_not_called()
+            self.assertEqual(result["engine"]["fallback_mode"], "no_activity_fail_fast")
+            self.assertTrue(result["engine"]["empty_response_fail_fast"])
+
+    def test_empty_async_worker_response_retries_in_fresh_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session") as delete_session, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    side_effect=[
+                        {"text": "", "completed": True, "reason": "", "event_count": 1},
+                        {"text": "fresh session completed", "completed": True, "reason": "", "event_count": 2},
+                    ],
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("fresh session completed", result["stdout"])
+            self.assertEqual(create_session.call_count, 2)
+            self.assertIn(mock.call(mock.ANY, "session-1"), delete_session.mock_calls)
+            self.assertEqual(prompt_async.call_count, 2)
+            self.assertIn("do work", prompt_async.call_args_list[1].kwargs["prompt"])
+            self.assertEqual(result["engine"]["empty_response_session_id"], "session-1")
+            self.assertEqual(result["engine"]["session_id"], "session-2")
+            self.assertEqual(result["engine"]["fallback_mode"], "async_empty_response_fresh_session")
+            self.assertIn("fresh session", log_path.read_text(encoding="utf-8"))
+
+    def test_empty_async_worker_response_retries_with_configured_fallback_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            cfg = SimpleNamespace(
+                env={"OPENAI_API_KEY": "sk-test", "ACA_WORKER_NO_ACTIVITY_FAIL_FAST_ENABLED": "false"},
+                provider=SimpleNamespace(
+                    base_url="",
+                    fallback_provider="openai",
+                    fallback_model="gpt-4.1-mini",
+                ),
+            )
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    side_effect=[
+                        {
+                            "text": "",
+                            "completed": False,
+                            "reason": "no_activity_timeout",
+                            "event_count": 6,
+                            "meaningful_event_count": 0,
+                        },
+                        {
+                            "text": "fallback route completed",
+                            "completed": True,
+                            "reason": "",
+                            "event_count": 2,
+                            "meaningful_event_count": 2,
+                        },
+                    ],
+                ) as stream_run:
+                result = stream_tandem_prompt(
+                    cfg,
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("fallback route completed", result["stdout"])
+            self.assertEqual(create_session.call_count, 2)
+            self.assertEqual(stream_run.call_count, 2)
+            self.assertEqual(stream_run.call_args_list[0].kwargs["empty_stream_timeout_seconds"], 45.0)
+            self.assertEqual(stream_run.call_args_list[0].kwargs["no_activity_timeout_seconds"], 90.0)
+            self.assertEqual(result["engine"]["timeouts"]["async_no_activity_seconds"], 90.0)
+            self.assertEqual(result["engine"]["stream_reason"], "no_activity_timeout")
+            self.assertEqual(result["engine"]["stream_event_count"], 2)
+            self.assertEqual(result["engine"]["stream_meaningful_event_count"], 2)
+            self.assertEqual(result["engine"]["empty_response_stream_reason"], "no_activity_timeout")
+            self.assertEqual(result["engine"]["empty_response_stream_event_count"], 6)
+            self.assertEqual(result["engine"]["empty_response_stream_meaningful_event_count"], 0)
+            self.assertEqual(create_session.call_args_list[0].kwargs["provider"], "openai-codex")
+            self.assertEqual(create_session.call_args_list[0].kwargs["model"], "gpt-5.5")
+            self.assertEqual(create_session.call_args_list[1].kwargs["provider"], "openai")
+            self.assertEqual(create_session.call_args_list[1].kwargs["model"], "gpt-4.1-mini")
+            switch = result["engine"]["empty_response_route_switch"]
+            self.assertEqual(switch["source"], "aca_fallback_provider")
+            self.assertEqual(switch["from"], {"provider": "openai-codex", "model": "gpt-5.5"})
+            self.assertEqual(switch["to"], {"provider": "openai", "model": "gpt-4.1-mini"})
+            self.assertEqual(result["engine"]["provider"], "openai")
+            self.assertEqual(result["engine"]["model"], "gpt-4.1-mini")
+            self.assertIn("ENGINE_EMPTY_RESPONSE_ROUTE_SWITCH", log_path.read_text(encoding="utf-8"))
+
+    def test_no_activity_retry_uses_fresh_prompt_sync_session_after_route_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            cfg = SimpleNamespace(
+                env={"OPENAI_API_KEY": "sk-test", "ACA_WORKER_NO_ACTIVITY_FAIL_FAST_ENABLED": "false"},
+                provider=SimpleNamespace(
+                    base_url="",
+                    fallback_provider="openai",
+                    fallback_model="gpt-4.1-mini",
+                ),
+            )
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2", "session-3"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session") as delete_session, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    side_effect=[{"run_id": "run-1"}, {"run_id": "run-2"}],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    side_effect=[
+                        {
+                            "text": "",
+                            "completed": False,
+                            "reason": "no_activity_timeout",
+                            "event_count": 3,
+                            "meaningful_event_count": 0,
+                        },
+                        {
+                            "text": "",
+                            "completed": False,
+                            "reason": "no_activity_timeout",
+                            "event_count": 4,
+                            "meaningful_event_count": 0,
+                        },
+                    ],
+                ), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    return_value={"messages": [{"info": {"role": "assistant"}, "parts": [{"text": "sync fallback"}]}]},
+                ) as prompt_sync:
+                result = stream_tandem_prompt(
+                    cfg,
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai-codex",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn("sync fallback", result["stdout"])
+            self.assertEqual(create_session.call_count, 3)
+            self.assertIn(mock.call(mock.ANY, "session-1"), delete_session.mock_calls)
+            self.assertIn(mock.call(mock.ANY, "session-2"), delete_session.mock_calls)
+            self.assertEqual(result["engine"]["fallback_mode"], "prompt_sync_fresh_session")
+            self.assertEqual(result["engine"]["prompt_sync_fallback_previous_session_id"], "session-2")
+            self.assertEqual(result["engine"]["prompt_sync_fallback_previous_run_id"], "run-2")
+            self.assertEqual(result["engine"]["session_id"], "session-3")
+            self.assertEqual(prompt_sync.call_args.kwargs["session_id"], "session-3")
+            self.assertIn("do work", prompt_sync.call_args.kwargs["prompt"])
+            self.assertEqual(prompt_sync.call_args.kwargs["timeout_seconds"], 45.0)
+            self.assertEqual(result["engine"]["empty_response_sync_fallback_timeout_seconds"], 45.0)
+            self.assertEqual(create_session.call_args_list[2].kwargs["provider"], "openai")
+            self.assertEqual(create_session.call_args_list[2].kwargs["model"], "gpt-4.1-mini")
+
+    def test_empty_async_worker_response_skips_fresh_retry_after_attempt_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            log_path = run_dir / "logs" / "worker-1.log"
+            log_path.parent.mkdir(parents=True)
+            attempts_path = run_dir / "active_worker_attempts.json"
+            attempts_path.write_text(json.dumps({"worker-1": "1-123"}), encoding="utf-8")
+            worktree = run_dir / "worktrees" / "worker-1--subtask--exec-1-123"
+            worktree.mkdir(parents=True)
+
+            def empty_after_attempt_replaced(*_args: object, **_kwargs: object) -> dict[str, object]:
+                attempts_path.write_text(json.dumps({"worker-2": "2-456"}), encoding="utf-8")
+                return {"text": "", "completed": True, "reason": "", "event_count": 1}
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    return_value={"run_id": "run-1"},
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    side_effect=empty_after_attempt_replaced,
+                ):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=worktree,
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_ATTEMPT_INACTIVE")
+            self.assertEqual(result["blocker_kind"], "worker_attempt_inactive")
+            self.assertEqual(create_session.call_count, 1)
+            prompt_async.assert_called_once()
+            self.assertIn("fresh-session async retry", result["stdout"])
+
+    def test_cancelled_async_worker_response_does_not_retry_or_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "worker.log"
+            with mock.patch("src.tandem_agents.core.execution.worker.create_tandem_session", return_value="session-1") as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async",
+                    return_value={"run_id": "run-1"},
+                ) as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.sdk_stream_run_text",
+                    return_value={"text": "", "completed": False, "reason": "cancelled", "event_count": 4},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.prompt_tandem_session_sync") as prompt_sync:
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=Path(tmp),
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                    prompt_sync_first=False,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "ENGINE_RUN_CANCELLED")
+            self.assertEqual(result["blocker_kind"], "engine_run_cancelled")
+            self.assertEqual(result["engine"]["stream_reason"], "cancelled")
+            self.assertIsNone(result["engine"]["fallback_mode"])
+            create_session.assert_called_once()
+            prompt_async.assert_called_once()
+            prompt_sync.assert_not_called()
+            self.assertIn("ENGINE_RUN_CANCELLED", result["stdout"])
+
     def test_write_required_worker_can_opt_out_of_prompt_sync_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
@@ -4711,6 +5469,57 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(create_session.call_count, 1)
             prompt_async.assert_not_called()
 
+    def test_prompt_sync_timeout_skips_async_recovery_after_dispatch_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run-1"
+            log_path = run_dir / "logs" / "worker-1.log"
+            log_path.parent.mkdir(parents=True)
+            attempts_path = run_dir / "active_worker_attempts.json"
+            attempts_path.write_text(json.dumps({"worker-1": "1-123"}), encoding="utf-8")
+            worktree = run_dir / "worktrees" / "worker-1--subtask--exec-1-123"
+            worktree.mkdir(parents=True)
+            timeout_error = RuntimeError(
+                "Engine request failed for /session/session-1/prompt_sync: operation timed out"
+            )
+
+            def timeout_after_dispatch_cancel(*_args: object, **_kwargs: object) -> dict[str, object]:
+                _clear_active_worker_attempt_marker(SimpleNamespace(run_dir=run_dir), "worker-1")
+                raise timeout_error
+
+            with mock.patch(
+                "src.tandem_agents.core.execution.worker.create_tandem_session",
+                side_effect=["session-1", "session-2"],
+            ) as create_session, \
+                mock.patch("src.tandem_agents.core.execution.worker.delete_tandem_session"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sdk_sessions_prompt_async") as prompt_async, \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.prompt_tandem_session_sync",
+                    side_effect=timeout_after_dispatch_cancel,
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker._engine_prompt_sync_timeout_seconds", return_value=5.0):
+                result = stream_tandem_prompt(
+                    SimpleNamespace(env={"ACA_WORKER_PROMPT_SYNC_FIRST": "true"}),
+                    role="worker-1",
+                    prompt="do work",
+                    cwd=worktree,
+                    provider="openai",
+                    model="gpt-5.5",
+                    env={},
+                    log_path=log_path,
+                    require_tool_use=True,
+                    write_required=True,
+                )
+
+            self.assertEqual(result["returncode"], 1)
+            self.assertEqual(result["failure_reason"], "WORKER_ATTEMPT_INACTIVE")
+            self.assertEqual(result["blocker_kind"], "worker_attempt_inactive")
+            self.assertEqual(create_session.call_count, 1)
+            prompt_async.assert_not_called()
+            self.assertEqual(
+                json.loads((run_dir / "cancelled_worker_attempts.json").read_text(encoding="utf-8")),
+                {"worker-1": ["1-123"]},
+            )
+
     def test_prompt_sync_first_hard_timeout_blocks_if_engine_call_hangs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "worker.log"
@@ -4993,6 +5802,39 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                     }
                 ],
                 worker_results=[{"subtask_id": "subtask-1", "status": "failed"}],
+                blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},
+            )
+
+            _apply_tolerated_failures(ctx)
+
+            self.assertEqual(ctx.worker_results[0]["status"], "failed")
+            self.assertNotEqual(ctx.blackboard["subtasks"][0]["status"], "tolerated_failure")
+
+    def test_linear_tasks_do_not_tolerate_generic_worker_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_path = Path(tmp)
+            target = repo_path / "src/lib.rs"
+            target.parent.mkdir(parents=True)
+            target.write_text("pub fn existing() {}\n", encoding="utf-8")
+            ctx = SimpleNamespace(
+                task={"source": {"type": "linear"}},
+                repo_path=repo_path,
+                planned_subtasks=[
+                    {
+                        "id": "subtask-1",
+                        "title": "Edit existing source",
+                        "goal": "Make a real source change",
+                        "files": ["src/lib.rs"],
+                    }
+                ],
+                worker_results=[
+                    {
+                        "subtask_id": "subtask-1",
+                        "worker_id": "worker-1",
+                        "status": "failed",
+                        "failure_reason": "WORKER_REPORTED_BLOCKER",
+                    }
+                ],
                 blackboard={"subtasks": [{"id": "subtask-1", "status": "failed"}]},
             )
 

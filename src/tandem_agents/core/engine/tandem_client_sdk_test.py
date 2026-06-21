@@ -142,6 +142,25 @@ class SyncClientAwaitableResultTest(unittest.TestCase):
 
         self.assertEqual(asyncio.run(_run()), {"ok": True})
 
+    def test_runs_entire_sync_client_call_off_existing_event_loop(self) -> None:
+        class FakeClient:
+            def call(self):
+                async def _payload():
+                    return {"ok": True}
+
+                return asyncio.run(_payload())
+
+            def close(self):
+                return None
+
+        async def _run():
+            from src.tandem_agents.core.engine import tandem_client_sdk as sdk
+
+            with unittest.mock.patch.object(sdk, "create_sync_tandem_client", return_value=FakeClient()):
+                return with_sync_tandem_client(SimpleNamespace(), lambda client: client.call())
+
+        self.assertEqual(asyncio.run(_run()), {"ok": True})
+
 
 class TandemClientSdkEventTextTest(unittest.TestCase):
     def test_extracts_message_part_updated_text(self) -> None:
@@ -203,6 +222,82 @@ class TandemClientSdkEventTextTest(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertEqual(result["reason"], "max_events_without_text")
         self.assertEqual(result["event_count"], 3)
+
+    def test_stream_run_text_times_out_empty_stream_before_global_timeout(self) -> None:
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def stream(self, session_id, run_id):
+                await asyncio.sleep(5)
+                if False:
+                    yield SimpleNamespace(type="run.completed", properties={})
+
+        cfg = SimpleNamespace(
+            tandem=SimpleNamespace(base_url="http://engine"),
+            tandem_token=lambda: "token",
+        )
+
+        from src.tandem_agents.core.engine import tandem_client_sdk as sdk
+
+        with unittest.mock.patch.object(sdk, "_import_async_client", return_value=FakeClient):
+            result = sdk_stream_run_text(
+                cfg,
+                "session-1",
+                "run-1",
+                timeout_seconds=5,
+                empty_stream_timeout_seconds=0.1,
+                no_text_timeout_seconds=1.0,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["reason"], "empty_stream_timeout")
+        self.assertEqual(result["event_count"], 0)
+
+    def test_stream_run_text_times_out_after_lifecycle_events_without_activity(self) -> None:
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def stream(self, session_id, run_id):
+                while True:
+                    yield SimpleNamespace(type="run.updated", properties={})
+                    await asyncio.sleep(0.02)
+
+        cfg = SimpleNamespace(
+            tandem=SimpleNamespace(base_url="http://engine"),
+            tandem_token=lambda: "token",
+        )
+
+        from src.tandem_agents.core.engine import tandem_client_sdk as sdk
+
+        with unittest.mock.patch.object(sdk, "_import_async_client", return_value=FakeClient):
+            result = sdk_stream_run_text(
+                cfg,
+                "session-1",
+                "run-1",
+                timeout_seconds=5,
+                empty_stream_timeout_seconds=0.01,
+                no_activity_timeout_seconds=0.1,
+                no_text_timeout_seconds=1.0,
+            )
+
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["reason"], "no_activity_timeout")
+        self.assertGreater(result["event_count"], 0)
+        self.assertEqual(result["meaningful_event_count"], 0)
 
     def test_stream_run_text_times_out_after_tool_events_go_silent(self) -> None:
         class FakeClient:
@@ -270,12 +365,14 @@ class TandemClientSdkEventTextTest(unittest.TestCase):
                 "session-1",
                 "run-1",
                 timeout_seconds=5,
+                empty_stream_timeout_seconds=0.05,
                 no_text_timeout_seconds=0.05,
             )
 
         self.assertTrue(result["completed"])
         self.assertEqual(result["reason"], "")
         self.assertEqual(result["event_count"], 9)
+        self.assertEqual(result["meaningful_event_count"], 8)
 
     def test_stream_run_text_stops_when_text_predicate_matches(self) -> None:
         class FakeClient:

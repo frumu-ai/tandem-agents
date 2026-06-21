@@ -41,8 +41,9 @@ def run_task_intake(
         ``return`` this immediately).
     """
     from src.tandem_agents.core.engine.engine import (
-        checkout_run_branch,
+        checkout_run_worktree,
         task_run_branch_name,
+        task_run_worktree_name,
     )
     from src.tandem_agents.core.integrations.github_mcp import github_mcp_scope, github_remote_sync_mode
     from src.tandem_agents.core.integrations.linear_mcp import linear_mcp_scope, linear_remote_sync_mode
@@ -219,15 +220,55 @@ def run_task_intake(
     # 4. Claim identity
     ctx.claim_identity = _rc._task_claim_identity(ctx.cfg, task)
 
-    # 5. Branch setup
-    ctx.branch_name = task_run_branch_name(
-        task, ctx.run_id, ctx.repo.get("slug") or ctx.cfg.repository.slug
-    )
-    checkout_run_branch(ctx.cfg, ctx.repo_path, ctx.branch_name)
-    ctx.repo = repository_status(
-        ctx.repo_path,
+    # 5. Branch/worktree setup
+    source_repo = dict(ctx.repo or {})
+    repo_slug = source_repo.get("slug") or ctx.cfg.repository.slug
+    ctx.branch_name = task_run_branch_name(task, ctx.run_id, repo_slug)
+    source_repo_path = ctx.repo_path
+    run_worktree_path = ctx.run_dir / "repo" / task_run_worktree_name(task, ctx.run_id, repo_slug)
+    run_repo_path = checkout_run_worktree(ctx.cfg, source_repo_path, run_worktree_path, ctx.branch_name)
+    active_repo = repository_status(
+        run_repo_path,
         ctx.cfg.repository.remote_name,
         ctx.cfg.repository.default_branch,
+    )
+    for key in ("slug", "clone_url", "hint", "credential_file"):
+        if source_repo.get(key):
+            active_repo[key] = source_repo[key]
+    active_repo["source_path"] = str(source_repo_path)
+    ctx.repo = active_repo
+    def attach_active_repo_metadata(target_task: dict) -> dict:
+        task_repo = dict(target_task.get("repo") or {})
+        for key in ("slug", "clone_url", "hint", "credential_file"):
+            if active_repo.get(key):
+                task_repo[key] = active_repo[key]
+        task_repo.update(
+            {
+                "path": str(run_repo_path),
+                "source_path": str(source_repo_path),
+                "branch": ctx.branch_name,
+                "default_branch": ctx.cfg.repository.default_branch,
+                "remote_name": ctx.cfg.repository.remote_name,
+            }
+        )
+        target_task["repo"] = task_repo
+        return target_task
+
+    task = attach_active_repo_metadata(task)
+    ctx.blackboard["task"] = task
+    ctx.blackboard["repo"] = dict(ctx.repo)
+    append_event(
+        ctx.layout["events"],
+        "repo.run_worktree_checked_out",
+        ctx.run_id,
+        {
+            "source_repo_path": str(source_repo_path),
+            "run_repo_path": str(run_repo_path),
+            "branch_name": ctx.branch_name,
+        },
+        task_id=task.get("task_id"),
+        role="manager",
+        repo={"path": str(run_repo_path)},
     )
 
     # 6. Register task + worker
@@ -289,19 +330,8 @@ def run_task_intake(
                 phase_detail=blocked_message,
                 coordination=ctx.coordination,
             )
-        active_lease = claim_result.get("active_lease") or {}
-        if active_lease.get("lease_id"):
-            try:
-                ctx.coordination.heartbeat_lease(
-                    str(active_lease["lease_id"]),
-                    lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to heartbeat existing lease during claim-blocked (run_id=%s)",
-                    ctx.run_id,
-                    exc_info=True,
-        )
+        # A failed claimant must not refresh a lease owned by another run.
+        # Otherwise repeated retries can keep an interrupted worker alive.
         logger.warning("Task already leased; blocking run %s", ctx.run_id)
         return block_run(
             run_id=ctx.run_id,
@@ -327,6 +357,7 @@ def run_task_intake(
             ctx.task["source"]["type"] = ctx.task["source"].get("type") or ctx.cfg.task_source.type
             ctx.task["source"].setdefault("board_path", str(board_path))
             ctx.task["execution_kind"] = task.get("execution_kind") or classify_task_execution_kind(task)
+            ctx.task = attach_active_repo_metadata(ctx.task)
             append_event(
                 ctx.layout["events"], "task.claimed", ctx.run_id,
                 {"card_id": card["id"], "lane": card.get("lane")},
@@ -337,6 +368,8 @@ def run_task_intake(
         ctx.task.setdefault("source", {})
         ctx.task["source"].setdefault("board_path", str(board_path))
 
+    ctx.blackboard["task"] = ctx.task
+    ctx.blackboard["repo"] = dict(ctx.repo)
     write_board_snapshot(ctx.run_dir, board)
 
     # 9. Source / sync metadata

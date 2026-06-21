@@ -349,6 +349,61 @@ class CoderSupervisorTest(unittest.TestCase):
             self.assertEqual(blackboard["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
             self.assertEqual(run_meta["pull_request_lifecycle"]["lifecycle_state"], "ready-to-merge")
 
+    def test_pr_lifecycle_refresh_failure_remains_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(cfg, store)
+
+            with patch.object(coder_supervisor, "refresh_pull_request_lifecycle", side_effect=RuntimeError("temporary GitHub MCP outage")):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            self.assertFalse(result["terminal"])
+            self.assertEqual(result["status"], "waiting-for-review")
+            status = load_status(cfg.output_root() / "run-pr" / "status.json")
+            blackboard = load_blackboard(cfg.output_root() / "run-pr" / "blackboard.yaml")
+            self.assertFalse(status["pull_request_lifecycle"]["terminal"])
+            self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "waiting-for-review")
+            self.assertEqual(blackboard["pull_request_lifecycle"]["lifecycle_state"], "waiting-for-review")
+
+    def test_pr_lifecycle_refresh_recovers_retryable_blocked_readback_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(cfg, store)
+            run_dir = cfg.output_root() / "run-pr"
+            status = load_status(run_dir / "status.json")
+            status["pull_request_lifecycle"]["lifecycle_state"] = "blocked"
+            status["pull_request_lifecycle"]["terminal"] = True
+            status["pull_request_lifecycle"]["error"] = "Could not read GitHub pull request acme/demo#7 through GitHub MCP."
+            write_status(run_dir / "status.json", status)
+            blackboard = load_blackboard(run_dir / "blackboard.yaml")
+            blackboard["pull_request_lifecycle"] = dict(status["pull_request_lifecycle"])
+            save_blackboard(run_dir / "blackboard.yaml", blackboard)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "review_state": "review_required",
+                "checks_state": "unknown",
+                "lifecycle_state": "waiting-for-review",
+                "terminal": False,
+            }
+            with patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed) as refresh:
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            refresh.assert_called_once()
+            self.assertEqual(result["status"], "waiting-for-review")
+            status = load_status(run_dir / "status.json")
+            self.assertFalse(status["pull_request_lifecycle"]["terminal"])
+            self.assertNotIn("error", status["pull_request_lifecycle"])
+
     def test_needs_repair_starts_pr_repair_pass_and_comments_linear(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _config(Path(tmp))

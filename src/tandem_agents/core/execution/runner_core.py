@@ -39,6 +39,7 @@ from src.tandem_agents.core.engine.engine import (
     write_provider_override_config,
 )
 from src.tandem_agents.core.engine.process_utils import run_command
+from src.tandem_agents.core.engine.engine_runtime import engine_provider_smoke_report
 from src.tandem_agents.core.integrations.github_mcp import (
     add_issue_comment,
     build_issue_comment_body,
@@ -139,9 +140,12 @@ _RETRYABLE_WORKER_BLOCKER_KINDS = {
     "worker_corrupt_diff",
     "carry_forward_patch_apply_failed",
     "worker_no_diff",
+    "worker_reported_blocker",
     "engine_tool_loop_stalled",
     "engine_tool_loop_stalled_no_diff",
     "engine_prompt_timeout",
+    "engine_empty_response",
+    "engine_no_activity_response",
 }
 
 _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS = {
@@ -328,6 +332,20 @@ def _candidate_source_files_under(path: Path) -> list[Path]:
     return files
 
 
+def _missing_repo_target_can_be_created(entry: str) -> bool:
+    rel_path = str(entry or "").strip().replace("\\", "/").lower()
+    if not rel_path:
+        return False
+    if rel_path.startswith(".github/workflows/") and rel_path.endswith((".yml", ".yaml")):
+        return True
+    if rel_path.startswith("docs/") and not rel_path.startswith("docs/internal/"):
+        return True
+    if "/tests/" in f"/{rel_path}/" or rel_path.startswith("tests/"):
+        return True
+    name = Path(rel_path).name
+    return name.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+
+
 def _explicit_file_score(path: Path, repo_path: Path, symbols: list[str], scope_text: str, original_index: int) -> tuple[int, int, str]:
     try:
         rel = path.relative_to(repo_path).as_posix()
@@ -384,6 +402,9 @@ def _explicit_task_target_files(repo_path: Path, task: dict[str, Any] | None, li
             if rel not in exact_files:
                 exact_files.append(rel)
             continue
+        if _missing_repo_target_can_be_created(mention) and mention not in exact_files:
+            exact_files.append(mention)
+            continue
         for index, file_path in enumerate(_candidate_source_files_under(candidate)):
             try:
                 rel = file_path.relative_to(repo_path).as_posix()
@@ -419,6 +440,13 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
         recovery_action = (
             first.get("recovery_action")
             or "Check Tandem engine provider/model routing and persisted engine snapshots, then reset the task to Backlog."
+        )
+    elif kind == "engine_no_activity_response":
+        message = "Tandem engine produced no visible assistant or tool activity for the worker prompt."
+        phase_detail = f"{worker_id} blocked on silent Tandem engine activity"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Retry with a narrower worker prompt before marking the task blocked."
         )
     elif kind == "worker_no_diff":
         message = "Worker inspected the task but produced no repository diff."
@@ -461,6 +489,13 @@ def _worker_failure_blocker(worker_results: list[dict[str, Any]]) -> dict[str, A
         recovery_action = (
             first.get("recovery_action")
             or "Retry with a smaller prompt that requires a real implementation-backed assertion before comments."
+        )
+    elif kind == "worker_reported_blocker":
+        message = failure_reason or "Worker reported a blocker before producing a repository diff."
+        phase_detail = f"{worker_id} reported a blocker"
+        recovery_action = (
+            first.get("recovery_action")
+            or "Retry with exact target file paths first; do not use brace globs to inspect concrete target files."
         )
     elif kind == "carry_forward_patch_apply_failed":
         message = failure_reason or "ACA could not apply the preserved partial diff before retry."
@@ -538,6 +573,16 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
     stdout_excerpt = _compact_partial_diff_retry_excerpt(str(worker.get("stdout") or "").strip(), kind, bool(patch_path))
     if len(stdout_excerpt) > 2000:
         stdout_excerpt = stdout_excerpt[:2000] + "\n..."
+    preserve_regression_guidance = ""
+    if _worker_failure_is_verifiable_diff_test_failed(blocker):
+        preserve_regression_guidance = (
+            "The preserved patch already contains source and test changes, but focused verification failed. "
+            "Treat the failure output as a repair target: preserve the regression assertions and public-contract "
+            "coverage unless they are factually wrong. Prefer fixing production, exports, imports, wiring, or setup "
+            "so the existing focused test passes. Do not make tests less strict, delete assertions, or reroute imports "
+            "just to avoid exercising the intended public contract."
+        )
+    focused_followup_guidance = _failed_verifiable_followup_retry_feedback(ctx, blocker)
     return "\n\n".join(
         part
         for part in (
@@ -548,6 +593,8 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
             "Changed files from the failed attempt:\n" + changed_text,
             f"Preserved partial patch: `{patch_path}`" if patch_path else "",
             "Worker output excerpt:\n" + stdout_excerpt if stdout_excerpt else "",
+            preserve_regression_guidance,
+            focused_followup_guidance,
             (
                 "Plan a smaller repair slice that preserves any useful existing diff, then explicitly addresses the unmet "
                 "acceptance criteria. Do not repeat only the same partial change, and do not mark the task complete "
@@ -558,6 +605,75 @@ def _worker_failure_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, A
                 "the desired behavior without calling existing production code, discard that approach and replace it "
                 "with coverage that exercises the real implementation."
             ),
+        )
+        if part
+    )
+
+
+def _failed_verifiable_followup_retry_feedback(ctx: "_PhaseRunContext", blocker: dict[str, Any]) -> str:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return ""
+    reason = str(worker.get("failure_reason") or "").strip()
+    if reason not in {"WORKER_OFF_TRACK_TESTLESS_DIFF", "WORKER_TEST_ONLY_DIFF"}:
+        return ""
+    artifacts = _repair_partial_diff_artifacts(ctx)
+    repair_key = _partial_diff_artifact_repair_key(worker)
+    if not repair_key:
+        return ""
+    failed_artifact: dict[str, Any] | None = None
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if _partial_diff_artifact_repair_key(artifact) != repair_key:
+            continue
+        artifact_reason = str(artifact.get("failure_reason") or "").strip()
+        if artifact_reason not in {"WORKER_VERIFIABLE_DIFF_TEST_FAILED", "WORKER_VERIFIABLE_DIFF_UNTERMINATED"}:
+            continue
+        changed_files = [
+            str(path or "").strip()
+            for path in artifact.get("changed_files") or []
+            if str(path or "").strip()
+        ]
+        if not _changed_files_include_source_and_test(changed_files):
+            continue
+        failed_artifact = artifact
+    if not failed_artifact:
+        return ""
+    command = failed_artifact.get("verification_command")
+    command_text = ""
+    if isinstance(command, list):
+        command_parts = [str(part or "").strip() for part in command if str(part or "").strip()]
+        if command_parts:
+            command_text = "Focused verification command: `" + " ".join(command_parts) + "`."
+    output = str(
+        failed_artifact.get("verification_output_excerpt")
+        or failed_artifact.get("worker_output_excerpt")
+        or ""
+    ).strip()
+    if len(output) > 2000:
+        output = output[:2000].rstrip() + "\n..."
+    required_tests = [
+        str(path or "").strip()
+        for path in (failed_artifact.get("subtask_target_files") or failed_artifact.get("subtask_files") or [])
+        if str(path or "").strip() and _repo_path_looks_like_test_file(str(path or "").strip())
+    ]
+    required_text = (
+        "Required test file(s) from the failed focused verification: "
+        + ", ".join(dict.fromkeys(required_tests))
+        + "."
+        if required_tests
+        else ""
+    )
+    return "\n".join(
+        part
+        for part in (
+            "The previous paired source+test diff reached focused verification and failed. "
+            "This follow-up repair must start from that verification output, fix the named failing test(s), "
+            "and rerun the focused command before returning.",
+            command_text,
+            required_text,
+            "Previous focused verification output:\n" + output if output else "",
         )
         if part
     )
@@ -606,7 +722,328 @@ def _worker_incomplete_diff_extra_retries(cfg: ResolvedConfig) -> int:
             return max(0, int(raw))
         except ValueError:
             logger.warning("Ignoring invalid ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES=%r", raw)
+    return 1
+
+
+def _worker_off_track_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_OFF_TRACK_EXTRA_RETRIES", "") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_OFF_TRACK_EXTRA_RETRIES=%r", raw)
+    return 1
+
+
+def _worker_engine_empty_response_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_WORKER_ENGINE_EMPTY_RESPONSE_EXTRA_RETRIES", "") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_ENGINE_EMPTY_RESPONSE_EXTRA_RETRIES=%r", raw)
+    return 1
+
+
+def _worker_verifiable_diff_test_failed_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_VERIFIABLE_DIFF_TEST_FAILED_EXTRA_RETRIES", "") or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_VERIFIABLE_DIFF_TEST_FAILED_EXTRA_RETRIES=%r", raw)
+    return 1
+
+
+def _worker_verifiable_diff_weak_test_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_VERIFIABLE_DIFF_WEAK_TEST_EXTRA_RETRIES", "") or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_VERIFIABLE_DIFF_WEAK_TEST_EXTRA_RETRIES=%r", raw)
     return 3
+
+
+def _worker_verifiable_diff_import_error_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_VERIFIABLE_DIFF_IMPORT_ERROR_EXTRA_RETRIES", "") or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_VERIFIABLE_DIFF_IMPORT_ERROR_EXTRA_RETRIES=%r", raw)
+    return 2
+
+
+def _worker_verifiable_diff_exception_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_VERIFIABLE_DIFF_EXCEPTION_EXTRA_RETRIES", "") or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_VERIFIABLE_DIFF_EXCEPTION_EXTRA_RETRIES=%r", raw)
+    return 2
+
+
+def _worker_verifiable_diff_assertion_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_VERIFIABLE_DIFF_ASSERTION_EXTRA_RETRIES", "") or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_VERIFIABLE_DIFF_ASSERTION_EXTRA_RETRIES=%r", raw)
+    return 2
+
+
+def _verification_repair_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(getattr(cfg, "env", {}).get("ACA_VERIFICATION_REPAIR_EXTRA_RETRIES", "") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_VERIFICATION_REPAIR_EXTRA_RETRIES=%r", raw)
+    return 1
+
+
+def _worker_repair_loop_extra_retries(cfg: ResolvedConfig) -> int:
+    return max(
+        _worker_incomplete_diff_extra_retries(cfg),
+        _worker_off_track_extra_retries(cfg),
+        _worker_engine_empty_response_extra_retries(cfg),
+        _worker_verifiable_diff_test_failed_extra_retries(cfg),
+        _worker_verifiable_diff_weak_test_extra_retries(cfg),
+        _worker_verifiable_diff_import_error_extra_retries(cfg),
+        _worker_verifiable_diff_exception_extra_retries(cfg),
+        _worker_verifiable_diff_assertion_extra_retries(cfg),
+    )
+
+
+def _repo_path_looks_like_test_file(path: str) -> bool:
+    rel_path = str(path or "").strip().replace("\\", "/")
+    while rel_path.startswith("./"):
+        rel_path = rel_path[2:]
+    if not rel_path or rel_path.startswith("/") or rel_path == ".." or rel_path.startswith("../"):
+        return False
+    if "/../" in f"/{rel_path}/":
+        return False
+    name = Path(rel_path).name.lower()
+    lowered = rel_path.lower()
+    return (
+        "/tests/" in f"/{lowered}/"
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith(".test.py")
+        or name.endswith("_test.rs")
+        or name.endswith(".test.ts")
+        or name.endswith(".test.tsx")
+        or name.endswith(".spec.ts")
+        or name.endswith(".spec.tsx")
+    )
+
+
+def _changed_files_include_source_and_test(changed_files: Any) -> bool:
+    if not isinstance(changed_files, list):
+        return False
+    normalized: list[str] = []
+    for raw_path in changed_files:
+        rel_path = str(raw_path or "").strip().replace("\\", "/")
+        while rel_path.startswith("./"):
+            rel_path = rel_path[2:]
+        if (
+            not rel_path
+            or rel_path == "__aca_temp_probe.txt"
+            or rel_path.startswith("/")
+            or rel_path == ".."
+            or rel_path.startswith("../")
+            or "/../" in f"/{rel_path}/"
+        ):
+            continue
+        normalized.append(rel_path)
+    return bool(normalized) and any(_repo_path_looks_like_test_file(path) for path in normalized) and any(
+        not _repo_path_looks_like_test_file(path) for path in normalized
+    )
+
+
+def _worker_failure_is_verifiable_diff_test_failed(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    if str(worker.get("failure_reason") or "").strip() not in {
+        "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+        "WORKER_VERIFIABLE_DIFF_UNTERMINATED",
+    }:
+        return False
+    if str(blocker.get("kind") or "").strip() != "worker_incomplete_diff":
+        return False
+    return _worker_failure_has_partial_diff(blocker) and _changed_files_include_source_and_test(
+        worker.get("changed_files")
+    )
+
+
+def _worker_failure_is_verifiable_diff_weak_test(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    if str(worker.get("failure_reason") or "").strip() not in {
+        "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+        "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+    }:
+        return False
+    if str(blocker.get("kind") or "").strip() != "worker_incomplete_diff":
+        return False
+    return _worker_failure_has_partial_diff(blocker) and _changed_files_include_source_and_test(
+        worker.get("changed_files")
+    )
+
+
+def _worker_failure_is_repair_no_change_on_preserved_partial(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    if str(blocker.get("kind") or "").strip() != "worker_no_progress":
+        return False
+    if str(worker.get("failure_reason") or "").strip() != "WORKER_REPAIR_NO_CHANGE":
+        return False
+    preserved_failure_reason = str(worker.get("preserved_failure_reason") or "").strip()
+    if preserved_failure_reason not in {
+        "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+        "WORKER_VERIFIABLE_DIFF_UNTERMINATED",
+        "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+        "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+        "ENGINE_PROMPT_TIMEOUT",
+        "ENGINE_TOOL_LOOP_STALLED",
+        "WORKER_OFF_TRACK_TESTLESS_DIFF",
+        "WORKER_TEST_ONLY_DIFF",
+    }:
+        return False
+    if not _worker_failure_has_partial_diff(blocker):
+        return False
+    if preserved_failure_reason in {
+        "ENGINE_PROMPT_TIMEOUT",
+        "ENGINE_TOOL_LOOP_STALLED",
+    }:
+        return True
+    return _changed_files_include_source_and_test(worker.get("changed_files"))
+
+
+def _worker_failure_is_incomplete_diff_with_partial(blocker: dict[str, Any]) -> bool:
+    if str(blocker.get("kind") or "").strip() != "worker_incomplete_diff":
+        return False
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    failure_reason = str(worker.get("failure_reason") or "").strip()
+    return failure_reason in {
+        "WORKER_TEST_ONLY_DIFF",
+        "ENGINE_PROMPT_TIMEOUT",
+        "ENGINE_TOOL_LOOP_STALLED",
+    } and _worker_failure_has_partial_diff(blocker)
+
+
+def _worker_failure_has_import_error(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    text = "\n".join(
+        str(worker.get(key) or "")
+        for key in (
+            "stdout",
+            "output_excerpt",
+            "failure_reason",
+            "verification_output_excerpt",
+        )
+    ).lower()
+    return ("importerror" in text and "cannot import name" in text) or (
+        "modulenotfounderror" in text and "no module named" in text
+    )
+
+
+def _worker_failure_has_repairable_exception(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    text = "\n".join(
+        str(worker.get(key) or "")
+        for key in (
+            "stdout",
+            "output_excerpt",
+            "failure_reason",
+            "verification_output_excerpt",
+        )
+    ).lower()
+    return (
+        "typeerror:" in text
+        and "got an unexpected keyword argument" in text
+    ) or (
+        "nameerror:" in text
+        and "is not defined" in text
+    ) or (
+        "typeerror:" in text
+        and " positional argument" in text
+        and " given" in text
+    ) or (
+        "typeerror:" in text
+        and "missing" in text
+        and "required positional argument" in text
+    ) or (
+        "attributeerror:" in text
+        and "'str' object has no attribute 'get'" in text
+    ) or (
+        "attributeerror:" in text
+        and "'nonetype' object has no attribute 'get'" in text
+    ) or (
+        "syntaxerror:" in text
+        and "from __future__ imports must occur at the beginning of the file" in text
+    )
+
+
+def _worker_failure_has_assertion_failure(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    text = "\n".join(
+        str(worker.get(key) or "")
+        for key in (
+            "stdout",
+            "output_excerpt",
+            "failure_reason",
+            "verification_output_excerpt",
+        )
+    ).lower()
+    return (
+        "assertionerror:" in text
+        or "\nfail:" in text
+        or "failed (failures=" in text
+    )
+
+
+def _worker_failure_is_false_missing_target_glob(blocker: dict[str, Any]) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    text = "\n".join(
+        str(worker.get(key) or "")
+        for key in (
+            "stdout",
+            "output_excerpt",
+            "failure_reason",
+        )
+    ).lower()
+    return (
+        "glob" in text
+        and "no matches" in text
+        and ("target file" in text or "target files" in text or "required target" in text)
+    )
 
 
 def _worker_failure_can_retry(
@@ -618,6 +1055,8 @@ def _worker_failure_can_retry(
     kind = str(blocker.get("kind") or "").strip()
     if kind not in _RETRYABLE_WORKER_BLOCKER_KINDS:
         return False
+    if kind == "worker_reported_blocker":
+        return _worker_failure_is_false_missing_target_glob(blocker) and attempt < base_max_loops - 1
     worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
     if (
         kind == "worker_no_progress"
@@ -625,15 +1064,53 @@ def _worker_failure_can_retry(
         and worker.get("worker_abandoned_after_timeout")
     ):
         return False
+    if kind in {"engine_empty_response", "engine_no_activity_response"}:
+        return attempt < base_max_loops - 1
     if kind == "worker_no_progress" and isinstance(worker, dict):
         failure_reason = str(worker.get("failure_reason") or "").strip()
-        if failure_reason in {"WORKER_NO_CHANGE", "WORKER_REPAIR_NO_CHANGE"}:
-            return False
+        if failure_reason == "WORKER_REPAIR_NO_CHANGE":
+            if not _worker_failure_is_repair_no_change_on_preserved_partial(blocker):
+                return False
+            extra_retries = (
+                _worker_verifiable_diff_test_failed_extra_retries(cfg)
+                if _changed_files_include_source_and_test(worker.get("changed_files"))
+                else _worker_incomplete_diff_extra_retries(cfg)
+            )
+            if _worker_failure_has_import_error(blocker):
+                extra_retries = max(extra_retries, _worker_verifiable_diff_import_error_extra_retries(cfg))
+            if _worker_failure_has_repairable_exception(blocker):
+                extra_retries = max(extra_retries, _worker_verifiable_diff_exception_extra_retries(cfg))
+            if _worker_failure_has_assertion_failure(blocker):
+                extra_retries = max(extra_retries, _worker_verifiable_diff_assertion_extra_retries(cfg))
+            return attempt < base_max_loops + extra_retries - 1
     if attempt < base_max_loops - 1:
         return True
     if kind not in _PARTIAL_DIFF_EXTRA_RETRY_BLOCKER_KINDS:
         return False
     if kind in {"engine_tool_loop_stalled", "engine_prompt_timeout"} and not _worker_failure_has_partial_diff(blocker):
+        return False
+    if kind == "worker_off_track":
+        extra_retries = _worker_off_track_extra_retries(cfg)
+        return attempt < base_max_loops + extra_retries - 1
+    if _worker_failure_is_verifiable_diff_test_failed(blocker):
+        extra_retries = _worker_verifiable_diff_test_failed_extra_retries(cfg)
+        if _worker_failure_has_import_error(blocker):
+            extra_retries = max(extra_retries, _worker_verifiable_diff_import_error_extra_retries(cfg))
+        if _worker_failure_has_repairable_exception(blocker):
+            extra_retries = max(extra_retries, _worker_verifiable_diff_exception_extra_retries(cfg))
+        if _worker_failure_has_assertion_failure(blocker):
+            extra_retries = max(extra_retries, _worker_verifiable_diff_assertion_extra_retries(cfg))
+        return attempt < base_max_loops + extra_retries - 1
+    if _worker_failure_is_verifiable_diff_weak_test(blocker):
+        extra_retries = _worker_verifiable_diff_weak_test_extra_retries(cfg)
+        if (
+            _worker_failure_has_import_error(blocker)
+            or _worker_failure_has_repairable_exception(blocker)
+            or _worker_failure_has_assertion_failure(blocker)
+        ):
+            extra_retries += 1
+        return attempt < base_max_loops + extra_retries - 1
+    if not _worker_failure_is_incomplete_diff_with_partial(blocker):
         return False
     extra_retries = _worker_incomplete_diff_extra_retries(cfg)
     return attempt < base_max_loops + extra_retries - 1
@@ -666,7 +1143,7 @@ def _verification_can_retry(
         return True
     if not _repair_state_has_worker_incomplete_diff(ctx):
         return False
-    extra_retries = _worker_incomplete_diff_extra_retries(cfg)
+    extra_retries = _worker_incomplete_diff_extra_retries(cfg) + _verification_repair_extra_retries(cfg)
     return attempt < base_max_loops + extra_retries - 1
 
 
@@ -717,12 +1194,47 @@ def _discard_partial_diff_repair_artifacts(ctx: "_PhaseRunContext", *, reason: s
                 discarded.extend(artifacts if isinstance(artifacts, list) else [artifacts])
         if repair.get("partial_diff_state") == "preserved_not_accepted":
             repair["partial_diff_state"] = "discarded_after_integration_rejection"
+        if str(repair.get("extra_retry_source") or "").strip() == "worker_incomplete_diff":
+            repair.pop("extra_retry_source", None)
+        sources = repair.get("extra_retry_sources")
+        if isinstance(sources, list):
+            filtered_sources = [source for source in sources if source != "worker_incomplete_diff"]
+            if filtered_sources:
+                repair["extra_retry_sources"] = filtered_sources
+            else:
+                repair.pop("extra_retry_sources", None)
         repair["partial_diff_discard_reason"] = reason
+
+
+def _worker_result_has_reviewable_synced_diff(result: dict[str, Any]) -> bool:
+    status = _normalized_text(result.get("status"))
+    if status != "completed" and int(result.get("returncode") or 0) != 0:
+        return False
+    if str(result.get("partial_diff_state") or "").strip() != "reviewable_terminalized":
+        return False
+    synced_files = result.get("synced_files")
+    return isinstance(synced_files, list) and any(str(path or "").strip() for path in synced_files)
+
+
+def _has_reviewable_synced_worker_result(worker_results: list[dict[str, Any]]) -> bool:
+    return any(_worker_result_has_reviewable_synced_diff(result) for result in worker_results)
+
+
+def _worker_failure_is_inherited_overlay_no_fresh_changes(result: dict[str, Any]) -> bool:
+    if _normalized_text(result.get("status")) != "failed" and int(result.get("returncode") or 0) == 0:
+        return False
+    if str(result.get("failure_reason") or "").strip() == "WORKER_INHERITED_OVERLAY_NO_FRESH_CHANGES":
+        return True
+    if result.get("fresh_changed_files") == [] and result.get("inherited_overlay_changed_files"):
+        return True
+    return False
 
 
 def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     for result in worker_results:
+        if _worker_result_has_reviewable_synced_diff(result):
+            continue
         patch_path = str(result.get("partial_diff_artifact") or "").strip()
         if not patch_path and isinstance(result.get("artifacts"), dict):
             patch_path = str(result["artifacts"].get("partial_diff") or "").strip()
@@ -740,25 +1252,60 @@ def _partial_diff_artifacts_for_retry(worker_results: list[dict[str, Any]]) -> l
             "patch_path": patch_path,
         }
         failure_reason = str(result.get("failure_reason") or "").strip()
+        preserved_failure_reason = str(result.get("preserved_failure_reason") or "").strip()
+        artifact_failure_reason = preserved_failure_reason or failure_reason
         blocker_kind = str(result.get("blocker_kind") or "").strip()
         recovery_action = str(result.get("recovery_action") or "").strip()
-        if failure_reason:
-            entry["failure_reason"] = failure_reason
+        if artifact_failure_reason:
+            entry["failure_reason"] = artifact_failure_reason
+        if preserved_failure_reason:
+            entry["preserved_from_failure_reason"] = failure_reason
         if blocker_kind:
             entry["blocker_kind"] = blocker_kind
         if recovery_action:
             entry["recovery_action"] = recovery_action
-        if failure_reason in {
+        if artifact_failure_reason in {
             "WORKER_OFF_TRACK_TESTLESS_DIFF",
             "WORKER_TEST_ONLY_DIFF",
-            "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
-            "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
         }:
             entry["patch_reusable"] = False
+            entry["patch_reusable_reason"] = "one_sided_guard"
+        elif artifact_failure_reason in {
+            "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+            "WORKER_RUNAWAY_DIFF",
+            "WORKER_DESTRUCTIVE_DIFF",
+        }:
+            entry["patch_reusable"] = False
+            entry["patch_reusable_reason"] = artifact_failure_reason.lower()
+        if blocker_kind == "worker_runaway_diff" or result.get("patch_reusable") is False:
+            entry["patch_reusable"] = False
+            entry.setdefault(
+                "patch_reusable_reason",
+                str(result.get("patch_reusable_reason") or "runtime_marked_non_reusable").strip()
+                or "runtime_marked_non_reusable",
+            )
         if changed_files:
             entry["changed_files"] = changed_files
         if output_excerpt:
             entry["worker_output_excerpt"] = output_excerpt
+        syntax_errors = result.get("syntax_errors")
+        if isinstance(syntax_errors, list):
+            cleaned_syntax_errors = [str(error or "").strip() for error in syntax_errors if str(error or "").strip()]
+            if cleaned_syntax_errors:
+                entry["syntax_errors"] = list(dict.fromkeys(cleaned_syntax_errors))
+        verification_command = result.get("verification_command")
+        if isinstance(verification_command, list):
+            command_parts = [str(part or "").strip() for part in verification_command if str(part or "").strip()]
+            if command_parts:
+                entry["verification_command"] = command_parts
+        for metadata_key in (
+            "verification_returncode",
+            "verification_timed_out",
+            "verification_output_excerpt",
+        ):
+            metadata_value = result.get(metadata_key)
+            if metadata_value not in (None, "", [], {}, ()):
+                entry[metadata_key] = metadata_value
         for metadata_key in ("subtask_files", "subtask_target_files"):
             metadata_value = result.get(metadata_key)
             if isinstance(metadata_value, list):
@@ -802,6 +1349,399 @@ def _merge_partial_diff_artifacts_for_retry(
         artifacts.append(dict(raw_artifact))
         seen.add(key)
     return artifacts
+
+
+def _repair_partial_diff_artifacts(ctx: Any) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    for source in (getattr(ctx, "blackboard", None), getattr(ctx, "status", None)):
+        if not isinstance(source, dict):
+            continue
+        repair = source.get("repair")
+        if not isinstance(repair, dict):
+            continue
+        values = repair.get("partial_diff_artifacts")
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, dict) and value not in artifacts:
+                artifacts.append(value)
+    return artifacts
+
+
+def _partial_diff_artifact_repair_key(artifact: dict[str, Any]) -> str:
+    subtask_id = str(artifact.get("subtask_id") or "").strip()
+    if subtask_id:
+        return f"subtask:{subtask_id}"
+    for key in ("subtask_target_files", "subtask_files", "changed_files"):
+        values = [
+            str(path or "").strip().replace("\\", "/")
+            for path in artifact.get(key) or []
+            if str(path or "").strip()
+        ]
+        if values:
+            return f"{key}:" + ",".join(values)
+    return ""
+
+
+def _partial_diff_artifacts_complementary_one_sided_pair_count(artifacts: list[dict[str, Any]]) -> int:
+    source_only_keys: set[str] = set()
+    test_only_keys: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        changed_files = [
+            str(path or "").strip().replace("\\", "/")
+            for path in artifact.get("changed_files") or []
+            if str(path or "").strip()
+        ]
+        if not changed_files:
+            continue
+        reason = str(artifact.get("failure_reason") or "").strip()
+        repair_key = _partial_diff_artifact_repair_key(artifact)
+        if not repair_key:
+            continue
+        if reason == "WORKER_OFF_TRACK_TESTLESS_DIFF" and all(
+            not _repo_path_looks_like_test_file(path) for path in changed_files
+        ):
+            source_only_keys.add(repair_key)
+        elif reason == "WORKER_TEST_ONLY_DIFF" and all(
+            _repo_path_looks_like_test_file(path) for path in changed_files
+        ):
+            test_only_keys.add(repair_key)
+    return len(source_only_keys & test_only_keys)
+
+
+def _partial_diff_artifacts_have_complementary_one_sided_pair(artifacts: list[dict[str, Any]]) -> bool:
+    return _partial_diff_artifacts_complementary_one_sided_pair_count(artifacts) > 0
+
+
+def _worker_complementary_partial_diff_loop_extra_retries(cfg: ResolvedConfig) -> int:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_COMPLEMENTARY_PARTIAL_DIFF_LOOP_EXTRA_RETRIES", "")
+        or ""
+    ).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid ACA_WORKER_COMPLEMENTARY_PARTIAL_DIFF_LOOP_EXTRA_RETRIES=%r", raw)
+    return 1
+
+
+def _complementary_one_sided_partial_diff_can_retry(
+    cfg: ResolvedConfig,
+    artifacts: list[dict[str, Any]],
+    *,
+    attempt: int,
+    base_max_loops: int,
+) -> bool:
+    pair_count = _partial_diff_artifacts_complementary_one_sided_pair_count(artifacts)
+    if pair_count <= 0:
+        return False
+    base_extra_retries = max(
+        _worker_incomplete_diff_extra_retries(cfg),
+        _worker_off_track_extra_retries(cfg),
+    ) + 1
+    # One pair preserves the existing retry budget. Additional serial subtasks
+    # can form their own one-sided pairs after earlier slices already consumed
+    # the base budget, so each additional pair earns one more combine pass.
+    extra_retries = base_extra_retries + max(0, pair_count - 1) * 2
+    return attempt < base_max_loops + extra_retries - 1
+
+
+def _partial_diff_artifacts_matching_failure_count(
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+    failure_reasons: set[str],
+) -> int:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    subtask_id = str(worker.get("subtask_id") or "").strip() if isinstance(worker, dict) else ""
+    count = 0
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if str(artifact.get("failure_reason") or "").strip() not in failure_reasons:
+            continue
+        artifact_subtask_id = str(artifact.get("subtask_id") or "").strip()
+        if subtask_id and artifact_subtask_id and artifact_subtask_id != subtask_id:
+            continue
+        count += 1
+    return count
+
+
+def _verifiable_diff_test_failed_partial_diff_can_retry(
+    cfg: ResolvedConfig,
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+    *,
+    attempt: int,
+    max_loops: int,
+) -> bool:
+    if attempt >= max_loops:
+        return False
+    if not _worker_failure_is_verifiable_diff_test_failed(blocker):
+        return False
+    extra_retries = _worker_verifiable_diff_test_failed_extra_retries(cfg)
+    if _worker_failure_has_import_error(blocker):
+        extra_retries = max(extra_retries, _worker_verifiable_diff_import_error_extra_retries(cfg))
+    if _worker_failure_has_repairable_exception(blocker):
+        extra_retries = max(extra_retries, _worker_verifiable_diff_exception_extra_retries(cfg))
+    if _worker_failure_has_assertion_failure(blocker):
+        extra_retries = max(extra_retries, _worker_verifiable_diff_assertion_extra_retries(cfg))
+    if extra_retries <= 0:
+        return False
+    matching_count = _partial_diff_artifacts_matching_failure_count(
+        artifacts,
+        blocker,
+        {"WORKER_VERIFIABLE_DIFF_TEST_FAILED", "WORKER_VERIFIABLE_DIFF_UNTERMINATED"},
+    )
+    return 0 < matching_count <= extra_retries
+
+
+def _partial_diff_artifact_has_engine_empty_repair_context(artifact: dict[str, Any]) -> bool:
+    changed_files = [
+        str(path or "").strip().replace("\\", "/")
+        for path in artifact.get("changed_files") or []
+        if str(path or "").strip()
+    ]
+    if _changed_files_include_source_and_test(changed_files):
+        return True
+    if not changed_files:
+        return False
+    reason = str(artifact.get("failure_reason") or "").strip()
+    if reason == "WORKER_OFF_TRACK_TESTLESS_DIFF":
+        return all(not _repo_path_looks_like_test_file(path) for path in changed_files)
+    if reason == "WORKER_TEST_ONLY_DIFF":
+        return all(_repo_path_looks_like_test_file(path) for path in changed_files)
+    return False
+
+
+def _engine_empty_response_repair_can_retry(
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+    *,
+    attempt: int,
+    max_loops: int,
+    used_retries: int = 0,
+    retry_budget: int = 1,
+) -> bool:
+    kind = str(blocker.get("kind") or "").strip()
+    if kind not in {"engine_empty_response", "engine_prompt_timeout"}:
+        return False
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    reason = str(worker.get("failure_reason") or "").strip() if isinstance(worker, dict) else ""
+    if kind == "engine_prompt_timeout" and reason not in {"", "ENGINE_PROMPT_TIMEOUT"}:
+        return False
+    if not any(_partial_diff_artifact_has_engine_empty_repair_context(artifact) for artifact in artifacts):
+        return False
+    used = max(0, int(used_retries or 0))
+    budget = max(0, int(retry_budget or 0))
+    if used >= budget:
+        return False
+    return attempt < max_loops - 1
+
+
+def _one_sided_repair_cycle_should_block(
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    current_reason = str(worker.get("failure_reason") or "").strip()
+    if current_reason not in {"WORKER_OFF_TRACK_TESTLESS_DIFF", "WORKER_TEST_ONLY_DIFF"}:
+        return False
+    current_key = _partial_diff_artifact_repair_key(worker)
+    if not current_key:
+        return False
+    source_only_seen = False
+    test_only_seen = False
+    paired_rebuild_seen = False
+    one_sided_after_pair_seen = False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if _partial_diff_artifact_repair_key(artifact) != current_key:
+            continue
+        reason = str(artifact.get("failure_reason") or "").strip()
+        changed_files = [
+            str(path or "").strip().replace("\\", "/")
+            for path in artifact.get("changed_files") or []
+            if str(path or "").strip()
+        ]
+        if reason == "WORKER_OFF_TRACK_TESTLESS_DIFF" and changed_files and all(
+            not _repo_path_looks_like_test_file(path) for path in changed_files
+        ):
+            if source_only_seen and test_only_seen:
+                one_sided_after_pair_seen = True
+            source_only_seen = True
+        elif reason == "WORKER_TEST_ONLY_DIFF" and changed_files and all(
+            _repo_path_looks_like_test_file(path) for path in changed_files
+        ):
+            if source_only_seen and test_only_seen:
+                one_sided_after_pair_seen = True
+            test_only_seen = True
+        elif reason in {
+            "WORKER_VERIFIABLE_DIFF_WEAK_TEST",
+            "WORKER_VERIFIABLE_DIFF_MISALIGNED_TEST",
+            "WORKER_VERIFIABLE_DIFF_TEST_FAILED",
+            "WORKER_VERIFIABLE_DIFF_UNTERMINATED",
+            "WORKER_RUNAWAY_DIFF",
+            "WORKER_DESTRUCTIVE_DIFF",
+        } and _changed_files_include_source_and_test(changed_files):
+            paired_rebuild_seen = True
+    return source_only_seen and test_only_seen and (paired_rebuild_seen or one_sided_after_pair_seen)
+
+
+def _failed_verifiable_followup_one_sided_can_retry(
+    cfg: ResolvedConfig,
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+) -> bool:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if not isinstance(worker, dict):
+        return False
+    current_reason = str(worker.get("failure_reason") or "").strip()
+    if current_reason not in {"WORKER_OFF_TRACK_TESTLESS_DIFF", "WORKER_TEST_ONLY_DIFF"}:
+        return False
+    current_key = _partial_diff_artifact_repair_key(worker)
+    if not current_key:
+        return False
+    followup_one_sided_count = 0
+    seen_failed_verifiable = False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if _partial_diff_artifact_repair_key(artifact) != current_key:
+            continue
+        reason = str(artifact.get("failure_reason") or "").strip()
+        changed_files = [
+            str(path or "").strip().replace("\\", "/")
+            for path in artifact.get("changed_files") or []
+            if str(path or "").strip()
+        ]
+        if reason in {"WORKER_VERIFIABLE_DIFF_TEST_FAILED", "WORKER_VERIFIABLE_DIFF_UNTERMINATED"}:
+            if _changed_files_include_source_and_test(changed_files):
+                seen_failed_verifiable = True
+                followup_one_sided_count = 0
+            continue
+        if not seen_failed_verifiable:
+            continue
+        if reason == "WORKER_OFF_TRACK_TESTLESS_DIFF" and changed_files and all(
+            not _repo_path_looks_like_test_file(path) for path in changed_files
+        ):
+            followup_one_sided_count += 1
+        elif reason == "WORKER_TEST_ONLY_DIFF" and changed_files and all(
+            _repo_path_looks_like_test_file(path) for path in changed_files
+        ):
+            followup_one_sided_count += 1
+    if followup_one_sided_count <= 0:
+        return False
+    retry_budget = max(1, _worker_verifiable_diff_test_failed_extra_retries(cfg))
+    return followup_one_sided_count <= retry_budget
+
+
+def _destructive_complementary_partial_diff_can_retry(
+    cfg: ResolvedConfig,
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+    *,
+    attempt: int,
+    base_max_loops: int,
+) -> bool:
+    if str(blocker.get("kind") or "").strip() != "worker_runaway_diff":
+        return False
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    if str(worker.get("failure_reason") or "").strip() != "WORKER_DESTRUCTIVE_DIFF":
+        return False
+    if not _worker_failure_has_partial_diff(blocker):
+        return False
+    if not _partial_diff_artifacts_have_complementary_one_sided_pair(artifacts):
+        return False
+    destructive_count = sum(
+        1
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+        and str(artifact.get("failure_reason") or "").strip()
+        in {"WORKER_DESTRUCTIVE_DIFF", "WORKER_RUNAWAY_DIFF"}
+    )
+    if destructive_count != 1:
+        return False
+    extra_retries = (
+        _worker_repair_loop_extra_retries(cfg)
+        + _worker_complementary_partial_diff_loop_extra_retries(cfg)
+    )
+    return attempt < base_max_loops + extra_retries - 1
+
+
+def _stalled_no_diff_repair_can_retry(
+    cfg: ResolvedConfig,
+    artifacts: list[dict[str, Any]],
+    blocker: dict[str, Any],
+    *,
+    attempt: int,
+    base_max_loops: int,
+) -> bool:
+    if str(blocker.get("kind") or "").strip() != "engine_tool_loop_stalled_no_diff":
+        return False
+    if not artifacts:
+        return False
+    useful_artifacts = [
+        artifact
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+        and str(artifact.get("patch_path") or "").strip()
+        and str(artifact.get("failure_reason") or "").strip()
+    ]
+    if not useful_artifacts:
+        return False
+    extra_retries = max(1, _worker_incomplete_diff_extra_retries(cfg))
+    return attempt < base_max_loops + extra_retries - 1
+
+
+def _destructive_complementary_retry_feedback(blocker: dict[str, Any], attempt: int) -> str:
+    worker = blocker.get("worker") if isinstance(blocker.get("worker"), dict) else {}
+    patch_path = str(worker.get("partial_diff_artifact") or "").strip()
+    changed_files = worker.get("changed_files") if isinstance(worker.get("changed_files"), list) else []
+    changed_text = "\n".join(f"- {path}" for path in changed_files if str(path or "").strip()) or "- none"
+    return "\n\n".join(
+        part
+        for part in (
+            f"CRITICAL: Worker attempt {attempt + 1} tripped the destructive diff guard during complementary partial-diff repair.",
+            str(blocker.get("message") or "").strip(),
+            f"Detail: {blocker.get('detail')}" if blocker.get("detail") else "",
+            "ACA will retry once from clean files because earlier attempts produced a source-only/test-only complementary pair, but the previous rebuild rewrote too much code.",
+            "Changed files from the destructive attempt:\n" + changed_text,
+            f"Rejected destructive patch: `{patch_path}`" if patch_path else "",
+            "Next repair constraints: preserve existing file structure, avoid deleting or replacing existing functions, keep deletions near zero, and make only small additive edits that satisfy the source+test contract.",
+        )
+        if part
+    )
+
+
+def _merge_worker_partial_diff_artifacts_into_repair(
+    ctx: Any,
+    *,
+    blocker_kind: str = "",
+) -> list[dict[str, Any]]:
+    partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
+    if not partial_diff_artifacts:
+        return []
+    status_repair = ctx.status.setdefault("repair", {})
+    blackboard_repair = ctx.blackboard.setdefault("repair", {})
+    existing = blackboard_repair.get("partial_diff_artifacts") or status_repair.get("partial_diff_artifacts")
+    merged = _merge_partial_diff_artifacts_for_retry(existing, partial_diff_artifacts)
+    for repair_state in (blackboard_repair, status_repair):
+        repair_state["partial_diff_artifacts"] = merged
+        repair_state["partial_diff_state"] = "preserved_not_accepted"
+        repair_state["extra_retry_source"] = repair_state.get("extra_retry_source") or "worker_incomplete_diff"
+        sources = repair_state.setdefault("extra_retry_sources", [])
+        if isinstance(sources, list):
+            if "worker_incomplete_diff" not in sources:
+                sources.append("worker_incomplete_diff")
+            if blocker_kind and blocker_kind not in sources:
+                sources.append(blocker_kind)
+    return merged
 
 
 def _completed_subtask_ids_for_retry(worker_results: list[dict[str, Any]]) -> list[str]:
@@ -1160,6 +2100,7 @@ def _run_start_preflight(
     engine_run_dir = engine_visible_path(layout["run_dir"])
     result = run_command(_git_repo_args(repo_path, "status", "--short", "--branch"), env=cfg.env)
     detail = result.stderr.strip() or result.stdout.strip()
+    git_status_ok = result.returncode == 0 and not re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout)
     preflight = {
         "run_id": run_id,
         "repo_path": str(repo_path),
@@ -1175,22 +2116,29 @@ def _run_start_preflight(
             "stderr": result.stderr,
         },
     }
+    provider_smoke: dict[str, Any] | None = None
+    if git_status_ok:
+        provider_smoke = engine_provider_smoke_report(cfg, role="worker", directory=repo_path)
+        preflight["provider_smoke"] = provider_smoke
     layout["artifacts"].mkdir(parents=True, exist_ok=True)
     artifact_path = layout["artifacts"] / "run_start_preflight.json"
     artifact_path.write_text(json.dumps(preflight, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     preflight["artifact"] = str(artifact_path)
-    append_event(
-        layout["events"],
-        "run.preflight",
-        run_id,
-        {
-            "artifact": str(artifact_path),
-            "repo_path": str(repo_path),
-            "engine_visible_repo_path": str(engine_repo_path),
-            "git_status_ok": result.returncode == 0
-            and not re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout),
-        },
-    )
+    event_payload = {
+        "artifact": str(artifact_path),
+        "repo_path": str(repo_path),
+        "engine_visible_repo_path": str(engine_repo_path),
+        "git_status_ok": git_status_ok,
+    }
+    if provider_smoke is not None:
+        event_payload["provider_smoke_ok"] = bool(provider_smoke.get("ok"))
+        event_payload["provider"] = provider_smoke.get("provider")
+        event_payload["model"] = provider_smoke.get("model")
+        event_payload["provider_source"] = provider_smoke.get("source")
+        event_payload["provider_smoke_reason"] = provider_smoke.get("reason")
+        if provider_smoke.get("error_class"):
+            event_payload["provider_smoke_error_class"] = provider_smoke.get("error_class")
+    append_event(layout["events"], "run.preflight", run_id, event_payload)
     if result.returncode == 0 and re.search(r"\[(?:[^\]]*ahead|[^\]]*behind)", result.stdout):
         return preflight, {
             "kind": "repository_base_not_synced",
@@ -1200,6 +2148,31 @@ def _run_start_preflight(
             ),
         }
     if result.returncode == 0:
+        if provider_smoke is not None and not provider_smoke.get("ok"):
+            provider_label = "/".join(
+                str(value or "").strip()
+                for value in (provider_smoke.get("provider"), provider_smoke.get("model"))
+                if str(value or "").strip()
+            )
+            reason = str(provider_smoke.get("reason") or "unknown").strip()
+            error_class = str(provider_smoke.get("error_class") or "").strip()
+            error = str(provider_smoke.get("error") or "").strip()
+            detail = reason
+            if error_class:
+                detail += f": {error_class}"
+            if error and error != error_class:
+                detail += f" ({error})"
+            return preflight, {
+                "kind": "engine_provider_smoke_failed",
+                "message": (
+                    "Selected Tandem engine provider route did not return visible assistant text"
+                    + (f" for {provider_label}" if provider_label else "")
+                    + f" ({detail})."
+                ),
+                "recovery_action": (
+                    "Fix provider/model credentials or Tandem engine streaming before claiming Linear work."
+                ),
+            }
         return preflight, None
     kind = "repo_safe_directory" if "dubious ownership" in detail.lower() else "engine_workspace_unreachable"
     return preflight, {
@@ -1723,24 +2696,13 @@ def _normalize_manager_subtasks(
         rel_path = str(entry or "").strip()
         return bool(rel_path) and (Path(repo_path) / rel_path).is_file()
 
-    def _missing_target_can_be_created(entry: str) -> bool:
-        rel_path = str(entry or "").strip().replace("\\", "/").lower()
-        if not rel_path:
-            return False
-        if rel_path.startswith(".github/workflows/") and rel_path.endswith((".yml", ".yaml")):
-            return True
-        if "/tests/" in f"/{rel_path}/" or rel_path.startswith("tests/"):
-            return True
-        name = Path(rel_path).name
-        return name.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
-
     def _drop_hallucinated_missing_source_targets(entries: list[str]) -> tuple[list[str], list[str]]:
         if contract_constrained or not any(_repo_file_exists(entry) for entry in entries):
             return entries, []
         kept: list[str] = []
         dropped: list[str] = []
         for entry in entries:
-            if _repo_file_exists(entry) or _missing_target_can_be_created(entry):
+            if _repo_file_exists(entry) or _missing_repo_target_can_be_created(entry):
                 kept.append(entry)
             elif entry not in dropped:
                 dropped.append(entry)
@@ -1896,6 +2858,16 @@ def _normalize_manager_subtasks(
             "repair_changed_files",
             "repair_requires_test_followup",
             "repair_requires_production_followup",
+            "repair_requires_paired_source_test",
+            "repair_requires_paired_source_test_diff",
+            "repair_mode",
+            "repair_focus_instructions",
+            "repair_precision_edit",
+            "repair_diff_line_budget",
+            "discarded_partial_diff_patches",
+            "discarded_destructive_partial_diff_patches",
+            "repair_rejected_source_only_files",
+            "repair_rejected_test_only_files",
             "repair_worker_output_excerpt",
             "repair_failure_summary",
             "repair_parent_target_files",
@@ -2130,12 +3102,15 @@ def _has_verifiable_worker_success(worker_results: list[dict[str, Any]]) -> bool
 
 
 def _has_unresolved_write_required_worker_failure(worker_results: list[dict[str, Any]]) -> bool:
+    has_reviewable_synced_diff = _has_reviewable_synced_worker_result(worker_results)
     for result in worker_results:
         if _normalized_text(result.get("status")) != "failed":
             continue
         if result.get("write_required") is False:
             continue
         if result.get("verified_existing"):
+            continue
+        if has_reviewable_synced_diff and _worker_failure_is_inherited_overlay_no_fresh_changes(result):
             continue
         return True
     return False
@@ -3758,10 +4733,33 @@ def _run_once_internal_impl(
     configured_max_retries = max(0, int(getattr(cfg.swarm, "max_retries", 1) or 0))
     base_max_loops = configured_max_retries + 1
     incomplete_diff_extra_retries = _worker_incomplete_diff_extra_retries(cfg)
-    max_loops = base_max_loops + incomplete_diff_extra_retries
+    off_track_extra_retries = _worker_off_track_extra_retries(cfg)
+    verifiable_diff_test_failed_extra_retries = _worker_verifiable_diff_test_failed_extra_retries(cfg)
+    verifiable_diff_weak_test_extra_retries = _worker_verifiable_diff_weak_test_extra_retries(cfg)
+    verifiable_diff_import_error_extra_retries = _worker_verifiable_diff_import_error_extra_retries(cfg)
+    verifiable_diff_exception_extra_retries = _worker_verifiable_diff_exception_extra_retries(cfg)
+    verifiable_diff_assertion_extra_retries = _worker_verifiable_diff_assertion_extra_retries(cfg)
+    engine_empty_response_extra_retries = _worker_engine_empty_response_extra_retries(cfg)
+    verification_repair_extra_retries = _verification_repair_extra_retries(cfg)
+    complementary_partial_diff_loop_extra_retries = _worker_complementary_partial_diff_loop_extra_retries(cfg)
+    max_loops = (
+        base_max_loops
+        + _worker_repair_loop_extra_retries(cfg)
+        + verification_repair_extra_retries
+        + complementary_partial_diff_loop_extra_retries
+    )
     ctx.status["repair"] = {
         "configured_max_retries": configured_max_retries,
         "worker_incomplete_diff_extra_retries": incomplete_diff_extra_retries,
+        "worker_off_track_extra_retries": off_track_extra_retries,
+        "worker_engine_empty_response_extra_retries": engine_empty_response_extra_retries,
+        "verification_repair_extra_retries": verification_repair_extra_retries,
+        "worker_complementary_partial_diff_loop_extra_retries": complementary_partial_diff_loop_extra_retries,
+        "worker_verifiable_diff_test_failed_extra_retries": verifiable_diff_test_failed_extra_retries,
+        "worker_verifiable_diff_weak_test_extra_retries": verifiable_diff_weak_test_extra_retries,
+        "worker_verifiable_diff_import_error_extra_retries": verifiable_diff_import_error_extra_retries,
+        "worker_verifiable_diff_exception_extra_retries": verifiable_diff_exception_extra_retries,
+        "worker_verifiable_diff_assertion_extra_retries": verifiable_diff_assertion_extra_retries,
         "base_max_loops": base_max_loops,
         "max_loops": max_loops,
         "attempt": 0,
@@ -3930,18 +4928,130 @@ def _run_once_internal_impl(
             source = ctx.task.get("source") if isinstance(ctx.task, dict) else {}
             worker_blocker = _worker_failure_blocker(ctx.worker_results)
             retry_feedback = _worker_failure_retry_feedback(ctx, worker_blocker, attempt)
-            if retry_feedback and _worker_failure_can_retry(cfg, worker_blocker, attempt, base_max_loops):
+            partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
+            existing_artifacts = (ctx.blackboard.setdefault("repair", {})).get("partial_diff_artifacts")
+            merged_partial_diff_artifacts = _merge_partial_diff_artifacts_for_retry(
+                existing_artifacts,
+                partial_diff_artifacts,
+            )
+            retry_allowed = bool(
+                retry_feedback and _worker_failure_can_retry(cfg, worker_blocker, attempt, base_max_loops)
+            )
+            repair_state_for_budget = ctx.blackboard.setdefault("repair", {})
+            try:
+                engine_empty_response_repair_attempts = max(
+                    0,
+                    int(repair_state_for_budget.get("engine_empty_response_repair_attempts") or 0),
+                )
+            except (TypeError, ValueError):
+                engine_empty_response_repair_attempts = 0
+            engine_empty_response_repair_budget = _worker_engine_empty_response_extra_retries(cfg)
+            one_sided_cycle_blocked = _one_sided_repair_cycle_should_block(
+                merged_partial_diff_artifacts,
+                worker_blocker,
+            )
+            failed_verifiable_followup_retry = (
+                one_sided_cycle_blocked
+                and _failed_verifiable_followup_one_sided_can_retry(
+                    cfg,
+                    merged_partial_diff_artifacts,
+                    worker_blocker,
+                )
+            )
+            if one_sided_cycle_blocked and not failed_verifiable_followup_retry:
+                retry_allowed = False
+                retry_feedback = None
+                for repair_state in (
+                    ctx.blackboard.setdefault("repair", {}),
+                    ctx.status.setdefault("repair", {}),
+                ):
+                    repair_state["one_sided_repair_cycle_blocked"] = True
+            elif failed_verifiable_followup_retry:
+                retry_allowed = True
+                for repair_state in (
+                    ctx.blackboard.setdefault("repair", {}),
+                    ctx.status.setdefault("repair", {}),
+                ):
+                    repair_state["one_sided_after_failed_verifiable_retry"] = True
+            if (
+                retry_allowed
+                and worker_blocker.get("kind") == "engine_empty_response"
+                and merged_partial_diff_artifacts
+                and not _engine_empty_response_repair_can_retry(
+                    merged_partial_diff_artifacts,
+                    worker_blocker,
+                    attempt=attempt,
+                    max_loops=max_loops,
+                    used_retries=engine_empty_response_repair_attempts,
+                    retry_budget=engine_empty_response_repair_budget,
+                )
+            ):
+                retry_allowed = False
+                retry_feedback = None
+                for repair_state in (
+                    ctx.blackboard.setdefault("repair", {}),
+                    ctx.status.setdefault("repair", {}),
+                ):
+                    repair_state["engine_empty_response_retry_blocked"] = True
+            complementary_retry = False
+            destructive_complementary_retry = False
+            focused_test_failed_partial_retry = False
+            engine_empty_response_repair_retry = False
+            stalled_no_diff_repair_retry = False
+            if retry_feedback and not retry_allowed and not one_sided_cycle_blocked:
+                complementary_retry = _complementary_one_sided_partial_diff_can_retry(
+                    cfg,
+                    merged_partial_diff_artifacts,
+                    attempt=attempt,
+                    base_max_loops=base_max_loops,
+                )
+                retry_allowed = complementary_retry
+            if retry_feedback and not retry_allowed and not one_sided_cycle_blocked:
+                focused_test_failed_partial_retry = _verifiable_diff_test_failed_partial_diff_can_retry(
+                    cfg,
+                    merged_partial_diff_artifacts,
+                    worker_blocker,
+                    attempt=attempt,
+                    max_loops=max_loops,
+                )
+                retry_allowed = focused_test_failed_partial_retry
+            if not retry_feedback and not retry_allowed:
+                destructive_complementary_retry = _destructive_complementary_partial_diff_can_retry(
+                    cfg,
+                    merged_partial_diff_artifacts,
+                    worker_blocker,
+                    attempt=attempt,
+                    base_max_loops=base_max_loops,
+                )
+                if destructive_complementary_retry:
+                    retry_feedback = _destructive_complementary_retry_feedback(worker_blocker, attempt)
+                    retry_allowed = True
+            if retry_feedback and not retry_allowed:
+                stalled_no_diff_repair_retry = _stalled_no_diff_repair_can_retry(
+                    cfg,
+                    merged_partial_diff_artifacts,
+                    worker_blocker,
+                    attempt=attempt,
+                    base_max_loops=base_max_loops,
+                )
+                retry_allowed = stalled_no_diff_repair_retry
+            if retry_feedback and not retry_allowed:
+                engine_empty_response_repair_retry = _engine_empty_response_repair_can_retry(
+                    merged_partial_diff_artifacts,
+                    worker_blocker,
+                    attempt=attempt,
+                    max_loops=max_loops,
+                    used_retries=engine_empty_response_repair_attempts,
+                    retry_budget=engine_empty_response_repair_budget,
+                )
+                retry_allowed = engine_empty_response_repair_retry
+            if retry_feedback and retry_allowed:
                 previous_feedback = retry_feedback
-                partial_diff_artifacts = _partial_diff_artifacts_for_retry(ctx.worker_results)
+                partial_diff_artifacts = merged_partial_diff_artifacts
                 completed_subtask_ids = _completed_subtask_ids_for_retry(ctx.worker_results)
                 failed_subtask = _failed_subtask_for_retry(ctx.pending_subtasks, ctx.worker_results)
                 deferred_subtasks = _deferred_subtasks_for_retry(ctx.pending_subtasks, ctx.worker_results)
                 if partial_diff_artifacts:
-                    existing_artifacts = (ctx.blackboard.setdefault("repair", {})).get("partial_diff_artifacts")
-                    partial_diff_artifacts = _merge_partial_diff_artifacts_for_retry(
-                        existing_artifacts,
-                        partial_diff_artifacts,
-                    )
                     ctx.blackboard.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
                     ctx.blackboard.setdefault("repair", {})["partial_diff_state"] = "preserved_not_accepted"
                     ctx.status.setdefault("repair", {})["partial_diff_artifacts"] = partial_diff_artifacts
@@ -3972,6 +5082,28 @@ def _run_once_internal_impl(
                             sources.append("worker_incomplete_diff")
                         if isinstance(sources, list) and worker_blocker["kind"] not in sources:
                             sources.append(worker_blocker["kind"])
+                if engine_empty_response_repair_retry:
+                    engine_empty_response_repair_attempts += 1
+                    for repair_state in (
+                        ctx.blackboard.setdefault("repair", {}),
+                        ctx.status.setdefault("repair", {}),
+                    ):
+                        repair_state["engine_empty_response_repair_attempts"] = engine_empty_response_repair_attempts
+                        repair_state["engine_empty_response_repair_budget"] = engine_empty_response_repair_budget
+                if stalled_no_diff_repair_retry:
+                    for repair_state in (
+                        ctx.blackboard.setdefault("repair", {}),
+                        ctx.status.setdefault("repair", {}),
+                    ):
+                        try:
+                            stalled_count = max(
+                                0,
+                                int(repair_state.get("stalled_no_diff_repair_attempts") or 0),
+                            )
+                        except (TypeError, ValueError):
+                            stalled_count = 0
+                        repair_state["stalled_no_diff_repair_attempts"] = stalled_count + 1
+                        repair_state["last_repair_stall_kind"] = worker_blocker["kind"]
                 _append_blackboard_note(
                     ctx.blackboard,
                     f"Attempt {attempt + 1} hit retryable worker blocker `{worker_blocker['kind']}`. Retrying.",
@@ -3987,6 +5119,24 @@ def _run_once_internal_impl(
                         "partial_diff_artifacts": partial_diff_artifacts,
                         "completed_subtask_ids": completed_subtask_ids,
                         "deferred_subtask_count": len(deferred_subtasks),
+                        "extra_retry_reason": (
+                            "destructive_complementary_partial_diff"
+                            if destructive_complementary_retry
+                            else "focused_test_failed_partial_diff"
+                            if focused_test_failed_partial_retry
+                            else "failed_verifiable_followup_one_sided"
+                            if failed_verifiable_followup_retry
+                            else "engine_prompt_timeout_during_repair"
+                            if engine_empty_response_repair_retry
+                            and worker_blocker.get("kind") == "engine_prompt_timeout"
+                            else "engine_empty_response_during_repair"
+                            if engine_empty_response_repair_retry
+                            else "complementary_one_sided_partial_diffs"
+                            if complementary_retry
+                            else "stalled_no_diff_preserved_partial_diff"
+                            if stalled_no_diff_repair_retry
+                            else ""
+                        ),
                     },
                     task_id=ctx.task.get("task_id"),
                     role="worker",
@@ -5013,10 +6163,12 @@ def _block_worker_failure(ctx: "_PhaseRunContext") -> dict[str, Any]:
     if blocker.get("engine"):
         ctx.status.setdefault("engine", {}).update(blocker["engine"])
     ctx.status.setdefault("artifacts", {})
+    _merge_worker_partial_diff_artifacts_into_repair(ctx, blocker_kind=blocker.get("kind", ""))
     for key in ("events_path", "messages_path", "sync_snapshot_path"):
         value = (blocker.get("engine") or {}).get(key)
         if value:
             ctx.status["artifacts"][f"engine_{key.replace('_path', '')}"] = value
+    write_status(ctx.layout["status"], ctx.status)
     ctx.blackboard.setdefault("blockers", []).append(
         {
             "kind": blocker["kind"],

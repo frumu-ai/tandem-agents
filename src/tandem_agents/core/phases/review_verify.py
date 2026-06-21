@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import re
 import shlex
 from typing import Any
 
@@ -83,6 +84,27 @@ def _run_engine_command_checks(
     return results
 
 
+def _verification_commands_from_task_text(task: dict[str, Any]) -> list[str]:
+    text = "\n".join(
+        str(value or "")
+        for value in (
+            task.get("description"),
+            task.get("raw_issue_body"),
+            (task.get("task_contract") or {}).get("raw_issue_body")
+            if isinstance(task.get("task_contract"), dict)
+            else "",
+        )
+        if str(value or "").strip()
+    )
+    commands: list[str] = []
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n(?P<body>.*?)```", text, re.IGNORECASE | re.DOTALL):
+        for line in match.group("body").splitlines():
+            command = line.strip()
+            if command and not command.startswith("#") and command not in commands:
+                commands.append(command)
+    return commands
+
+
 def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
     """Execute the reviewer and tester prompts and verify the result.
 
@@ -132,6 +154,9 @@ def run_review_and_test(ctx: RunContext) -> dict[str, Any]:
         for entry in _as_list(ctx.task.get("verification_commands"))
         if str(entry).strip()
     ]
+    for command in _verification_commands_from_task_text(ctx.task):
+        if command not in task_verification_commands:
+            task_verification_commands.append(command)
     manager_command_checks = extract_command_checks(ctx.manager_plan)
     worker_changed_files: list[str] = []
     for result in ctx.worker_results:

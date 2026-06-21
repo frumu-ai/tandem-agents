@@ -165,6 +165,169 @@ class FinalizePhaseTest(unittest.TestCase):
             self.assertIn("`src/tandem_agents/core/phases/finalize.py`", body)
             self.assertNotEqual(body.strip(), "ACA automated PR for task: Create PR")
 
+    def test_build_pull_request_body_filters_repair_loop_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            ctx.task["title"] = "ACA smoke 02: add multiply support to calculator harness"
+            ctx.manager_plan = {
+                "kind": "complementary_guarded_partial_diff",
+                "summary": (
+                    "Deterministic repair for complementary one-sided guard partial diffs; "
+                    "ACA will compose both saved patches before asking the worker to verify."
+                ),
+                "subtasks": [
+                    {
+                        "title": "Verify complementary source and test partial diffs",
+                        "goal": (
+                            "Verify and minimally fix the combined source+test repair for "
+                            "src/tandem_agents/aca_harness/calculator.py."
+                        ),
+                    }
+                ],
+            }
+            ctx.worker_results = [
+                {
+                    "worker_id": "worker-1",
+                    "title": "Verify complementary source and test partial diffs",
+                    "status": "completed",
+                    "changed_files": [
+                        "src/tandem_agents/aca_harness/calculator.py",
+                        "src/tandem_agents/aca_harness/calculator_test.py",
+                    ],
+                }
+            ]
+
+            body = build_pull_request_body(ctx, "")
+
+        self.assertIn("ACA completed task: ACA smoke 02: add multiply support to calculator harness.", body)
+        self.assertIn("Updated the files listed below to satisfy the task contract.", body)
+        self.assertIn("`src/tandem_agents/aca_harness/calculator.py`", body)
+        self.assertNotIn("Deterministic repair", body)
+        self.assertNotIn("Verify complementary source and test partial diffs", body)
+
+    def test_build_pull_request_body_filters_stale_repair_risks_after_verified_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            ctx.task["title"] = "ACA smoke 03: add divide support with zero guard"
+            ctx.manager_plan = {
+                "summary": "ACA completed task: ACA smoke 03: add divide support with zero guard.",
+                "risks": [
+                    "The preserved source+test patch may still need a narrow fix before the focused verification passes.",
+                ],
+            }
+            ctx.worker_results = [
+                {
+                    "worker_id": "worker-1",
+                    "title": "Repair failed source+test partial diff",
+                    "status": "completed",
+                    "changed_files": [
+                        "src/tandem_agents/aca_harness/calculator.py",
+                        "src/tandem_agents/aca_harness/calculator_test.py",
+                    ],
+                    "verification_command": [
+                        "python3",
+                        "-m",
+                        "unittest",
+                        "src.tandem_agents.aca_harness.calculator_test",
+                    ],
+                    "verification_returncode": 0,
+                }
+            ]
+            ctx.review_result = {"returncode": 0}
+            ctx.test_result = {"returncode": 0}
+
+            body = build_pull_request_body(ctx, "")
+
+        self.assertNotIn("## Known Limitations", body)
+        self.assertNotIn("may still need", body)
+        self.assertIn("`src/tandem_agents/aca_harness/calculator.py`", body)
+
+    def test_build_pull_request_body_filters_recovered_engine_fallback_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            ctx.task["title"] = "ACA smoke 04: add operation registry helper"
+            ctx.task["acceptance_criteria"] = [
+                "Add `available_operations()` returning a sorted tuple of supported operation names.",
+                "Use a single internal registry for operation lookup where practical.",
+            ]
+            ctx.manager_plan = {
+                "summary": (
+                    "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync fallback timed out "
+                    "after 90s following an empty async transcript."
+                ),
+                "risks": [
+                    "Manager planning did not return a valid JSON object.",
+                ],
+            }
+            ctx.worker_results = [
+                {
+                    "worker_id": "worker-1",
+                    "title": "ACA smoke 04: add operation registry helper - remaining repo-context targets",
+                    "status": "completed",
+                    "changed_files": [
+                        "src/tandem_agents/aca_harness/calculator.py",
+                        "src/tandem_agents/aca_harness/calculator_test.py",
+                    ],
+                }
+            ]
+            ctx.review_result = {"returncode": 0}
+            ctx.test_result = {"returncode": 0}
+
+            body = build_pull_request_body(ctx, "")
+
+        self.assertIn("ACA completed task: ACA smoke 04: add operation registry helper.", body)
+        self.assertIn("Updated the files listed below to satisfy the task contract.", body)
+        self.assertIn("Add 'available_operations()'", body)
+        self.assertNotIn("ENGINE_PROMPT_TIMEOUT", body)
+        self.assertNotIn("empty async transcript", body)
+        self.assertNotIn("remaining repo-context", body)
+        self.assertNotIn("Manager planning did not return", body)
+        self.assertNotIn("## Known Limitations", body)
+
+    def test_build_pull_request_body_lists_declared_fenced_verification_without_filler_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self._ctx(Path(tmp))
+            ctx.task["title"] = "ACA smoke 05: document the smoke harness contract"
+            ctx.task["description"] = (
+                "Verification:\n\n"
+                "```bash\n"
+                "python3 -m unittest src.tandem_agents.aca_harness.calculator_test\n"
+                "```\n"
+            )
+            ctx.task["acceptance_criteria"] = [
+                "The PR body lists the changed files, the verification command, and why the smoke harness documentation exists."
+            ]
+            ctx.manager_plan = {
+                "summary": "Document the deterministic ACA smoke harness.",
+                "subtasks": [
+                    {
+                        "goal": "ACA smoke 05: document the smoke harness contract",
+                    }
+                ],
+            }
+            ctx.worker_results = [
+                {
+                    "worker_id": "worker-1",
+                    "title": "ACA smoke 05: document the smoke harness contract",
+                    "status": "completed",
+                    "changed_files": ["docs/README.md", "docs/ACA_SMOKE_HARNESS.md"],
+                    "output_excerpt": (
+                        "- Adds a new `docs/ACA_SMOKE_HARNESS.md` contract.\n"
+                        "- None visible from the provided diff excerpt.\n"
+                    ),
+                }
+            ]
+            ctx.review_result = {"returncode": 0}
+            ctx.test_result = {"returncode": 0}
+
+            body = build_pull_request_body(ctx, "")
+
+        self.assertIn("Declared verification: `python3 -m unittest src.tandem_agents.aca_harness.calculator_test`", body)
+        self.assertIn("Adds a new 'docs/ACA_SMOKE_HARNESS.md' contract.", body)
+        self.assertNotIn("None visible from the provided diff excerpt", body)
+        self.assertNotIn("- ACA smoke 05: document the smoke harness contract (completed).", body)
+        self.assertNotIn("- ACA smoke 05: document the smoke harness contract\n", body)
+
     def test_build_pull_request_body_keeps_string_risks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self._ctx(Path(tmp))

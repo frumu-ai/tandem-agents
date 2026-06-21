@@ -31,7 +31,7 @@ def build_pull_request_body(ctx: RunContext, final_diff_snapshot: str) -> str:
 
     changed_files = _changed_files(workers, repo_validation, ctx.expected_repo_files)
     lines.extend(["", "## What Changed", ""])
-    change_notes = _change_notes(workers, manager_plan)
+    change_notes = _change_notes(task, task_contract, workers, manager_plan)
     if change_notes:
         lines.extend(f"- {note}" for note in change_notes[:8])
     elif changed_files:
@@ -51,7 +51,7 @@ def build_pull_request_body(ctx: RunContext, final_diff_snapshot: str) -> str:
         if len(acceptance) > 12:
             lines.append(f"- ...and {len(acceptance) - 12} more")
 
-    verification = _verification_lines(repo_validation, review, test)
+    verification = _verification_lines(task, task_contract, repo_validation, review, test)
     lines.extend(["", "## Verification", ""])
     if verification:
         lines.extend(f"- {item}" for item in verification[:12])
@@ -117,16 +117,51 @@ def _unique(items: list[str]) -> list[str]:
     return result
 
 
+def _repair_internal_text(text: str) -> bool:
+    lowered = _text(text).lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "deterministic repair",
+            "partial diff",
+            "carry-forward",
+            "one-sided",
+            "worker_off_track",
+            "complementary",
+            "preserved patch",
+            "preserved source+test patch",
+            "preserved source/test patch",
+            "repair loop",
+            "source+test repair",
+            "source+test patch",
+            "focused verification",
+            "engine_prompt_timeout",
+            "prompt_sync fallback timed out",
+            "empty async transcript",
+            "manager planning did not return",
+            "fallback-remaining",
+            "remaining repo-context",
+        )
+    )
+
+
+def _task_summary_text(task: dict[str, Any]) -> str:
+    task_contract = _dict_value(task.get("task_contract"))
+    title = _text(task_contract.get("local_goal") or task.get("local_goal") or task.get("title"))
+    return f"ACA completed task: {title or 'Untitled task'}."
+
+
 def _summary_text(task: dict[str, Any], manager_plan: dict[str, Any], workers: list[dict[str, Any]]) -> str:
     summary = _text(manager_plan.get("summary"))
-    if summary:
+    if summary and not _repair_internal_text(summary):
         return _bounded_text(summary, 700)
     for worker in workers:
         title = _text(worker.get("title"))
-        if title:
+        if title and not _repair_internal_text(title):
             return f"ACA completed: {title}."
-    title = _text(task.get("title"))
-    return f"ACA automated PR for task: {title or 'Untitled task'}."
+    return _task_summary_text(task)
 
 
 def _markdown_section(markdown: str, heading: str) -> str:
@@ -184,21 +219,48 @@ def _extract_worker_bullets(output: str) -> list[str]:
             continue
         if body.lower().startswith(("verification", "remaining implementation blockers", "changed files")):
             continue
+        lowered = body.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "none visible",
+                "no visible",
+                "no blockers",
+                "no remaining blockers",
+                "nothing visible",
+            )
+        ):
+            continue
         bullets.append(_clean_inline(body))
     return [item for item in _unique(bullets) if item]
 
 
-def _change_notes(workers: list[dict[str, Any]], manager_plan: dict[str, Any]) -> list[str]:
+def _task_title_set(task: dict[str, Any], task_contract: dict[str, Any]) -> set[str]:
+    titles = {
+        _clean_inline(_text(task.get("title")), 260),
+        _clean_inline(_text(task.get("local_goal")), 260),
+        _clean_inline(_text(task_contract.get("local_goal")), 260),
+    }
+    return {title.lower() for title in titles if title}
+
+
+def _change_notes(
+    task: dict[str, Any],
+    task_contract: dict[str, Any],
+    workers: list[dict[str, Any]],
+    manager_plan: dict[str, Any],
+) -> list[str]:
     notes: list[str] = []
+    task_titles = _task_title_set(task, task_contract)
     for worker in workers:
         title = _clean_inline(_text(worker.get("title")), 180)
         status = _text(worker.get("status"))
-        if title:
+        if title and title.lower() not in task_titles and not _repair_internal_text(title):
             notes.append(f"{title}{f' ({status})' if status else ''}.")
         notes.extend(_extract_worker_bullets(_text(worker.get("output_excerpt") or worker.get("stdout"))))
     for subtask in _list_of_dicts(manager_plan.get("subtasks")):
         goal = _clean_inline(_text(subtask.get("goal") or subtask.get("title")), 260)
-        if goal:
+        if goal and goal.lower() not in task_titles and not _repair_internal_text(goal):
             notes.append(goal)
     return _unique(notes)
 
@@ -220,13 +282,38 @@ def _parse_stdout_json(result: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _verification_lines(repo_validation: dict[str, Any], review: dict[str, Any], test: dict[str, Any]) -> list[str]:
+def _verification_commands_from_task(task: dict[str, Any], task_contract: dict[str, Any]) -> list[str]:
+    commands: list[str] = []
+    for source in (task.get("verification_commands"), task_contract.get("verification_commands")):
+        if isinstance(source, list):
+            commands.extend(_text(item) for item in source if _text(item))
+    markdown = _text(task.get("description") or task.get("raw_issue_body") or task_contract.get("raw_issue_body"))
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n(?P<body>.*?)```", markdown, re.IGNORECASE | re.DOTALL):
+        for line in match.group("body").splitlines():
+            command = line.strip()
+            if command and not command.startswith("#"):
+                commands.append(command)
+    return _unique(commands)
+
+
+def _verification_lines(
+    task: dict[str, Any],
+    task_contract: dict[str, Any],
+    repo_validation: dict[str, Any],
+    review: dict[str, Any],
+    test: dict[str, Any],
+) -> list[str]:
     lines: list[str] = []
+    checked_commands: set[str] = set()
     for check in _list_of_dicts(repo_validation.get("command_checks")):
         command = _text(check.get("command"))
         status = _text(check.get("status")) or ("passed" if check.get("returncode") == 0 else "failed")
         if command:
+            checked_commands.add(command)
             lines.append(f"`{command}`: {status}")
+    for command in _verification_commands_from_task(task, task_contract):
+        if command not in checked_commands:
+            lines.append(f"Declared verification: `{command}`")
     if review:
         rc = review.get("returncode")
         if rc is not None:
@@ -267,13 +354,16 @@ def _risk_lines(manager_plan: dict[str, Any], task_contract: dict[str, Any]) -> 
             if isinstance(item, dict):
                 risk = _clean_inline(_text(item.get("risk")), 260)
                 mitigation = _clean_inline(_text(item.get("mitigation")), 260)
+                risk_line = ""
                 if risk and mitigation:
-                    risks.append(f"{risk} Mitigation: {mitigation}")
+                    risk_line = f"{risk} Mitigation: {mitigation}"
                 elif risk:
-                    risks.append(risk)
+                    risk_line = risk
+                if risk_line and not _repair_internal_text(risk_line):
+                    risks.append(risk_line)
             else:
                 risk = _clean_inline(_text(item), 260)
-                if risk:
+                if risk and not _repair_internal_text(risk):
                     risks.append(risk)
     verification = task_contract.get("verification_commands")
     if isinstance(verification, list):

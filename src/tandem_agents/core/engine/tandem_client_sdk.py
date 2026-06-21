@@ -124,12 +124,34 @@ def _jsonify_sdk_result(result: Any) -> Any:
     return result
 
 
-def with_sync_tandem_client(cfg: ResolvedConfig, fn: Any) -> Any:
+def _with_sync_tandem_client_in_current_thread(cfg: ResolvedConfig, fn: Any) -> Any:
     client = create_sync_tandem_client(cfg)
     try:
         return _jsonify_sdk_result(fn(client))
     finally:
         _close_quietly(client)
+
+
+def with_sync_tandem_client(cfg: ResolvedConfig, fn: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _with_sync_tandem_client_in_current_thread(cfg, fn)
+
+    holder: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            holder["result"] = _with_sync_tandem_client_in_current_thread(cfg, fn)
+        except BaseException as exc:  # noqa: BLE001
+            holder["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("result")
 
 
 def sdk_execute_tool(cfg: ResolvedConfig, tool: str, args: dict[str, Any] | None = None) -> Any:
@@ -580,6 +602,8 @@ def sdk_stream_run_text(
     run_id: str,
     log_writer: Any | None = None,
     timeout_seconds: float = 600.0,
+    empty_stream_timeout_seconds: float | None = None,
+    no_activity_timeout_seconds: float | None = None,
     no_text_timeout_seconds: float | None = None,
     max_events_without_text: int | None = None,
     stop_when_text: Callable[[str], bool] | None = None,
@@ -595,12 +619,23 @@ def sdk_stream_run_text(
             completed = False
             reason = ""
             event_count = 0
+            meaningful_event_count = 0
             events_without_text = 0
             last_activity_at = time.monotonic()
             no_text_timeout = (
                 float(no_text_timeout_seconds)
                 if no_text_timeout_seconds is not None and no_text_timeout_seconds > 0
                 else None
+            )
+            empty_stream_timeout = (
+                float(empty_stream_timeout_seconds)
+                if empty_stream_timeout_seconds is not None and empty_stream_timeout_seconds > 0
+                else None
+            )
+            no_activity_timeout = (
+                float(no_activity_timeout_seconds)
+                if no_activity_timeout_seconds is not None and no_activity_timeout_seconds > 0
+                else empty_stream_timeout
             )
             max_empty_events = (
                 int(max_events_without_text)
@@ -609,13 +644,17 @@ def sdk_stream_run_text(
             )
 
             async def _consume() -> None:
-                nonlocal completed, event_count, events_without_text, last_activity_at, reason
+                nonlocal completed, event_count, meaningful_event_count, events_without_text, last_activity_at, reason
                 started_at = time.monotonic()
                 stream = client.stream(session_id, run_id)
                 iterator = stream.__aiter__()
                 while True:
                     now = time.monotonic()
                     wait_seconds = max(0.1, float(timeout_seconds or 1.0) - (now - started_at))
+                    if event_count == 0 and empty_stream_timeout is not None:
+                        wait_seconds = min(wait_seconds, max(0.1, empty_stream_timeout - (now - started_at)))
+                    elif meaningful_event_count == 0 and no_activity_timeout is not None:
+                        wait_seconds = min(wait_seconds, max(0.1, no_activity_timeout - (now - started_at)))
                     if no_text_timeout is not None and event_count >= 5:
                         wait_seconds = min(wait_seconds, max(0.1, no_text_timeout - (now - last_activity_at)))
                     try:
@@ -625,7 +664,15 @@ def sdk_stream_run_text(
                         return
                     except asyncio.TimeoutError:
                         now = time.monotonic()
-                        if no_text_timeout is not None and event_count >= 5 and now - last_activity_at >= no_text_timeout:
+                        if empty_stream_timeout is not None and event_count == 0 and now - started_at >= empty_stream_timeout:
+                            reason = "empty_stream_timeout"
+                        elif (
+                            no_activity_timeout is not None
+                            and meaningful_event_count == 0
+                            and now - started_at >= no_activity_timeout
+                        ):
+                            reason = "no_activity_timeout"
+                        elif no_text_timeout is not None and event_count >= 5 and now - last_activity_at >= no_text_timeout:
                             reason = "no_text_timeout"
                         else:
                             reason = "timeout"
@@ -634,7 +681,9 @@ def sdk_stream_run_text(
                     last_activity_at = time.monotonic()
                     t = str(getattr(evt, "type", "") or "").strip()
                     delta = _extract_event_text_delta(evt)
+                    event_is_meaningful = "tool" in t or "permission" in t
                     if delta:
+                        meaningful_event_count += 1
                         parts.append(delta)
                         events_without_text = 0
                         if log_writer is not None:
@@ -647,11 +696,24 @@ def sdk_stream_run_text(
                             reason = "stop_condition"
                             return
                     else:
+                        if event_is_meaningful:
+                            meaningful_event_count += 1
                         events_without_text += 1
+                    if t in {"run.cancelled", "run.canceled", "session.run.cancelled", "session.run.canceled"}:
+                        completed = False
+                        reason = "cancelled"
+                        return
                     if t in {"run.complete", "run.completed", "run.failed", "session.run.finished"}:
                         completed = True
                         return
                     now = time.monotonic()
+                    if (
+                        no_activity_timeout is not None
+                        and meaningful_event_count == 0
+                        and now - started_at >= no_activity_timeout
+                    ):
+                        reason = "no_activity_timeout"
+                        return
                     if no_text_timeout is not None and event_count >= 5 and now - last_activity_at >= no_text_timeout:
                         reason = "no_text_timeout"
                         return
@@ -664,6 +726,12 @@ def sdk_stream_run_text(
             except asyncio.TimeoutError:
                 reason = "timeout"
             text = "".join(parts)
-            return {"text": text, "completed": completed, "reason": reason, "event_count": event_count}
+            return {
+                "text": text,
+                "completed": completed,
+                "reason": reason,
+                "event_count": event_count,
+                "meaningful_event_count": meaningful_event_count,
+            }
 
     return asyncio.run(_runner())

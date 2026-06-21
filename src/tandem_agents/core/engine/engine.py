@@ -10,6 +10,7 @@ from src.tandem_agents.core.engine.engine_runtime import (
     disconnect_mcp_server,
     effective_tandem_provider,
     engine_env,
+    engine_empty_response_fallback_provider_model,
     engine_session_provider_model,
     engine_health,
     engine_status_report,
@@ -35,6 +36,7 @@ from src.tandem_agents.core.repository.repository import (
     _git_identity_args,
     _remote_is_empty,
     checkout_run_branch,
+    checkout_run_worktree,
     commit_repository_changes,
     current_repository_branch,
     create_worktree,
@@ -49,6 +51,7 @@ from src.tandem_agents.core.repository.repository import (
     resolve_repository,
     sync_worktree_changes,
     task_run_branch_name,
+    task_run_worktree_name,
     worker_worktree_name,
 )
 
@@ -63,6 +66,7 @@ __all__ = [
     "_remote_is_empty",
     "_run_command",
     "checkout_run_branch",
+    "checkout_run_worktree",
     "cli_version",
     "command_exists",
     "commit_repository_changes",
@@ -74,6 +78,7 @@ __all__ = [
     "disconnect_mcp_server",
     "effective_tandem_provider",
     "engine_env",
+    "engine_empty_response_fallback_provider_model",
     "engine_session_provider_model",
     "engine_health",
     "engine_status_report",
@@ -100,6 +105,7 @@ __all__ = [
     "start_engine",
     "sync_worktree_changes",
     "task_run_branch_name",
+    "task_run_worktree_name",
     "write_provider_override_config",
     "worker_worktree_name",
 ]

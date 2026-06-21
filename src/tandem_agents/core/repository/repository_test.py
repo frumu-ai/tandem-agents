@@ -17,6 +17,8 @@ from src.tandem_agents.core.repository.repository import (
     _git_repo_args,
     _github_pat,
     checkout_run_branch,
+    checkout_run_worktree,
+    commit_repository_changes,
     create_worktree,
     current_repository_branch,
     fetch_pr_refs,
@@ -29,6 +31,7 @@ from src.tandem_agents.core.repository.repository import (
     repository_binding_issues,
     resolve_repository,
     task_run_branch_name,
+    task_run_worktree_name,
     worker_worktree_name,
 )
 
@@ -107,6 +110,129 @@ class RepositoryNamingTest(unittest.TestCase):
             with mock.patch.dict("os.environ", {"ACA_ROOT": str(root)}):
                 self.assertIn("README.md", git_diff_stat(worktree))
 
+    def test_checkout_run_worktree_creates_branch_without_mutating_repo_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            cfg = _config_for_repo(root, repo)
+            branch = task_run_branch_name(
+                {"title": "LACA-12 Add per-issue worktree and branch isolation", "task_id": "TAN-170"},
+                "run-20260620T030612Z-a3d61420",
+                "frumu-ai/tandem-agents",
+            )
+            worktree_name = task_run_worktree_name(
+                {"title": "LACA-12 Add per-issue worktree and branch isolation", "task_id": "TAN-170"},
+                "run-20260620T030612Z-a3d61420",
+                "frumu-ai/tandem-agents",
+            )
+            worktree = root / "runs" / "run-1" / "repo" / worktree_name
+
+            checked_out = checkout_run_worktree(cfg, repo, worktree, branch)
+
+            self.assertEqual(checked_out, worktree.resolve())
+            self.assertEqual(current_repository_branch(checked_out, cfg=cfg), branch)
+            self.assertEqual(current_repository_branch(repo, cfg=cfg), "main")
+            self.assertEqual((checked_out / "README.md").read_text(encoding="utf-8"), "before\n")
+            self.assertNotIn("/", checked_out.name)
+
+    def test_checkout_run_worktree_gitdir_is_visible_to_engine_and_aca(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aca_root = root / "aca"
+            host_root = root / "host"
+            aca_root.mkdir()
+            host_root.symlink_to(aca_root, target_is_directory=True)
+            repo = aca_root / "workspace" / "repos" / "demo"
+            repo.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=ACA",
+                    "-c",
+                    "user.email=tandem-agents.invalid",
+                    "add",
+                    "README.md",
+                ]
+            )
+            run_command(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=ACA",
+                    "-c",
+                    "user.email=tandem-agents.invalid",
+                    "commit",
+                    "-m",
+                    "init",
+                ]
+            )
+            branch = "aca/test-run"
+            worktree = aca_root / "runs" / "run-1" / "repo" / "demo-run"
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "ACA_ROOT": str(aca_root),
+                    "ACA_ENGINE_HOST_ROOT": str(host_root),
+                },
+            ):
+                cfg = _config_for_repo(aca_root, repo)
+                checked_out = checkout_run_worktree(cfg, repo, worktree, branch)
+                git_file_text = (checked_out / ".git").read_text(encoding="utf-8")
+                self.assertIn(str(host_root), git_file_text)
+                self.assertEqual(current_repository_branch(checked_out, cfg=cfg), branch)
+
+                (checked_out / "README.md").write_text("after\n", encoding="utf-8")
+                commit = commit_repository_changes(cfg, checked_out, "update readme")
+
+            self.assertIsNotNone(commit)
+            self.assertEqual(current_repository_branch(repo, cfg=cfg), "main")
+
+    def test_checkout_run_worktree_rejects_destination_outside_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            cfg = _config_for_repo(root, repo)
+            outside = root / "outside-run-worktree"
+
+            with self.assertRaisesRegex(RuntimeError, "worktree destination must stay inside"):
+                checkout_run_worktree(cfg, repo, outside, "aca/run-outside")
+
+            self.assertFalse(outside.exists())
+
+    def test_create_worktree_rejects_destination_outside_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "runs" / "run-1" / "repo" / "source"
+            repo.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "README.md"])
+            run_command(["git", "-C", str(repo), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            outside = root / "runs" / "run-2" / "worktrees" / "worker-1"
+
+            with self.assertRaisesRegex(RuntimeError, "worktree destination must stay inside"):
+                create_worktree(repo, outside)
+
+            self.assertFalse(outside.exists())
+
     def test_resolve_repo_after_checkout_preserves_run_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -156,6 +282,32 @@ class RepositoryNamingTest(unittest.TestCase):
             host_status = run_command(["git", "-C", str(host_worktree), "status", "--short"])
             self.assertEqual(host_status.returncode, 0, host_status.stderr)
             self.assertIn("README.md", host_status.stdout)
+
+    def test_create_worktree_overlays_dirty_run_checkout_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "repo"
+            source.mkdir()
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("before\n", encoding="utf-8")
+            (source / "remove.txt").write_text("remove me\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "add", "."])
+            run_command(["git", "-C", str(source), "-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid", "commit", "-m", "init"])
+            (source / "README.md").write_text("after worker one\n", encoding="utf-8")
+            (source / "new.txt").write_text("new from worker one\n", encoding="utf-8")
+            (source / "remove.txt").unlink()
+            worktree = root / "runs" / "run-1" / "worktrees" / "worker-2"
+
+            create_worktree(source, worktree)
+
+            self.assertEqual((worktree / "README.md").read_text(encoding="utf-8"), "after worker one\n")
+            self.assertEqual((worktree / "new.txt").read_text(encoding="utf-8"), "new from worker one\n")
+            self.assertFalse((worktree / "remove.txt").exists())
+            status = run_command(["git", "-C", str(worktree), "status", "--short"])
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertIn("M README.md", status.stdout)
+            self.assertIn("?? new.txt", status.stdout)
+            self.assertIn("D remove.txt", status.stdout)
 
     def test_git_diff_stat_ignores_aca_internal_context_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -279,6 +431,27 @@ class RepositoryNamingTest(unittest.TestCase):
         )
 
         self.assertEqual(branch, "aca/frumu-ai-hello-tandem/fix-readme-1234abcd-run5678")
+
+    def test_task_run_branch_name_preserves_run_id_uniqueness(self) -> None:
+        task = {
+            "title": "LACA-12 Add per-issue worktree and branch isolation for parallel ACA runs",
+            "task_id": "TAN-170",
+        }
+
+        first = task_run_branch_name(
+            task,
+            "run-20260619T025756Z-e3914a29",
+            "frumu-ai/tandem-agents",
+        )
+        second = task_run_branch_name(
+            task,
+            "run-20260619T025957Z-fe7f5461",
+            "frumu-ai/tandem-agents",
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertIn("run-20260619t025756z-e3914a29", first)
+        self.assertIn("run-20260619t025957z-fe7f5461", second)
 
     def test_worker_worktree_name_includes_worker_and_subtask(self) -> None:
         self.assertEqual(worker_worktree_name("worker-a", "subtask-1"), "worker-a--subtask-1")
@@ -685,6 +858,62 @@ class RepositoryNamingTest(unittest.TestCase):
             self.assertEqual(backup_head, local_head)
             show = run_command(["git", "-C", str(target), "show", "--name-only", "--format=", backup_names[0]])
             self.assertIn("LOCAL.md", show.stdout)
+
+    def test_resolve_repository_archives_dirty_managed_aca_branch_before_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace" / "repos"
+            source = workspace / "source"
+            target = workspace / "checkout"
+            source.mkdir(parents=True, exist_ok=True)
+            ident = ["-c", "user.name=ACA", "-c", "user.email=tandem-agents.invalid"]
+            run_command(["git", "init", "--initial-branch=main", str(source)])
+            (source / "README.md").write_text("one\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), *ident, "add", "README.md"])
+            run_command(["git", "-C", str(source), *ident, "commit", "-m", "one"])
+            run_command(["git", "clone", str(source), str(target)])
+            run_command(["git", "-C", str(target), "checkout", "-b", "aca/old-run"])
+            (target / "README.md").write_text("dirty run edit\n", encoding="utf-8")
+            (source / "README.md").write_text("two\n", encoding="utf-8")
+            run_command(["git", "-C", str(source), *ident, "commit", "-am", "two"])
+            (root / "agent.yaml").write_text(
+                "\n".join(
+                    [
+                        "agent:",
+                        "  name: ACA",
+                        "tandem:",
+                        "  base_url: http://127.0.0.1:39733",
+                        "task_source:",
+                        "  type: manual",
+                        "  prompt: Repository pull",
+                        "repository:",
+                        "  path: workspace/repos/checkout",
+                        "  worktree_root: workspace/repos",
+                        f"  clone_url: {source}",
+                        "  allowed_hosts: local",
+                        "  default_branch: main",
+                        "provider:",
+                        "  id: openai",
+                        "  model: gpt-4.1-mini",
+                        "output:",
+                        "  root: runs",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cfg = resolve_config(root)
+
+            resolve_repository(cfg)
+
+            self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "two\n")
+            self.assertEqual(current_repository_branch(target, cfg=cfg), "main")
+            self.assertEqual(run_command(["git", "-C", str(target), "status", "--porcelain"]).stdout.strip(), "")
+            backups = run_command(["git", "-C", str(target), "branch", "--list", "aca/archive/dirty/aca-old-run/*"])
+            backup_names = [line.strip().lstrip("* ").strip() for line in backups.stdout.splitlines() if line.strip()]
+            self.assertEqual(len(backup_names), 1, backups.stdout)
+            archived_readme = run_command(["git", "-C", str(target), "show", f"{backup_names[0]}:README.md"])
+            self.assertEqual(archived_readme.stdout, "dirty run edit\n")
 
     def test_resolve_repository_rejects_non_managed_default_branch_ahead_of_origin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

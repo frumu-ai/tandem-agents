@@ -413,12 +413,38 @@ class SchedulerTest(unittest.TestCase):
                     },
                     "last_error": "Authorization required.",
                 },
+            ), patch(
+                "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                return_value={"ok": True, "reason": "ok"},
             ):
                 blockers = scheduler_integration_blockers(cfg)
 
             self.assertEqual(len(blockers), 1)
             self.assertEqual(blockers[0]["reason"], "linear_mcp_auth_required")
             self.assertEqual(blockers[0]["project_key"], "linear:team-1/project-target")
+
+    def test_scheduler_reports_engine_session_readiness_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+
+            with patch(
+                "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                return_value={
+                    "ok": False,
+                    "reason": "exception",
+                    "base_url": "http://127.0.0.1:39731",
+                    "error": "ReadTimeout",
+                    "error_class": "ReadTimeout",
+                    "timeout_seconds": 2.0,
+                },
+            ):
+                blockers = scheduler_integration_blockers(cfg, project_key="linear:team/project")
+
+            self.assertEqual(len(blockers), 1)
+            self.assertEqual(blockers[0]["reason"], "engine_session_api_unavailable")
+            self.assertEqual(blockers[0]["project_key"], "linear:team/project")
+            self.assertEqual(blockers[0]["error_class"], "ReadTimeout")
+            self.assertEqual(blockers[0]["base_url"], "http://127.0.0.1:39731")
 
     def test_scheduler_requests_linear_auth_url_when_server_list_omits_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -443,7 +469,10 @@ class SchedulerTest(unittest.TestCase):
             ), patch(
                 "src.tandem_agents.core.scheduling.scheduler._request_linear_auth_url",
                 return_value="https://linear.example.test/authorize",
-            ) as request_auth:
+            ) as request_auth, patch(
+                "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                return_value={"ok": True, "reason": "ok"},
+            ):
                 blockers = scheduler_integration_blockers(cfg)
 
             self.assertEqual(len(blockers), 1)
@@ -478,7 +507,10 @@ class SchedulerTest(unittest.TestCase):
             ), patch(
                 "src.tandem_agents.core.scheduling.scheduler._request_linear_auth_url",
                 return_value="https://linear.example.test/new-authorize",
-            ) as request_auth:
+            ) as request_auth, patch(
+                "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                return_value={"ok": True, "reason": "ok"},
+            ):
                 blockers = scheduler_integration_blockers(cfg)
 
             self.assertEqual(len(blockers), 1)
