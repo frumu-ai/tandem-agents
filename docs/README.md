@@ -4,6 +4,12 @@ This directory contains the setup, schema, and workflow docs for the local
 Tandem Agents stack: Tandem engine, control panel, ACA runtime, KB MCP, and
 supporting operator scripts.
 
+ACA smoke harness documentation:
+
+- [ACA_SMOKE_HARNESS.md](ACA_SMOKE_HARNESS.md) - contract for the ACA smoke
+  harness purpose, expected task order, docs-only file scope, and verification
+  command.
+
 Project files live one level up in the repository tree:
 
 - [../README.md](../README.md) - root pointer to this docs index
