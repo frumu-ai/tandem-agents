@@ -2,6 +2,8 @@
 
 import unittest
 
+from src.tandem_agents.aca_harness import calculator
+
 from . import (
     add as exported_add,
     describe_operation as exported_describe_operation,
@@ -37,9 +39,22 @@ class CalculatorTest(unittest.TestCase):
 
     def test_describe_operation_rejects_unknown_operation(self):
         with self.assertRaises(ValueError) as error:
-            describe_operation("divide", 2, 3)
+            describe_operation("power", 2, 3)
 
-        self.assertEqual(str(error.exception), "unknown operation: divide")
+        self.assertEqual(str(error.exception), "unknown operation: power")
+
+    def test_divide_returns_quotient(self):
+        self.assertEqual(calculator.divide(8, 2), 4)
+
+    def test_divide_raises_for_zero_right_operand(self):
+        with self.assertRaises(ZeroDivisionError):
+            calculator.divide(8, 0)
+
+    def test_describe_operation_supports_divide(self):
+        self.assertEqual(
+            calculator.describe_operation("divide", 8, 2),
+            "8 / 2 = 4.0",
+        )
 
 
 if __name__ == "__main__":
