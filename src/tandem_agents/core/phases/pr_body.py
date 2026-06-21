@@ -31,7 +31,7 @@ def build_pull_request_body(ctx: RunContext, final_diff_snapshot: str) -> str:
 
     changed_files = _changed_files(workers, repo_validation, ctx.expected_repo_files)
     lines.extend(["", "## What Changed", ""])
-    change_notes = _change_notes(workers, manager_plan)
+    change_notes = _change_notes(task, task_contract, workers, manager_plan)
     if change_notes:
         lines.extend(f"- {note}" for note in change_notes[:8])
     elif changed_files:
@@ -235,17 +235,32 @@ def _extract_worker_bullets(output: str) -> list[str]:
     return [item for item in _unique(bullets) if item]
 
 
-def _change_notes(workers: list[dict[str, Any]], manager_plan: dict[str, Any]) -> list[str]:
+def _task_title_set(task: dict[str, Any], task_contract: dict[str, Any]) -> set[str]:
+    titles = {
+        _clean_inline(_text(task.get("title")), 260),
+        _clean_inline(_text(task.get("local_goal")), 260),
+        _clean_inline(_text(task_contract.get("local_goal")), 260),
+    }
+    return {title.lower() for title in titles if title}
+
+
+def _change_notes(
+    task: dict[str, Any],
+    task_contract: dict[str, Any],
+    workers: list[dict[str, Any]],
+    manager_plan: dict[str, Any],
+) -> list[str]:
     notes: list[str] = []
+    task_titles = _task_title_set(task, task_contract)
     for worker in workers:
         title = _clean_inline(_text(worker.get("title")), 180)
         status = _text(worker.get("status"))
-        if title and not _repair_internal_text(title):
+        if title and title.lower() not in task_titles and not _repair_internal_text(title):
             notes.append(f"{title}{f' ({status})' if status else ''}.")
         notes.extend(_extract_worker_bullets(_text(worker.get("output_excerpt") or worker.get("stdout"))))
     for subtask in _list_of_dicts(manager_plan.get("subtasks")):
         goal = _clean_inline(_text(subtask.get("goal") or subtask.get("title")), 260)
-        if goal and not _repair_internal_text(goal):
+        if goal and goal.lower() not in task_titles and not _repair_internal_text(goal):
             notes.append(goal)
     return _unique(notes)
 

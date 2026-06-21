@@ -325,6 +325,8 @@ class FinalizePhaseTest(unittest.TestCase):
         self.assertIn("Declared verification: `python3 -m unittest src.tandem_agents.aca_harness.calculator_test`", body)
         self.assertIn("Adds a new 'docs/ACA_SMOKE_HARNESS.md' contract.", body)
         self.assertNotIn("None visible from the provided diff excerpt", body)
+        self.assertNotIn("- ACA smoke 05: document the smoke harness contract (completed).", body)
+        self.assertNotIn("- ACA smoke 05: document the smoke harness contract\n", body)
 
     def test_build_pull_request_body_keeps_string_risks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
