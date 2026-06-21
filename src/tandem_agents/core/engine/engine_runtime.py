@@ -58,6 +58,179 @@ ROLE_MODEL_ENV_NAMES = {
 }
 
 
+
+def _engine_text_from_part(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(exclude_none=True)
+    if isinstance(value, dict):
+        chunks: list[str] = []
+        for key in ("delta", "text", "content", "message", "parts", "response", "output", "stdout"):
+            if key in value:
+                chunks.append(_engine_text_from_part(value.get(key)))
+        return "".join(chunk for chunk in chunks if chunk)
+    if isinstance(value, list):
+        return "".join(_engine_text_from_part(item) for item in value)
+    return ""
+
+
+def _engine_text_from_messages(messages: Any) -> str:
+    if hasattr(messages, "model_dump"):
+        messages = messages.model_dump(exclude_none=True)
+    if isinstance(messages, dict):
+        for key in ("messages", "message", "response", "output", "stdout", "text", "content", "parts"):
+            text = _engine_text_from_messages(messages.get(key))
+            if text.strip():
+                return text.strip()
+        return ""
+    if not isinstance(messages, list):
+        return _engine_text_from_part(messages).strip()
+    for message in reversed(messages):
+        if hasattr(message, "model_dump"):
+            message = message.model_dump(exclude_none=True)
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info") if isinstance(message.get("info"), dict) else {}
+        role = str(message.get("role") or info.get("role") or "").strip().lower()
+        if role and role != "assistant":
+            continue
+        text = _engine_text_from_part(message.get("parts") or message.get("content") or message)
+        if text.strip():
+            return text.strip()
+    return ""
+
+
+def _engine_provider_smoke_enabled(cfg: ResolvedConfig) -> bool:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_PROVIDER_SMOKE_ENABLED", "") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _engine_provider_smoke_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_PROVIDER_SMOKE_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return min(180.0, max(3.0, float(raw)))
+        except ValueError:
+            pass
+    return 90.0
+
+
+def _engine_session_readiness_enabled(cfg: ResolvedConfig) -> bool:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_SESSION_READINESS_ENABLED", "") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _engine_session_readiness_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_SESSION_READINESS_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return min(10.0, max(0.5, float(raw)))
+        except ValueError:
+            pass
+    return 2.0
+
+
+def engine_session_readiness_report(cfg: ResolvedConfig) -> dict[str, Any]:
+    if not _engine_session_readiness_enabled(cfg):
+        return {"ok": True, "skipped": True, "reason": "disabled"}
+    timeout_seconds = _engine_session_readiness_timeout_seconds(cfg)
+    tandem_cfg = getattr(cfg, "tandem", None)
+    base_url = str(getattr(tandem_cfg, "base_url", "") or "")
+    try:
+        response = _engine_request_json(cfg, "/session", timeout=timeout_seconds)
+        return {
+            "ok": isinstance(response, (list, dict)),
+            "reason": "ok" if isinstance(response, (list, dict)) else "unexpected_payload",
+            "timeout_seconds": timeout_seconds,
+            "base_url": base_url,
+        }
+    except Exception as exc:
+        error_class = exc.__class__.__name__
+        error_text = str(exc).strip()
+        return {
+            "ok": False,
+            "reason": "exception",
+            "timeout_seconds": timeout_seconds,
+            "base_url": base_url,
+            "error": error_text or error_class,
+            "error_class": error_class,
+        }
+
+
+def engine_provider_smoke_report(
+    cfg: ResolvedConfig,
+    *,
+    role: str = "worker",
+    directory: Path | None = None,
+) -> dict[str, Any]:
+    route = engine_session_provider_model(cfg, role)
+    provider = str(route.get("provider") or "").strip()
+    model = str(route.get("model") or "").strip()
+    if not _engine_provider_smoke_enabled(cfg):
+        return {"ok": True, "skipped": True, "reason": "disabled", "provider": provider, "model": model}
+    if not provider or not model:
+        return {"ok": False, "reason": "missing_provider_model", "provider": provider, "model": model}
+    root = directory or cfg.root
+    session_id = ""
+    timeout_seconds = _engine_provider_smoke_timeout_seconds(cfg)
+    try:
+        session_id = create_tandem_session(
+            cfg,
+            title=f"ACA {role} provider smoke",
+            directory=root,
+            provider=provider,
+            model=model,
+        )
+        response = prompt_tandem_session_sync(
+            cfg,
+            session_id=session_id,
+            prompt="Reply with exactly ACA_SMOKE_OK and no other text.",
+            tool_mode="auto",
+            require_tool_use=False,
+            write_required=False,
+            timeout_seconds=timeout_seconds,
+        )
+        text = _engine_text_from_messages(response)
+        ok = "ACA_SMOKE_OK" in text
+        return {
+            "ok": ok,
+            "reason": "ok" if ok else "empty_or_unexpected_transcript",
+            "provider": provider,
+            "model": model,
+            "source": str(route.get("source") or ""),
+            "configured_provider": str(route.get("configured_provider") or ""),
+            "configured_model": str(route.get("configured_model") or ""),
+            "timeout_seconds": timeout_seconds,
+            "text_length": len(text),
+        }
+    except Exception as exc:
+        error_class = exc.__class__.__name__
+        error_text = str(exc).strip()
+        return {
+            "ok": False,
+            "reason": "exception",
+            "provider": provider,
+            "model": model,
+            "source": str(route.get("source") or ""),
+            "timeout_seconds": timeout_seconds,
+            "error": error_text or error_class,
+            "error_class": error_class,
+        }
+    finally:
+        if session_id:
+            try:
+                delete_tandem_session(cfg, session_id)
+            except Exception:
+                pass
+
+
 def parse_base_url(base_url: str) -> tuple[str, int]:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"}:
@@ -98,6 +271,10 @@ def _engine_request_json(
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
             f"Engine request failed ({exc.code}) for {path}: {detail or exc.reason}"
+        ) from exc
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Engine request timed out after {timeout}s for {path} at {cfg.tandem.base_url}"
         ) from exc
     except OSError as exc:
         raise RuntimeError(
@@ -140,18 +317,25 @@ def _operator_provider_override_present(cfg: ResolvedConfig, role: str) -> bool:
     if _config_env_is_set(cfg, ROLE_MODEL_ENV_NAMES.get(role, ()) + ("ACA_MODEL", "AUTOCODER_MODEL")):
         return True
     resolved = cfg.provider_for_role_with_source(role)
-    if resolved["provider_source"] in {"role", "fallback"} or resolved["model_source"] in {"role", "fallback"}:
+    if resolved["provider_source"] in {"role", "provider", "fallback"} or resolved["model_source"] in {
+        "role",
+        "provider",
+        "fallback",
+    }:
         return True
     return False
 
 
-def engine_default_provider_model(cfg: ResolvedConfig) -> tuple[str, str] | None:
-    """Read Tandem's current default provider/model without exposing secrets."""
+def _engine_provider_payload(cfg: ResolvedConfig) -> dict[str, Any] | None:
     try:
         payload = _engine_request_json(cfg, "/config/providers", timeout=3.0)
     except Exception:
         return None
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def _engine_default_provider_model_from_payload(payload: dict[str, Any] | None) -> tuple[str, str] | None:
+    if payload is None:
         return None
 
     selected = payload.get("selected_model") or payload.get("selectedModel") or {}
@@ -179,7 +363,26 @@ def engine_default_provider_model(cfg: ResolvedConfig) -> tuple[str, str] | None
     ).strip()
     if provider and model:
         return provider, model
+
+    if isinstance(providers, dict):
+        for candidate_provider, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            candidate = str(candidate_provider or "").strip()
+            candidate_model = str(
+                entry.get("default_model")
+                or entry.get("defaultModel")
+                or entry.get("model")
+                or ""
+            ).strip()
+            if candidate and candidate_model and _provider_entry_has_engine_secret(entry):
+                return candidate, candidate_model
     return None
+
+
+def engine_default_provider_model(cfg: ResolvedConfig) -> tuple[str, str] | None:
+    """Read Tandem's current default provider/model without exposing secrets."""
+    return _engine_default_provider_model_from_payload(_engine_provider_payload(cfg))
 
 
 def engine_session_provider_model(cfg: ResolvedConfig, role: str) -> dict[str, str]:
@@ -191,17 +394,160 @@ def engine_session_provider_model(cfg: ResolvedConfig, role: str) -> dict[str, s
     run model, read Tandem's current default and pass that to the session API.
     """
     configured_provider, configured_model = cfg.provider_for_role(role)
+    configured_provider = effective_tandem_provider(configured_provider, cfg)
     if _operator_provider_override_present(cfg, role):
-        provider = effective_tandem_provider(configured_provider, cfg)
-        return {"provider": provider, "model": configured_model, "source": "aca_config"}
+        engine_payload = None
+        if not _local_provider_secret_available(cfg, configured_provider):
+            engine_payload = _engine_provider_payload(cfg)
+        if _provider_route_has_credentials(cfg, configured_provider, engine_payload=engine_payload):
+            return {"provider": configured_provider, "model": configured_model, "source": "aca_config"}
+        engine_default = _engine_default_provider_model_from_payload(
+            engine_payload if isinstance(engine_payload, dict) else _engine_provider_payload(cfg)
+        )
+        if engine_default:
+            provider, model = engine_default
+            if _provider_route_has_credentials(
+                cfg,
+                provider,
+                engine_payload=engine_payload if isinstance(engine_payload, dict) else _engine_provider_payload(cfg),
+            ):
+                return {
+                    "provider": provider,
+                    "model": model,
+                    "source": "engine_default_missing_config_credentials",
+                }
+        return {"provider": configured_provider, "model": configured_model, "source": "aca_config_missing_credentials"}
 
     engine_default = engine_default_provider_model(cfg)
     if engine_default:
         provider, model = engine_default
         return {"provider": provider, "model": model, "source": "engine_default"}
 
-    provider = effective_tandem_provider(configured_provider, cfg)
-    return {"provider": provider, "model": configured_model, "source": "aca_fallback"}
+    return {"provider": configured_provider, "model": configured_model, "source": "aca_fallback"}
+
+
+def _provider_entry_has_engine_secret(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for key in (
+        "api_key",
+        "apiKey",
+        "access_token",
+        "accessToken",
+        "token",
+        "refresh_token",
+        "refreshToken",
+    ):
+        if str(entry.get(key) or "").strip():
+            return True
+    auth_kind = str(entry.get("auth_kind") or entry.get("authKind") or "").strip().lower()
+    if auth_kind == "oauth" and (
+        str(entry.get("account_id") or entry.get("accountId") or "").strip()
+        or str(entry.get("expires_at_ms") or entry.get("expiresAtMs") or "").strip()
+    ):
+        return True
+    return False
+
+
+def _local_provider_secret_available(cfg: ResolvedConfig, provider: str) -> bool:
+    env = getattr(cfg, "env", {}) or {}
+    secret_env_name = _provider_secret_env_name(provider)
+    if secret_env_name and str(env.get(secret_env_name) or "").strip():
+        return True
+    if str(env.get("ACA_PROVIDER_KEY") or "").strip():
+        return True
+    return False
+
+
+def _provider_route_has_credentials(
+    cfg: ResolvedConfig,
+    provider: str,
+    *,
+    engine_payload: dict[str, Any] | None,
+) -> bool:
+    if _local_provider_secret_available(cfg, provider):
+        return True
+    providers = engine_payload.get("providers") if isinstance(engine_payload, dict) else {}
+    if not isinstance(providers, dict):
+        return False
+    return _provider_entry_has_engine_secret(providers.get(provider))
+
+
+def _engine_registry_empty_response_fallback_allowed(cfg: ResolvedConfig) -> bool:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_ALLOW_ENGINE_REGISTRY_EMPTY_RESPONSE_FALLBACK", "") or ""
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def engine_empty_response_fallback_provider_model(
+    cfg: ResolvedConfig,
+    role: str,
+    *,
+    current_provider: str,
+    current_model: str,
+) -> dict[str, str] | None:
+    """Return an explicit credentialed provider/model for silent engine retries.
+
+    A silent engine session is a routing/engine-health signal, so retrying the
+    same selected engine default is usually wasted work. Only operator-provided
+    fallback routes or explicit ACA role/global selections are eligible; engine
+    registry entries are not enough because a stored key may still lack credits
+    or capacity. Hidden built-in defaults are still ignored.
+    """
+
+    engine_payload = _engine_provider_payload(cfg)
+    provider_cfg = getattr(cfg, "provider", None)
+    fallback_provider = str(getattr(provider_cfg, "fallback_provider", "") or "").strip()
+    fallback_model = str(getattr(provider_cfg, "fallback_model", "") or "").strip()
+    if fallback_provider and fallback_model:
+        provider = effective_tandem_provider(fallback_provider, cfg)
+        if (
+            (provider != current_provider or fallback_model != current_model)
+            and _provider_route_has_credentials(cfg, provider, engine_payload=engine_payload)
+        ):
+            return {"provider": provider, "model": fallback_model, "source": "aca_fallback_provider"}
+
+    resolver = getattr(cfg, "provider_for_role_with_source", None)
+    if callable(resolver):
+        resolved = resolver(role)
+        if (
+            resolved["provider_source"] in {"role", "provider"}
+            or resolved["model_source"] in {"role", "provider"}
+        ):
+            provider = effective_tandem_provider(str(resolved.get("provider") or ""), cfg)
+            model = str(resolved.get("model") or "").strip()
+            if (
+                provider
+                and model
+                and (provider != current_provider or model != current_model)
+                and _provider_route_has_credentials(cfg, provider, engine_payload=engine_payload)
+            ):
+                return {"provider": provider, "model": model, "source": "aca_config_alternate"}
+
+    if not _engine_registry_empty_response_fallback_allowed(cfg):
+        return None
+
+    providers = engine_payload.get("providers") if isinstance(engine_payload, dict) else {}
+    if isinstance(providers, dict):
+        for candidate_provider, entry in providers.items():
+            provider = str(candidate_provider or "").strip()
+            if not provider or provider == current_provider or "::" in provider:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            model = str(
+                entry.get("default_model")
+                or entry.get("defaultModel")
+                or entry.get("model")
+                or ""
+            ).strip()
+            if not model or (provider == current_provider and model == current_model):
+                continue
+            if _provider_route_has_credentials(cfg, provider, engine_payload=engine_payload):
+                return {"provider": provider, "model": model, "source": "engine_registry_alternate"}
+
+    return None
 
 
 def cli_version() -> str | None:

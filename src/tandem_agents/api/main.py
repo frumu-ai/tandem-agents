@@ -25,11 +25,16 @@ from src.tandem_agents.config.config import resolve_config, validate_config
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.coordination.coordination_reaper import coordination_reaper_interval, coordination_reaper_tick
 from src.tandem_agents.core.execution.runtime_entrypoints import run_coordinator
+from src.tandem_agents.core.execution.run_recovery import (
+    cleanup_terminal_orphaned_engine_sessions,
+    recover_restart_orphaned_runs,
+)
 from src.tandem_agents.core.scheduling.scheduler import (
     plan_task_admissions,
     scheduler_integration_blockers,
     scheduler_snapshot,
     task_project_key,
+    task_repo_key,
 )
 from src.tandem_agents.core.scheduling.scheduler_dispatcher import dispatch_scheduled_runs
 from src.tandem_agents.core.scheduling.coder_supervisor import (
@@ -39,6 +44,7 @@ from src.tandem_agents.core.scheduling.coder_supervisor import (
 )
 from src.tandem_agents.core.execution.runner_core import run_qa
 from src.tandem_agents.core.engine.engine import engine_status_report, resolve_repository
+from src.tandem_agents.core.engine.engine_runtime import engine_provider_smoke_report
 from src.tandem_agents.runtime.operator_dashboard import render_operator_dashboard
 from src.tandem_agents.runtime.operator_view import build_operator_summary
 from src.tandem_agents.runtime.workspace_registry import (
@@ -136,6 +142,7 @@ _coder_supervisor_stop = threading.Event()
 _coder_supervisor_reconcile_lock = threading.Lock()
 _health_monitor_task: Optional[asyncio.Task[None]] = None
 _health_monitor_stop = threading.Event()
+_run_recovery_task: Optional[asyncio.Task[None]] = None
 _event_loop_lag_lock = threading.Lock()
 _event_loop_lag_ms = 0.0
 _event_loop_lag_updated_at_ms = 0
@@ -188,6 +195,7 @@ async def _attach_run_manager_loop():
     await _start_health_monitor()
     await _start_coder_supervisor()
     await _start_coordination_reaper()
+    await _start_run_recovery()
 
 
 @app.on_event("shutdown")
@@ -200,6 +208,11 @@ async def _shutdown_background_tasks():
         _health_monitor_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _health_monitor_task
+    global _run_recovery_task
+    if _run_recovery_task and not _run_recovery_task.done():
+        _run_recovery_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _run_recovery_task
     global _coordination_reaper_task
     if _coordination_reaper_task and not _coordination_reaper_task.done():
         _coordination_reaper_task.cancel()
@@ -335,6 +348,35 @@ async def _start_coordination_reaper() -> None:
     _coordination_reaper_stop.clear()
     _coordination_reaper_task = asyncio.create_task(_coordination_reaper_loop(cfg))
 
+
+async def _run_recovery_once() -> None:
+    root = Path(os.environ.get("ACA_ROOT", "."))
+    cfg = resolve_config(root)
+    try:
+        recovered = await asyncio.to_thread(recover_restart_orphaned_runs, cfg)
+        cleaned_sessions = await asyncio.to_thread(cleanup_terminal_orphaned_engine_sessions, cfg)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Restart-orphan run recovery failed")
+        return
+    if recovered:
+        logger.info("Recovered %s restart-orphaned ACA run(s).", len(recovered))
+        run_manager.broadcast_global("run_recovery.completed", {"count": len(recovered), "runs": recovered})
+    if cleaned_sessions:
+        logger.info("Cleaned terminal-run orphaned engine sessions for %s ACA run(s).", len(cleaned_sessions))
+        run_manager.broadcast_global(
+            "run_recovery.engine_sessions_cleaned",
+            {"count": len(cleaned_sessions), "runs": cleaned_sessions},
+        )
+
+
+async def _start_run_recovery() -> None:
+    global _run_recovery_task
+    if _run_recovery_task and not _run_recovery_task.done():
+        return
+    _run_recovery_task = asyncio.create_task(_run_recovery_once())
+
 def load_projects(root: Optional[Path] = None) -> Dict[str, Any]:
     root = root or Path(os.environ.get("ACA_ROOT", "."))
     workspace = load_workspace(root)
@@ -426,6 +468,8 @@ def _start_run_integration_blockers(
     project_slug: Optional[str],
     task_source_type: Optional[str],
     overrides: Optional[Dict[str, str]],
+    *,
+    include_engine_smoke: bool = False,
 ) -> list[dict[str, Any]]:
     run_env: Dict[str, str] = {}
     project_key = ""
@@ -442,7 +486,24 @@ def _start_run_integration_blockers(
         run_env["ACA_TASK_SOURCE_TYPE"] = task_source_type
     run_env.update(overrides or {})
     cfg = resolve_config(root, env=run_env)
-    return scheduler_integration_blockers(cfg, project_key=project_key)
+    blockers = scheduler_integration_blockers(cfg, project_key=project_key)
+    if include_engine_smoke and not blockers:
+        report = engine_provider_smoke_report(cfg, role="worker", directory=root)
+        if not report.get("ok"):
+            blockers.append(
+                {
+                    "reason": "engine_provider_smoke_failed",
+                    "message": "Selected Tandem engine provider route did not return visible assistant text.",
+                    "provider": report.get("provider"),
+                    "model": report.get("model"),
+                    "source": report.get("source"),
+                    "detail": report.get("reason"),
+                    "error": report.get("error"),
+                    "error_class": report.get("error_class"),
+                    "timeout_seconds": report.get("timeout_seconds"),
+                }
+            )
+    return blockers
 
 
 def _raise_if_integration_blocked(blockers: list[dict[str, Any]], *, message: str) -> None:
@@ -462,6 +523,31 @@ def _raise_if_start_blocked(blockers: list[dict[str, Any]]) -> None:
         blockers,
         message="ACA cannot start this run while a required integration is blocked.",
     )
+
+
+def _plan_with_integration_blockers(plan: dict[str, Any], blockers: list[dict[str, Any]]) -> dict[str, Any]:
+    if not blockers:
+        return plan
+    blocked: list[dict[str, Any]] = []
+    first_blocker = blockers[0]
+    for task in plan.get("admitted") or []:
+        if not isinstance(task, dict):
+            continue
+        blocked.append(
+            {
+                "task_key": task.get("task_key"),
+                "task_id": task.get("task_id"),
+                "project_key": task_project_key(task),
+                "repo_key": task_repo_key(task),
+                "reason": first_blocker.get("reason"),
+                "blocked_reason": first_blocker.get("blocked_reason") or first_blocker.get("message"),
+                "task": task,
+            }
+        )
+    adjusted = dict(plan)
+    adjusted["blocked"] = [*(plan.get("blocked") or []), *blocked]
+    adjusted["admitted"] = []
+    return adjusted
 
 
 def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: str = "") -> Dict[str, str]:
@@ -495,6 +581,7 @@ def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: 
             repo_path = f"workspace/repos/{repo_name}"
     if not worktree_root and repo_path.startswith("workspace/repos/"):
         worktree_root = "workspace/repos"
+    repo_path, worktree_root = _runtime_managed_repo_paths(repo_path, worktree_root)
     if repo_path:
         env["ACA_REPO_PATH"] = repo_path
     if worktree_root:
@@ -508,6 +595,40 @@ def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: 
         env["GITHUB_PERSONAL_ACCESS_TOKEN_FILE"] = credential_file
     _apply_task_source_env(env, project.get("task_source") or project.get("source"))
     return env
+
+
+def _runtime_managed_repo_paths(repo_path: str, worktree_root: str) -> tuple[str, str]:
+    """Map the API's safe workspace/repos shorthand to the runtime's writable mount.
+
+    Project registration rejects arbitrary absolute paths, so UI/API-created
+    bindings store managed checkouts as workspace/repos/<name>. In the Docker
+    runtime that shorthand points under ACA_ROOT, which is read-only; the actual
+    writable checkout mount is supplied by AUTOCODER_WORKTREE_ROOT/ACA_WORKTREE_ROOT.
+    """
+
+    configured_root = (
+        os.environ.get("ACA_WORKTREE_ROOT")
+        or os.environ.get("AUTOCODER_WORKTREE_ROOT")
+        or ""
+    ).strip()
+    if not configured_root:
+        return repo_path, worktree_root
+
+    configured_path = Path(configured_root).expanduser()
+    if not configured_path.is_absolute():
+        return repo_path, worktree_root
+
+    managed_prefix = "workspace/repos"
+    normalized_repo_path = repo_path.replace("\\", "/")
+    normalized_worktree_root = worktree_root.replace("\\", "/")
+    if normalized_repo_path == managed_prefix:
+        repo_path = str(configured_path)
+    elif normalized_repo_path.startswith(f"{managed_prefix}/"):
+        rel = normalized_repo_path.removeprefix(f"{managed_prefix}/")
+        repo_path = str(configured_path / rel)
+    if normalized_worktree_root == managed_prefix:
+        worktree_root = str(configured_path)
+    return repo_path, worktree_root
 
 
 def _project_config(root: Path, slug: str):
@@ -1965,6 +2086,7 @@ async def trigger_run(project_slug: Optional[str] = None, task_source_type: Opti
         project_slug,
         task_source_type,
         overrides,
+        include_engine_smoke=True,
     )
     _raise_if_start_blocked(blockers)
     if item:
@@ -2014,6 +2136,7 @@ async def trigger_runs_batch(
         project_slug,
         task_source_type,
         overrides,
+        include_engine_smoke=True,
     )
     _raise_if_start_blocked(blockers)
 
@@ -2631,6 +2754,7 @@ async def get_scheduler_plan(limit: int = 25, token: str = Depends(get_token)):
     bounded_limit = max(1, min(limit, 100))
     snapshot = scheduler_snapshot(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
     plan = plan_task_admissions(cfg, coordination=store, limit=bounded_limit, project_keys=project_keys)
+    plan = _plan_with_integration_blockers(plan, integration_blockers)
     return {
         "snapshot": snapshot,
         "plan": plan,
@@ -2654,6 +2778,15 @@ async def dispatch_scheduler_batch(
     store.ensure_schema()
     project_keys = _active_scheduler_project_keys(root, cfg)
     integration_blockers = await asyncio.to_thread(_active_scheduler_integration_blockers, root, cfg)
+    if integration_blockers:
+        return {
+            "started": [],
+            "errors": [],
+            "skipped": True,
+            "skip_reason": "integration_blocked",
+            "project_filter": sorted(project_keys),
+            "integration_blockers": integration_blockers,
+        }
     result = dispatch_scheduled_runs(
         cfg,
         coordination=store,

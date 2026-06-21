@@ -6,7 +6,9 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.engine.engine import (
@@ -996,7 +998,187 @@ def get_pull_request(cfg: ResolvedConfig, owner: str, repo: str, pr_number: int)
         data = _parse_json_output(result)
         if data:
             return data
+    data = _get_pull_request_via_github_api(cfg, owner, repo, pr_number)
+    if data:
+        return data
+    data = _get_pull_request_via_gh_cli(owner, repo, pr_number)
+    if data:
+        return data
     raise RuntimeError(f"Could not read GitHub pull request {owner}/{repo}#{pr_number} through GitHub MCP.")
+
+
+def _github_token(cfg: ResolvedConfig) -> str:
+    candidates = _github_token_candidates(cfg)
+    return candidates[0] if candidates else ""
+
+
+def _github_token_candidates(cfg: ResolvedConfig) -> list[str]:
+    candidates: list[str] = []
+    for key in ("GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"):
+        value = str(cfg.env.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+    token_files = [
+        cfg.env.get("GITHUB_PERSONAL_ACCESS_TOKEN_FILE"),
+        cfg.env.get("GITHUB_TOKEN_FILE"),
+        cfg.env.get("ACA_REPO_TOKEN_FILE"),
+        cfg.repository.credential_file,
+        "/run/secrets/github_token",
+    ]
+    for raw_path in token_files:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            continue
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = cfg.root_dir / path
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if token:
+            candidates.append(token)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for token in candidates:
+        if token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def _get_pull_request_via_github_api(
+    cfg: ResolvedConfig,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> dict[str, Any]:
+    tokens = _github_token_candidates(cfg)
+    if not tokens:
+        return {}
+    query = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number
+      url
+      headRefName
+      baseRefName
+      state
+      isDraft
+      merged
+      reviewDecision
+      statusCheckRollup {
+        contexts(first: 50) {
+          nodes {
+            __typename
+            ... on CheckRun {
+              name
+              status
+              conclusion
+              detailsUrl
+            }
+            ... on StatusContext {
+              context
+              state
+              targetUrl
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+    body = json.dumps({"query": query, "variables": {"owner": owner, "repo": repo, "number": pr_number}}).encode("utf-8")
+    for token in tokens:
+        request = Request(
+            "https://api.github.com/graphql",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                continue
+            return {}
+        except (OSError, URLError, json.JSONDecodeError):
+            return {}
+        if not isinstance(parsed, dict) or parsed.get("errors"):
+            return {}
+        pr = (((parsed.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
+        if not isinstance(pr, dict) or not pr:
+            return {}
+        rollup = pr.get("statusCheckRollup")
+        if isinstance(rollup, dict):
+            contexts = rollup.get("contexts")
+            nodes = contexts.get("nodes") if isinstance(contexts, dict) else rollup.get("nodes")
+            pr["statusCheckRollup"] = _normalize_graphql_check_nodes(nodes)
+        pr.setdefault("base_repo", f"{owner}/{repo}")
+        return pr
+    return {}
+
+
+def _normalize_graphql_check_nodes(nodes: Any) -> list[dict[str, Any]]:
+    if not isinstance(nodes, list):
+        return []
+    checks: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if node.get("__typename") == "StatusContext":
+            checks.append(
+                {
+                    "name": node.get("context"),
+                    "status": node.get("state"),
+                    "conclusion": node.get("state"),
+                    "detailsUrl": node.get("targetUrl"),
+                }
+            )
+        else:
+            checks.append(dict(node))
+    return checks
+
+
+def _get_pull_request_via_gh_cli(owner: str, repo: str, pr_number: int) -> dict[str, Any]:
+    repo_slug = f"{owner}/{repo}"
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr_number),
+                "--repo",
+                repo_slug,
+                "--json",
+                "number,url,headRefName,baseRefName,state,isDraft,mergedAt,reviewDecision,statusCheckRollup",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    payload.setdefault("base_repo", repo_slug)
+    return payload
 
 
 def get_pull_request_files(cfg: ResolvedConfig, owner: str, repo: str, pr_number: int) -> list[dict[str, Any]]:

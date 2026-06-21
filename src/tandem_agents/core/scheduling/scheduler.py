@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from src.tandem_agents.config.config_types import ResolvedConfig
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import coder_backend_mode
+from src.tandem_agents.core.engine.engine_runtime import engine_session_readiness_report
 from src.tandem_agents.core.integrations.linear_mcp import get_mcp_server, linear_mcp_server_name
 from src.tandem_agents.core.task_contract import classify_task_execution_kind
 from src.tandem_agents.core.scheduling.coder_supervisor import list_active_coder_task_refs
@@ -306,8 +307,30 @@ def _linear_mcp_admission_blocker(cfg: ResolvedConfig, queued: list[dict[str, An
     return _linear_mcp_status_blocker(cfg)
 
 
+def _engine_session_readiness_blocker(cfg: ResolvedConfig) -> dict[str, Any] | None:
+    report = engine_session_readiness_report(cfg)
+    if report.get("ok"):
+        return None
+    return {
+        "reason": "engine_session_api_unavailable",
+        "blocked_reason": (
+            "Tandem engine session API did not respond within "
+            + str(report.get("timeout_seconds") or "")
+            + "s."
+        ),
+        "base_url": report.get("base_url"),
+        "detail": report.get("reason"),
+        "error": report.get("error"),
+        "error_class": report.get("error_class"),
+        "timeout_seconds": report.get("timeout_seconds"),
+    }
+
+
 def scheduler_integration_blockers(cfg: ResolvedConfig, *, project_key: str = "") -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
+    engine_blocker = _engine_session_readiness_blocker(cfg)
+    if engine_blocker is not None:
+        blockers.append({"source_type": "engine", "project_key": _nonempty(project_key), **engine_blocker})
     if str(cfg.task_source.type or "").strip().lower() == "linear":
         blocker = _linear_mcp_status_blocker(cfg)
         if blocker is not None:

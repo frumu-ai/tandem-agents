@@ -127,12 +127,33 @@ curl -s "http://127.0.0.1:39735/scheduler/plan" \
   -H "Authorization: Bearer $(cat tandem-data/aca_api_token)" | jq .
 ```
 
+If the plan shows `engine_session_api_unavailable`, ACA will keep queued work
+out of the admitted batch until the configured Tandem engine answers the
+session API. Check the same path directly before retrying dispatch:
+
+```bash
+TOKEN="$(cat tandem-data/local_tandem_api_token)"
+curl -sS -m 5 -w "\nHTTP %{http_code}\n" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  "http://127.0.0.1:39731/session"
+```
+
+On ACA startup, terminal-run recovery also attempts a bounded cleanup of
+orphaned engine sessions recorded in terminal run state. Tune that pass with
+`ACA_ORPHAN_ENGINE_SESSION_CLEANUP_MAX_SESSIONS` and
+`ACA_ORPHAN_ENGINE_SESSION_CLEANUP_TIMEOUT_SECONDS` if old sessions are causing
+slow startup while the engine is unhealthy.
+
 Dispatch the currently admitted batch:
 
 ```bash
 curl -s -X POST "http://127.0.0.1:39735/scheduler/dispatch?wait=false" \
   -H "Authorization: Bearer $(cat tandem-data/aca_api_token)" | jq .
 ```
+
+When integrations are blocked, including the engine session API readiness
+check, dispatch returns `started: []` with `skipped: true` instead of creating a
+run that will immediately block before task intake.
 
 Inspect the workspace registry:
 

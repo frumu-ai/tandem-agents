@@ -153,6 +153,57 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("python3 -m unittest", prompt)
         self.assertIn("Do not treat missing `pytest` as a blocker", prompt)
 
+    def test_worker_prompt_uses_compact_docs_only_mode(self) -> None:
+        subtask = self._subtask(
+            title="Document smoke harness",
+            goal="Create and link the smoke harness docs.",
+            files=["docs/ACA_SMOKE_HARNESS.md", "docs/README.md"],
+            existing_files=["docs/README.md"],
+            acceptance_criteria=[
+                "docs/ACA_SMOKE_HARNESS.md describes the harness purpose.",
+                "docs/README.md links to docs/ACA_SMOKE_HARNESS.md.",
+                "Run or attempt python3 -m unittest src.tandem_agents.aca_harness.calculator_test.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertLess(len(prompt), 3000)
+        self.assertIn("Target docs: [\"docs/ACA_SMOKE_HARNESS.md\", \"docs/README.md\"]", prompt)
+        self.assertIn("Keep the diff limited to the target docs", prompt)
+        self.assertIn("python3 -m unittest src.tandem_agents.aca_harness.calculator_test", prompt)
+        self.assertNotIn("private helpers", prompt)
+        self.assertNotIn("Verification/coverage guardrail", prompt)
+        self.assertNotIn("paired source+test", prompt)
+
+    def test_worker_prompt_uses_compact_docs_only_mode_for_carried_repair(self) -> None:
+        subtask = self._subtask(
+            title="Document smoke harness",
+            goal="Finish the preserved partial worker diff.",
+            files=["docs/ACA_SMOKE_HARNESS.md", "docs/README.md"],
+            target_files=["docs/ACA_SMOKE_HARNESS.md", "docs/README.md"],
+            carry_forward_patch="/runs/run-1/artifacts/worker-1.patch",
+            repair_worker_output_excerpt=(
+                "Remaining implementation blockers: docs/README.md should link to docs/ACA_SMOKE_HARNESS.md."
+            ),
+            existing_files=["docs/ACA_SMOKE_HARNESS.md", "docs/README.md"],
+            acceptance_criteria=[
+                "The preserved docs diff is already applied.",
+                "Finish any remaining declared docs target before broadening scope.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertLess(len(prompt), 3200)
+        self.assertIn("Preserved docs patch status", prompt)
+        self.assertIn("Continue from the current worktree state", prompt)
+        self.assertIn("docs/README.md should link to docs/ACA_SMOKE_HARNESS.md", prompt)
+        self.assertIn("Keep the diff limited to the target docs", prompt)
+        self.assertNotIn("production-backed assertion", prompt)
+        self.assertNotIn("private helpers", prompt)
+        self.assertNotIn("paired source+test", prompt)
+
     def test_worker_prompt_bounds_verbose_task_payloads(self) -> None:
         task = {
             "title": "TAN-999 Reduce timeout risk",
@@ -444,7 +495,8 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertNotIn("This is a test/regression coverage subtask", prompt)
         self.assertNotIn("Read and edit at least one required test target first", prompt)
         self.assertIn("must keep test coverage paired with production behavior", prompt)
-        self.assertIn("first behavioral edit in a paired production target", prompt)
+        self.assertIn("Prefer one focused write step that edits both", prompt)
+        self.assertIn("production edit and test edit back-to-back", prompt)
         self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
 
     def test_testless_diff_repair_prompt_requires_test_first(self) -> None:
@@ -469,11 +521,11 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
 
         prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
 
-        self.assertIn("must satisfy required test coverage", prompt)
-        self.assertIn("Read and edit at least one required test target first", prompt)
+        self.assertIn("replace a rejected production-only repair with one paired source+test diff", prompt)
+        self.assertIn("Prefer one focused write step that edits both", prompt)
+        self.assertIn("test edit and production edit back-to-back", prompt)
         self.assertIn("src/tandem_agents/core/repository/repository_test.py", prompt)
-        self.assertIn("test-only final diff fails", prompt)
-        self.assertIn("A production-only diff fails this worker", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
 
     def test_test_only_partial_repair_prompt_requires_production_first(self) -> None:
         subtask = self._subtask(
@@ -496,6 +548,180 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("first new semantic edit in the paired production target", prompt)
         self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
         self.assertNotIn("Read and edit at least one required test target first", prompt)
+
+    def test_complementary_rejected_repair_prompt_requires_one_paired_diff(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_mode="complementary_rejected_partial_diff",
+            repair_requires_paired_source_test_diff=True,
+            repair_requires_production_followup=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=["src/tandem_agents/core/repository/repository_test.py"],
+            discarded_partial_diff_patches=[
+                "runs/run-1/artifacts/source.patch",
+                "runs/run-1/artifacts/test.patch",
+            ],
+            write_required=True,
+            acceptance_criteria=["Rebuild one paired source+test repair from clean files."],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("paired source+test diff", prompt)
+        self.assertIn("single attempt", prompt)
+        self.assertIn("Prefer one focused write step that edits both", prompt)
+        self.assertIn("back-to-back before running searches", prompt)
+        self.assertIn("production-only diff fails and a test-only diff fails", prompt)
+        self.assertIn("substantive diff exists only after both", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository_test.py", prompt)
+        self.assertIn("src/tandem_agents/core/repository/repository.py", prompt)
+        self.assertNotIn("preserved test-only partial diff", prompt)
+
+    def test_weak_source_test_precision_repair_prompt_requires_bounded_pair(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            discarded_partial_diff_patch="runs/run-1/artifacts/weak.patch",
+            repair_changed_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_requires_production_followup=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=["src/tandem_agents/core/repository/repository_test.py"],
+            repair_requires_paired_source_test_diff=True,
+            repair_precision_edit=True,
+            repair_diff_line_budget=80,
+            repair_focus_instructions=["Produce one small paired source+test diff in this attempt."],
+            write_required=True,
+            acceptance_criteria=["Rebuild source+test coverage without replaying the weak patch."],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("paired source+test diff", prompt)
+        self.assertIn("Precision repair budget", prompt)
+        self.assertIn("under about 80 changed lines", prompt)
+        self.assertIn("under about 80 changed diff lines", prompt)
+        self.assertIn("do not rewrite or duplicate whole files", prompt)
+        self.assertIn("Do not use whole-file write/overwrite tools", prompt)
+        self.assertIn("Produce one small paired source+test diff", prompt)
+
+    def test_weak_source_test_carry_forward_prompt_requires_one_paired_diff(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_mode="weak_source_test_diff",
+            repair_requires_paired_source_test_diff=True,
+            repair_requires_production_followup=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=["src/tandem_agents/core/repository/repository_test.py"],
+            carry_forward_patch="/tmp/worker-1.partial-worker-diff.patch",
+            write_required=True,
+            acceptance_criteria=["Add a real assertion for the carried source+test diff."],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("one paired source+test diff", prompt)
+        self.assertIn("tests=", prompt)
+        self.assertIn("production=", prompt)
+        self.assertNotIn("preserved test-only partial diff", prompt)
+
+    def test_weak_source_test_live_repair_prompt_infers_pair_mode_from_text(self) -> None:
+        subtask = self._subtask(
+            title="Repair weak source+test partial diff",
+            goal=(
+                "Finish the preserved weak-test partial worker diff with production-backed regression coverage for "
+                "src/tandem_agents/core/repository/repository.py, "
+                "src/tandem_agents/core/repository/repository_test.py."
+            ),
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_requires_production_followup=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=["src/tandem_agents/core/repository/repository_test.py"],
+            carry_forward_patch="/tmp/worker-1.partial-worker-diff.patch",
+            scope_note=(
+                "ACA generated this repair plan deterministically after rejecting a source+test partial "
+                "diff whose test changes lacked a real test method or assertion. The preserved weak source+test "
+                "patch is applied before this worker starts so the retry can add missing assertion coverage."
+            ),
+            write_required=True,
+            acceptance_criteria=[
+                "The preserved weak source+test patch is applied before this worker starts.",
+                "Make the first new repair edit in the required test file(s): "
+                "src/tandem_agents/core/repository/repository_test.py; add a real test method or assertion.",
+                "Treat the preserved source patch as the paired production behavior.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("one paired source+test diff", prompt)
+        self.assertIn("tests=", prompt)
+        self.assertIn("production=", prompt)
+        self.assertNotIn("preserved test-only partial diff", prompt)
+        self.assertNotIn("first new semantic edit in the paired production target", prompt)
+
+    def test_complementary_repair_prompt_infers_pair_mode_from_live_repair_text(self) -> None:
+        subtask = self._subtask(
+            title="Rebuild complementary source and test partial diffs",
+            goal=(
+                "Rebuild a single source+test repair for "
+                "src/tandem_agents/core/repository/repository.py, "
+                "src/tandem_agents/core/repository/repository_test.py without copying either rejected partial patch."
+            ),
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_requires_production_followup=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=["src/tandem_agents/core/repository/repository_test.py"],
+            repair_failure_summary="previous retries produced separate source-only and test-only partial diffs",
+            scope_note=(
+                "ACA detected complementary rejected partial diffs: one source-only attempt and one test-only attempt. "
+                "Rebuild both sides from clean files."
+            ),
+            write_required=True,
+            acceptance_criteria=[
+                "Make the first new semantic edit in the required test file(s): src/tandem_agents/core/repository/repository_test.py.",
+                "Immediately pair that test edit with the smallest production edit in: src/tandem_agents/core/repository/repository.py.",
+                "A production-only diff repeats WORKER_OFF_TRACK_TESTLESS_DIFF and fails this repair; a test-only diff repeats WORKER_TEST_ONLY_DIFF and fails this repair.",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("paired source+test diff", prompt)
+        self.assertIn("Prefer one focused write step that edits both", prompt)
+        self.assertNotIn("preserved test-only partial diff", prompt)
+        self.assertNotIn("first new semantic edit in the paired production target", prompt)
 
     def test_write_required_prompt_treats_metadata_targets_as_support_only(self) -> None:
         subtask = self._subtask(
@@ -549,6 +775,42 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("ACA scope note", prompt)
         self.assertIn("overbroad one-worker target set", prompt)
 
+    def test_worker_prompt_warns_against_brace_globs_for_target_files(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/phases/task_intake.py",
+                "src/tandem_agents/core/repository/repository.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/phases/task_intake.py",
+                "src/tandem_agents/core/repository/repository.py",
+            ],
+        )
+
+        prompt = build_worker_prompt("run1", "worker-2", subtask, self._TASK, "/wt")
+
+        self.assertIn("Do not combine concrete target files into brace-glob patterns", prompt)
+        self.assertIn("retry the exact target path", prompt)
+
+    def test_worker_prompt_forces_write_required_for_linear_code_edit_targets(self) -> None:
+        task = {
+            "title": "Linear code edit",
+            "execution_kind": "code_edit",
+            "source": {"type": "linear"},
+            "task_contract": {},
+        }
+        subtask = self._subtask(
+            files=["src/tandem_agents/core/phases/task_intake.py"],
+            target_files=["src/tandem_agents/core/phases/task_intake.py"],
+            write_required=False,
+            pre_satisfied=False,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-2", subtask, task, "/wt")
+
+        self.assertIn("Write required for this worker: true", prompt)
+        self.assertIn("This worker is write-required", prompt)
+
     def test_worker_prompt_includes_compact_rejected_partial_repair_directive(self) -> None:
         subtask = self._subtask(
             files=[
@@ -572,6 +834,51 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("First actions: read the target files", prompt)
         self.assertIn("verification did not run", prompt)
         self.assertNotIn("/runs/run-1/artifacts/worker-1.patch", prompt)
+
+    def test_worker_prompt_compacts_repair_context(self) -> None:
+        task = {
+            "title": "TAN-170 Add isolated ACA worktrees",
+            "task_contract": {
+                "local_goal": "Implement repository isolation.",
+                "target_files": [
+                    "src/tandem_agents/core/repository/repository.py",
+                    "src/tandem_agents/core/repository/repository_test.py",
+                ],
+                "notes_for_agent": "N" * 20_000,
+            },
+        }
+        subtask = self._subtask(
+            title="Repair testless partial diff",
+            goal="G" * 20_000,
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            scope_note="S" * 20_000,
+            acceptance_criteria=["A" * 20_000],
+            discarded_partial_diff_patch="/runs/run-1/artifacts/source-only.patch",
+            deterministic_partial_diff_repair=True,
+            repair_changed_files=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=[
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_failure_summary="Worker drifted off the required regression path.",
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, task, "/wt")
+
+        self.assertIn("Repair directive:", prompt)
+        self.assertIn("Coverage/verification rule", prompt)
+        self.assertIn("First read at least one required test target", prompt)
+        self.assertIn("[truncated for worker prompt budget]", prompt)
+        self.assertNotIn("N" * 5000, prompt)
+        self.assertNotIn("S" * 5000, prompt)
+        self.assertLess(len(prompt), 14_000)
 
     def test_worker_prompt_treats_applied_carry_forward_patch_as_current_diff(self) -> None:
         subtask = self._subtask(
@@ -604,6 +911,30 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertNotIn("/runs/run-1/artifacts/source.patch", prompt)
         self.assertNotIn("/runs/run-1/artifacts/test.patch", prompt)
 
+    def test_worker_prompt_counts_carried_source_patch_for_test_followup(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            carry_forward_patch="/runs/run-1/artifacts/source.patch",
+            repair_changed_files=["src/tandem_agents/core/repository/repository.py"],
+            repair_requires_test_followup=[
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("carried source diff counts as the paired production edit", prompt)
+        self.assertIn("Read and edit at least one required test target first", prompt)
+        self.assertNotIn("Prefer one focused write step that edits both", prompt)
+
     def test_worker_prompt_includes_carry_forward_directive_for_single_preserved_patch(self) -> None:
         subtask = self._subtask(
             files=[
@@ -619,6 +950,10 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
                 "src/tandem_agents/core/repository/repository.py",
                 "src/tandem_agents/core/repository/repository_test.py",
             ],
+            repair_focus_instruction=(
+                "Focused TypeError repair: production function(s) `worker_worktree_name` "
+                "are being called with 3 positional arguments."
+            ),
             repair_verification_first=True,
             write_required=True,
         )
@@ -629,7 +964,43 @@ class WorkerPromptPrRefsTest(unittest.TestCase):
         self.assertIn("already applied the preserved partial patch data", prompt)
         self.assertIn("carried diff counts as the required working-tree change", prompt)
         self.assertIn("Run the focused verification first", prompt)
+        self.assertIn("Immediate repair focus: Focused TypeError repair", prompt)
+        self.assertIn("worker_worktree_name", prompt)
+        self.assertIn("Failed-test repair rule", prompt)
+        self.assertIn("inspect the current production function definitions", prompt)
+        self.assertIn("do not invent a new branch/worktree/name format", prompt)
         self.assertNotIn("/runs/run-1/artifacts/worker.patch", prompt)
+
+    def test_worker_prompt_includes_multiple_repair_focuses(self) -> None:
+        subtask = self._subtask(
+            files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            target_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            carry_forward_patch="/runs/run-1/artifacts/worker.patch",
+            repair_changed_files=[
+                "src/tandem_agents/core/repository/repository.py",
+                "src/tandem_agents/core/repository/repository_test.py",
+            ],
+            repair_focus_instructions=[
+                "Focused NameError repair: resolve undefined symbol(s) `_slug`.",
+                "Focused TypeError repair: update production function(s) `task_run_branch_name` to accept `issue_id`.",
+            ],
+            repair_verification_first=True,
+            write_required=True,
+        )
+
+        prompt = build_worker_prompt("run1", "worker-1", subtask, self._TASK, "/wt")
+
+        self.assertIn("Immediate repair focus: Focused NameError repair", prompt)
+        self.assertIn("_slug", prompt)
+        self.assertIn("Immediate repair focus: Focused TypeError repair", prompt)
+        self.assertIn("issue_id", prompt)
+        self.assertIn("Failed-test repair rule", prompt)
 
 
 if __name__ == "__main__":

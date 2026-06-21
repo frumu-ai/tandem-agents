@@ -153,7 +153,12 @@ def _is_pr_lifecycle_supervisable(status: dict[str, Any], blackboard: dict[str, 
         "waiting-for-review",
         "needs-repair",
         "ready-to-merge",
-    }
+    } or (state == "blocked" and _is_retryable_pr_lifecycle_error(lifecycle))
+
+
+def _is_retryable_pr_lifecycle_error(lifecycle: dict[str, Any]) -> bool:
+    error = str(lifecycle.get("error") or "").strip()
+    return "Could not read GitHub pull request" in error or "GitHub MCP" in error
 
 
 def _source_task_terminal(task: dict[str, Any]) -> bool:
@@ -627,10 +632,17 @@ def _refresh_pr_lifecycle_for_run(
         refreshed = refresh_pull_request_lifecycle(cfg, existing)
     except Exception as exc:
         message = str(exc).strip() or repr(exc)
+        existing_state = str(existing.get("lifecycle_state") or "").strip()
+        retryable_state = existing_state if existing_state in {
+            "running",
+            "waiting-for-review",
+            "needs-repair",
+            "ready-to-merge",
+        } else "waiting-for-review"
         failed = {
             **existing,
-            "lifecycle_state": "blocked",
-            "terminal": True,
+            "lifecycle_state": retryable_state,
+            "terminal": False,
             "error": message,
             "last_checked_at_ms": now_ms(),
         }
@@ -644,7 +656,7 @@ def _refresh_pr_lifecycle_for_run(
             pull_request=failed,
         )
         append_event(layout["events"], "github_pull_request.lifecycle_refresh_failed", run_id, failed)
-        return {"run_id": run_id, "status": "blocked", "terminal": True, "pull_request": failed, "error": message}
+        return {"run_id": run_id, "status": retryable_state, "terminal": False, "pull_request": failed, "error": message}
     refreshed["last_checked_at_ms"] = now_ms()
     _persist_pull_request_lifecycle(
         cfg,

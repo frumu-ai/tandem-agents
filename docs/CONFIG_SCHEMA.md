@@ -128,8 +128,17 @@ Required fields:
 
 Optional fields:
 
-- `fallback_provider`
-- `fallback_model`
+- `fallback_provider`: explicit alternate provider for worker fresh-session retries after an empty engine transcript
+- `fallback_model`: explicit alternate model for `fallback_provider`; ACA uses the pair only when both are set
+
+Provider smoke gate environment:
+
+- `ACA_ENGINE_PROVIDER_SMOKE_ENABLED`: when true, ACA verifies the selected worker provider/model route returns visible assistant text before starting a run; default `true`
+- `ACA_ENGINE_PROVIDER_SMOKE_TIMEOUT_SECONDS`: timeout for the provider smoke prompt, clamped to `3..180` seconds; default `90`
+- `ACA_ENGINE_SESSION_READINESS_ENABLED`: when true, scheduler/admission probes the Tandem engine `/session` API before dispatching queued work; default `true`
+- `ACA_ENGINE_SESSION_READINESS_TIMEOUT_SECONDS`: timeout for the fast `/session` readiness probe, clamped to `0.5..10` seconds; default `2`
+- `ACA_ORPHAN_ENGINE_SESSION_CLEANUP_MAX_SESSIONS`: maximum terminal-run engine sessions ACA startup recovery will attempt to delete in one pass; default `6`
+- `ACA_ORPHAN_ENGINE_SESSION_CLEANUP_TIMEOUT_SECONDS`: per-session timeout for terminal-run orphan cleanup deletes, clamped to `0.5..10` seconds; default `2`
 
 ### `storage`
 
@@ -183,7 +192,7 @@ Optional fields:
 
 - `backend`: one of `auto`, `legacy`, or `coder`
 - `coder_wait_timeout_seconds`: how long ACA should poll a Tandem coder run before reporting that ACA's supervisor wait budget expired; default `3600`
-- `coder_poll_interval_seconds`: how often ACA should poll Tandem for coder run status; default `15`
+- `coder_poll_interval_seconds`: how often ACA should poll Tandem for coder run status; default `30`
 - `coder_supervisor_enabled`: keep reconciling detached Tandem coder runs after ACA request timeout or process restart; default `true`
 - `ACA_CODER_SUPERVISOR_STARTUP_RECONCILE`: run an initial coder-supervisor reconciliation during API startup before the periodic loop starts; default `false`
 - `ACA_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS`: maximum time the API startup hook waits for the initial coder-supervisor reconciliation when startup reconciliation is enabled; default `10`
@@ -195,10 +204,34 @@ Optional fields:
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS`: outer worker watchdog for no terminal result; default `540`
 - `ACA_WORKER_NO_CHANGE_ABORT_SECONDS`: write-required worker no-change watchdog floor; default `240`
 - `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS`: repair-worker no-change watchdog; default `180`
-- `ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES`: extra full repair loops for preserved partial/incomplete worker diffs; default `0`
-- `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS`: outer manager planning watchdog; default `90`
+- `ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS`: content guard for source-only diffs when required tests are missing; default `120`
+- `ACA_WORKER_TEST_ONLY_DIFF_ABORT_SECONDS`: content guard for test-only diffs when production follow-up is required; default `180`
+- `ACA_WORKER_PAIRED_REPAIR_ONE_SIDED_ABORT_SECONDS`: tighter source-only/test-only guard for explicit paired source+test repair subtasks; measured from when ACA first observes the one-sided diff shape, default `45`
+- `ACA_WORKER_PAIRED_SOURCE_TEST_NO_CHANGE_ABORT_SECONDS`: tighter no-change guard for paired source+test subtasks before the worker makes any useful filesystem edit; default `150`, with a recovery floor of two empty-stream watchdog windows plus terminalization grace
+- `ACA_WORKER_COMMENT_ONLY_DIFF_ABORT_SECONDS`: content guard for comment-only/no-op diffs; default `180`
+- `ACA_WORKER_VERIFIABLE_DIFF_ABORT_SECONDS`: content guard for source+test diffs that can be preserved and focused for repair; default `120`
+- `ACA_WORKER_NO_DIFF_TOOL_LOOP_ABORT_SECONDS`: guard for workers looping through tools without creating a diff; default `90`
+- `ACA_WORKER_ASYNC_PROMPT_TIMEOUT_SECONDS`: async worker prompt timeout; default `360`
+- `ACA_ENGINE_EMPTY_STREAM_TIMEOUT_SECONDS`: async stream watchdog for runs that emit zero events before provider/model route fallback; default `45`
+- `ACA_ENGINE_NO_ACTIVITY_TIMEOUT_SECONDS`: async stream watchdog for runs that emit lifecycle events but no visible assistant/tool activity yet; default `90`
+- `ACA_WORKER_NO_ACTIVITY_FAIL_FAST_ENABLED`: when true, write-required workers stop after a no-activity async stream instead of launching fresh-session and prompt-sync fallback retries; default `true`
+- `ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS`: async worker no-text watchdog after engine stream activity has started; default `180`
+- `ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS`: grace window for terminalizing an async worker session; default `60`
+- `ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES`: extra full repair loops for preserved partial/incomplete worker diffs; default `1`
+- `ACA_WORKER_OFF_TRACK_EXTRA_RETRIES`: extra clean repair loops for off-track workers that changed source without required test coverage; default `1`
+- `ACA_WORKER_ENGINE_EMPTY_RESPONSE_EXTRA_RETRIES`: extra retry loops for workers whose active engine session produced no assistant/tool activity before the no-change guard fired; default `1`
+- `ACA_VERIFICATION_REPAIR_EXTRA_RETRIES`: extra full repair loops when reviewer/tester verification returns `repair_needed`; default `1`
+- `ACA_WORKER_COMPLEMENTARY_PARTIAL_DIFF_LOOP_EXTRA_RETRIES`: one extra outer repair-loop slot reserved for deterministic source-only/test-only complementary partial-diff combine passes across serial subtasks; default `1`
+- `ACA_WORKER_VERIFIABLE_DIFF_TEST_FAILED_EXTRA_RETRIES`: extra focused repair loops for preserved source+test partial diffs whose focused verification failed; default `1`
+- `ACA_WORKER_VERIFIABLE_DIFF_WEAK_TEST_EXTRA_RETRIES`: extra focused repair loops for source+test partial diffs rejected because the test additions are weak or do not exercise newly introduced production API; default `3`
+- `ACA_WORKER_VERIFIABLE_DIFF_IMPORT_ERROR_EXTRA_RETRIES`: extra focused repair loops for preserved source+test partial diffs whose focused verification is failing on a Python missing-import error; default `2`
+- `ACA_WORKER_VERIFIABLE_DIFF_EXCEPTION_EXTRA_RETRIES`: extra focused repair loops for preserved source+test partial diffs whose focused verification is failing on a compact root-cause exception such as an unexpected-keyword `TypeError`; default `2`
+- `ACA_WORKER_VERIFIABLE_DIFF_ASSERTION_EXTRA_RETRIES`: extra focused repair loops for preserved source+test partial diffs whose focused verification is failing on assertion mismatches; default `2`
+- `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS`: outer manager planning watchdog; default `390` with standard coordination settings, matching the engine stream timeout plus a short grace window
+- `ACA_MANAGER_PROMPT_TIMEOUT_GRACE_SECONDS`: final wait before cancelling a manager prompt that reached the outer watchdog; default `10`
+- `ACA_MANAGER_GRAPH_FIRST_REPO_CONTEXT_PLAN`: allow graph-backed Linear code tasks with required files to skip manager prompting and use deterministic repo-context planning; default `true`
 - `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS`: outer integration watchdog; default `300`
-- `ACA_SERIAL_SUBTASK_LIMIT`: maximum planned worker slices for disabled-swarm serial runs; default `4`
+- `ACA_SERIAL_SUBTASK_LIMIT`: maximum planned worker slices for disabled-swarm serial runs; default `1`
 
 Behavior:
 
@@ -332,17 +365,48 @@ Behavior:
 - `ACA_WORKER_NO_PROGRESS_TIMEOUT_SECONDS` -> legacy worker no-progress watchdog
 - `ACA_WORKER_NO_CHANGE_ABORT_SECONDS` -> write-required worker no-change watchdog floor
 - `ACA_WORKER_REPAIR_NO_CHANGE_ABORT_SECONDS` -> repair-worker no-change watchdog
+- `ACA_WORKER_TESTLESS_DIFF_ABORT_SECONDS` -> source-only diff content guard when required tests are missing
+- `ACA_WORKER_TEST_ONLY_DIFF_ABORT_SECONDS` -> test-only diff content guard when production follow-up is required
+- `ACA_WORKER_PAIRED_REPAIR_ONE_SIDED_ABORT_SECONDS` -> tighter source-only/test-only guard for paired source+test repair subtasks, measured from first one-sided diff observation
+- `ACA_WORKER_PAIRED_SOURCE_TEST_NO_CHANGE_ABORT_SECONDS` -> tighter no-change guard for paired source+test subtasks
+- `ACA_WORKER_COMMENT_ONLY_DIFF_ABORT_SECONDS` -> comment-only/no-op diff content guard
+- `ACA_WORKER_VERIFIABLE_DIFF_ABORT_SECONDS` -> source+test partial diff preservation guard
+- `ACA_WORKER_NO_DIFF_TOOL_LOOP_ABORT_SECONDS` -> no-diff tool loop guard
+- `ACA_WORKER_ASYNC_PROMPT_TIMEOUT_SECONDS` -> async worker prompt timeout
+- `ACA_ENGINE_EMPTY_STREAM_TIMEOUT_SECONDS` -> async worker zero-event stream watchdog before empty-response route fallback
+- `ACA_ENGINE_NO_ACTIVITY_TIMEOUT_SECONDS` -> async worker lifecycle-only/no-meaningful-activity watchdog before no-activity fail-fast
+- `ACA_WORKER_ASYNC_NO_TEXT_TIMEOUT_SECONDS` -> async worker no-text watchdog after stream activity starts
+- `ACA_WORKER_TERMINALIZE_TIMEOUT_SECONDS` -> async worker terminalization grace window
 - `ACA_WORKER_INCOMPLETE_DIFF_EXTRA_RETRIES` -> extra full repair loops for preserved partial/incomplete worker diffs
+- `ACA_WORKER_OFF_TRACK_EXTRA_RETRIES` -> extra clean repair loops for off-track source-only diffs that missed required tests
+- `ACA_WORKER_ENGINE_EMPTY_RESPONSE_EXTRA_RETRIES` -> extra retry loops for silent worker engine sessions detected by the no-change guard
+- `ACA_ALLOW_ENGINE_REGISTRY_EMPTY_RESPONSE_FALLBACK` -> opt into using another credentialed engine-registered provider after explicit fallback/config routes are unavailable
+- `ACA_ENGINE_PROVIDER_SMOKE_ENABLED` -> fail run start before task claim when the selected worker provider/model route cannot produce visible assistant text
+- `ACA_ENGINE_PROVIDER_SMOKE_TIMEOUT_SECONDS` -> timeout for the provider smoke prompt; default `90`
+- `ACA_ENGINE_SESSION_READINESS_ENABLED` -> block scheduler dispatch while the Tandem engine session API is unavailable; default `true`
+- `ACA_ENGINE_SESSION_READINESS_TIMEOUT_SECONDS` -> timeout for the fast scheduler/admission `/session` probe; default `2`
+- `ACA_ORPHAN_ENGINE_SESSION_CLEANUP_MAX_SESSIONS` -> max orphaned terminal-run engine sessions cleaned during one ACA startup recovery pass; default `6`
+- `ACA_ORPHAN_ENGINE_SESSION_CLEANUP_TIMEOUT_SECONDS` -> per-session delete timeout for orphaned terminal-run engine cleanup; default `2`
+- `ACA_WORKER_NO_ACTIVITY_FAIL_FAST_ENABLED` -> stop silent write-required worker attempts before expensive fallback retries; default `true`
+- `ACA_VERIFICATION_REPAIR_EXTRA_RETRIES` -> extra full repair loops when reviewer/tester verification returns `repair_needed`
+- `ACA_WORKER_COMPLEMENTARY_PARTIAL_DIFF_LOOP_EXTRA_RETRIES` -> one extra outer slot for deterministic complementary source-only/test-only partial-diff repair passes
+- `ACA_WORKER_VERIFIABLE_DIFF_TEST_FAILED_EXTRA_RETRIES` -> extra focused repair loops for preserved source+test partial diffs with failed focused verification
+- `ACA_WORKER_VERIFIABLE_DIFF_WEAK_TEST_EXTRA_RETRIES` -> extra focused repair loops for source+test partial diffs with weak or misaligned test additions
+- `ACA_WORKER_VERIFIABLE_DIFF_IMPORT_ERROR_EXTRA_RETRIES` -> extra focused repair loops for chained missing-import failures in preserved source+test partial diffs
+- `ACA_WORKER_VERIFIABLE_DIFF_EXCEPTION_EXTRA_RETRIES` -> extra focused repair loops for compact root-cause exceptions in preserved source+test partial diffs
+- `ACA_WORKER_VERIFIABLE_DIFF_ASSERTION_EXTRA_RETRIES` -> extra focused repair loops for assertion mismatches in preserved source+test partial diffs
 - `ACA_MANAGER_PROMPT_TIMEOUT_SECONDS` -> legacy manager planning watchdog
+- `ACA_MANAGER_PROMPT_TIMEOUT_GRACE_SECONDS` -> legacy manager planning cancellation grace window
+- `ACA_MANAGER_GRAPH_FIRST_REPO_CONTEXT_PLAN` -> graph-first deterministic manager bypass for Linear code tasks with repo-context required files
 - `ACA_INTEGRATION_PROMPT_TIMEOUT_SECONDS` -> legacy manager integration watchdog
 - `ACA_SERIAL_SUBTASK_LIMIT` -> disabled-swarm serial planning slice limit
 - `ACA_PROVIDER_KEY` -> primary generic provider secret for simple single-provider setups; ACA maps it onto the active provider's expected secret env var for Tandem subprocesses
-- `ACA_FALLBACK_PROVIDER` -> `provider.fallback_provider`
+- `ACA_FALLBACK_PROVIDER` -> `provider.fallback_provider`; used with `ACA_FALLBACK_MODEL` as the alternate route after empty worker engine transcripts
 - `ACA_REVIEW_POLICY` -> `review.policy`
 - `ACA_MERGE_REQUIRES_APPROVAL` -> `review.merge_requires_approval`
 - `ACA_BRANCH_DELETE_REQUIRES_APPROVAL` -> `review.branch_delete_requires_approval`
 - `ACA_DELETE_BRANCH_AFTER_MERGE` -> `review.delete_branch_after_merge`
-- `ACA_FALLBACK_MODEL` -> `provider.fallback_model`
+- `ACA_FALLBACK_MODEL` -> `provider.fallback_model`; used only when `ACA_FALLBACK_PROVIDER` is also configured
 - `AUTOCODER_PROVIDER` and friends -> legacy aliases still accepted by the loader
 
 ### Storage

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timezone
+import hashlib
 import os
 import re
 import shutil
@@ -163,6 +164,56 @@ def _ensure_repo_path_in_workspace(cfg: ResolvedConfig, repo_path: Path) -> None
     )
 
 
+def _run_root_for_path(path: Path) -> Path | None:
+    resolved = path.resolve()
+    parts = resolved.parts
+    for index, part in enumerate(parts[:-1]):
+        if part == "runs" and index + 1 < len(parts):
+            run_part = parts[index + 1]
+            if str(run_part).startswith("run-"):
+                return Path(*parts[: index + 2])
+    return None
+
+
+def _safe_status_rel_path(path: str) -> str:
+    rel_path = str(path or "").strip().replace("\\", "/")
+    while rel_path.startswith("./"):
+        rel_path = rel_path[2:]
+    if (
+        not rel_path
+        or rel_path.startswith("/")
+        or rel_path == ".."
+        or rel_path.startswith("../")
+        or "/../" in f"/{rel_path}/"
+    ):
+        raise RuntimeError(f"Refusing unsafe repository-relative path: {path}")
+    return rel_path
+
+
+def _ensure_run_worktree_destination(
+    worktree_path: Path,
+    *,
+    repo_path: Path,
+    cfg: ResolvedConfig | None = None,
+) -> None:
+    resolved = worktree_path.resolve()
+    allowed_roots: list[Path] = []
+    if cfg is not None:
+        allowed_roots.append(cfg.output_root())
+    run_root = _run_root_for_path(repo_path) or _run_root_for_path(worktree_path)
+    if run_root is not None:
+        allowed_roots.append(run_root)
+    if not allowed_roots:
+        return
+    if any(_path_is_within(resolved, root) for root in allowed_roots):
+        return
+    allowed = ", ".join(str(root.resolve()) for root in allowed_roots)
+    raise RuntimeError(
+        "ACA worktree destination must stay inside the run output tree "
+        f"({allowed}): {resolved}"
+    )
+
+
 def _git_clone_args_and_env(cfg: ResolvedConfig, clone_url: str, target: Path) -> tuple[list[str], dict[str, str]]:
     _validate_repository_reference(cfg, clone_url, field_name="repository.clone_url")
     env = dict(cfg.env)
@@ -247,9 +298,10 @@ def _sync_existing_repository(cfg: ResolvedConfig, repo_path: Path) -> None:
     if status.returncode != 0:
         raise RuntimeError(status.stderr.strip() or status.stdout.strip())
     if status.stdout.strip():
-        raise RuntimeError(
-            f"Repository has uncommitted changes and ACA will not pull over them: {repo_path}"
-        )
+        if not _archive_dirty_managed_run_branch(cfg, repo_path, env=cfg.env):
+            raise RuntimeError(
+                f"Repository has uncommitted changes and ACA will not pull over them: {repo_path}"
+            )
 
     remote_name = _validate_remote_name(cfg.repository.remote_name or "origin")
     default_branch = cfg.repository.default_branch or "main"
@@ -310,6 +362,18 @@ def _archive_branch_name(default_branch: str, short_head: str) -> str:
     return f"aca/archive/{branch_part}/{timestamp}-{suffix}"
 
 
+def _archive_dirty_branch_name(branch_name: str, short_head: str) -> str:
+    branch_part = slugify(str(branch_name or "detached").replace("/", "-"), limit=60)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    suffix = slugify(short_head or "head", limit=16)
+    return f"aca/archive/dirty/{branch_part}/{timestamp}-{suffix}"
+
+
+def _is_aca_run_branch(branch_name: str) -> bool:
+    branch = str(branch_name or "").strip()
+    return branch.startswith("aca/") and not branch.startswith("aca/archive/")
+
+
 def _archive_local_default_branch(repo_path: Path, default_branch: str, *, env: dict[str, str] | None = None) -> str:
     short_head = run_command(_git_repo_args(repo_path, "rev-parse", "--short=12", "HEAD"), env=env)
     if short_head.returncode != 0:
@@ -320,6 +384,58 @@ def _archive_local_default_branch(repo_path: Path, default_branch: str, *, env: 
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
     return backup_branch
+
+
+def _rev_parse_ref(repo_path: Path, ref: str, *, env: dict[str, str] | None = None) -> str:
+    result = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", ref), env=env)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _archive_dirty_managed_run_branch(
+    cfg: ResolvedConfig,
+    repo_path: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    if not _is_managed_repository_cache(cfg, repo_path):
+        return ""
+    branch = current_repository_branch(repo_path, cfg=cfg)
+    if not _is_aca_run_branch(branch):
+        return ""
+
+    short_head = run_command(_git_repo_args(repo_path, "rev-parse", "--short=12", "HEAD"), env=env)
+    if short_head.returncode != 0:
+        raise RuntimeError(short_head.stderr.strip() or short_head.stdout.strip())
+    archive_branch = _archive_dirty_branch_name(branch, short_head.stdout.strip())
+    previous_stash = _rev_parse_ref(repo_path, "refs/stash", env=env)
+    identity_prefix = ["git", *_git_identity_args(cfg)]
+    stash_env = {"GIT_TERMINAL_PROMPT": "0", **(env or cfg.env)}
+    stash_result = run_command(
+        _git_repo_args(
+            repo_path,
+            "stash",
+            "push",
+            "--include-untracked",
+            "-m",
+            f"ACA dirty managed run branch archive: {branch}",
+            prefix=identity_prefix,
+        ),
+        env=stash_env,
+    )
+    if stash_result.returncode != 0:
+        raise RuntimeError(stash_result.stderr.strip() or stash_result.stdout.strip())
+    current_stash = _rev_parse_ref(repo_path, "refs/stash", env=env)
+    if not current_stash or current_stash == previous_stash:
+        raise RuntimeError(
+            f"Repository has uncommitted changes but ACA could not archive them before sync: {repo_path}"
+        )
+    update_ref = run_command(
+        _git_repo_args(repo_path, "update-ref", f"refs/heads/{archive_branch}", current_stash),
+        env=env,
+    )
+    if update_ref.returncode != 0:
+        raise RuntimeError(update_ref.stderr.strip() or update_ref.stdout.strip())
+    return archive_branch
 
 
 def _archive_and_reset_managed_default_branch(
@@ -594,13 +710,24 @@ def repository_binding_issues(cfg: ResolvedConfig) -> list[str]:
     return issues
 
 
+def _run_id_branch_part(run_id: str) -> str:
+    raw = str(run_id or "run").strip() or "run"
+    run_slug = slugify(raw, limit=64)
+    if len(run_slug) <= 32:
+        return run_slug
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    prefix = slugify(run_slug, limit=24)
+    suffix = slugify(run_slug[-8:], limit=8)
+    return slugify(f"{prefix}-{suffix}-{digest}", limit=42)
+
+
 def task_run_branch_name(task: dict[str, Any], run_id: str, repo_slug: str = "") -> str:
     task_title = str(task.get("title") or task.get("task_id") or "task").strip()
     task_id = str(task.get("task_id") or run_id or "run").strip()
     repo_part = slugify(repo_slug.replace("/", "-"), limit=28) if repo_slug else ""
     task_part = slugify(task_title, limit=32)
     task_id_part = slugify(task_id, limit=16)
-    run_part = slugify(run_id, limit=16)
+    run_part = _run_id_branch_part(run_id)
     tail = f"{task_part}-{task_id_part}-{run_part}"
     if repo_part:
         return f"aca/{repo_part}/{tail}"
@@ -613,6 +740,11 @@ def worker_worktree_name(worker_id: str, subtask_id: str | None = None) -> str:
         subtask_part = slugify(subtask_id, limit=32)
         return f"{worker_part}--{subtask_part}"
     return worker_part
+
+
+def task_run_worktree_name(task: dict[str, Any], run_id: str, repo_slug: str = "") -> str:
+    branch = task_run_branch_name(task, run_id, repo_slug)
+    return slugify(branch.replace("/", "-"), limit=120)
 
 
 def _resolve_repository_unlocked(cfg: ResolvedConfig) -> dict[str, Any]:
@@ -723,6 +855,64 @@ def checkout_run_branch(cfg: ResolvedConfig, repo_path: Path, branch_name: str) 
     return branch_name
 
 
+def checkout_run_worktree(
+    cfg: ResolvedConfig,
+    repo_path: Path,
+    worktree_path: Path,
+    branch_name: str,
+) -> Path:
+    """Create a per-run worktree on a fresh run branch without mutating the repo cache."""
+    default_branch = cfg.repository.default_branch or "main"
+    remote_name = _validate_remote_name(cfg.repository.remote_name or "origin")
+    _ensure_repo_path_in_workspace(cfg, repo_path)
+    _ensure_run_worktree_destination(worktree_path, repo_path=repo_path, cfg=cfg)
+    base_ref = f"{remote_name}/{default_branch}"
+    remote_ref = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", base_ref), env=cfg.env)
+    if remote_ref.returncode != 0:
+        raise RuntimeError(
+            f"Remote default branch `{base_ref}` is not available for ACA run worktree checkout."
+        )
+    _heal_managed_default_branch_ahead(cfg, repo_path, remote_name, default_branch, env=cfg.env)
+
+    branch_exists = run_command(_git_repo_args(repo_path, "rev-parse", "--verify", branch_name), env=cfg.env)
+    if branch_exists.returncode == 0:
+        raise RuntimeError(f"ACA run branch already exists and will not be reused: {branch_name}")
+
+    with WORKTREE_LOCK:
+        run_command(_git_repo_args(repo_path, "worktree", "prune"), env=cfg.env)
+        if worktree_path.exists():
+            remove_result = run_command(
+                _git_repo_args(repo_path, "worktree", "remove", "--force", str(worktree_path)),
+                env=cfg.env,
+            )
+            if remove_result.returncode != 0 and worktree_path.exists():
+                shutil.rmtree(worktree_path)
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        create_result = run_command(
+            _git_repo_args(
+                repo_path,
+                "worktree",
+                "add",
+                "--force",
+                "-b",
+                branch_name,
+                str(worktree_path),
+                base_ref,
+            ),
+            env=cfg.env,
+        )
+        if create_result.returncode != 0:
+            raise RuntimeError(create_result.stderr.strip() or create_result.stdout.strip())
+        _rewrite_worktree_gitdir_for_engine(worktree_path)
+
+    current = current_repository_branch(worktree_path, cfg=cfg)
+    if current != branch_name:
+        raise RuntimeError(
+            f"ACA expected run worktree branch `{branch_name}` but worktree is on `{current or 'unknown'}`."
+        )
+    return worktree_path.resolve()
+
+
 def current_repository_branch(repo_path: Path, *, cfg: ResolvedConfig | None = None) -> str:
     env = cfg.env if cfg is not None else None
     result = run_command(_git_repo_args(repo_path, "rev-parse", "--abbrev-ref", "HEAD"), env=env)
@@ -771,6 +961,7 @@ def repository_status(repo_path: Path, remote_name: str = "origin", default_bran
 
 
 def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
+    _ensure_run_worktree_destination(worktree_path, repo_path=repo_path)
     with WORKTREE_LOCK:
         run_command(_git_repo_args(repo_path, "worktree", "prune"))
         if worktree_path.exists():
@@ -794,7 +985,32 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         _rewrite_worktree_gitdir_for_engine(worktree_path)
+        _overlay_worktree_changes(repo_path, worktree_path)
         return worktree_path.resolve()
+
+
+def _overlay_worktree_changes(source_path: Path, target_path: Path) -> list[str]:
+    _ensure_run_worktree_destination(target_path, repo_path=source_path)
+    copied: list[str] = []
+    for change in list_worktree_changes(source_path):
+        rel_path = _safe_status_rel_path(change["path"])
+        source = source_path / rel_path
+        target = target_path / rel_path
+        status = change["status"]
+        if "D" in status:
+            if target.exists():
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            copied.append(rel_path)
+            continue
+        if not source.exists() or source.is_dir():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        copied.append(rel_path)
+    return copied
 
 
 def _aca_root() -> Path:
@@ -1047,9 +1263,10 @@ def list_worktree_changes(worktree_path: Path) -> list[dict[str, str]]:
 
 def sync_worktree_changes(worktree_path: Path, repo_path: Path) -> list[str]:
     copied: list[str] = []
+    _ensure_run_worktree_destination(worktree_path, repo_path=repo_path)
     with REPO_SYNC_LOCK:
         for change in list_worktree_changes(worktree_path):
-            rel_path = change["path"]
+            rel_path = _safe_status_rel_path(change["path"])
             source = worktree_path / rel_path
             target = repo_path / rel_path
             status = change["status"]

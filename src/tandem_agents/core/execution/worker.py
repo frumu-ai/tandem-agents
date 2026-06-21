@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
@@ -21,6 +22,7 @@ from src.tandem_agents.core.engine.engine import (
     create_worktree,
     delete_tandem_session,
     engine_env,
+    engine_empty_response_fallback_provider_model,
     engine_session_provider_model,
     engine_visible_path,
     git_command_for_worktree,
@@ -81,6 +83,7 @@ WORKER_FAILURE_MARKERS = (
     "TOOL_MODE_REQUIRED_NOT_SATISFIED",
     "WRITE_REQUIRED_NOT_SATISFIED",
     "ENGINE_EMPTY_RESPONSE",
+    "ENGINE_NO_ACTIVITY_RESPONSE",
     "ENGINE_PROMPT_TIMEOUT",
     "ENGINE_TOOL_LOOP_STALLED",
     "ENGINE_SESSION_RUN_CONFLICT",
@@ -307,6 +310,33 @@ def _worker_prompt_sync_timeout_seconds(cfg: ResolvedConfig) -> float:
         except ValueError:
             logger.debug("Invalid ACA_WORKER_PROMPT_SYNC_TIMEOUT_SECONDS=%s", raw)
     return 300.0
+
+
+def _worker_empty_response_sync_fallback_timeout_seconds(
+    cfg: ResolvedConfig,
+    prompt_sync_timeout: float,
+) -> float:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_EMPTY_RESPONSE_SYNC_FALLBACK_TIMEOUT_SECONDS", "")
+        or ""
+    ).strip()
+    if raw:
+        try:
+            return min(float(prompt_sync_timeout), max(5.0, float(raw)))
+        except ValueError:
+            logger.debug("Invalid ACA_WORKER_EMPTY_RESPONSE_SYNC_FALLBACK_TIMEOUT_SECONDS=%s", raw)
+    return min(float(prompt_sync_timeout), 45.0)
+
+
+
+def _worker_no_activity_fail_fast_enabled(cfg: ResolvedConfig) -> bool:
+    raw = str(
+        getattr(cfg, "env", {}).get("ACA_WORKER_NO_ACTIVITY_FAIL_FAST_ENABLED", "")
+        or ""
+    ).strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def _worker_prompt_sync_max_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -985,26 +1015,41 @@ def _empty_transcript_retry_prompt(
     role: str = "",
     require_tool_use: bool = False,
     write_required: bool = False,
+    original_prompt: str = "",
 ) -> str:
+    prompt_excerpt = str(original_prompt or "").strip()
+    if len(prompt_excerpt) > 12000:
+        prompt_excerpt = prompt_excerpt[:12000].rstrip() + "\n\n[original prompt clipped]"
+    prompt_context = (
+        "\n\nOriginal prompt excerpt:\n"
+        "```\n"
+        f"{prompt_excerpt}\n"
+        "```"
+        if prompt_excerpt
+        else ""
+    )
     if role == "manager" and not require_tool_use and not write_required:
         return (
             "The previous async manager run completed without a visible assistant transcript. "
-            "Retry the planning task using the context already in this session. "
+            "Retry the planning task using the original prompt excerpt below. "
             "Return JSON only with keys: summary, subtasks, risks, tests."
+            f"{prompt_context}"
         )
     if require_tool_use or write_required:
         return (
             "The previous async worker run completed without a visible assistant transcript. "
-            "Continue the original task using repository tools now. "
+            "Continue the original task using the original prompt excerpt below and repository tools now. "
             "Do not stop with only a summary. Finish only after you have either produced and verified "
             "filesystem changes, or inspected the target files and reported a concrete blocker with the "
             "exact next operator action."
+            f"{prompt_context}"
         )
     return (
         "The previous async engine run completed without a visible assistant transcript. "
-        "Retry the same task now using the context already in this session. "
+        "Retry the same task now using the original prompt excerpt below. "
         "Use tools if they are required. Finish with a concise textual summary. "
         "If blocked, state the exact blocker and the next operator action."
+        f"{prompt_context}"
     )
 
 
@@ -1345,18 +1390,20 @@ def _diff_satisfies_targeted_subtask(
 
 def _is_aca_repo_artifact_path(path: str) -> bool:
     rel_path = str(path or "").strip().replace("\\", "/")
-    name = Path(rel_path).name
     if not rel_path:
         return True
     if rel_path.startswith(".aca/"):
         return True
+    path_obj = Path(rel_path)
+    name = path_obj.name
     if name == "__aca_temp_probe.txt":
         return True
     if name == ".aca_worker_blocker_note.txt":
         return True
-    if name.startswith("aca-") and name.endswith(".md"):
+    root_level = len(path_obj.parts) == 1
+    if root_level and name.startswith("aca-") and name.endswith(".md"):
         return True
-    if name.startswith("ACA_") and name.endswith(".md"):
+    if root_level and name.startswith("ACA_") and name.endswith(".md"):
         return True
     return False
 
@@ -1395,6 +1442,179 @@ def _worktree_changed_files(worktree: Path) -> list[str]:
         if path and not _is_aca_repo_artifact_path(path):
             changed.append(path)
     return changed
+
+
+def _worker_baseline_file_state(worktree: Path, rel_path: str) -> dict[str, Any]:
+    path = worktree / rel_path
+    try:
+        if path.is_symlink():
+            return {"kind": "symlink", "target": os.readlink(path)}
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return {"kind": "file", "sha256": digest.hexdigest()}
+        if path.exists():
+            return {"kind": "other"}
+    except OSError as exc:
+        return {"kind": "error", "detail": str(exc)[:200]}
+    return {"kind": "absent"}
+
+
+def _worker_start_baseline_metadata(worktree: Path) -> dict[str, Any]:
+    changed_files = _worktree_changed_files(worktree)
+    file_states = {
+        rel_path: _worker_baseline_file_state(worktree, rel_path)
+        for rel_path in changed_files
+    }
+    digest_text = json.dumps(
+        {"changed_files": changed_files, "file_states": file_states},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "baseline_changed_files": changed_files,
+        "baseline_file_states": file_states,
+        "baseline_state_digest": hashlib.sha256(digest_text.encode("utf-8")).hexdigest(),
+    }
+
+
+def _fresh_changed_files_since_worker_baseline(
+    worktree: Path,
+    baseline_metadata: dict[str, Any] | None,
+) -> list[str]:
+    changed_files = _worktree_changed_files(worktree)
+    if not changed_files:
+        return []
+    if not isinstance(baseline_metadata, dict):
+        return changed_files
+    baseline_states = baseline_metadata.get("baseline_file_states")
+    if not isinstance(baseline_states, dict):
+        return changed_files
+    fresh: list[str] = []
+    for rel_path in changed_files:
+        old_state = baseline_states.get(rel_path)
+        if not isinstance(old_state, dict):
+            fresh.append(rel_path)
+            continue
+        if _worker_baseline_file_state(worktree, rel_path) != old_state:
+            fresh.append(rel_path)
+    return list(dict.fromkeys(fresh))
+
+
+def _worktree_has_only_inherited_overlay_changes(
+    worktree: Path,
+    baseline_metadata: dict[str, Any] | None,
+) -> bool:
+    changed_files = _worktree_changed_files(worktree)
+    return bool(changed_files) and not _fresh_changed_files_since_worker_baseline(
+        worktree,
+        baseline_metadata,
+    )
+
+
+def _inherited_overlay_no_fresh_changes_result(
+    result: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+    baseline_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    changed_files = _worktree_changed_files(worktree)
+    baseline_files = []
+    if isinstance(baseline_metadata, dict):
+        baseline_files = [
+            str(path or "").strip()
+            for path in baseline_metadata.get("baseline_changed_files") or []
+            if str(path or "").strip()
+        ]
+    message = (
+        "\nACA ignored inherited overlay changes from this worker's start baseline. "
+        "The worker made no fresh filesystem changes, so ACA will not preserve the "
+        "baseline overlay as a new partial diff.\n"
+    )
+    if changed_files:
+        message += "Inherited changed files:\n" + "\n".join(f"- {path}" for path in changed_files) + "\n"
+    if baseline_files:
+        message += "Baseline changed files:\n" + "\n".join(f"- {path}" for path in baseline_files) + "\n"
+    try:
+        log_path.write_text(log_path.read_text(encoding="utf-8") + message, encoding="utf-8")
+    except OSError:
+        logger.debug("Failed to append inherited-overlay note to worker log", exc_info=True)
+    normalized = dict(result)
+    existing_blocker = str(normalized.get("blocker_kind") or "").strip()
+    existing_reason = str(normalized.get("failure_reason") or "").strip()
+    if existing_blocker:
+        normalized["engine_blocker_kind"] = existing_blocker
+    if existing_reason:
+        normalized["engine_failure_reason"] = existing_reason
+    normalized["stdout"] = f"{normalized.get('stdout') or ''}{message}"
+    normalized["returncode"] = 1
+    normalized["failure_reason"] = "WORKER_INHERITED_OVERLAY_NO_FRESH_CHANGES"
+    normalized["blocker_kind"] = "worker_no_progress"
+    normalized["recovery_action"] = (
+        "Continue with the already-synced reviewable diff or retry only if the remaining "
+        "subtask still needs fresh edits."
+    )
+    normalized["changed_files"] = []
+    normalized["inherited_overlay_changed_files"] = changed_files
+    normalized["fresh_changed_files"] = []
+    normalized.pop("partial_diff_artifact", None)
+    artifacts = dict(normalized.get("artifacts") or {})
+    artifacts.pop("partial_diff", None)
+    if artifacts:
+        normalized["artifacts"] = artifacts
+    else:
+        normalized.pop("artifacts", None)
+    normalized.pop("partial_diff_preserved_after_engine_stall", None)
+    return normalized
+
+
+def _carried_diff_ready_for_verification_result(
+    worker_id: str,
+    subtask: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+) -> dict[str, Any] | None:
+    if not _subtask_allows_carried_diff_without_fresh_write(subtask):
+        return None
+    changed_files = _worktree_changed_files(worktree)
+    if not changed_files:
+        return None
+    if not _diff_satisfies_targeted_subtask(
+        subtask,
+        requires_real_diff=True,
+        targets_exist=_target_files_exist(worktree, subtask),
+        diff_touches_targets=_diff_touches_target_files(worktree, subtask),
+        diff_touches_substantive_targets=_diff_touches_substantive_target_files(worktree, subtask),
+    ) and not _diff_touches_nearby_test_files(worktree, subtask):
+        return None
+    result = {
+        "worker_id": worker_id,
+        "subtask_id": str(subtask.get("id") or "").strip(),
+        "returncode": 1,
+        "stdout": (
+            "ACA applied carry-forward source/test partial diffs for a verification-first repair. "
+            "No fresh worker edit is required before focused validation; hand the composed diff to "
+            "the dispatcher review gate.\n"
+        ),
+        "log_path": str(log_path),
+        "failure_reason": "WORKER_CARRIED_DIFF_READY_FOR_VERIFICATION",
+        "blocker_kind": "worker_incomplete_diff",
+        "recovery_action": (
+            "Validate the composed carry-forward diff with the existing source+test review gate and "
+            "sync it if focused verification passes."
+        ),
+        "write_required": False,
+        "verified_existing": False,
+        "changed_files": changed_files,
+    }
+    return _preserve_partial_worker_diff(
+        result,
+        log_path,
+        worktree,
+        reason="WORKER_CARRIED_DIFF_READY_FOR_VERIFICATION",
+    )
 
 
 def _changed_files_have_substantive_content(worktree: Path, changed_files: list[str]) -> bool:
@@ -1466,6 +1686,26 @@ def _engine_no_text_timeout_seconds(cfg: ResolvedConfig) -> float:
         except ValueError:
             logger.debug("Invalid ACA_ENGINE_NO_TEXT_TIMEOUT_SECONDS=%s", raw)
     return 210.0
+
+
+def _engine_empty_stream_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_EMPTY_STREAM_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(5.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_EMPTY_STREAM_TIMEOUT_SECONDS=%s", raw)
+    return 45.0
+
+
+def _engine_no_activity_timeout_seconds(cfg: ResolvedConfig) -> float:
+    raw = str(getattr(cfg, "env", {}).get("ACA_ENGINE_NO_ACTIVITY_TIMEOUT_SECONDS", "") or "").strip()
+    if raw:
+        try:
+            return max(15.0, float(raw))
+        except ValueError:
+            logger.debug("Invalid ACA_ENGINE_NO_ACTIVITY_TIMEOUT_SECONDS=%s", raw)
+    return 90.0
 
 
 def _worker_async_prompt_timeout_seconds(cfg: ResolvedConfig) -> float:
@@ -1655,7 +1895,7 @@ def _extract_partial_worker_diff_artifact(artifact_text: str) -> str:
     marker = "## git diff --binary"
     index = artifact_text.find(marker)
     if index < 0:
-        return artifact_text.strip()
+        return artifact_text
     return artifact_text[index + len(marker):].lstrip("\r\n")
 
 
@@ -2208,6 +2448,17 @@ def _log_path_worker_attempt_is_current(log_path: Path, worker_id: str, cwd: Pat
     worker_id = str(worker_id or "").strip()
     if not execution_id or not worker_id:
         return True
+    cancelled_path = log_path.parent.parent / "cancelled_worker_attempts.json"
+    if cancelled_path.is_file():
+        try:
+            cancelled = json.loads(cancelled_path.read_text(encoding="utf-8"))
+        except Exception:
+            cancelled = {}
+        values = cancelled.get(worker_id) if isinstance(cancelled, dict) else None
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list) and execution_id in {str(value).strip() for value in values}:
+            return False
     attempts_path = log_path.parent.parent / "active_worker_attempts.json"
     if not attempts_path.is_file():
         return True
@@ -2225,6 +2476,13 @@ def _active_worker_attempts_path(layout: dict[str, Path]) -> Path | None:
     if not isinstance(run_dir, Path):
         return None
     return run_dir / "active_worker_attempts.json"
+
+
+def _cancelled_worker_attempts_path(layout: dict[str, Path]) -> Path | None:
+    run_dir = layout.get("run_dir")
+    if not isinstance(run_dir, Path):
+        return None
+    return run_dir / "cancelled_worker_attempts.json"
 
 
 def _active_worker_engine_sessions_path(run_dir: Path) -> Path:
@@ -2328,6 +2586,29 @@ def _clear_active_worker_engine_session(log_path: Path, worker_id: str, session_
         _write_active_worker_engine_sessions(path, sessions)
 
 
+def _mark_active_worker_engine_session_cleanup_failed(
+    log_path: Path,
+    worker_id: str,
+    session_id: str,
+    error: str,
+) -> None:
+    worker_id = str(worker_id or "").strip()
+    session_id = str(session_id or "").strip()
+    if (worker_id != "manager" and not worker_id.startswith("worker-")) or not session_id:
+        return
+    path = _active_worker_engine_sessions_path_for_log(log_path)
+    if path is None:
+        return
+    with WORKER_STATUS_LOCK:
+        sessions = _load_active_worker_engine_sessions(path)
+        current = dict(sessions.get(worker_id) or {})
+        current["session_id"] = session_id
+        current["cleanup_failed_at_ms"] = now_ms()
+        current["cleanup_error"] = str(error or "session_delete_failed")[:500]
+        sessions[worker_id] = current
+        _write_active_worker_engine_sessions(path, sessions)
+
+
 def _load_active_worker_attempts(layout: dict[str, Path]) -> dict[str, str]:
     path = _active_worker_attempts_path(layout)
     if not isinstance(path, Path) or not path.is_file():
@@ -2352,6 +2633,36 @@ def _write_active_worker_attempts(layout: dict[str, Path], attempts: dict[str, s
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _load_cancelled_worker_attempts(layout: dict[str, Path]) -> dict[str, list[str]]:
+    path = _cancelled_worker_attempts_path(layout)
+    if not isinstance(path, Path) or not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    cancelled: dict[str, list[str]] = {}
+    for raw_worker_id, raw_values in loaded.items():
+        worker_id = str(raw_worker_id or "").strip()
+        if not worker_id:
+            continue
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        execution_ids = [str(value).strip() for value in values if str(value).strip()]
+        if execution_ids:
+            cancelled[worker_id] = execution_ids
+    return cancelled
+
+
+def _worker_attempt_is_cancelled(layout: dict[str, Path], worker_id: str, execution_id: str) -> bool:
+    worker_id = str(worker_id or "").strip()
+    execution_id = str(execution_id or "").strip()
+    if not worker_id or not execution_id:
+        return False
+    return execution_id in set(_load_cancelled_worker_attempts(layout).get(worker_id, []))
 
 
 def _mark_active_worker_attempt(layout: dict[str, Path], worker_id: str, execution_id: str) -> None:
@@ -2383,6 +2694,8 @@ def _worker_event_attempt_is_current(layout: dict[str, Path], payload: dict[str,
     worker_id = str(payload.get("worker_id") or "").strip()
     if not execution_id or not worker_id:
         return True
+    if _worker_attempt_is_cancelled(layout, worker_id, execution_id):
+        return False
     attempts = _load_active_worker_attempts(layout)
     return str(attempts.get(worker_id) or "").strip() == execution_id
 
@@ -2501,6 +2814,51 @@ def _subtask_requires_real_diff(subtask: dict[str, Any]) -> bool:
     )
     padded = f" {text} "
     return any(marker in padded for marker in diff_markers)
+
+
+def _subtask_allows_carried_diff_without_fresh_write(subtask: dict[str, Any]) -> bool:
+    """Return whether carried patches satisfy the write budget for a verification-first repair."""
+    if not subtask.get("repair_verification_first"):
+        return False
+    if _subtask_needs_focused_carried_diff_edit(subtask):
+        return False
+    if subtask.get("carry_forward_patch"):
+        return True
+    return bool(subtask.get("carry_forward_patches"))
+
+
+def _subtask_needs_focused_carried_diff_edit(subtask: dict[str, Any]) -> bool:
+    """Return true when a carried patch has already failed focused verification."""
+    focus_text = "\n".join(
+        str(value or "")
+        for value in (
+            subtask.get("repair_focus_instruction"),
+            "\n".join(str(item or "") for item in subtask.get("repair_focus_instructions") or []),
+            subtask.get("repair_failure_summary"),
+            subtask.get("repair_worker_output_excerpt"),
+        )
+    ).lower()
+    if not focus_text:
+        return False
+    return any(
+        marker in focus_text
+        for marker in (
+            "focused nameerror repair",
+            "focused typeerror repair",
+            "focused attributeerror repair",
+            "focused assertionerror repair",
+            "focused zero-division repair",
+            "nameerror:",
+            "typeerror:",
+            "attributeerror:",
+            "assertionerror:",
+            "zerodivisionerror:",
+            "failed (errors=",
+            "failed (failures=",
+            "focused verification failed",
+            "focused tests failed",
+        )
+    )
 
 
 def _pr_candidate_ref_map(subtask: dict[str, Any]) -> dict[str, str]:
@@ -3489,6 +3847,8 @@ def stream_tandem_prompt(
     if config_path is None:
         session_id: str | None = None
         last_run_id = ""
+        current_provider = provider
+        current_model = model
         if role == "manager" and not require_tool_use and not write_required:
             session_tool_allowlist: list[str] | None = []
             session_permission_rules: list[dict[str, str]] | None = None
@@ -3548,8 +3908,8 @@ def stream_tandem_prompt(
                             cfg,
                             title=f"ACA {role}",
                             directory=cwd,
-                            provider=provider,
-                            model=model,
+                            provider=current_provider,
+                            model=current_model,
                             temperature=session_temperature,
                             permission_rules=session_permission_rules,
                         )
@@ -3568,6 +3928,8 @@ def stream_tandem_prompt(
                     "run_id": "",
                     "retry_count": 0,
                     "fallback_mode": None,
+                    "provider": current_provider,
+                    "model": current_model,
                     "recovery": [],
                 }
                 _mark_active_worker_engine_session(
@@ -3595,18 +3957,28 @@ def stream_tandem_prompt(
                     write_required,
                     timeout_multiplier,
                 )
+                async_empty_stream_timeout = min(
+                    _engine_empty_stream_timeout_seconds(cfg),
+                    async_prompt_timeout,
+                )
+                async_no_activity_timeout = max(
+                    async_empty_stream_timeout,
+                    min(_engine_no_activity_timeout_seconds(cfg), async_prompt_timeout),
+                )
                 async_dispatch_timeout = min(
                     _engine_async_dispatch_timeout_seconds(cfg),
                     async_prompt_timeout,
                 )
+                engine_meta["timeouts"] = {
+                    "prompt_sync_seconds": prompt_sync_timeout,
+                    "async_prompt_seconds": async_prompt_timeout,
+                    "async_empty_stream_seconds": async_empty_stream_timeout,
+                    "async_no_activity_seconds": async_no_activity_timeout,
+                    "async_no_text_seconds": async_no_text_timeout,
+                    "async_dispatch_seconds": async_dispatch_timeout,
+                }
                 if timeout_multiplier > 1.0:
                     engine_meta["timeout_multiplier"] = timeout_multiplier
-                    engine_meta["timeouts"] = {
-                        "prompt_sync_seconds": prompt_sync_timeout,
-                        "async_prompt_seconds": async_prompt_timeout,
-                        "async_no_text_seconds": async_no_text_timeout,
-                        "async_dispatch_seconds": async_dispatch_timeout,
-                    }
 
                 def _writer(delta: str) -> None:
                     for line in delta.splitlines(keepends=True):
@@ -3654,6 +4026,44 @@ def stream_tandem_prompt(
                         "blocker_kind": blocker_kind,
                         "recovery_action": recovery_action,
                     }
+
+                def _switch_empty_response_retry_route(stage: str) -> None:
+                    nonlocal current_provider, current_model
+                    if not role.startswith("worker"):
+                        return
+                    route = engine_empty_response_fallback_provider_model(
+                        cfg,
+                        role,
+                        current_provider=current_provider,
+                        current_model=current_model,
+                    )
+                    if not route:
+                        return
+                    previous = {"provider": current_provider, "model": current_model}
+                    current_provider = str(route.get("provider") or "").strip()
+                    current_model = str(route.get("model") or "").strip()
+                    if not current_provider or not current_model:
+                        current_provider = previous["provider"]
+                        current_model = previous["model"]
+                        return
+                    switch = {
+                        "stage": stage,
+                        "from": previous,
+                        "to": {"provider": current_provider, "model": current_model},
+                        "source": str(route.get("source") or "").strip(),
+                    }
+                    engine_meta["provider"] = current_provider
+                    engine_meta["model"] = current_model
+                    engine_meta["empty_response_route_switch"] = switch
+                    engine_meta.setdefault("route_switches", []).append(switch)
+                    notice = (
+                        "ENGINE_EMPTY_RESPONSE_ROUTE_SWITCH: retrying worker through "
+                        f"{current_provider}/{current_model} after silent route "
+                        f"{previous['provider']}/{previous['model']} ({switch['source'] or 'configured alternate'}).\n"
+                    )
+                    log.write(notice)
+                    log.flush()
+                    _print_line(role, notice)
 
                 if role.startswith("worker") and write_required and _use_prompt_sync_first(cfg, prompt_sync_first):
                     engine_meta["fallback_mode"] = "prompt_sync_first"
@@ -3864,12 +4274,13 @@ def stream_tandem_prompt(
                         session_temperature = None
                         if hasattr(cfg, "sampling_for_role"):
                             session_temperature = cfg.sampling_for_role(role).get("temperature")
+                        _switch_empty_response_retry_route("prompt_sync_first_async_recovery")
                         session_id = create_tandem_session(
                             cfg,
                             title=f"ACA {role} async recovery",
                             directory=cwd,
-                            provider=provider,
-                            model=model,
+                            provider=current_provider,
+                            model=current_model,
                             temperature=session_temperature,
                             permission_rules=session_permission_rules,
                         )
@@ -3984,6 +4395,8 @@ def stream_tandem_prompt(
                             run_id,
                             _writer,
                             timeout_seconds=async_prompt_timeout,
+                            empty_stream_timeout_seconds=async_empty_stream_timeout,
+                            no_activity_timeout_seconds=async_no_activity_timeout,
                             no_text_timeout_seconds=async_no_text_timeout,
                             max_events_without_text=_engine_max_events_without_text(cfg, role),
                             stop_when_text=(
@@ -4002,6 +4415,8 @@ def stream_tandem_prompt(
                         engine_meta["stream_reason"] = stream_reason
                     if stream_result.get("event_count") is not None:
                         engine_meta["stream_event_count"] = stream_result.get("event_count")
+                    if stream_result.get("meaningful_event_count") is not None:
+                        engine_meta["stream_meaningful_event_count"] = stream_result.get("meaningful_event_count")
                     if completed and streamed_text.strip():
                         return streamed_text, True, run_id, stream_reason
                     recovered_text = ""
@@ -4029,6 +4444,17 @@ def stream_tandem_prompt(
                         return stop_result
                     previous_session_id = session_id
                     engine_meta["empty_response_session_id"] = previous_session_id
+                    engine_meta["empty_response_stream_reason"] = stream_reason
+                    if engine_meta.get("stream_event_count") is not None:
+                        engine_meta["empty_response_stream_event_count"] = engine_meta.get("stream_event_count")
+                    if engine_meta.get("stream_meaningful_event_count") is not None:
+                        engine_meta["empty_response_stream_meaningful_event_count"] = engine_meta.get("stream_meaningful_event_count")
+                    fail_fast_no_activity = (
+                        role.startswith("worker")
+                        and stream_reason == "no_activity_timeout"
+                        and int(engine_meta.get("stream_meaningful_event_count") or 0) == 0
+                        and _worker_no_activity_fail_fast_enabled(cfg)
+                    )
                     if previous_session_id:
                         try:
                             _call_with_timeout(
@@ -4037,15 +4463,46 @@ def stream_tandem_prompt(
                             )
                         except Exception:
                             logger.debug("Failed to delete empty-response session before retry", exc_info=True)
+                    if previous_session_id == session_id:
+                        session_id = ""
+                    if fail_fast_no_activity:
+                        engine_meta["fallback_mode"] = "no_activity_fail_fast"
+                        engine_meta["empty_response_fail_fast"] = True
+                        message = (
+                            "ENGINE_NO_ACTIVITY_RESPONSE: Tandem engine completed the worker prompt without "
+                            "assistant or tool activity before the no-activity watchdog; skipping fresh-session "
+                            "and prompt-sync retries. Last engine run: "
+                            f"{run_id or last_run_id or 'unknown'}.\n"
+                        )
+                        log.write(message)
+                        log.flush()
+                        _print_line(role, message)
+                        return {
+                            "role": role,
+                            "returncode": 1,
+                            "stdout": message,
+                            "log_path": str(log_path),
+                            "cwd": str(cwd),
+                            "session_id": previous_session_id or session_id,
+                            "engine_run_id": run_id or last_run_id,
+                            "engine": engine_meta,
+                            "failure_reason": "ENGINE_NO_ACTIVITY_RESPONSE",
+                            "blocker_kind": "engine_no_activity_response",
+                            "recovery_action": (
+                                "Inspect Tandem engine/provider streaming for the selected worker prompt; "
+                                "ACA did not retry because the engine produced no visible assistant/tool activity."
+                            ),
+                        }
                     session_temperature = None
                     if hasattr(cfg, "sampling_for_role"):
                         session_temperature = cfg.sampling_for_role(role).get("temperature")
+                    _switch_empty_response_retry_route("async_empty_response_fresh_session")
                     session_id = create_tandem_session(
                         cfg,
                         title=f"ACA {role} empty response retry",
                         directory=cwd,
-                        provider=provider,
-                        model=model,
+                        provider=current_provider,
+                        model=current_model,
                         temperature=session_temperature,
                         permission_rules=session_permission_rules,
                     )
@@ -4071,6 +4528,7 @@ def stream_tandem_prompt(
                             role=role,
                             require_tool_use=require_tool_use,
                             write_required=write_required,
+                            original_prompt=prompt,
                         ),
                         1,
                     )
@@ -4090,9 +4548,54 @@ def stream_tandem_prompt(
                     stop_result = _worker_stop_result("prompt_sync fallback")
                     if stop_result is not None:
                         return stop_result
-                    engine_meta["fallback_mode"] = "prompt_sync"
+                    fallback_previous_session_id = session_id
+                    fallback_previous_run_id = run_id or last_run_id
+                    if stream_reason in {"empty_stream_timeout", "no_activity_timeout", "max_events_without_text"}:
+                        if fallback_previous_session_id:
+                            engine_meta["prompt_sync_fallback_previous_session_id"] = fallback_previous_session_id
+                        if fallback_previous_run_id:
+                            engine_meta["prompt_sync_fallback_previous_run_id"] = fallback_previous_run_id
+                        if fallback_previous_session_id:
+                            try:
+                                _call_with_timeout(
+                                    lambda: delete_tandem_session(cfg, fallback_previous_session_id),
+                                    timeout_seconds=5.0,
+                                )
+                            except Exception:
+                                logger.debug("Failed to delete async fallback session before prompt_sync fallback", exc_info=True)
+                        session_temperature = None
+                        if hasattr(cfg, "sampling_for_role"):
+                            session_temperature = cfg.sampling_for_role(role).get("temperature")
+                        session_id = create_tandem_session(
+                            cfg,
+                            title=f"ACA {role} prompt_sync fallback",
+                            directory=cwd,
+                            provider=current_provider,
+                            model=current_model,
+                            temperature=session_temperature,
+                            permission_rules=session_permission_rules,
+                        )
+                        engine_meta["session_id"] = session_id
+                        engine_meta["run_id"] = ""
+                        run_id = ""
+                        last_run_id = ""
+                        _mark_active_worker_engine_session(
+                            log_path,
+                            worker_id=role,
+                            session_id=session_id,
+                            cwd=cwd,
+                        )
+                        engine_meta["fallback_mode"] = "prompt_sync_fresh_session"
+                    else:
+                        engine_meta["fallback_mode"] = "prompt_sync"
+                    empty_response_sync_timeout = (
+                        _worker_empty_response_sync_fallback_timeout_seconds(cfg, prompt_sync_timeout)
+                        if role.startswith("worker")
+                        else prompt_sync_timeout
+                    )
+                    engine_meta["empty_response_sync_fallback_timeout_seconds"] = empty_response_sync_timeout
                     fallback_notice = (
-                        f"ENGINE_EMPTY_RESPONSE_FALLBACK: engine run {run_id or 'unknown'} still had "
+                        f"ENGINE_EMPTY_RESPONSE_FALLBACK: engine run {fallback_previous_run_id or run_id or 'unknown'} still had "
                         "no transcript text; using prompt_sync fallback.\n"
                     )
                     log.write(fallback_notice)
@@ -4111,12 +4614,13 @@ def stream_tandem_prompt(
                                     role=role,
                                     require_tool_use=require_tool_use,
                                     write_required=write_required,
+                                    original_prompt=prompt,
                                 ),
                                 tool_allowlist=session_tool_allowlist,
                                 tool_mode=prompt_tool_mode,
                                 require_tool_use=require_tool_use,
                                 write_required=write_required,
-                                timeout_seconds=prompt_sync_timeout,
+                                timeout_seconds=empty_response_sync_timeout,
                             )
                         except Exception as exc:
                             conflict = _engine_session_run_conflict(exc)
@@ -4126,7 +4630,7 @@ def stream_tandem_prompt(
                                     fallback_blocker_kind = "engine_prompt_timeout"
                                     fallback_failure_message = (
                                         "ENGINE_PROMPT_TIMEOUT: Tandem engine prompt_sync fallback timed out "
-                                        "after an empty async transcript. "
+                                        f"after {empty_response_sync_timeout:.0f}s following an empty async transcript. "
                                         f"Last engine run: {run_id or last_run_id or 'unknown'}.\n"
                                     )
                                     break
@@ -4330,13 +4834,25 @@ def stream_tandem_prompt(
                 }
             finally:
                 if session_id:
-                    _clear_active_worker_engine_session(log_path, role, session_id)
                     try:
                         _call_with_timeout(lambda: delete_tandem_session(cfg, session_id), timeout_seconds=5.0)
+                        _clear_active_worker_engine_session(log_path, role, session_id)
                     except TimeoutError:
                         logger.debug("Timed out deleting tandem session %s", session_id)
+                        _mark_active_worker_engine_session_cleanup_failed(
+                            log_path,
+                            role,
+                            session_id,
+                            "session_delete_timeout",
+                        )
                     except Exception:
                         logger.debug("Failed to delete tandem session", exc_info=True)
+                        _mark_active_worker_engine_session_cleanup_failed(
+                            log_path,
+                            role,
+                            session_id,
+                            "session_delete_failed",
+                        )
     return {"role": role, "returncode": 1, "stdout": "Internal Error: session-less stream requested"}
 
 
@@ -4497,17 +5013,19 @@ def run_worker_subtask(
     config_path = None
     
     task_source = task.get("source") if isinstance(task, dict) else {}
-    require_filesystem_changes = (
-        isinstance(task_source, dict)
-        and str(task_source.get("type") or "").strip() == "github_project"
+    source_type = str(task_source.get("type") or "").strip() if isinstance(task_source, dict) else ""
+    execution_kind = str(task.get("execution_kind") or "").strip() if isinstance(task, dict) else ""
+    require_filesystem_changes = source_type == "github_project" or (
+        source_type == "linear" and execution_kind == "code_edit"
     )
 
+    carried_diff_verification_only = _subtask_allows_carried_diff_without_fresh_write(subtask)
     requires_real_diff = require_filesystem_changes or _subtask_requires_real_diff(subtask)
     worktree_satisfied = bool(subtask.get("pre_satisfied")) and not requires_real_diff
     if not worktree_satisfied and not requires_real_diff:
         worktree_satisfied = _target_files_exist(worktree, subtask) and bool(_readable_target_files(worktree, subtask))
     
-    write_required = requires_real_diff or not worktree_satisfied
+    write_required = False if carried_diff_verification_only else (requires_real_diff or not worktree_satisfied)
     subtask = dict(subtask)
     subtask["write_required"] = write_required
     timeout_multiplier = _worker_timeout_multiplier(subtask)
@@ -4521,6 +5039,7 @@ def run_worker_subtask(
     
     if execution_id:
         _mark_active_worker_attempt(layout, worker_id, execution_id)
+    baseline_metadata = _worker_start_baseline_metadata(worktree)
     append_event(
         layout["events"],
         "worker.started",
@@ -4530,6 +5049,7 @@ def run_worker_subtask(
             "subtask_id": subtask["id"],
             "worktree": str(worktree),
             "execution_id": execution_id,
+            **baseline_metadata,
         },
         task_id=task.get("task_id"),
         role="worker",
@@ -4539,6 +5059,25 @@ def run_worker_subtask(
     def _summarize_and_clear_current_attempt(worker_result: dict[str, Any]) -> dict[str, Any]:
         _clear_active_worker_attempt(layout, worker_id, execution_id)
         return summarize_worker_notes(worker_result, worker_id, subtask, worktree, index)
+
+    carried_result = _carried_diff_ready_for_verification_result(
+        worker_id,
+        subtask,
+        log_path,
+        worktree,
+    )
+    if carried_result is not None:
+        _append_worker_event_if_run_active(
+            layout,
+            log_path,
+            "worker.carried_diff_ready_for_verification",
+            run_id,
+            _partial_diff_payload(carried_result, worker_id, subtask),
+            task_id=task.get("task_id"),
+            role="worker",
+            repo={"path": str(repo_path)},
+        )
+        return _summarize_and_clear_current_attempt(carried_result)
 
     result = _run_deterministic_throughput_slice(worktree, subtask, log_path) if write_required else None
     if result is not None:
@@ -4594,52 +5133,55 @@ def run_worker_subtask(
     if not _run_has_terminal_status(layout):
         sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
-    result_before_terminalize = dict(result)
-    result = _terminalize_worker_after_tool_loop(
-        cfg,
-        result,
-        log_path,
-        worktree,
-        subtask,
-        role=worker_id,
-        provider=worker_cli_provider,
-        model=worker_model,
-        require_filesystem_changes=require_filesystem_changes,
-    )
-    if result.get("terminalized_after_tool_loop") and not result_before_terminalize.get("terminalized_after_tool_loop"):
-        _append_worker_event_if_run_active(
-            layout,
+    if result.get("returncode", 0) != 0 and _worktree_has_only_inherited_overlay_changes(worktree, baseline_metadata):
+        result = _inherited_overlay_no_fresh_changes_result(result, log_path, worktree, baseline_metadata)
+    else:
+        result_before_terminalize = dict(result)
+        result = _terminalize_worker_after_tool_loop(
+            cfg,
+            result,
             log_path,
-            "worker.terminalized_after_tool_loop",
-            run_id,
-            {
-                "worker_id": worker_id,
-                "subtask_id": subtask["id"],
-                "execution_id": execution_id,
-                "changed_files": list(result.get("changed_files") or []),
-                "returncode": result.get("returncode"),
-                "partial_diff_state": "accepted",
-            },
-            task_id=task.get("task_id"),
-            role="worker",
-            repo={"path": str(repo_path)},
+            worktree,
+            subtask,
+            role=worker_id,
+            provider=worker_cli_provider,
+            model=worker_model,
+            require_filesystem_changes=require_filesystem_changes,
         )
+        if result.get("terminalized_after_tool_loop") and not result_before_terminalize.get("terminalized_after_tool_loop"):
+            _append_worker_event_if_run_active(
+                layout,
+                log_path,
+                "worker.terminalized_after_tool_loop",
+                run_id,
+                {
+                    "worker_id": worker_id,
+                    "subtask_id": subtask["id"],
+                    "execution_id": execution_id,
+                    "changed_files": list(result.get("changed_files") or []),
+                    "returncode": result.get("returncode"),
+                    "partial_diff_state": "accepted",
+                },
+                task_id=task.get("task_id"),
+                role="worker",
+                repo={"path": str(repo_path)},
+            )
 
-    result = _coerce_worker_failure(
-        result,
-        log_path,
-        worktree,
-        subtask,
-        require_filesystem_changes=require_filesystem_changes,
-    )
-    result = _recover_nonzero_result_if_diff_satisfies_subtask(
-        result,
-        log_path,
-        worktree,
-        subtask,
-        require_filesystem_changes=require_filesystem_changes,
-        reason=str(result.get("failure_reason") or "late target diff"),
-    )
+        result = _coerce_worker_failure(
+            result,
+            log_path,
+            worktree,
+            subtask,
+            require_filesystem_changes=require_filesystem_changes,
+        )
+        result = _recover_nonzero_result_if_diff_satisfies_subtask(
+            result,
+            log_path,
+            worktree,
+            subtask,
+            require_filesystem_changes=require_filesystem_changes,
+            reason=str(result.get("failure_reason") or "late target diff"),
+        )
     if result.get("partial_diff_artifact"):
         _append_worker_event_if_run_active(
             layout,
@@ -4749,53 +5291,61 @@ def run_worker_subtask(
         if not _run_has_terminal_status(layout):
             sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
-        retry_before_terminalize = dict(retry_result)
-        retry_result = _terminalize_worker_after_tool_loop(
-            cfg,
-            retry_result,
-            log_path,
-            worktree,
-            subtask,
-            role=worker_id,
-            provider=worker_cli_provider,
-            model=worker_model,
-            require_filesystem_changes=require_filesystem_changes,
-        )
-        if retry_result.get("terminalized_after_tool_loop") and not retry_before_terminalize.get("terminalized_after_tool_loop"):
-            _append_worker_event_if_run_active(
-                layout,
+        if retry_result.get("returncode", 0) != 0 and _worktree_has_only_inherited_overlay_changes(worktree, baseline_metadata):
+            retry_result = _inherited_overlay_no_fresh_changes_result(
+                retry_result,
                 log_path,
-                "worker.terminalized_after_tool_loop",
-                run_id,
-                {
-                    "worker_id": worker_id,
-                    "subtask_id": subtask["id"],
-                    "execution_id": execution_id,
-                    "changed_files": list(retry_result.get("changed_files") or []),
-                    "returncode": retry_result.get("returncode"),
-                    "partial_diff_state": "accepted",
-                },
-                task_id=task.get("task_id"),
-                role="worker",
-                repo={"path": str(repo_path)},
+                worktree,
+                baseline_metadata,
             )
+        else:
+            retry_before_terminalize = dict(retry_result)
+            retry_result = _terminalize_worker_after_tool_loop(
+                cfg,
+                retry_result,
+                log_path,
+                worktree,
+                subtask,
+                role=worker_id,
+                provider=worker_cli_provider,
+                model=worker_model,
+                require_filesystem_changes=require_filesystem_changes,
+            )
+            if retry_result.get("terminalized_after_tool_loop") and not retry_before_terminalize.get("terminalized_after_tool_loop"):
+                _append_worker_event_if_run_active(
+                    layout,
+                    log_path,
+                    "worker.terminalized_after_tool_loop",
+                    run_id,
+                    {
+                        "worker_id": worker_id,
+                        "subtask_id": subtask["id"],
+                        "execution_id": execution_id,
+                        "changed_files": list(retry_result.get("changed_files") or []),
+                        "returncode": retry_result.get("returncode"),
+                        "partial_diff_state": "accepted",
+                    },
+                    task_id=task.get("task_id"),
+                    role="worker",
+                    repo={"path": str(repo_path)},
+                )
 
-        retry_result = _coerce_worker_failure(
-            retry_result,
-            log_path,
-            worktree,
-            subtask,
-            require_filesystem_changes=require_filesystem_changes,
-        )
-        if retry_result["returncode"] != 0:
-            retry_result = _recover_nonzero_result_if_diff_satisfies_subtask(
+            retry_result = _coerce_worker_failure(
                 retry_result,
                 log_path,
                 worktree,
                 subtask,
                 require_filesystem_changes=require_filesystem_changes,
-                reason=str(retry_result.get("failure_reason") or "retry produced diff"),
             )
+            if retry_result["returncode"] != 0:
+                retry_result = _recover_nonzero_result_if_diff_satisfies_subtask(
+                    retry_result,
+                    log_path,
+                    worktree,
+                    subtask,
+                    require_filesystem_changes=require_filesystem_changes,
+                    reason=str(retry_result.get("failure_reason") or "retry produced diff"),
+                )
         if retry_result.get("partial_diff_artifact"):
             _append_worker_event_if_run_active(
                 layout,
