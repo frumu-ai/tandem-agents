@@ -262,6 +262,14 @@ def _git_repo_args(repo_path: Path, *args: str, prefix: list[str] | None = None)
     ]
 
 
+def _with_git_prefix(command: list[str], prefix: list[str]) -> list[str]:
+    if not prefix:
+        return command
+    if command and command[0] == "git":
+        return [*prefix, *command[1:]]
+    return [*prefix, *command]
+
+
 def _remote_is_empty(cfg: ResolvedConfig, clone_url: str) -> bool:
     args, env = _git_auth_args(cfg, clone_url)
     result = run_command(args + ["ls-remote", clone_url], env=env)
@@ -915,7 +923,7 @@ def checkout_run_worktree(
 
 def current_repository_branch(repo_path: Path, *, cfg: ResolvedConfig | None = None) -> str:
     env = cfg.env if cfg is not None else None
-    result = run_command(_git_repo_args(repo_path, "rev-parse", "--abbrev-ref", "HEAD"), env=env)
+    result = run_command(_git_command_for_worktree(repo_path, "rev-parse", "--abbrev-ref", "HEAD"), env=env)
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -938,16 +946,19 @@ def push_repository_changes_result(
     remote_url = _remote_url_for_existing_repo(cfg, repo_path)
     prefix, env = _git_auth_args(cfg, remote_url)
     return run_command(
-        _git_repo_args(repo_path, "push", "-u", remote_name, branch_name, prefix=prefix),
+        _with_git_prefix(
+            _git_command_for_worktree(repo_path, "push", "-u", remote_name, branch_name),
+            prefix,
+        ),
         env=env,
     )
 
 
 def repository_status(repo_path: Path, remote_name: str = "origin", default_branch: str = "main") -> dict[str, Any]:
-    branch = run_command(_git_repo_args(repo_path, "rev-parse", "--abbrev-ref", "HEAD"))
-    commit = run_command(_git_repo_args(repo_path, "rev-parse", "HEAD"))
-    status = run_command(_git_repo_args(repo_path, "status", "--porcelain"))
-    remote = run_command(_git_repo_args(repo_path, "remote", "-v"))
+    branch = run_command(_git_command_for_worktree(repo_path, "rev-parse", "--abbrev-ref", "HEAD"))
+    commit = run_command(_git_command_for_worktree(repo_path, "rev-parse", "HEAD"))
+    status = run_command(_git_command_for_worktree(repo_path, "status", "--porcelain"))
+    remote = run_command(_git_command_for_worktree(repo_path, "remote", "-v"))
     return {
         "path": str(repo_path.resolve()),
         "remote_name": remote_name,
@@ -1292,11 +1303,11 @@ def commit_repository_changes(cfg: ResolvedConfig, repo_path: Path, message: str
     if not git_diff_stat(repo_path).strip():
         return None
     env = {"GIT_TERMINAL_PROMPT": "0", **cfg.env}
-    add_result = run_command(_git_repo_args(repo_path, "add", "-A"), env=env)
+    add_result = run_command(_git_command_for_worktree(repo_path, "add", "-A"), env=env)
     if add_result.returncode != 0:
         raise RuntimeError(add_result.stderr.strip() or add_result.stdout.strip())
     commit_result = run_command(
-        _git_repo_args(repo_path, *_git_identity_args(cfg), "commit", "-m", message),
+        _git_command_for_worktree(repo_path, *_git_identity_args(cfg), "commit", "-m", message),
         env=env,
     )
     if commit_result.returncode != 0:
@@ -1306,7 +1317,7 @@ def commit_repository_changes(cfg: ResolvedConfig, repo_path: Path, message: str
         if "nothing to commit" in combined.lower():
             return None
         raise RuntimeError(stderr or stdout)
-    head_result = run_command(_git_repo_args(repo_path, "rev-parse", "HEAD"), env=env)
+    head_result = run_command(_git_command_for_worktree(repo_path, "rev-parse", "HEAD"), env=env)
     if head_result.returncode != 0:
         raise RuntimeError(head_result.stderr.strip() or head_result.stdout.strip())
     return {

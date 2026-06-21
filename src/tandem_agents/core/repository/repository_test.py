@@ -18,6 +18,7 @@ from src.tandem_agents.core.repository.repository import (
     _github_pat,
     checkout_run_branch,
     checkout_run_worktree,
+    commit_repository_changes,
     create_worktree,
     current_repository_branch,
     fetch_pr_refs,
@@ -138,6 +139,66 @@ class RepositoryNamingTest(unittest.TestCase):
             self.assertEqual(current_repository_branch(repo, cfg=cfg), "main")
             self.assertEqual((checked_out / "README.md").read_text(encoding="utf-8"), "before\n")
             self.assertNotIn("/", checked_out.name)
+
+    def test_checkout_run_worktree_gitdir_is_visible_to_engine_and_aca(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aca_root = root / "aca"
+            host_root = root / "host"
+            aca_root.mkdir()
+            host_root.symlink_to(aca_root, target_is_directory=True)
+            repo = aca_root / "workspace" / "repos" / "demo"
+            repo.mkdir(parents=True)
+            run_command(["git", "init", "--initial-branch=main", str(repo)])
+            (repo / "README.md").write_text("before\n", encoding="utf-8")
+            run_command(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=ACA",
+                    "-c",
+                    "user.email=tandem-agents.invalid",
+                    "add",
+                    "README.md",
+                ]
+            )
+            run_command(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=ACA",
+                    "-c",
+                    "user.email=tandem-agents.invalid",
+                    "commit",
+                    "-m",
+                    "init",
+                ]
+            )
+            branch = "aca/test-run"
+            worktree = aca_root / "runs" / "run-1" / "repo" / "demo-run"
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "ACA_ROOT": str(aca_root),
+                    "ACA_ENGINE_HOST_ROOT": str(host_root),
+                },
+            ):
+                cfg = _config_for_repo(aca_root, repo)
+                checked_out = checkout_run_worktree(cfg, repo, worktree, branch)
+                git_file_text = (checked_out / ".git").read_text(encoding="utf-8")
+                self.assertIn(str(host_root), git_file_text)
+                self.assertEqual(current_repository_branch(checked_out, cfg=cfg), branch)
+
+                (checked_out / "README.md").write_text("after\n", encoding="utf-8")
+                commit = commit_repository_changes(cfg, checked_out, "update readme")
+
+            self.assertIsNotNone(commit)
+            self.assertEqual(current_repository_branch(repo, cfg=cfg), "main")
 
     def test_checkout_run_worktree_rejects_destination_outside_output_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
