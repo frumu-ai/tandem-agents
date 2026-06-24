@@ -25,7 +25,9 @@ from src.tandem_agents.core.integrations.github_mcp import (
     cached_project_item_status,
     ensure_github_mcp_connected,
     fetch_project_item,
+    github_project_operator_actions,
     github_project_status_key_is_actionable,
+    github_projects_readiness_message,
     normalize_status_key,
     remember_project_item_status,
 )
@@ -75,7 +77,13 @@ def _github_project_schema(cfg: ResolvedConfig, owner: str, project: int) -> dic
             return _extract_project_schema(result)
         except RuntimeError:
             continue
-    raise RuntimeError("Could not extract GitHub project schema from MCP result.")
+    raise RuntimeError(
+        github_projects_readiness_message(
+            "read",
+            "schema drift: could not extract GitHub Project fields from MCP result",
+            actions=["connect_github_project"],
+        )
+    )
 
 
 def _github_project_items(
@@ -97,7 +105,13 @@ def _github_project_items(
         if result is None:
             continue
         return result
-    raise RuntimeError("Could not read GitHub project items from the connected GitHub MCP server.")
+    raise RuntimeError(
+        github_projects_readiness_message(
+            "read",
+            "could not read Project items from the connected GitHub MCP server",
+            actions=["connect_github_project"],
+        )
+    )
 
 
 def _github_project_board_cache_path(cfg: ResolvedConfig) -> Path:
@@ -530,6 +544,73 @@ def _project_status_field_ids(schema: dict[str, Any]) -> list[str]:
         if field_id:
             status_field_ids.append(field_id)
     return status_field_ids
+
+
+def _github_project_readiness(
+    schema: dict[str, Any],
+    items: list[dict[str, Any]],
+    *,
+    read_error: str = "",
+) -> dict[str, Any]:
+    status_field_id, status_option_map = _normalized_status_option_map(schema)
+    unresolved_items = []
+    for item in items:
+        status_key = normalize_status_key(
+            str(
+                item.get("effective_status_name")
+                or item.get("status_name")
+                or item.get("project_column")
+                or ""
+            )
+        )
+        if status_key and status_key != "unknown":
+            continue
+        unresolved_items.append(
+            str(item.get("project_item_id") or item.get("id") or item.get("title") or "").strip()
+        )
+    unresolved_items = [item for item in unresolved_items if item]
+    read_ready = not read_error and bool(items) and not unresolved_items
+    write_ready = bool(status_field_id and status_option_map)
+    read_detail = ""
+    if read_error:
+        read_detail = read_error
+    elif not items:
+        read_detail = "no Project items were returned"
+    elif unresolved_items:
+        if not _project_status_field_ids(schema):
+            read_detail = "schema drift: Status field values were not returned for Project items"
+        else:
+            read_detail = "remote divergence or schema drift: Project item status is missing"
+        read_detail += f" ({', '.join(unresolved_items[:5])})"
+    write_detail = ""
+    if not write_ready:
+        if status_field_id is None:
+            write_detail = "Status field id is missing, so Project item status updates cannot be written"
+        else:
+            write_detail = "Status option map is missing, so Project item status updates cannot be written"
+    return {
+        "read": {
+            "ready": read_ready,
+            "message": ""
+            if read_ready
+            else github_projects_readiness_message(
+                "read",
+                read_detail or "read capability unavailable",
+                actions=["connect_github_project"],
+            ),
+        },
+        "write": {
+            "ready": write_ready,
+            "message": ""
+            if write_ready
+            else github_projects_readiness_message(
+                "write",
+                write_detail or "write capability unavailable",
+                actions=["connect_github_project"],
+            ),
+        },
+        "operator_actions": github_project_operator_actions(),
+    }
 
 
 def _github_token(cfg: ResolvedConfig) -> str:
@@ -1886,6 +1967,13 @@ def linear_board_snapshot(
             snapshot["source"] = "cached"
             snapshot["is_stale"] = False
             snapshot["cache_age_ms"] = now_ms - last_synced_at_ms
+            snapshot.setdefault(
+                "readiness",
+                _github_project_readiness(
+                    dict(snapshot.get("project_schema") or {}),
+                    list(snapshot.get("items") or []),
+                ),
+            )
             return snapshot
     try:
         statuses, _labels, issues = _load_linear_live_data(
@@ -1900,6 +1988,11 @@ def linear_board_snapshot(
             snapshot["is_stale"] = True
             snapshot["warning"] = str(exc)
             snapshot["cache_age_ms"] = now_ms - int(snapshot.get("last_synced_at_ms") or 0)
+            snapshot["readiness"] = _github_project_readiness(
+                dict(snapshot.get("project_schema") or {}),
+                list(snapshot.get("items") or []),
+                read_error=str(exc),
+            )
             return snapshot
         raise
     hydration_candidates = [
@@ -2318,11 +2411,13 @@ def github_project_board_snapshot(
             "project_number": project_number,
             "name": _github_project_name(schema, owner, project_number),
         },
+        "project_schema": schema,
         "status_field_id": status_field_id,
         "status_option_map": status_option_map,
         "columns": columns,
         "items": board_items,
         "scheduler": scheduler,
+        "readiness": _github_project_readiness(schema, board_items),
         "source": "live",
         "is_stale": False,
         "warning": "",
@@ -2779,6 +2874,7 @@ def preview_task(cfg: ResolvedConfig, coordination: CoordinationStore | None = N
             "source_type": source_type,
             "board_path": None,
             "board_summary": board_summary,
+            "readiness": _github_project_readiness(schema, items),
         }
         if warning:
             preview["warning"] = warning

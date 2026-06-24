@@ -28,6 +28,18 @@ def normalize_status_key(value: str | None) -> str:
 
 
 GITHUB_PROJECT_ACTIONABLE_STATUS_KEYS = {"ready", "backlog", "todo", "todos"}
+GITHUB_PROJECT_TERMINAL_STATUS_KEYS = {"done", "completed", "closed"}
+GITHUB_PROJECT_ACTIVE_STATUS_KEYS = {
+    "claimed",
+    "active",
+    "running",
+    "in_progress",
+    "planning",
+    "worker_execution",
+    "coder_execution",
+    "review",
+    "testing",
+}
 GITHUB_PROJECT_STATUS_BY_TASK_STATE = {
     "ready": "Ready",
     "queued": "Ready",
@@ -47,6 +59,13 @@ GITHUB_PROJECT_STATUS_BY_TASK_STATE = {
     "failed": "Blocked",
     "cancelled": "Blocked",
     "done": "Done",
+}
+
+GITHUB_PROJECT_OPERATOR_ACTIONS = {
+    "connect_github_project": "Connect GitHub Project",
+    "resync_outward": "Re-sync outward",
+    "ignore_remote_drift": "Ignore remote drift",
+    "start_new_run_from_reopened_item": "Start new run from reopened item",
 }
 
 
@@ -70,6 +89,49 @@ def github_project_status_name_for_outcome(outcome: str | None) -> str:
 
 def github_project_status_key_is_actionable(status_name: str | None) -> bool:
     return normalize_status_key(status_name) in GITHUB_PROJECT_ACTIONABLE_STATUS_KEYS
+
+
+def github_project_operator_actions() -> list[dict[str, str]]:
+    return [
+        {
+            "id": "connect_github_project",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["connect_github_project"],
+            "description": "Connect or refresh the GitHub MCP server with Project read/write scopes.",
+        },
+        {
+            "id": "resync_outward",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["resync_outward"],
+            "description": "Apply ACA's intended status or comment to the remote GitHub Project item.",
+        },
+        {
+            "id": "ignore_remote_drift",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["ignore_remote_drift"],
+            "description": "Keep ACA's local run state and leave the remote Project item unchanged.",
+        },
+        {
+            "id": "start_new_run_from_reopened_item",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["start_new_run_from_reopened_item"],
+            "description": "Treat a reopened actionable Project item as a fresh task source candidate.",
+        },
+    ]
+
+
+def github_projects_readiness_message(
+    mode: str,
+    detail: str,
+    *,
+    actions: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    mode_text = str(mode or "read").strip().lower()
+    detail_text = str(detail or "capability unavailable").strip()
+    selected_actions = list(actions or ["connect_github_project"])
+    labels = [
+        GITHUB_PROJECT_OPERATOR_ACTIONS.get(action, action.replace("_", " "))
+        for action in selected_actions
+        if action
+    ]
+    suffix = f" Operator actions: {', '.join(labels)}." if labels else ""
+    return f"GitHub Projects {mode_text} readiness degraded: {detail_text}.{suffix}"
 
 
 def _github_project_status_cache_path(cfg: ResolvedConfig) -> Path:
@@ -780,7 +842,19 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
     option_map = dict(source.get("status_option_map") or {})
     option_id = option_map.get(normalize_status_key(status_name))
     if not status_field_id or not project_item_id or not option_id:
-        return f"Missing GitHub Project status metadata for target status '{status_name}'."
+        missing = []
+        if not status_field_id:
+            missing.append("status_field_id")
+        if not project_item_id:
+            missing.append("project_item_id")
+        if not option_id:
+            missing.append(f"status option for '{status_name}'")
+        return github_projects_readiness_message(
+            "write",
+            "missing GitHub Project status metadata for target status "
+            f"'{status_name}' ({', '.join(missing)})",
+            actions=["connect_github_project"],
+        )
     current_status = str(
         cached_project_item_status(
             cfg,
@@ -789,29 +863,42 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
             item_id=project_item_id,
         )
     ).strip()
-    if normalize_status_key(current_status) != normalize_status_key(status_name):
-        try:
-            live_item = fetch_project_item(
+    live_status = ""
+    try:
+        live_item = fetch_project_item(
+            cfg,
+            str(source.get("owner") or ""),
+            int(source.get("project") or 0),
+            int(project_item_id),
+            fields=[str(status_field_id)],
+        )
+        live_status = _project_item_status_name(live_item)
+    except Exception:
+        pass
+
+    target_key = normalize_status_key(status_name)
+    current_key = normalize_status_key(current_status)
+    live_key = normalize_status_key(live_status)
+    if live_status:
+        if live_key == target_key:
+            remember_project_item_status(
                 cfg,
-                str(source.get("owner") or ""),
-                int(source.get("project") or 0),
-                int(project_item_id),
-                fields=[str(status_field_id)],
+                owner=str(source.get("owner") or ""),
+                project_number=source.get("project") or 0,
+                item_id=project_item_id,
+                status_name=status_name,
+                source="github_mcp.update_project_item_status.live",
             )
-            live_status = _project_item_status_name(live_item)
-            if normalize_status_key(live_status) == normalize_status_key(status_name):
-                remember_project_item_status(
-                    cfg,
-                    owner=str(source.get("owner") or ""),
-                    project_number=source.get("project") or 0,
-                    item_id=project_item_id,
-                    status_name=status_name,
-                    source="github_mcp.update_project_item_status.live",
-                )
-                return None
-        except Exception:
-            pass
-    else:
+            return None
+        if live_key in GITHUB_PROJECT_TERMINAL_STATUS_KEYS and target_key in GITHUB_PROJECT_ACTIVE_STATUS_KEYS:
+            return github_projects_readiness_message(
+                "write",
+                "remote divergence detected for Project item "
+                f"{project_item_id}: cached status '{current_status}', live status '{live_status}', "
+                f"target status '{status_name}'",
+                actions=["resync_outward", "ignore_remote_drift", "start_new_run_from_reopened_item"],
+            )
+    if current_key == target_key and not live_status:
         return None
     result = execute_engine_tool(
         cfg,
