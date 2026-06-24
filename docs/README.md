@@ -62,6 +62,7 @@ Project files live one level up in the repository tree:
 - `COMMANDS.md` - operator commands for checking and triggering actions
 - `RUN_STATE_SCHEMA.md` - exact run-state contract for status and events
 - `CODING_TASKS_WITH_TANDEM.md` - coding-task execution loop for Tandem-backed repository edits
+- `CODING_TASK_CONTRACT.md` - canonical coding-task envelope, coder handoff, and debugger surface contract
 - `DOCKER_COMPOSE.md` - containerized startup notes
 - `MONITORING.md` - how to watch runs and logs
 - `TANDEM_CONTROL_PANEL_INTEGRATION.md` - how to connect external control panels
@@ -79,15 +80,16 @@ Project files live one level up in the repository tree:
 5. Read `KANBAN_BOARD.md`
 6. Read `REPO_BINDING.md`
 7. Read `CODING_TASKS_WITH_TANDEM.md`
-8. Read `CONFIG_SCHEMA.md`
-9. Read `COMMANDS.md`
-10. Read `RUN_STATE_SCHEMA.md`
-11. Read `ENGINE_MANAGEMENT.md`
-12. Read `DOCKER_COMPOSE.md`
-13. Read `MONITORING.md`
-14. Read `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md`
-15. Read `LINEAR_ACA_SMOKE_RUNBOOK.md` before testing the Linear ACA coding loop
-16. Run `../scripts/setup.sh` to seed token files and the local control-panel config
+8. Read `CODING_TASK_CONTRACT.md`
+9. Read `CONFIG_SCHEMA.md`
+10. Read `COMMANDS.md`
+11. Read `RUN_STATE_SCHEMA.md`
+12. Read `ENGINE_MANAGEMENT.md`
+13. Read `DOCKER_COMPOSE.md`
+14. Read `MONITORING.md`
+15. Read `TANDEM_KB_MCP_AND_ACA_OVERVIEW.md`
+16. Read `LINEAR_ACA_SMOKE_RUNBOOK.md` before testing the Linear ACA coding loop
+17. Run `../scripts/setup.sh` to seed token files and the local control-panel config
 
 ## Typical Setup
 
