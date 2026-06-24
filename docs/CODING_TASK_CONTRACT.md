@@ -51,6 +51,21 @@ ACA recognizes common headings such as `Program context`, `Local goal`, `Scope`,
 When present, a `tandem:coder_handoff:v1` HTML comment can add structured
 handoff data from an upstream triage system. That handoff may contribute likely
 files, verification steps, acceptance criteria, failure context, and risk notes.
+The JSON object inside the comment must include
+`"handoff_type": "tandem_autonomous_coder_issue"`; ACA ignores handoff blocks
+without that type so unrelated comments cannot be interpreted as coding tasks.
+
+Example:
+
+```markdown
+<!-- tandem:coder_handoff:v1
+{
+  "handoff_type": "tandem_autonomous_coder_issue",
+  "likely_files": ["src/example.py"],
+  "verification_commands": ["python3 -m unittest tests.example_test"]
+}
+-->
+```
 
 The current implementation lives in:
 
