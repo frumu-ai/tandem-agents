@@ -431,6 +431,53 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertFalse(snapshot["readiness"]["write"]["ready"])
             self.assertIn("GitHub Projects write readiness degraded", snapshot["readiness"]["write"]["message"])
 
+    def test_github_project_stale_cache_degrades_read_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Cached ready task",
+                    "status_name": "Ready",
+                    "content": {"number": 188421130, "title": "Cached ready task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    live_snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertTrue(live_snapshot["readiness"]["read"]["ready"])
+            self.assertTrue(live_snapshot["readiness"]["write"]["ready"])
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                side_effect=RuntimeError("schema drift: live Project items unavailable"),
+            ):
+                stale_snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertEqual(stale_snapshot["source"], "cached")
+            self.assertTrue(stale_snapshot["is_stale"])
+            self.assertEqual(stale_snapshot["warning"], "schema drift: live Project items unavailable")
+            self.assertFalse(stale_snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", stale_snapshot["readiness"]["read"]["message"])
+            self.assertIn("schema drift", stale_snapshot["readiness"]["read"]["message"])
+            self.assertTrue(stale_snapshot["readiness"]["write"]["ready"])
+
     def test_github_project_readiness_degrades_when_status_is_cached_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -2265,6 +2265,15 @@ def github_project_board_snapshot(
             snapshot["is_stale"] = True
             snapshot["warning"] = str(exc)
             snapshot["cache_age_ms"] = now_ms - int(snapshot.get("last_synced_at_ms") or 0)
+            project_schema = snapshot.get("project_schema")
+            cached_schema = project_schema if isinstance(project_schema, dict) else {}
+            project_items = snapshot.get("items")
+            cached_items = project_items if isinstance(project_items, list) else []
+            snapshot["readiness"] = _github_project_readiness(
+                cached_schema,
+                cached_items,
+                read_error=str(exc),
+            )
             return snapshot
         raise
     status_field_id, status_option_map = _normalized_status_option_map(schema)
