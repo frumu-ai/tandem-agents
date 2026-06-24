@@ -163,6 +163,40 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertIn("Start new run from reopened item", warning or "")
             tool_mock.assert_not_called()
 
+    def test_update_project_item_status_reports_non_terminal_remote_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Ready",
+                source="test",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Blocked"}}
+                    warning = update_project_item_status(cfg, task, "In progress")
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'Ready'", warning or "")
+            self.assertIn("live status 'Blocked'", warning or "")
+            self.assertIn("target status 'In progress'", warning or "")
+            tool_mock.assert_not_called()
+
     def test_github_project_readiness_action_labels_are_stable(self) -> None:
         labels = [action["label"] for action in github_project_operator_actions()]
         self.assertIn("Connect GitHub Project", labels)

@@ -890,6 +890,14 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
                 source="github_mcp.update_project_item_status.live",
             )
             return None
+        if current_status and live_key != current_key:
+            return github_projects_readiness_message(
+                "write",
+                "remote divergence detected for Project item "
+                f"{project_item_id}: cached status '{current_status}', live status '{live_status}', "
+                f"target status '{status_name}'",
+                actions=["resync_outward", "ignore_remote_drift", "start_new_run_from_reopened_item"],
+            )
         if live_key in GITHUB_PROJECT_TERMINAL_STATUS_KEYS and target_key in GITHUB_PROJECT_ACTIVE_STATUS_KEYS:
             return github_projects_readiness_message(
                 "write",
