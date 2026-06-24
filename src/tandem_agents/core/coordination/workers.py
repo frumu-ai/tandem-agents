@@ -149,6 +149,20 @@ class CoordinationWorkersMixin:
                 """,
                 (now - stale_after_ms,),
             ).fetchall()
+            stale_by_host: dict[str, int] = {}
+            for row in rows:
+                host_id = str(row["host_id"] or "").strip()
+                if host_id:
+                    stale_by_host[host_id] = stale_by_host.get(host_id, 0) + 1
+            dead_hosts: set[str] = set()
+            for host_id, stale_count in stale_by_host.items():
+                total_row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM workers WHERE host_id = ? AND current_lease_id IS NOT NULL",
+                    (host_id,),
+                ).fetchone()
+                active_count = int((total_row["count"] if total_row else 0) or 0)
+                if active_count > 1 and stale_count >= active_count:
+                    dead_hosts.add(host_id)
             for row in rows:
                 lease_id = str(row["current_lease_id"] or "").strip()
                 lease = conn.execute("SELECT * FROM leases WHERE lease_id = ?", (lease_id,)).fetchone() if lease_id else None
@@ -156,10 +170,13 @@ class CoordinationWorkersMixin:
                 row_worker_id = str(row["worker_id"] or "").strip()
                 lease_owned_by_worker = bool(lease and lease_worker_id == row_worker_id)
                 lease_heartbeat_at = int(lease["heartbeat_at_ms"] or 0) if lease else 0
+                lease_is_active = bool(lease and str(lease["status"] or "").strip().lower() == "active")
                 lease_heartbeat_stale = lease_heartbeat_at <= now - stale_after_ms
-                if lease and lease["status"] == "active" and lease_owned_by_worker and not lease_heartbeat_stale:
+                host_is_dead = str(row["host_id"] or "").strip() in dead_hosts
+                should_reap_lease = lease_is_active and lease_owned_by_worker and (lease_heartbeat_stale or host_is_dead)
+                if lease_is_active and lease_owned_by_worker and not should_reap_lease:
                     continue
-                if lease and lease["status"] == "active" and lease_owned_by_worker and lease_heartbeat_stale:
+                if should_reap_lease:
                     conn.execute(
                         "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
                         (now, lease_id),
@@ -177,7 +194,7 @@ class CoordinationWorkersMixin:
                     (now, row["worker_id"]),
                 )
                 stale_worker = self._row_to_worker(row)
-                if lease_owned_by_worker and lease_heartbeat_stale:
+                if should_reap_lease:
                     stale_worker.update(
                         {
                             "lease_id": str(lease["lease_id"] or ""),
@@ -202,16 +219,33 @@ class CoordinationWorkersMixin:
             """,
             (now - stale_after_ms,),
         ).fetchall()
+        stale_by_host: dict[str, int] = {}
+        for row in rows:
+            host_id = str(row["host_id"] or "").strip()
+            if host_id:
+                stale_by_host[host_id] = stale_by_host.get(host_id, 0) + 1
+        dead_hosts: set[str] = set()
+        for host_id, stale_count in stale_by_host.items():
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM workers WHERE host_id = ? AND current_lease_id IS NOT NULL",
+                (host_id,),
+            ).fetchone()
+            active_count = int((total_row["count"] if total_row else 0) or 0)
+            if active_count > 1 and stale_count >= active_count:
+                dead_hosts.add(host_id)
         for row in rows:
             lease_id = str(row["current_lease_id"] or "").strip()
             lease = conn.execute("SELECT * FROM leases WHERE lease_id = ?", (lease_id,)).fetchone() if lease_id else None
             lease_worker_id = str(lease["worker_id"] or "").strip() if lease else ""
             row_worker_id = str(row["worker_id"] or "").strip()
             lease_heartbeat_at = int(lease["heartbeat_at_ms"] or 0) if lease else 0
+            lease_is_active = bool(lease and str(lease["status"] or "").strip().lower() == "active")
             lease_heartbeat_stale = lease_heartbeat_at <= now - stale_after_ms
-            if lease and lease["status"] == "active" and lease_worker_id == row_worker_id and not lease_heartbeat_stale:
+            host_is_dead = str(row["host_id"] or "").strip() in dead_hosts
+            should_reap_lease = lease_is_active and lease_worker_id == row_worker_id and (lease_heartbeat_stale or host_is_dead)
+            if lease_is_active and lease_worker_id == row_worker_id and not should_reap_lease:
                 continue
-            if lease and lease["status"] == "active" and lease_worker_id == row_worker_id and lease_heartbeat_stale:
+            if should_reap_lease:
                 conn.execute(
                     "UPDATE leases SET status = 'stale', released_at_ms = ?, release_reason = 'worker stale' WHERE lease_id = ?",
                     (now, lease_id),
