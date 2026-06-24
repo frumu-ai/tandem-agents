@@ -680,6 +680,53 @@ class LinearTaskSourceTest(unittest.TestCase):
 
             self.assertNotEqual(_linear_board_cache_key(cfg_a), _linear_board_cache_key(cfg_b))
 
+    def test_linear_cached_snapshots_do_not_report_github_project_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cache_path = cfg.output_root() / "state" / "linear_boards.json"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_key = _linear_board_cache_key(cfg)
+            cached_snapshot = {
+                "project": {"team": "ENG", "project": "Runtime", "name": "Runtime"},
+                "columns": [],
+                "items": [],
+                "scheduler": {"next_item_ids": [], "next_issue_numbers": []},
+                "source": "live",
+                "is_stale": False,
+                "warning": "",
+                "last_synced_at_ms": 9_999_999_999_999,
+                "cache_age_ms": 0,
+                "readiness": {
+                    "read": {
+                        "ready": False,
+                        "message": "GitHub Projects read readiness degraded: stale cache",
+                    },
+                    "write": {
+                        "ready": False,
+                        "message": "GitHub Projects write readiness degraded: stale cache",
+                    },
+                },
+            }
+            cache_path.write_text(json.dumps({cache_key: cached_snapshot}), encoding="utf-8")
+
+            fresh_cached = linear_board_snapshot(cfg)
+
+            self.assertEqual(fresh_cached["source"], "cached")
+            self.assertNotIn("readiness", fresh_cached)
+
+            cached_snapshot["last_synced_at_ms"] = 1
+            cache_path.write_text(json.dumps({cache_key: cached_snapshot}), encoding="utf-8")
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                side_effect=RuntimeError("linear unavailable"),
+            ):
+                stale_cached = linear_board_snapshot(cfg, force_refresh=True)
+
+            self.assertEqual(stale_cached["source"], "cached")
+            self.assertTrue(stale_cached["is_stale"])
+            self.assertEqual(stale_cached["warning"], "linear unavailable")
+            self.assertNotIn("readiness", stale_cached)
+
     def test_linear_selection_prefers_configured_actionable_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self._config(Path(tmp))

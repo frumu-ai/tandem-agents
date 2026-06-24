@@ -1967,13 +1967,7 @@ def linear_board_snapshot(
             snapshot["source"] = "cached"
             snapshot["is_stale"] = False
             snapshot["cache_age_ms"] = now_ms - last_synced_at_ms
-            snapshot.setdefault(
-                "readiness",
-                _github_project_readiness(
-                    dict(snapshot.get("project_schema") or {}),
-                    list(snapshot.get("items") or []),
-                ),
-            )
+            snapshot.pop("readiness", None)
             return snapshot
     try:
         statuses, _labels, issues = _load_linear_live_data(
@@ -1988,11 +1982,7 @@ def linear_board_snapshot(
             snapshot["is_stale"] = True
             snapshot["warning"] = str(exc)
             snapshot["cache_age_ms"] = now_ms - int(snapshot.get("last_synced_at_ms") or 0)
-            snapshot["readiness"] = _github_project_readiness(
-                dict(snapshot.get("project_schema") or {}),
-                list(snapshot.get("items") or []),
-                read_error=str(exc),
-            )
+            snapshot.pop("readiness", None)
             return snapshot
         raise
     hydration_candidates = [
