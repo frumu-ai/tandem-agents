@@ -3,6 +3,8 @@
 This guide explains how ACA should handle code-changing work when it is using Tandem as the execution runtime.
 
 Use this when a task turns into a real repository edit, not just planning or status tracking.
+For the canonical task envelope, coder handoff fields, and debugger surface
+expectations, see [ACA Coding Task Contract](./CODING_TASK_CONTRACT.md).
 
 ## Core rule
 
@@ -113,6 +115,7 @@ Example stage contract:
 
 ## Related docs
 
+- [ACA Coding Task Contract](./CODING_TASK_CONTRACT.md)
 - [Repo Binding](./REPO_BINDING.md)
 - GitHub Projects guidance is kept in internal docs and omitted from the public repo.
 - [Autonomous Coding Over Python SDK: Git Access](./AUTONOMOUS_CODING_PYTHON_SDK_GIT_ACCESS.md)
