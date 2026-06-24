@@ -431,6 +431,91 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertFalse(snapshot["readiness"]["write"]["ready"])
             self.assertIn("GitHub Projects write readiness degraded", snapshot["readiness"]["write"]["message"])
 
+    def test_github_project_readiness_degrades_when_status_is_cached_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=188421130,
+                status_name="Ready",
+                source="test",
+            )
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Cached ready task",
+                    "effective_status_name": "Ready",
+                    "effective_status_key": "ready",
+                    "content": {"number": 188421130, "title": "Cached ready task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            item = snapshot["items"][0]
+            self.assertEqual(item["status_key"], "ready")
+            self.assertTrue(item["actionable"])
+            self.assertFalse(snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", snapshot["readiness"]["read"]["message"])
+            self.assertIn("status is missing", snapshot["readiness"]["read"]["message"])
+            self.assertTrue(snapshot["readiness"]["write"]["ready"])
+
+    def test_github_project_readiness_uses_raw_status_before_preview_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Selected missing status task",
+                    "content": {"number": 188421130, "title": "Selected missing status task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch(
+                    "src.tandem_agents.runtime.task_sources.preview_task",
+                    return_value={"task": {"source": {"project_item_id": 188421130}}},
+                ):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            item = snapshot["items"][0]
+            self.assertEqual(item["status_key"], "ready")
+            self.assertTrue(item["actionable"])
+            self.assertFalse(snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", snapshot["readiness"]["read"]["message"])
+
     def test_reopened_terminal_project_item_prefers_live_actionable_status_over_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -496,6 +581,7 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
                 {
                     "project_item_id": 188421130,
                     "title": "Ready task",
+                    "status_name": "Ready",
                     "effective_status_name": "Ready",
                     "effective_status_key": "ready",
                     "content": {"number": 188421130, "title": "Ready task"},

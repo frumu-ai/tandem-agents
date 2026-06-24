@@ -555,14 +555,7 @@ def _github_project_readiness(
     status_field_id, status_option_map = _normalized_status_option_map(schema)
     unresolved_items = []
     for item in items:
-        status_key = normalize_status_key(
-            str(
-                item.get("effective_status_name")
-                or item.get("status_name")
-                or item.get("project_column")
-                or ""
-            )
-        )
+        status_key = normalize_status_key(str(item.get("status_name") or ""))
         if status_key and status_key != "unknown":
             continue
         unresolved_items.append(
@@ -2223,6 +2216,9 @@ def _load_github_project_live_data(
                 _collect_project_items(detail, detail_items)
                 if detail_items:
                     detail_item = detail_items[0]
+                    detail_status = str(detail_item.get("status_name") or "").strip()
+                    if detail_status:
+                        item["status_name"] = detail_status
                     effective_status_name, effective_status_key = _effective_project_status(
                         cfg,
                         owner=owner,
@@ -2272,6 +2268,7 @@ def github_project_board_snapshot(
             return snapshot
         raise
     status_field_id, status_option_map = _normalized_status_option_map(schema)
+    readiness = _github_project_readiness(schema, items)
 
     columns: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -2407,7 +2404,7 @@ def github_project_board_snapshot(
         "columns": columns,
         "items": board_items,
         "scheduler": scheduler,
-        "readiness": _github_project_readiness(schema, board_items),
+        "readiness": readiness,
         "source": "live",
         "is_stale": False,
         "warning": "",
