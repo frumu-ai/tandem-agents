@@ -119,6 +119,24 @@ Provider stream failures masked a missing workspace artifact.
         self.assertIn("Bug Monitor triage run: automation-v2-run-123", task["notes_for_agent"])
         self.assertIn("Bug Monitor coder-ready signal: True", task["notes_for_agent"])
 
+    def test_tandem_coder_handoff_accepts_documented_aliases(self) -> None:
+        body = """<!-- tandem:coder_handoff:v1
+{
+  "handoff_type": "tandem_autonomous_coder_issue",
+  "likely_files": ["src/example.py"],
+  "verification_commands": ["python3 -m unittest tests.example_test"]
+}
+-->
+"""
+
+        task = apply_task_contract({"title": "Fix example", "description": body})
+
+        self.assertEqual(task["target_files"], ["src/example.py"])
+        self.assertEqual(
+            task["verification_commands"],
+            ["python3 -m unittest tests.example_test"],
+        )
+
     def test_linear_decision_note_task_is_not_code_edit(self) -> None:
         body = """## Context
 

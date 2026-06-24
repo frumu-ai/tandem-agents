@@ -271,12 +271,21 @@ def parse_task_contract(
             target_files,
             [
                 _normalize_repo_relative_path(entry)
-                for entry in _coerce_text_list(tandem_coder_handoff.get("likely_files_to_edit"))
+                for entry in _merge_unique(
+                    _coerce_text_list(tandem_coder_handoff.get("likely_files_to_edit")),
+                    _merge_unique(
+                        _coerce_text_list(tandem_coder_handoff.get("likely_files")),
+                        _coerce_text_list(tandem_coder_handoff.get("target_files")),
+                    ),
+                )
             ],
         )
         verification_commands = _merge_unique(
             verification_commands,
-            _coerce_text_list(tandem_coder_handoff.get("verification_steps")),
+            _merge_unique(
+                _coerce_text_list(tandem_coder_handoff.get("verification_steps")),
+                _coerce_text_list(tandem_coder_handoff.get("verification_commands")),
+            ),
         )
         acceptance_criteria = _merge_unique(
             acceptance_criteria,
