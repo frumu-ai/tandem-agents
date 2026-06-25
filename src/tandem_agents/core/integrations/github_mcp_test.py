@@ -226,6 +226,44 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertIn("target status 'In progress'", warning or "")
             tool_mock.assert_not_called()
 
+    def test_update_project_item_status_uses_intake_observation_as_claim_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Ready",
+                source="github_project.intake.live_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Blocked"}}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("active"),
+                    )
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'Ready'", warning or "")
+            self.assertIn("live status 'Blocked'", warning or "")
+            self.assertIn("target status 'In progress'", warning or "")
+            tool_mock.assert_not_called()
+
     def test_update_project_item_status_claims_reopened_actionable_item(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

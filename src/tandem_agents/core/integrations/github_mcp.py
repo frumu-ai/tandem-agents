@@ -307,9 +307,6 @@ def cached_project_item_status(
     if not isinstance(record, dict):
         return ""
     if baseline_only:
-        source = str(record.get("source") or "")
-        if _github_project_status_source_is_observation(source):
-            return ""
         return str(record.get("status_name") or "").strip()
     observed_status = str(record.get("observed_status_name") or "").strip()
     if observed_status:
