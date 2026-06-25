@@ -28,6 +28,19 @@ def normalize_status_key(value: str | None) -> str:
 
 
 GITHUB_PROJECT_ACTIONABLE_STATUS_KEYS = {"ready", "backlog", "todo", "todos"}
+GITHUB_PROJECT_TERMINAL_STATUS_KEYS = {"done", "completed", "closed"}
+GITHUB_PROJECT_ACTIVE_STATUS_KEYS = {
+    "claimed",
+    "active",
+    "running",
+    "in_progress",
+    "planning",
+    "worker_execution",
+    "coder_execution",
+    "review",
+    "in_review",
+    "testing",
+}
 GITHUB_PROJECT_STATUS_BY_TASK_STATE = {
     "ready": "Ready",
     "queued": "Ready",
@@ -47,6 +60,13 @@ GITHUB_PROJECT_STATUS_BY_TASK_STATE = {
     "failed": "Blocked",
     "cancelled": "Blocked",
     "done": "Done",
+}
+
+GITHUB_PROJECT_OPERATOR_ACTIONS = {
+    "connect_github_project": "Connect GitHub Project",
+    "resync_outward": "Re-sync outward",
+    "ignore_remote_drift": "Ignore remote drift",
+    "start_new_run_from_reopened_item": "Start new run from reopened item",
 }
 
 
@@ -72,12 +92,62 @@ def github_project_status_key_is_actionable(status_name: str | None) -> bool:
     return normalize_status_key(status_name) in GITHUB_PROJECT_ACTIONABLE_STATUS_KEYS
 
 
+def github_project_operator_actions() -> list[dict[str, str]]:
+    return [
+        {
+            "id": "connect_github_project",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["connect_github_project"],
+            "description": "Connect or refresh the GitHub MCP server with Project read/write scopes.",
+        },
+        {
+            "id": "resync_outward",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["resync_outward"],
+            "description": "Apply ACA's intended status or comment to the remote GitHub Project item.",
+        },
+        {
+            "id": "ignore_remote_drift",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["ignore_remote_drift"],
+            "description": "Keep ACA's local run state and leave the remote Project item unchanged.",
+        },
+        {
+            "id": "start_new_run_from_reopened_item",
+            "label": GITHUB_PROJECT_OPERATOR_ACTIONS["start_new_run_from_reopened_item"],
+            "description": "Treat a reopened actionable Project item as a fresh task source candidate.",
+        },
+    ]
+
+
+def github_projects_readiness_message(
+    mode: str,
+    detail: str,
+    *,
+    actions: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    mode_text = str(mode or "read").strip().lower()
+    detail_text = str(detail or "capability unavailable").strip()
+    selected_actions = list(actions or ["connect_github_project"])
+    labels = [
+        GITHUB_PROJECT_OPERATOR_ACTIONS.get(action, action.replace("_", " "))
+        for action in selected_actions
+        if action
+    ]
+    suffix = f" Operator actions: {', '.join(labels)}." if labels else ""
+    return f"GitHub Projects {mode_text} readiness degraded: {detail_text}.{suffix}"
+
+
 def _github_project_status_cache_path(cfg: ResolvedConfig) -> Path:
     return cfg.output_root() / "state" / "github_project_statuses.json"
 
 
 def _github_project_cache_key(owner: str, project_number: int | str, item_id: int | str) -> str:
     return f"{str(owner).strip().lower()}:{int(project_number)}:{int(item_id)}"
+
+
+def _github_project_status_source_is_observation(source: str | None) -> bool:
+    source_text = str(source or "").strip()
+    return source_text.startswith("github_project.intake.") or source_text.startswith(
+        "github_project.board_snapshot."
+    )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -180,14 +250,42 @@ def remember_project_item_status(
         return
     cache = _load_project_status_cache(cfg)
     key = _github_project_cache_key(owner_text, project_number, item_id)
-    cache[key] = {
+    existing = cache.get(key)
+    record = dict(existing) if isinstance(existing, dict) else {}
+    now_ms = int(time.time() * 1000)
+    base_record = {
         "owner": owner_text,
         "project": int(project_number),
         "project_item_id": int(item_id),
+    }
+    if _github_project_status_source_is_observation(source):
+        record.update(base_record)
+        record["observed_status_name"] = status_text
+        record["observed_status_key"] = normalize_status_key(status_text)
+        record["observed_source"] = source
+        record["observed_at_epoch_ms"] = now_ms
+        if not record.get("status_name"):
+            record.update(
+                {
+                    "status_name": status_text,
+                    "status_key": normalize_status_key(status_text),
+                    "source": source,
+                    "updated_at_epoch_ms": now_ms,
+                }
+            )
+        cache[key] = record
+        _write_json(_github_project_status_cache_path(cfg), cache)
+        return
+    cache[key] = {
+        **base_record,
         "status_name": status_text,
         "status_key": normalize_status_key(status_text),
         "source": source,
-        "updated_at_epoch_ms": int(time.time() * 1000),
+        "updated_at_epoch_ms": now_ms,
+        "observed_status_name": status_text,
+        "observed_status_key": normalize_status_key(status_text),
+        "observed_source": source,
+        "observed_at_epoch_ms": now_ms,
     }
     _write_json(_github_project_status_cache_path(cfg), cache)
 
@@ -198,6 +296,7 @@ def cached_project_item_status(
     owner: str,
     project_number: int | str,
     item_id: int | str,
+    baseline_only: bool = False,
 ) -> str:
     owner_text = str(owner).strip()
     if not owner_text or project_number in (None, "") or item_id in (None, ""):
@@ -207,6 +306,11 @@ def cached_project_item_status(
     record = cache.get(key)
     if not isinstance(record, dict):
         return ""
+    if baseline_only:
+        return str(record.get("status_name") or "").strip()
+    observed_status = str(record.get("observed_status_name") or "").strip()
+    if observed_status:
+        return observed_status
     return str(record.get("status_name") or "").strip()
 
 
@@ -713,13 +817,24 @@ def _project_field_text(value: Any) -> str:
     return ""
 
 
+def _project_status_field_value(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _project_field_text(value)
+    for key in ("value", "option", "displayValue", "display_value"):
+        text = _project_field_text(value.get(key))
+        if text:
+            return text
+    name = _project_field_text(value.get("name"))
+    return "" if normalize_status_key(name) == "status" else name
+
+
 def _project_item_status_name(value: Any) -> str:
     if isinstance(value, dict):
         status = value.get("status")
         if isinstance(status, dict):
-            name = status.get("name")
-            if isinstance(name, str) and name.strip():
-                return name.strip()
+            status_text = _project_status_field_value(status)
+            if status_text:
+                return status_text
         elif isinstance(status, str) and status.strip():
             return status.strip()
         status_name = value.get("status_name") or value.get("statusName")
@@ -729,21 +844,16 @@ def _project_item_status_name(value: Any) -> str:
         if isinstance(field_values, dict):
             nested = field_values.get("status")
             if isinstance(nested, dict):
-                name = nested.get("name")
-                if isinstance(name, str) and name.strip():
-                    return name.strip()
+                status_text = _project_status_field_value(nested)
+                if status_text:
+                    return status_text
         elif isinstance(field_values, list):
             for field in field_values:
                 if not isinstance(field, dict):
                     continue
                 if normalize_status_key(_project_field_text(field.get("name"))) != "status":
                     continue
-                status_name = _project_field_text(
-                    field.get("value")
-                    or field.get("name")
-                    or field.get("option")
-                    or field.get("displayValue")
-                )
+                status_name = _project_status_field_value(field)
                 if status_name:
                     return status_name
         fields = value.get("fields")
@@ -753,7 +863,7 @@ def _project_item_status_name(value: Any) -> str:
                     continue
                 if normalize_status_key(_project_field_text(field.get("name"))) != "status":
                     continue
-                status_name = _project_field_text(field.get("value") or field.get("name") or field.get("option"))
+                status_name = _project_status_field_value(field)
                 if status_name:
                     return status_name
         content = value.get("content")
@@ -780,38 +890,77 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
     option_map = dict(source.get("status_option_map") or {})
     option_id = option_map.get(normalize_status_key(status_name))
     if not status_field_id or not project_item_id or not option_id:
-        return f"Missing GitHub Project status metadata for target status '{status_name}'."
+        missing = []
+        if not status_field_id:
+            missing.append("status_field_id")
+        if not project_item_id:
+            missing.append("project_item_id")
+        if not option_id:
+            missing.append(f"status option for '{status_name}'")
+        return github_projects_readiness_message(
+            "write",
+            "missing GitHub Project status metadata for target status "
+            f"'{status_name}' ({', '.join(missing)})",
+            actions=["connect_github_project"],
+        )
     current_status = str(
         cached_project_item_status(
             cfg,
             owner=str(source.get("owner") or ""),
             project_number=source.get("project") or 0,
             item_id=project_item_id,
+            baseline_only=True,
         )
     ).strip()
-    if normalize_status_key(current_status) != normalize_status_key(status_name):
-        try:
-            live_item = fetch_project_item(
+    live_status = ""
+    try:
+        live_item = fetch_project_item(
+            cfg,
+            str(source.get("owner") or ""),
+            int(source.get("project") or 0),
+            int(project_item_id),
+            fields=[str(status_field_id)],
+        )
+        live_status = _project_item_status_name(live_item)
+    except Exception:
+        pass
+
+    target_key = normalize_status_key(status_name)
+    current_key = normalize_status_key(current_status)
+    live_key = normalize_status_key(live_status)
+    reclaims_reopened_item = (
+        current_key in GITHUB_PROJECT_TERMINAL_STATUS_KEYS
+        and live_key in GITHUB_PROJECT_ACTIONABLE_STATUS_KEYS
+        and target_key == "in_progress"
+    )
+    if live_status:
+        if live_key == target_key:
+            remember_project_item_status(
                 cfg,
-                str(source.get("owner") or ""),
-                int(source.get("project") or 0),
-                int(project_item_id),
-                fields=[str(status_field_id)],
+                owner=str(source.get("owner") or ""),
+                project_number=source.get("project") or 0,
+                item_id=project_item_id,
+                status_name=status_name,
+                source="github_mcp.update_project_item_status.live",
             )
-            live_status = _project_item_status_name(live_item)
-            if normalize_status_key(live_status) == normalize_status_key(status_name):
-                remember_project_item_status(
-                    cfg,
-                    owner=str(source.get("owner") or ""),
-                    project_number=source.get("project") or 0,
-                    item_id=project_item_id,
-                    status_name=status_name,
-                    source="github_mcp.update_project_item_status.live",
-                )
-                return None
-        except Exception:
-            pass
-    else:
+            return None
+        if current_status and live_key != current_key and not reclaims_reopened_item:
+            return github_projects_readiness_message(
+                "write",
+                "remote divergence detected for Project item "
+                f"{project_item_id}: cached status '{current_status}', live status '{live_status}', "
+                f"target status '{status_name}'",
+                actions=["resync_outward", "ignore_remote_drift", "start_new_run_from_reopened_item"],
+            )
+        if live_key in GITHUB_PROJECT_TERMINAL_STATUS_KEYS and target_key in GITHUB_PROJECT_ACTIVE_STATUS_KEYS:
+            return github_projects_readiness_message(
+                "write",
+                "remote divergence detected for Project item "
+                f"{project_item_id}: cached status '{current_status}', live status '{live_status}', "
+                f"target status '{status_name}'",
+                actions=["resync_outward", "ignore_remote_drift", "start_new_run_from_reopened_item"],
+            )
+    if current_key == target_key and not live_status:
         return None
     result = execute_engine_tool(
         cfg,

@@ -17,12 +17,15 @@ from src.tandem_agents.core.integrations.github_mcp import (
     create_pull_request,
     create_pull_request_metadata,
     evaluate_auto_merge_gates,
+    github_project_operator_actions,
     github_project_status_key_is_actionable,
     github_project_status_name_for_outcome,
     github_project_status_name_for_task_state,
+    github_projects_readiness_message,
     guarded_auto_merge,
     list_pull_requests,
     normalize_pull_request_metadata,
+    remember_project_item_status,
     refresh_pull_request_lifecycle,
     update_project_item_status,
 )
@@ -102,6 +105,295 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertIsNone(warning)
             fetch_mock.assert_called_once_with(cfg, "frumu-ai", 1, 2, fields=["7"])
             tool_mock.assert_not_called()
+
+    def test_update_project_item_status_reports_missing_write_readiness_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_option_map": {},
+                }
+            }
+
+            warning = update_project_item_status(cfg, task, "In progress")
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("status_field_id", warning or "")
+            self.assertIn("status option", warning or "")
+            self.assertIn("Connect GitHub Project", warning or "")
+
+    def test_update_project_item_status_reports_remote_terminal_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="In progress",
+                source="test",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Done"}}
+                    warning = update_project_item_status(cfg, task, "In progress")
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'In progress'", warning or "")
+            self.assertIn("live status 'Done'", warning or "")
+            self.assertIn("Re-sync outward", warning or "")
+            self.assertIn("Ignore remote drift", warning or "")
+            self.assertIn("Start new run from reopened item", warning or "")
+            tool_mock.assert_not_called()
+
+    def test_update_project_item_status_blocks_terminal_drift_for_review_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_review": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Done"}}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("review"),
+                    )
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("live status 'Done'", warning or "")
+            self.assertIn("target status 'In review'", warning or "")
+            tool_mock.assert_not_called()
+
+    def test_update_project_item_status_reports_non_terminal_remote_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Ready",
+                source="test",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Blocked"}}
+                    warning = update_project_item_status(cfg, task, "In progress")
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'Ready'", warning or "")
+            self.assertIn("live status 'Blocked'", warning or "")
+            self.assertIn("target status 'In progress'", warning or "")
+            tool_mock.assert_not_called()
+
+    def test_update_project_item_status_uses_intake_observation_as_claim_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Ready",
+                source="github_project.intake.live_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Blocked"}}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("active"),
+                    )
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'Ready'", warning or "")
+            self.assertIn("live status 'Blocked'", warning or "")
+            self.assertIn("target status 'In progress'", warning or "")
+            tool_mock.assert_not_called()
+
+    def test_update_project_item_status_ignores_status_field_label_for_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Ready",
+                source="github_project.intake.live_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"fieldValues": [{"name": "Status", "displayValue": "Ready"}]}
+                    tool_mock.return_value = {"output": "{}"}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("active"),
+                    )
+
+            self.assertIsNone(warning)
+            tool_mock.assert_called_once()
+
+    def test_update_project_item_status_claims_reopened_actionable_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Done",
+                source="github_mcp.update_project_item_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Todo"}}
+                    tool_mock.return_value = {"output": "{}"}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("active"),
+                    )
+
+            self.assertIsNone(warning)
+            tool_mock.assert_called_once()
+            self.assertEqual(tool_mock.call_args.args[1], "mcp.github.projects_write")
+            self.assertEqual(tool_mock.call_args.args[2]["updated_field"], {"id": 7, "value": "opt-1"})
+
+    def test_update_project_item_status_ignores_live_observation_as_drift_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="In progress",
+                source="github_mcp.update_project_item_status",
+            )
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Blocked",
+                source="github_project.intake.live_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_review": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Blocked"}}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("review"),
+                    )
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'In progress'", warning or "")
+            self.assertIn("live status 'Blocked'", warning or "")
+            self.assertIn("target status 'In review'", warning or "")
+            tool_mock.assert_not_called()
+
+    def test_github_project_readiness_action_labels_are_stable(self) -> None:
+        labels = [action["label"] for action in github_project_operator_actions()]
+        self.assertIn("Connect GitHub Project", labels)
+        self.assertIn("Re-sync outward", labels)
+        self.assertIn("Ignore remote drift", labels)
+        self.assertIn("Start new run from reopened item", labels)
+        message = github_projects_readiness_message(
+            "read",
+            "schema drift",
+            actions=["connect_github_project"],
+        )
+        self.assertIn("GitHub Projects read readiness degraded", message)
 
     def test_add_issue_comment_skips_existing_marker_comment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -470,6 +762,12 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
         self.assertFalse(github_project_status_key_is_actionable("Blocked"))
         self.assertFalse(github_project_status_key_is_actionable("In progress"))
         self.assertFalse(github_project_status_key_is_actionable("In review"))
+
+    def test_project_item_status_name_uses_field_value_not_label(self) -> None:
+        payload = {"fieldValues": [{"name": "Status", "displayValue": "Ready"}]}
+        self.assertEqual(_project_item_status_name(payload), "Ready")
+        payload = {"fieldValues": {"status": {"name": "Status", "option": {"name": "Todo"}}}}
+        self.assertEqual(_project_item_status_name(payload), "Todo")
 
     def test_refresh_pull_request_lifecycle_falls_back_to_gh_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

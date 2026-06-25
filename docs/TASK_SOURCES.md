@@ -158,6 +158,10 @@ Each task source has different requirements. Make sure the required dependencies
 - If Tandem returns a task-intake preview, ACA should treat `preferred_route` as a hint and keep the project context on the normalized task record
 - ACA can scope GitHub MCP to intake/finalize only via `ACA_GITHUB_MCP_SCOPE`, so normal coding phases can run without GitHub MCP tools in context
 - Finalize-time project status/comment sync is controlled by `ACA_GITHUB_REMOTE_SYNC`
+- Board snapshots and task previews include `readiness.read` and `readiness.write` so operators can see schema drift, missing status metadata, or unavailable write capability separately
+- Read readiness degrades when Project schema/items cannot provide usable item status values
+- Write readiness degrades when the Status field id or option map is missing, or when live remote status diverges from ACA's cached status before an outward write
+- Drift actions use stable ids: `connect_github_project`, `resync_outward`, `ignore_remote_drift`, and `start_new_run_from_reopened_item`
 
 **How to check:**
 

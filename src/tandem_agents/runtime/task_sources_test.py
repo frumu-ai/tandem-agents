@@ -10,6 +10,8 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
     _collect_project_items,
     _hydrate_project_item_statuses_from_graphql,
+    _github_project_board_cache_key,
+    _github_project_schema,
     _linear_board_cache_key,
     _linear_status_is_actionable,
     _load_github_project_live_data,
@@ -21,6 +23,7 @@ from src.tandem_agents.runtime.task_sources import (
     linear_board_snapshot,
     preview_task,
 )
+from src.tandem_agents.core.integrations.github_mcp import remember_project_item_status
 
 
 class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
@@ -394,6 +397,301 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertEqual(items[0]["effective_status_name"], "Ready")
             self.assertEqual(items[0]["effective_status_key"], "ready")
 
+    def test_github_project_schema_drift_error_identifies_read_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+
+            with patch("src.tandem_agents.runtime.task_sources.execute_engine_tool", return_value={"output": "{}"}):
+                with self.assertRaisesRegex(RuntimeError, "GitHub Projects read readiness degraded.*schema drift"):
+                    _github_project_schema(cfg, owner="frumu-ai", project=1)
+
+    def test_github_project_board_snapshot_reports_schema_drift_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {"name": "Project 1", "fields": [{"id": 1, "name": "Title"}]}
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Drifted task",
+                    "content": {"number": 188421130, "title": "Drifted task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertFalse(snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", snapshot["readiness"]["read"]["message"])
+            self.assertIn("schema drift", snapshot["readiness"]["read"]["message"])
+            self.assertFalse(snapshot["readiness"]["write"]["ready"])
+            self.assertIn("GitHub Projects write readiness degraded", snapshot["readiness"]["write"]["message"])
+
+    def test_github_project_stale_cache_degrades_read_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Cached ready task",
+                    "status_name": "Ready",
+                    "content": {"number": 188421130, "title": "Cached ready task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    live_snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertTrue(live_snapshot["readiness"]["read"]["ready"])
+            self.assertTrue(live_snapshot["readiness"]["write"]["ready"])
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                side_effect=RuntimeError("schema drift: live Project items unavailable"),
+            ):
+                stale_snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertEqual(stale_snapshot["source"], "cached")
+            self.assertTrue(stale_snapshot["is_stale"])
+            self.assertEqual(stale_snapshot["warning"], "schema drift: live Project items unavailable")
+            self.assertFalse(stale_snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", stale_snapshot["readiness"]["read"]["message"])
+            self.assertIn("schema drift", stale_snapshot["readiness"]["read"]["message"])
+            self.assertTrue(stale_snapshot["readiness"]["write"]["ready"])
+
+    def test_github_project_stale_legacy_cache_preserves_write_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cache_path = cfg.output_root() / "state" / "github_project_boards.json"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cached_snapshot = {
+                "project": {
+                    "owner": "frumu-ai",
+                    "repo": "example",
+                    "project_number": 1,
+                    "name": "Project 1",
+                },
+                "status_field_id": 7,
+                "status_option_map": {"ready": "ready-id"},
+                "columns": [{"id": "ready-id", "name": "Ready", "key": "ready", "item_count": 1}],
+                "items": [
+                    {
+                        "id": "188421130",
+                        "project_item_id": 188421130,
+                        "title": "Cached ready task",
+                        "status_name": "Ready",
+                        "status_key": "ready",
+                    }
+                ],
+                "scheduler": {},
+                "readiness": {"read": {"ready": True}, "write": {"ready": True}},
+                "source": "live",
+                "is_stale": False,
+                "warning": "",
+                "last_synced_at_ms": 1,
+                "cache_age_ms": 0,
+            }
+            cache_key = _github_project_board_cache_key("frumu-ai", 1)
+            cache_path.write_text(json.dumps({cache_key: cached_snapshot}), encoding="utf-8")
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                side_effect=RuntimeError("schema drift: live Project items unavailable"),
+            ):
+                stale_snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertEqual(stale_snapshot["source"], "cached")
+            self.assertTrue(stale_snapshot["is_stale"])
+            self.assertFalse(stale_snapshot["readiness"]["read"]["ready"])
+            self.assertTrue(stale_snapshot["readiness"]["write"]["ready"])
+
+    def test_github_project_readiness_degrades_when_status_is_cached_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=188421130,
+                status_name="Ready",
+                source="test",
+            )
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Cached ready task",
+                    "effective_status_name": "Ready",
+                    "effective_status_key": "ready",
+                    "content": {"number": 188421130, "title": "Cached ready task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            item = snapshot["items"][0]
+            self.assertEqual(item["status_key"], "ready")
+            self.assertTrue(item["actionable"])
+            self.assertFalse(snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", snapshot["readiness"]["read"]["message"])
+            self.assertIn("status is missing", snapshot["readiness"]["read"]["message"])
+            self.assertTrue(snapshot["readiness"]["write"]["ready"])
+
+    def test_github_project_readiness_uses_raw_status_before_preview_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Selected missing status task",
+                    "content": {"number": 188421130, "title": "Selected missing status task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch(
+                    "src.tandem_agents.runtime.task_sources.preview_task",
+                    return_value={"task": {"source": {"project_item_id": 188421130}}},
+                ):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            item = snapshot["items"][0]
+            self.assertEqual(item["status_key"], "ready")
+            self.assertTrue(item["actionable"])
+            self.assertFalse(snapshot["readiness"]["read"]["ready"])
+            self.assertIn("GitHub Projects read readiness degraded", snapshot["readiness"]["read"]["message"])
+
+    def test_reopened_terminal_project_item_prefers_live_actionable_status_over_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=188421130,
+                status_name="Done",
+                source="test",
+            )
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [
+                            {"id": "todo-id", "name": "Todo"},
+                            {"id": "done-id", "name": "Done"},
+                        ],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Reopened task",
+                    "status_name": "Todo",
+                    "content": {"number": 188421130, "title": "Reopened task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                with patch("src.tandem_agents.runtime.task_sources.preview_task", return_value={}):
+                    snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            item = snapshot["items"][0]
+            self.assertEqual(item["status_key"], "todo")
+            self.assertTrue(item["actionable"])
+            self.assertTrue(snapshot["readiness"]["read"]["ready"])
+            self.assertTrue(snapshot["readiness"]["write"]["ready"])
+
+    def test_github_project_preview_exposes_read_write_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            schema = {
+                "name": "Project 1",
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "Status",
+                        "options": [{"id": "ready-id", "name": "Ready"}],
+                    }
+                ],
+            }
+            items = [
+                {
+                    "project_item_id": 188421130,
+                    "title": "Ready task",
+                    "status_name": "Ready",
+                    "effective_status_name": "Ready",
+                    "effective_status_key": "ready",
+                    "content": {"number": 188421130, "title": "Ready task"},
+                }
+            ]
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                return_value=(schema, items),
+            ):
+                preview = preview_task(cfg)
+
+            self.assertTrue(preview["readiness"]["read"]["ready"])
+            self.assertTrue(preview["readiness"]["write"]["ready"])
+
     def test_hydrate_project_item_statuses_from_graphql_uses_node_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -562,6 +860,53 @@ class LinearTaskSourceTest(unittest.TestCase):
             cfg_b.repository.path = "/workspace/repos/tandem-agents"
 
             self.assertNotEqual(_linear_board_cache_key(cfg_a), _linear_board_cache_key(cfg_b))
+
+    def test_linear_cached_snapshots_do_not_report_github_project_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(Path(tmp))
+            cache_path = cfg.output_root() / "state" / "linear_boards.json"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_key = _linear_board_cache_key(cfg)
+            cached_snapshot = {
+                "project": {"team": "ENG", "project": "Runtime", "name": "Runtime"},
+                "columns": [],
+                "items": [],
+                "scheduler": {"next_item_ids": [], "next_issue_numbers": []},
+                "source": "live",
+                "is_stale": False,
+                "warning": "",
+                "last_synced_at_ms": 9_999_999_999_999,
+                "cache_age_ms": 0,
+                "readiness": {
+                    "read": {
+                        "ready": False,
+                        "message": "GitHub Projects read readiness degraded: stale cache",
+                    },
+                    "write": {
+                        "ready": False,
+                        "message": "GitHub Projects write readiness degraded: stale cache",
+                    },
+                },
+            }
+            cache_path.write_text(json.dumps({cache_key: cached_snapshot}), encoding="utf-8")
+
+            fresh_cached = linear_board_snapshot(cfg)
+
+            self.assertEqual(fresh_cached["source"], "cached")
+            self.assertNotIn("readiness", fresh_cached)
+
+            cached_snapshot["last_synced_at_ms"] = 1
+            cache_path.write_text(json.dumps({cache_key: cached_snapshot}), encoding="utf-8")
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_linear_live_data",
+                side_effect=RuntimeError("linear unavailable"),
+            ):
+                stale_cached = linear_board_snapshot(cfg, force_refresh=True)
+
+            self.assertEqual(stale_cached["source"], "cached")
+            self.assertTrue(stale_cached["is_stale"])
+            self.assertEqual(stale_cached["warning"], "linear unavailable")
+            self.assertNotIn("readiness", stale_cached)
 
     def test_linear_selection_prefers_configured_actionable_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
