@@ -143,6 +143,13 @@ def _github_project_cache_key(owner: str, project_number: int | str, item_id: in
     return f"{str(owner).strip().lower()}:{int(project_number)}:{int(item_id)}"
 
 
+def _github_project_status_source_is_observation(source: str | None) -> bool:
+    source_text = str(source or "").strip()
+    return source_text.startswith("github_project.intake.") or source_text.startswith(
+        "github_project.board_snapshot."
+    )
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
@@ -243,14 +250,42 @@ def remember_project_item_status(
         return
     cache = _load_project_status_cache(cfg)
     key = _github_project_cache_key(owner_text, project_number, item_id)
-    cache[key] = {
+    existing = cache.get(key)
+    record = dict(existing) if isinstance(existing, dict) else {}
+    now_ms = int(time.time() * 1000)
+    base_record = {
         "owner": owner_text,
         "project": int(project_number),
         "project_item_id": int(item_id),
+    }
+    if _github_project_status_source_is_observation(source):
+        record.update(base_record)
+        record["observed_status_name"] = status_text
+        record["observed_status_key"] = normalize_status_key(status_text)
+        record["observed_source"] = source
+        record["observed_at_epoch_ms"] = now_ms
+        if not record.get("status_name"):
+            record.update(
+                {
+                    "status_name": status_text,
+                    "status_key": normalize_status_key(status_text),
+                    "source": source,
+                    "updated_at_epoch_ms": now_ms,
+                }
+            )
+        cache[key] = record
+        _write_json(_github_project_status_cache_path(cfg), cache)
+        return
+    cache[key] = {
+        **base_record,
         "status_name": status_text,
         "status_key": normalize_status_key(status_text),
         "source": source,
-        "updated_at_epoch_ms": int(time.time() * 1000),
+        "updated_at_epoch_ms": now_ms,
+        "observed_status_name": status_text,
+        "observed_status_key": normalize_status_key(status_text),
+        "observed_source": source,
+        "observed_at_epoch_ms": now_ms,
     }
     _write_json(_github_project_status_cache_path(cfg), cache)
 
@@ -261,6 +296,7 @@ def cached_project_item_status(
     owner: str,
     project_number: int | str,
     item_id: int | str,
+    baseline_only: bool = False,
 ) -> str:
     owner_text = str(owner).strip()
     if not owner_text or project_number in (None, "") or item_id in (None, ""):
@@ -270,6 +306,14 @@ def cached_project_item_status(
     record = cache.get(key)
     if not isinstance(record, dict):
         return ""
+    if baseline_only:
+        source = str(record.get("source") or "")
+        if _github_project_status_source_is_observation(source):
+            return ""
+        return str(record.get("status_name") or "").strip()
+    observed_status = str(record.get("observed_status_name") or "").strip()
+    if observed_status:
+        return observed_status
     return str(record.get("status_name") or "").strip()
 
 
@@ -862,6 +906,7 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
             owner=str(source.get("owner") or ""),
             project_number=source.get("project") or 0,
             item_id=project_item_id,
+            baseline_only=True,
         )
     ).strip()
     live_status = ""

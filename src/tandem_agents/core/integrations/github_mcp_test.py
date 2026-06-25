@@ -226,6 +226,52 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertIn("target status 'In progress'", warning or "")
             tool_mock.assert_not_called()
 
+    def test_update_project_item_status_ignores_live_observation_as_drift_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="In progress",
+                source="github_mcp.update_project_item_status",
+            )
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Blocked",
+                source="github_project.intake.live_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_review": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Blocked"}}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("review"),
+                    )
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("cached status 'In progress'", warning or "")
+            self.assertIn("live status 'Blocked'", warning or "")
+            self.assertIn("target status 'In review'", warning or "")
+            tool_mock.assert_not_called()
+
     def test_github_project_readiness_action_labels_are_stable(self) -> None:
         labels = [action["label"] for action in github_project_operator_actions()]
         self.assertIn("Connect GitHub Project", labels)
