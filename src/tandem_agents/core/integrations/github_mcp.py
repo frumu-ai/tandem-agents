@@ -38,6 +38,7 @@ GITHUB_PROJECT_ACTIVE_STATUS_KEYS = {
     "worker_execution",
     "coder_execution",
     "review",
+    "in_review",
     "testing",
 }
 GITHUB_PROJECT_STATUS_BY_TASK_STATE = {

@@ -163,6 +163,35 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertIn("Start new run from reopened item", warning or "")
             tool_mock.assert_not_called()
 
+    def test_update_project_item_status_blocks_terminal_drift_for_review_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_review": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"status": {"name": "Done"}}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("review"),
+                    )
+
+            self.assertIn("GitHub Projects write readiness degraded", warning or "")
+            self.assertIn("remote divergence", warning or "")
+            self.assertIn("live status 'Done'", warning or "")
+            self.assertIn("target status 'In review'", warning or "")
+            tool_mock.assert_not_called()
+
     def test_update_project_item_status_reports_non_terminal_remote_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
