@@ -925,6 +925,11 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
     target_key = normalize_status_key(status_name)
     current_key = normalize_status_key(current_status)
     live_key = normalize_status_key(live_status)
+    reclaims_reopened_item = (
+        current_key in GITHUB_PROJECT_TERMINAL_STATUS_KEYS
+        and live_key in GITHUB_PROJECT_ACTIONABLE_STATUS_KEYS
+        and target_key == "in_progress"
+    )
     if live_status:
         if live_key == target_key:
             remember_project_item_status(
@@ -936,7 +941,7 @@ def update_project_item_status(cfg: ResolvedConfig, task: dict[str, Any], status
                 source="github_mcp.update_project_item_status.live",
             )
             return None
-        if current_status and live_key != current_key:
+        if current_status and live_key != current_key and not reclaims_reopened_item:
             return github_projects_readiness_message(
                 "write",
                 "remote divergence detected for Project item "
