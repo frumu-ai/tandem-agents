@@ -817,13 +817,24 @@ def _project_field_text(value: Any) -> str:
     return ""
 
 
+def _project_status_field_value(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _project_field_text(value)
+    for key in ("value", "option", "displayValue", "display_value"):
+        text = _project_field_text(value.get(key))
+        if text:
+            return text
+    name = _project_field_text(value.get("name"))
+    return "" if normalize_status_key(name) == "status" else name
+
+
 def _project_item_status_name(value: Any) -> str:
     if isinstance(value, dict):
         status = value.get("status")
         if isinstance(status, dict):
-            name = status.get("name")
-            if isinstance(name, str) and name.strip():
-                return name.strip()
+            status_text = _project_status_field_value(status)
+            if status_text:
+                return status_text
         elif isinstance(status, str) and status.strip():
             return status.strip()
         status_name = value.get("status_name") or value.get("statusName")
@@ -833,21 +844,16 @@ def _project_item_status_name(value: Any) -> str:
         if isinstance(field_values, dict):
             nested = field_values.get("status")
             if isinstance(nested, dict):
-                name = nested.get("name")
-                if isinstance(name, str) and name.strip():
-                    return name.strip()
+                status_text = _project_status_field_value(nested)
+                if status_text:
+                    return status_text
         elif isinstance(field_values, list):
             for field in field_values:
                 if not isinstance(field, dict):
                     continue
                 if normalize_status_key(_project_field_text(field.get("name"))) != "status":
                     continue
-                status_name = _project_field_text(
-                    field.get("value")
-                    or field.get("name")
-                    or field.get("option")
-                    or field.get("displayValue")
-                )
+                status_name = _project_status_field_value(field)
                 if status_name:
                     return status_name
         fields = value.get("fields")
@@ -857,7 +863,7 @@ def _project_item_status_name(value: Any) -> str:
                     continue
                 if normalize_status_key(_project_field_text(field.get("name"))) != "status":
                     continue
-                status_name = _project_field_text(field.get("value") or field.get("name") or field.get("option"))
+                status_name = _project_status_field_value(field)
                 if status_name:
                     return status_name
         content = value.get("content")

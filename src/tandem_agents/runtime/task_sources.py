@@ -606,6 +606,27 @@ def _github_project_readiness(
     }
 
 
+def _github_project_cached_readiness_schema(snapshot: dict[str, Any]) -> dict[str, Any]:
+    project_schema = snapshot.get("project_schema")
+    if isinstance(project_schema, dict):
+        return project_schema
+    status_field_id = snapshot.get("status_field_id")
+    status_option_map = snapshot.get("status_option_map")
+    if status_field_id in (None, "") or not isinstance(status_option_map, dict) or not status_option_map:
+        return {}
+    options = [
+        {
+            "id": str(option_id),
+            "name": str(option_key).replace("_", " "),
+        }
+        for option_key, option_id in status_option_map.items()
+        if option_id not in (None, "")
+    ]
+    if not options:
+        return {}
+    return {"fields": [{"id": status_field_id, "name": "Status", "options": options}]}
+
+
 def _github_token(cfg: ResolvedConfig) -> str:
     for key in ("GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOKEN"):
         value = str(cfg.env.get(key) or "").strip()
@@ -2265,8 +2286,7 @@ def github_project_board_snapshot(
             snapshot["is_stale"] = True
             snapshot["warning"] = str(exc)
             snapshot["cache_age_ms"] = now_ms - int(snapshot.get("last_synced_at_ms") or 0)
-            project_schema = snapshot.get("project_schema")
-            cached_schema = project_schema if isinstance(project_schema, dict) else {}
+            cached_schema = _github_project_cached_readiness_schema(snapshot)
             project_items = snapshot.get("items")
             cached_items = project_items if isinstance(project_items, list) else []
             snapshot["readiness"] = _github_project_readiness(

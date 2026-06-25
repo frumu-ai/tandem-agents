@@ -264,6 +264,41 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             self.assertIn("target status 'In progress'", warning or "")
             tool_mock.assert_not_called()
 
+    def test_update_project_item_status_ignores_status_field_label_for_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            remember_project_item_status(
+                cfg,
+                owner="frumu-ai",
+                project_number=1,
+                item_id=2,
+                status_name="Ready",
+                source="github_project.intake.live_status",
+            )
+            task = {
+                "source": {
+                    "type": "github_project",
+                    "owner": "frumu-ai",
+                    "project": 1,
+                    "project_item_id": 2,
+                    "status_field_id": 7,
+                    "status_option_map": {"in_progress": "opt-1"},
+                }
+            }
+            with patch("src.tandem_agents.core.integrations.github_mcp.fetch_project_item") as fetch_mock:
+                with patch("src.tandem_agents.core.integrations.github_mcp.execute_engine_tool") as tool_mock:
+                    fetch_mock.return_value = {"fieldValues": [{"name": "Status", "displayValue": "Ready"}]}
+                    tool_mock.return_value = {"output": "{}"}
+                    warning = update_project_item_status(
+                        cfg,
+                        task,
+                        github_project_status_name_for_task_state("active"),
+                    )
+
+            self.assertIsNone(warning)
+            tool_mock.assert_called_once()
+
     def test_update_project_item_status_claims_reopened_actionable_item(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -727,6 +762,12 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
         self.assertFalse(github_project_status_key_is_actionable("Blocked"))
         self.assertFalse(github_project_status_key_is_actionable("In progress"))
         self.assertFalse(github_project_status_key_is_actionable("In review"))
+
+    def test_project_item_status_name_uses_field_value_not_label(self) -> None:
+        payload = {"fieldValues": [{"name": "Status", "displayValue": "Ready"}]}
+        self.assertEqual(_project_item_status_name(payload), "Ready")
+        payload = {"fieldValues": {"status": {"name": "Status", "option": {"name": "Todo"}}}}
+        self.assertEqual(_project_item_status_name(payload), "Todo")
 
     def test_refresh_pull_request_lifecycle_falls_back_to_gh_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

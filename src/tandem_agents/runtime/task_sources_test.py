@@ -10,6 +10,7 @@ from src.tandem_agents.config.config_loader import resolve_config
 from src.tandem_agents.runtime.task_sources import (
     _collect_project_items,
     _hydrate_project_item_statuses_from_graphql,
+    _github_project_board_cache_key,
     _github_project_schema,
     _linear_board_cache_key,
     _linear_status_is_actionable,
@@ -476,6 +477,53 @@ class GitHubProjectTaskSourceStatusTest(unittest.TestCase):
             self.assertFalse(stale_snapshot["readiness"]["read"]["ready"])
             self.assertIn("GitHub Projects read readiness degraded", stale_snapshot["readiness"]["read"]["message"])
             self.assertIn("schema drift", stale_snapshot["readiness"]["read"]["message"])
+            self.assertTrue(stale_snapshot["readiness"]["write"]["ready"])
+
+    def test_github_project_stale_legacy_cache_preserves_write_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cache_path = cfg.output_root() / "state" / "github_project_boards.json"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cached_snapshot = {
+                "project": {
+                    "owner": "frumu-ai",
+                    "repo": "example",
+                    "project_number": 1,
+                    "name": "Project 1",
+                },
+                "status_field_id": 7,
+                "status_option_map": {"ready": "ready-id"},
+                "columns": [{"id": "ready-id", "name": "Ready", "key": "ready", "item_count": 1}],
+                "items": [
+                    {
+                        "id": "188421130",
+                        "project_item_id": 188421130,
+                        "title": "Cached ready task",
+                        "status_name": "Ready",
+                        "status_key": "ready",
+                    }
+                ],
+                "scheduler": {},
+                "readiness": {"read": {"ready": True}, "write": {"ready": True}},
+                "source": "live",
+                "is_stale": False,
+                "warning": "",
+                "last_synced_at_ms": 1,
+                "cache_age_ms": 0,
+            }
+            cache_key = _github_project_board_cache_key("frumu-ai", 1)
+            cache_path.write_text(json.dumps({cache_key: cached_snapshot}), encoding="utf-8")
+
+            with patch(
+                "src.tandem_agents.runtime.task_sources._load_github_project_live_data",
+                side_effect=RuntimeError("schema drift: live Project items unavailable"),
+            ):
+                stale_snapshot = github_project_board_snapshot(cfg, force_refresh=True)
+
+            self.assertEqual(stale_snapshot["source"], "cached")
+            self.assertTrue(stale_snapshot["is_stale"])
+            self.assertFalse(stale_snapshot["readiness"]["read"]["ready"])
             self.assertTrue(stale_snapshot["readiness"]["write"]["ready"])
 
     def test_github_project_readiness_degrades_when_status_is_cached_only(self) -> None:
