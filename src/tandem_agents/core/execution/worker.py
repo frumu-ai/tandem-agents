@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import re
 import shutil
@@ -5059,25 +5060,6 @@ def run_worker_subtask(
     def _summarize_and_clear_current_attempt(worker_result: dict[str, Any]) -> dict[str, Any]:
         _clear_active_worker_attempt(layout, worker_id, execution_id)
         return summarize_worker_notes(worker_result, worker_id, subtask, worktree, index)
-
-    carried_result = _carried_diff_ready_for_verification_result(
-        worker_id,
-        subtask,
-        log_path,
-        worktree,
-    )
-    if carried_result is not None:
-        _append_worker_event_if_run_active(
-            layout,
-            log_path,
-            "worker.carried_diff_ready_for_verification",
-            run_id,
-            _partial_diff_payload(carried_result, worker_id, subtask),
-            task_id=task.get("task_id"),
-            role="worker",
-            repo={"path": str(repo_path)},
-        )
-        return _summarize_and_clear_current_attempt(carried_result)
 
     result = _run_deterministic_throughput_slice(worktree, subtask, log_path) if write_required else None
     if result is not None:

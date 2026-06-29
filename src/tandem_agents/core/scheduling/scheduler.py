@@ -328,9 +328,6 @@ def _engine_session_readiness_blocker(cfg: ResolvedConfig) -> dict[str, Any] | N
 
 def scheduler_integration_blockers(cfg: ResolvedConfig, *, project_key: str = "") -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
-    engine_blocker = _engine_session_readiness_blocker(cfg)
-    if engine_blocker is not None:
-        blockers.append({"source_type": "engine", "project_key": _nonempty(project_key), **engine_blocker})
     if str(cfg.task_source.type or "").strip().lower() == "linear":
         blocker = _linear_mcp_status_blocker(cfg)
         if blocker is not None:
@@ -350,6 +347,10 @@ def scheduler_integration_blockers(cfg: ResolvedConfig, *, project_key: str = ""
                     **blocker,
                 }
             )
+            return blockers
+    engine_blocker = _engine_session_readiness_blocker(cfg)
+    if engine_blocker is not None:
+        blockers.append({"source_type": "engine", "project_key": _nonempty(project_key), **engine_blocker})
     return blockers
 
 

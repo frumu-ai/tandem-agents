@@ -555,6 +555,7 @@ def _plan_with_integration_blockers(plan: dict[str, Any], blockers: list[dict[st
 def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: str = "") -> Dict[str, str]:
     env: Dict[str, str] = {}
     repo = project.get("repo") if isinstance(project.get("repo"), dict) else {}
+    task_source = project.get("task_source") or project.get("source")
     project_id = str(project.get("id") or project.get("slug") or fallback_slug or "").strip()
     repo_slug = str(repo.get("slug") or project.get("repo_slug") or project.get("slug") or project_id).strip()
     repo_url = str(project.get("repo_url") or repo.get("clone_url") or repo.get("repo_url") or "").strip()
@@ -583,6 +584,8 @@ def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: 
             repo_path = f"workspace/repos/{repo_name}"
     if not worktree_root and repo_path.startswith("workspace/repos/"):
         worktree_root = "workspace/repos"
+    if not worktree_root:
+        worktree_root = _relative_managed_worktree_root(repo_path)
     repo_path, worktree_root = _runtime_managed_repo_paths(repo_path, worktree_root)
     if repo_path:
         env["ACA_REPO_PATH"] = repo_path
@@ -595,8 +598,20 @@ def _project_runtime_env(root: Path, project: Dict[str, Any], *, fallback_slug: 
     if credential_file:
         env["ACA_REPO_TOKEN_FILE"] = credential_file
         env["GITHUB_PERSONAL_ACCESS_TOKEN_FILE"] = credential_file
-    _apply_task_source_env(env, project.get("task_source") or project.get("source"))
+    _apply_task_source_env(env, task_source)
+    if isinstance(task_source, dict) and str(task_source.get("type") or "").strip().lower() == "linear":
+        env["ACA_LINEAR_MCP_ENABLED"] = "true"
     return env
+
+
+def _relative_managed_worktree_root(repo_path: str) -> str:
+    normalized = str(repo_path or "").strip().replace("\\", "/")
+    if not normalized or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        return ""
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) <= 1 or any(part in {".", ".."} for part in parts):
+        return ""
+    return "/".join(parts[:-1])
 
 
 def _runtime_managed_repo_paths(repo_path: str, worktree_root: str) -> tuple[str, str]:

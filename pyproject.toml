@@ -24,6 +24,11 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8.0",
+]
+
 [project.scripts]
 aca = "src.tandem_agents.cli.cli:main"
 
@@ -31,3 +36,16 @@ aca = "src.tandem_agents.cli.cli:main"
 where = ["."]
 include = ["src*"]
 namespaces = true
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = [
+    "docs/internal",
+    "runs",
+    "workspace",
+    "tandem-data",
+    "tandem-engine-state",
+]
+
+[tool.ruff.lint]
+select = ["F821"]

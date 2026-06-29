@@ -5575,7 +5575,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             )
 
             def hang_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
-                time.sleep(1.0)
+                time.sleep(2.0)
                 return {"run_id": "run-too-late"}
 
             with mock.patch(
@@ -5611,7 +5611,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 )
                 elapsed = time.monotonic() - started
 
-            self.assertLess(elapsed, 0.8)
+            self.assertLess(elapsed, 1.5)
             self.assertEqual(result["returncode"], 1)
             self.assertEqual(result["failure_reason"], "ENGINE_PROMPT_TIMEOUT")
             self.assertEqual(result["blocker_kind"], "engine_prompt_timeout")

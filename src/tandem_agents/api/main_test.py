@@ -75,10 +75,23 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         )
 
     def test_mcp_routes_are_registered_on_the_main_api(self) -> None:
-        paths = {getattr(route, "path", "") for route in app.routes}
-        self.assertIn("/server.json", paths)
-        self.assertIn("/.well-known/mcp/server.json", paths)
-        self.assertIn("/mcp", paths)
+        env = {"ACA_API_TOKEN": "secret-token"}
+        with patch.dict(os.environ, env, clear=False):
+            with TestClient(app) as client:
+                manifest = client.get("/server.json", headers={"Authorization": "Bearer secret-token"})
+                well_known = client.get(
+                    "/.well-known/mcp/server.json",
+                    headers={"Authorization": "Bearer secret-token"},
+                )
+                rpc = client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                    headers={"Authorization": "Bearer secret-token"},
+                )
+
+        self.assertEqual(manifest.status_code, 200, manifest.text)
+        self.assertEqual(well_known.status_code, 200, well_known.text)
+        self.assertEqual(rpc.status_code, 200, rpc.text)
 
     def test_aca_api_worker_count_defaults_to_single_worker(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -484,6 +497,10 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
             }
 
             with patch.dict("os.environ", env, clear=False), \
+                patch(
+                    "src.tandem_agents.core.scheduling.scheduler.engine_session_readiness_report",
+                    return_value={"ok": True, "reason": "ok"},
+                ), \
                 patch(
                     "src.tandem_agents.api.main._scheduler_filtered_source_items",
                     return_value=["TAN-1", "TAN-2", "TAN-3"],
@@ -1158,6 +1175,24 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
 
         self.assertEqual(env["ACA_REPO_PATH"], "/workspace/repos/tandem-agents")
         self.assertEqual(env["ACA_WORKTREE_ROOT"], "/workspace/repos")
+        self.assertEqual(env["ACA_LINEAR_MCP_ENABLED"], "true")
+
+    def test_project_runtime_env_uses_repo_parent_as_worktree_root_for_relative_paths(self) -> None:
+        env = _project_runtime_env(
+            Path("/tmp/aca"),
+            {
+                "id": "alpha",
+                "repo": {
+                    "path": "repos/alpha",
+                    "default_branch": "main",
+                    "remote_name": "origin",
+                },
+                "task_source": {"type": "manual", "prompt": "Hello"},
+            },
+        )
+
+        self.assertEqual(env["ACA_REPO_PATH"], "repos/alpha")
+        self.assertEqual(env["ACA_WORKTREE_ROOT"], "repos")
 
     def test_project_runtime_env_serializes_task_source_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

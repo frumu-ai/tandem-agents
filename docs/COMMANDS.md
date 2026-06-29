@@ -28,6 +28,12 @@ Use the Compose-sidecar command when you want the ACA-managed engine.
 ```
 
 ```bash
+python3 -m ruff check .
+python3 -m compileall -q src scripts
+python3 -m unittest discover -s src -p '*_test.py'
+```
+
+```bash
 tandem-engine status
 curl -s http://127.0.0.1:39731/global/health | jq .
 docker compose exec tandem-engine tandem-engine status
