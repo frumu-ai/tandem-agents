@@ -146,6 +146,8 @@ _run_recovery_task: Optional[asyncio.Task[None]] = None
 _event_loop_lag_lock = threading.Lock()
 _event_loop_lag_ms = 0.0
 _event_loop_lag_updated_at_ms = 0
+_linear_catalog_cache_lock = asyncio.Lock()
+_linear_catalog_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 DEFAULT_READY_ENGINE_TIMEOUT_SECONDS = 5.0
 DEFAULT_CODER_SUPERVISOR_STARTUP_TIMEOUT_SECONDS = 10.0
 DEFAULT_CODER_SUPERVISOR_STARTUP_RECONCILE = False
@@ -1247,7 +1249,6 @@ def _normalize_linear_team(team: Dict[str, Any]) -> Dict[str, Any]:
         "key": key,
         "name": name or key or team_id,
         "display": f"{name} ({key})" if name and key and name != key else name or key or team_id,
-        "raw": team,
     }
 
 
@@ -1263,15 +1264,63 @@ def _normalize_linear_project(project: Dict[str, Any]) -> Dict[str, Any]:
     team_name = _linear_catalog_text(
         project.get("teamName") or project.get("team_name") or team.get("name") or first_team.get("name")
     )
+    priority = project.get("priority") if isinstance(project.get("priority"), dict) else {}
+    lead = project.get("lead") if isinstance(project.get("lead"), dict) else {}
+    status_value = project.get("status") if isinstance(project.get("status"), dict) else {}
+    labels = project.get("labels") if isinstance(project.get("labels"), list) else []
+    initiatives = project.get("initiatives") if isinstance(project.get("initiatives"), list) else []
     return {
         "id": project_id or slug or name,
         "name": name or slug or project_id,
         "slug": slug,
+        "icon": _linear_catalog_text(project.get("icon")),
+        "color": _linear_catalog_text(project.get("color")),
+        "summary": _linear_catalog_text(project.get("summary")),
+        "url": _linear_catalog_text(project.get("url")),
         "team_id": team_id,
         "team_key": team_key,
         "team_name": team_name,
+        "priority": {
+            "value": priority.get("value"),
+            "name": _linear_catalog_text(priority.get("name")),
+        }
+        if priority
+        else None,
+        "priority_value": priority.get("value") if priority else None,
+        "priority_name": _linear_catalog_text(priority.get("name")) if priority else "",
+        "lead": {
+            "id": _linear_catalog_text(lead.get("id")),
+            "name": _linear_catalog_text(lead.get("name") or lead.get("displayName") or lead.get("email")),
+        }
+        if lead
+        else None,
+        "lead_name": _linear_catalog_text(lead.get("name") or lead.get("displayName") or lead.get("email")) if lead else "",
+        "status": {
+            "id": _linear_catalog_text(status_value.get("id")),
+            "name": _linear_catalog_text(status_value.get("name")),
+            "type": _linear_catalog_text(status_value.get("type")),
+        }
+        if status_value
+        else None,
+        "status_name": _linear_catalog_text(status_value.get("name")) if status_value else "",
+        "status_type": _linear_catalog_text(status_value.get("type")) if status_value else "",
+        "start_date": _linear_catalog_text(project.get("startDate") or project.get("start_date")),
+        "target_date": _linear_catalog_text(project.get("targetDate") or project.get("target_date")),
+        "started_at": _linear_catalog_text(project.get("startedAt") or project.get("started_at")),
+        "completed_at": _linear_catalog_text(project.get("completedAt") or project.get("completed_at")),
+        "canceled_at": _linear_catalog_text(project.get("canceledAt") or project.get("canceled_at")),
+        "updated_at": _linear_catalog_text(project.get("updatedAt") or project.get("updated_at")),
+        "labels": [
+            _linear_catalog_text(label.get("name") if isinstance(label, dict) else label)
+            for label in labels
+            if _linear_catalog_text(label.get("name") if isinstance(label, dict) else label)
+        ],
+        "initiatives": [
+            _linear_catalog_text(initiative.get("name") if isinstance(initiative, dict) else initiative)
+            for initiative in initiatives
+            if _linear_catalog_text(initiative.get("name") if isinstance(initiative, dict) else initiative)
+        ],
         "issue_count": project.get("issueCount") or project.get("issue_count") or project.get("issuesCount"),
-        "raw": project,
     }
 
 
@@ -1286,6 +1335,54 @@ def _dedupe_linear_catalog_entries(entries: list[Dict[str, Any]], keys: tuple[st
         seen.add(identity)
         deduped.append(entry)
     return deduped
+
+
+def _linear_catalog_timeout_seconds() -> float:
+    raw = str(os.environ.get("ACA_LINEAR_CATALOG_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return 8.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 8.0
+    return max(1.0, min(value, 30.0))
+
+
+def _linear_catalog_cache_key(team: str, query: str, include_archived: bool) -> str:
+    return json.dumps(
+        {
+            "team": team,
+            "query": query,
+            "include_archived": bool(include_archived),
+        },
+        sort_keys=True,
+    )
+
+
+def _linear_catalog_cached_response(cache_key: str, *, max_age_seconds: float = 15.0) -> dict[str, Any] | None:
+    cached = _linear_catalog_cache.get(cache_key)
+    if not cached:
+        return None
+    cached_at, payload = cached
+    if time.monotonic() - cached_at > max_age_seconds:
+        return None
+    return json.loads(json.dumps(payload))
+
+
+def _linear_catalog_store_cache(cache_key: str, payload: dict[str, Any]) -> None:
+    _linear_catalog_cache[cache_key] = (time.monotonic(), json.loads(json.dumps(payload)))
+
+
+async def _linear_catalog_thread_call(label: str, timeout_seconds: float, func, *args, **kwargs):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"Timed out loading Linear {label} after {timeout_seconds:g}s."
+        ) from exc
 
 
 def _linear_auth_challenge(server: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -1352,18 +1449,69 @@ async def linear_catalog(
 ):
     root = Path(os.environ.get("ACA_ROOT", "."))
     cfg = resolve_config(root)
+    team_filter = str(team or "").strip()
+    query_filter = str(query or "").strip()
+    timeout_seconds = _linear_catalog_timeout_seconds()
+    cache_key = _linear_catalog_cache_key(team_filter, query_filter, include_archived)
+    cached = _linear_catalog_cached_response(cache_key)
+    if cached is not None:
+        return cached
     try:
         from src.tandem_agents.core.integrations.linear_mcp import (
             get_mcp_server,
-            linear_count_issues,
-            linear_list_issues,
             linear_list_projects,
             linear_list_teams,
             linear_mcp_server_name,
         )
 
         server_name = linear_mcp_server_name(cfg)
-        server = await asyncio.to_thread(get_mcp_server, cfg, server_name)
+        async with _linear_catalog_cache_lock:
+            cached = _linear_catalog_cached_response(cache_key)
+            if cached is not None:
+                return cached
+            server = await _linear_catalog_thread_call(
+                "MCP server status",
+                min(timeout_seconds, 5.0),
+                get_mcp_server,
+                cfg,
+                server_name,
+            )
+            payload = await _linear_catalog_payload(
+                cfg=cfg,
+                server_name=server_name,
+                server=server,
+                team_filter=team_filter,
+                query_filter=query_filter,
+                include_archived=include_archived,
+                timeout_seconds=timeout_seconds,
+                linear_list_teams=linear_list_teams,
+                linear_list_projects=linear_list_projects,
+            )
+            if payload.get("connected") and (payload.get("teams") or payload.get("projects")):
+                _linear_catalog_store_cache(cache_key, payload)
+            return payload
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not read Linear teams/projects through Tandem's connected Linear MCP server: "
+                f"{exc}"
+            ),
+        )
+
+
+async def _linear_catalog_payload(
+    *,
+    cfg,
+    server_name: str,
+    server: Dict[str, Any] | None,
+    team_filter: str,
+    query_filter: str,
+    include_archived: bool,
+    timeout_seconds: float,
+    linear_list_teams,
+    linear_list_projects,
+) -> dict[str, Any]:
         if server is None:
             return {
                 "ok": False,
@@ -1387,7 +1535,9 @@ async def linear_catalog(
             public_origin = _control_panel_public_origin(cfg)
             if public_origin and _linear_auth_redirect_origin(authorization_url) != public_origin:
                 try:
-                    auth_payload = await asyncio.to_thread(
+                    auth_payload = await _linear_catalog_thread_call(
+                        "auth challenge",
+                        min(timeout_seconds, 3.0),
                         _request_linear_auth_challenge,
                         cfg,
                         server_name,
@@ -1418,16 +1568,38 @@ async def linear_catalog(
                     "the Linear server, finish OAuth, then refresh the Linear catalog."
                 ),
             }
-        team_filter = str(team or "").strip()
-        teams_raw = await asyncio.to_thread(linear_list_teams, cfg, query=str(query or "").strip(), limit=100)
-        projects_raw = await asyncio.to_thread(
-            linear_list_projects,
-            cfg,
-            team=team_filter,
-            query=str(query or "").strip(),
-            include_archived=include_archived,
-            limit=100,
+        teams_result, projects_result = await asyncio.gather(
+            _linear_catalog_thread_call(
+                "teams",
+                timeout_seconds,
+                linear_list_teams,
+                cfg,
+                query=query_filter,
+                limit=100,
+            ),
+            _linear_catalog_thread_call(
+                "projects",
+                timeout_seconds,
+                linear_list_projects,
+                cfg,
+                team=team_filter,
+                query=query_filter,
+                include_archived=include_archived,
+                limit=100,
+            ),
+            return_exceptions=True,
         )
+        catalog_errors: list[str] = []
+        if isinstance(teams_result, Exception):
+            catalog_errors.append(str(teams_result))
+            teams_raw = []
+        else:
+            teams_raw = teams_result
+        if isinstance(projects_result, Exception):
+            catalog_errors.append(str(projects_result))
+            projects_raw = []
+        else:
+            projects_raw = projects_result
         teams = _dedupe_linear_catalog_entries(
             [_normalize_linear_team(entry) for entry in teams_raw],
             ("id", "key", "name"),
@@ -1436,37 +1608,25 @@ async def linear_catalog(
             [_normalize_linear_project(entry) for entry in projects_raw],
             ("id", "slug", "name"),
         )
-        for project in projects:
-            if project.get("issue_count") not in (None, ""):
-                continue
-            selector = str(project.get("id") or project.get("name") or "").strip()
-            if not selector:
-                continue
-            try:
-                project["issue_count"] = await asyncio.to_thread(
-                    linear_count_issues,
-                    cfg,
-                    team=team_filter or str(project.get("team_key") or project.get("team_name") or ""),
-                    project=selector,
-                )
-            except Exception:
-                project["issue_count"] = None
+        if catalog_errors and not teams and not projects:
+            return {
+                "ok": False,
+                "server": server_name,
+                "connected": bool(server.get("connected")),
+                "auth_required": False,
+                "teams": [],
+                "projects": [],
+                "message": " ".join(catalog_errors),
+            }
         return {
-            "ok": True,
+            "ok": not catalog_errors,
             "server": server_name,
             "connected": bool(server.get("connected")),
             "auth_required": False,
             "teams": teams,
             "projects": projects,
+            "message": " ".join(catalog_errors),
         }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not read Linear teams/projects through Tandem's connected Linear MCP server: "
-                f"{exc}"
-            ),
-        )
 
 
 @app.post("/projects")
@@ -2799,4 +2959,10 @@ async def dispatch_scheduler_batch(
     return result
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("ACA_API_PORT", 39735)))
+    workers = max(1, int(os.environ.get("ACA_API_WORKERS") or "2"))
+    uvicorn.run(
+        "src.tandem_agents.api.main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("ACA_API_PORT", 39735)),
+        workers=workers,
+    )

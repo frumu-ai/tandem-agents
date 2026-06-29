@@ -86,23 +86,22 @@ services:
     environment:
       TANDEM_CONTROL_PANEL_HOST: 0.0.0.0
       TANDEM_CONTROL_PANEL_PORT: ${TANDEM_CONTROL_PANEL_PORT:-39734}
-      TANDEM_ENGINE_URL: http://tandem-engine:${TANDEM_PORT:-39733}
+      TANDEM_ENGINE_URL: ${TANDEM_ENGINE_URL:-http://127.0.0.1:${TANDEM_PORT:-39733}}
       TANDEM_CONTROL_PANEL_AUTO_START_ENGINE: "0"
       TANDEM_STATE_DIR: /var/lib/tandem/panel
       TANDEM_CONTROL_PANEL_STATE_DIR: /var/lib/tandem/panel/control-panel
       TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
       TANDEM_CONTROL_PANEL_MODE: ${TANDEM_CONTROL_PANEL_MODE:-auto}
-      ACA_BASE_URL: http://aca:${ACA_API_PORT:-39735}
+      ACA_BASE_URL: ${ACA_BASE_URL:-http://127.0.0.1:${ACA_API_PORT:-39735}}
       ACA_API_TOKEN_FILE: /workspace/tandem-data/aca_api_token
-      TANDEM_KB_ADMIN_URL: http://tandem-kb-mcp:${KB_PORT:-39736}
+      TANDEM_KB_ADMIN_URL: ${TANDEM_KB_ADMIN_URL:-http://127.0.0.1:${KB_PORT:-39736}}
       TANDEM_KB_ADMIN_API_KEY_FILE: /run/secrets/kb_admin_api_key
       TANDEM_KB_DEFAULT_COLLECTION_ID: ${TANDEM_KB_DEFAULT_COLLECTION_ID:-}
+    network_mode: host
     volumes:
       - tandem-panel-state:/var/lib/tandem/panel
       - ./tandem-data:/workspace/tandem-data:ro
       - ./secrets:/run/secrets:ro
-    ports:
-      - "${TANDEM_CONTROL_PANEL_PORT:-39734}:${TANDEM_CONTROL_PANEL_PORT:-39734}"
     depends_on:
       tandem-engine:
         condition: service_healthy

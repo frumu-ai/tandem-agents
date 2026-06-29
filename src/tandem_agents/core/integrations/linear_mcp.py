@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Any
 
@@ -19,6 +20,9 @@ from src.tandem_agents.core.engine.engine import (
 LINEAR_ACTIONABLE_STATUS_KEYS = {"backlog", "todo", "to_do", "ready", "unstarted", "triage"}
 LINEAR_DONE_STATUS_KEYS = {"done", "complete", "completed", "closed", "canceled", "cancelled"}
 LINEAR_ACTIVE_STATUS_KEYS = {"in_progress", "started", "working", "review", "in_review"}
+_TOOL_IDS_CACHE_SECONDS = 5.0
+_tool_ids_cache_lock = threading.Lock()
+_tool_ids_cache: dict[str, tuple[float, list[str]]] = {}
 
 
 def normalize_linear_key(value: str | None) -> str:
@@ -88,6 +92,20 @@ def linear_status_key_is_actionable(status_name: str | None, state_type: str | N
 def list_mcp_servers(cfg: ResolvedConfig) -> dict[str, Any]:
     payload = _list_mcp_servers(cfg)
     return payload if isinstance(payload, dict) else {}
+
+
+def _cached_engine_tool_ids(cfg: ResolvedConfig) -> list[str]:
+    server_name = linear_mcp_server_name(cfg)
+    cache_key = f"{cfg.tandem.base_url.rstrip('/')}::{server_name}"
+    now = time.monotonic()
+    with _tool_ids_cache_lock:
+        cached = _tool_ids_cache.get(cache_key)
+        if cached and now - cached[0] < _TOOL_IDS_CACHE_SECONDS:
+            return list(cached[1])
+    ids = list_engine_tool_ids(cfg)
+    with _tool_ids_cache_lock:
+        _tool_ids_cache[cache_key] = (now, list(ids))
+    return ids
 
 
 def get_mcp_server(cfg: ResolvedConfig, name: str | None = None) -> dict[str, Any] | None:
@@ -258,7 +276,7 @@ def _alias_variants(alias: str) -> list[str]:
 
 def _resolve_linear_tool_id(cfg: ResolvedConfig, aliases: list[str]) -> str:
     server_name = linear_mcp_server_name(cfg)
-    ids = list_engine_tool_ids(cfg)
+    ids = _cached_engine_tool_ids(cfg)
     candidates: list[str] = []
     for alias in aliases:
         for variant in _alias_variants(alias):

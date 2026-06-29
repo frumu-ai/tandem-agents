@@ -31,6 +31,9 @@ from src.tandem_agents.core.coordination.coordination import CoordinationStore
 
 
 class AcaApiWorkspaceGuideTest(unittest.TestCase):
+    def setUp(self) -> None:
+        api_main._linear_catalog_cache.clear()
+
     def _write_minimal_config(self, root: Path) -> None:
         (root / "tandem-data").mkdir(parents=True, exist_ok=True)
         (root / ".env").write_text(
@@ -977,6 +980,123 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         )
 
         self.assertEqual(_linear_auth_redirect_origin(url), "https://tests.frumu.ai")
+
+    def test_linear_catalog_returns_projects_without_issue_count_fanout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            with patch.dict(
+                os.environ,
+                {"ACA_ROOT": str(root), "ACA_API_TOKEN": "secret-token"},
+                clear=False,
+            ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.linear_mcp_server_name",
+                    return_value="linear",
+                ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.get_mcp_server",
+                    return_value={"name": "linear", "connected": True},
+                ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.linear_list_teams",
+                    return_value=[{"id": "team-1", "key": "TAN", "name": "Tandem"}],
+                ) as list_teams, \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.linear_list_projects",
+                    return_value=[
+                        {
+                            "id": "project-1",
+                            "name": "Runtime",
+                            "teamKey": "TAN",
+                            "icon": "Server",
+                            "color": "#26B5CE",
+                            "summary": "Runtime work",
+                            "url": "https://linear.app/test/project/runtime",
+                            "priority": {"value": 2, "name": "High"},
+                            "lead": {"id": "user-1", "name": "evan@example.com"},
+                            "status": {"id": "status-1", "name": "Backlog", "type": "backlog"},
+                            "startDate": "2026-06-28",
+                            "targetDate": "2026-07-05",
+                            "labels": [{"name": "Platform"}],
+                            "initiatives": [{"name": "Hosted"}],
+                        }
+                    ],
+                ) as list_projects:
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/linear/catalog",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["teams"][0]["key"], "TAN")
+        self.assertEqual(payload["projects"][0]["id"], "project-1")
+        self.assertEqual(payload["projects"][0]["icon"], "Server")
+        self.assertEqual(payload["projects"][0]["color"], "#26B5CE")
+        self.assertEqual(payload["projects"][0]["summary"], "Runtime work")
+        self.assertEqual(payload["projects"][0]["priority_name"], "High")
+        self.assertEqual(payload["projects"][0]["priority_value"], 2)
+        self.assertEqual(payload["projects"][0]["lead_name"], "evan@example.com")
+        self.assertEqual(payload["projects"][0]["status_name"], "Backlog")
+        self.assertEqual(payload["projects"][0]["status_type"], "backlog")
+        self.assertEqual(payload["projects"][0]["target_date"], "2026-07-05")
+        self.assertEqual(payload["projects"][0]["labels"], ["Platform"])
+        self.assertEqual(payload["projects"][0]["initiatives"], ["Hosted"])
+        self.assertIsNone(payload["projects"][0]["issue_count"])
+        self.assertNotIn("raw", payload["teams"][0])
+        self.assertNotIn("raw", payload["projects"][0])
+        list_teams.assert_called_once()
+        list_projects.assert_called_once()
+
+    def test_linear_catalog_returns_partial_catalog_when_one_side_times_out(self) -> None:
+        async def fake_catalog_call(label, _timeout_seconds, func, *args, **kwargs):
+            if label == "teams":
+                raise TimeoutError("Timed out loading Linear teams after 1s.")
+            return func(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_minimal_config(root)
+            with patch.dict(
+                os.environ,
+                {"ACA_ROOT": str(root), "ACA_API_TOKEN": "secret-token"},
+                clear=False,
+            ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.linear_mcp_server_name",
+                    return_value="linear",
+                ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.get_mcp_server",
+                    return_value={"name": "linear", "connected": True},
+                ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.linear_list_teams",
+                    return_value=[],
+                ), \
+                patch(
+                    "src.tandem_agents.core.integrations.linear_mcp.linear_list_projects",
+                    return_value=[{"id": "project-1", "name": "Runtime", "teamKey": "TAN"}],
+                ), \
+                patch(
+                    "src.tandem_agents.api.main._linear_catalog_thread_call",
+                    side_effect=fake_catalog_call,
+                ):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/linear/catalog",
+                        headers={"Authorization": "Bearer secret-token"},
+                    )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["teams"], [])
+        self.assertEqual(payload["projects"][0]["id"], "project-1")
+        self.assertIn("Timed out loading Linear teams", payload["message"])
 
     def test_project_runtime_env_uses_managed_checkout_path_for_remote_project(self) -> None:
         with patch.dict(os.environ, {"ACA_WORKTREE_ROOT": "", "AUTOCODER_WORKTREE_ROOT": ""}, clear=False):
