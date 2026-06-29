@@ -2958,8 +2958,13 @@ async def dispatch_scheduler_batch(
     result["integration_blockers"] = integration_blockers
     return result
 
+
+def _aca_api_worker_count() -> int:
+    return max(1, int(os.environ.get("ACA_API_WORKERS") or "1"))
+
+
 if __name__ == "__main__":
-    workers = max(1, int(os.environ.get("ACA_API_WORKERS") or "2"))
+    workers = _aca_api_worker_count()
     uvicorn.run(
         "src.tandem_agents.api.main:app",
         host="0.0.0.0",

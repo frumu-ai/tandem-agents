@@ -80,6 +80,14 @@ class AcaApiWorkspaceGuideTest(unittest.TestCase):
         self.assertIn("/.well-known/mcp/server.json", paths)
         self.assertIn("/mcp", paths)
 
+    def test_aca_api_worker_count_defaults_to_single_worker(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(api_main._aca_api_worker_count(), 1)
+        with patch.dict(os.environ, {"ACA_API_WORKERS": "3"}, clear=True):
+            self.assertEqual(api_main._aca_api_worker_count(), 3)
+        with patch.dict(os.environ, {"ACA_API_WORKERS": "0"}, clear=True):
+            self.assertEqual(api_main._aca_api_worker_count(), 1)
+
     def test_operator_state_translation_matches_coordination_states(self) -> None:
         self.assertEqual(_operator_coordination_state("Todo"), "queued")
         self.assertEqual(_operator_coordination_state("Backlog"), "queued")
