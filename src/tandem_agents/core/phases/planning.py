@@ -1240,7 +1240,7 @@ def _split_dense_serial_subtasks(
             or subtask.get("discarded_partial_diff_patch")
             or subtask.get("repair_parent_target_files")
         )
-        if serial_limit <= 1 or skip_repair_split or len(criteria) <= max_acceptance_criteria:
+        if skip_repair_split or len(criteria) <= max_acceptance_criteria:
             split.append(subtask)
             continue
 
@@ -1525,17 +1525,18 @@ def _deterministic_invalid_manager_subtasks(
     fallback_files: list[str],
     existing_subtasks: list[dict[str, Any]],
     fallback_label: str = "repo-context fallback targets",
+    *,
+    cap_disabled_swarm: bool = True,
 ) -> list[dict[str, Any]]:
     """Build a stable fallback plan from repo-context files after manager JSON failure."""
     if not fallback_files:
         return []
 
     swarm_cfg = getattr(ctx.cfg, "swarm", None)
-    max_workers = (
-        max(1, int(getattr(swarm_cfg, "max_workers", 1) or 1))
-        if bool(getattr(swarm_cfg, "enabled", False))
-        else _serial_subtask_limit(ctx.cfg)
-    )
+    if bool(getattr(swarm_cfg, "enabled", False)) or cap_disabled_swarm:
+        max_workers = max(1, int(getattr(swarm_cfg, "max_workers", 1) or 1))
+    else:
+        max_workers = max(1, len(fallback_files), len(existing_subtasks))
     title = str(ctx.task.get("title") or ctx.task.get("local_goal") or "ACA fallback plan").strip()
     acceptance_criteria = _all_task_acceptance_criteria(ctx)
     by_name = {Path(path).name: path for path in fallback_files}
@@ -1807,7 +1808,13 @@ def _constrain_invalid_manager_fallback(
     if not fallback_files:
         return [], []
     fallback_label = "explicit task fallback targets" if explicit_files else "repo-context fallback targets"
-    fallback_subtasks = _deterministic_invalid_manager_subtasks(ctx, fallback_files, subtasks, fallback_label)
+    fallback_subtasks = _deterministic_invalid_manager_subtasks(
+        ctx,
+        fallback_files,
+        subtasks,
+        fallback_label,
+        cap_disabled_swarm=False,
+    )
     if fallback_subtasks:
         ctx.blackboard["manager_deterministic_repo_context_plan"] = {
             "reason": (

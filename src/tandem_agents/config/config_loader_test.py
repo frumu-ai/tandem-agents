@@ -468,6 +468,65 @@ class ConfigLoaderControlPanelOverlayTest(unittest.TestCase):
             self.assertEqual(cfg.mcp_servers["linear"]["transport"], "https://mcp.linear.app/mcp")
             self.assertEqual(cfg.mcp_servers["linear"]["auth_kind"], "oauth")
 
+    def test_linear_task_source_overrides_stale_bootstrap_disabled_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env").write_text("ACA_LINEAR_MCP_ENABLED=false\n", encoding="utf-8")
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: linear
+                      team: Tandem
+                    repository:
+                      slug: frumu-ai/tandem
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(root)
+
+            self.assertTrue(cfg.linear_mcp.enabled)
+
+    def test_runtime_env_can_disable_yaml_linear_mcp_for_non_linear_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agent.yaml").write_text(
+                dedent(
+                    """
+                    agent:
+                      name: ACA
+                    task_source:
+                      type: kanban_board
+                      path: config/board.yaml
+                    repository:
+                      slug: frumu-ai/tandem
+                    provider:
+                      id: openai
+                      model: gpt-4.1-mini
+                    output:
+                      root: runs
+                    linear_mcp:
+                      enabled: true
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = resolve_config(root, env={"ACA_LINEAR_MCP_ENABLED": "false"})
+
+            self.assertFalse(cfg.linear_mcp.enabled)
+
     def test_coder_supervision_timing_can_come_from_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

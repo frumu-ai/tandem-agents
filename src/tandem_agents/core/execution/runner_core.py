@@ -4291,12 +4291,18 @@ def run_qa(cfg: ResolvedConfig, pr_number: int) -> dict[str, Any]:
     append_event(layout["events"], "qa.pr_fetched", run_id, {"branch": head_branch, "title": pr_info["title"]})
     
     # 3. Checkout PR Branch
-    run_command(["git", "-C", str(repo_path), "fetch", "origin", head_branch], env=cfg.env)
-    run_command(["git", "-C", str(repo_path), "checkout", head_branch], env=cfg.env)
+    fetch_result = run_command(["git", "-C", str(repo_path), "fetch", "origin", head_branch], env=cfg.env)
+    if fetch_result.returncode != 0:
+        raise RuntimeError(f"Could not fetch PR branch {head_branch}: {fetch_result.stderr.strip()}")
+    checkout_result = run_command(["git", "-C", str(repo_path), "checkout", head_branch], env=cfg.env)
+    if checkout_result.returncode != 0:
+        raise RuntimeError(f"Could not checkout PR branch {head_branch}: {checkout_result.stderr.strip()}")
     
     # 4. Get Diff against Base
     base_branch = pr_info["base"]["ref"]
     diff_result = run_command(["git", "-C", str(repo_path), "diff", f"origin/{base_branch}...HEAD"], env=cfg.env)
+    if diff_result.returncode != 0:
+        raise RuntimeError(f"Could not compute PR diff against {base_branch}: {diff_result.stderr.strip()}")
     diff_text = diff_result.stdout
     
     # 5. Execute QA Agent
@@ -4327,7 +4333,7 @@ def run_qa(cfg: ResolvedConfig, pr_number: int) -> dict[str, Any]:
     sync_worker_artifacts(repo_path, layout["artifacts"], run_id, "qa-agent", layout["events"])
     
     # 6. Finalize
-    status = initial_status(run_id, {"title": f"QA Audit: PR #{pr_number}"}, repo, {"version": "qa"}, {"id": qa_provider, "model": qa_model}, {}, run_dir)
+    status = initial_status(run_id, {"title": f"QA Audit: PR #{pr_number}"}, repo, {"version": "qa"}, {"id": qa_cli_provider, "model": qa_model}, {}, run_dir)
     status["run"]["status"] = "completed" if result["returncode"] == 0 else "failed"
     write_status(layout["status"], status)
     

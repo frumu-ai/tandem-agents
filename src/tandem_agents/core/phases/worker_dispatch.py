@@ -120,12 +120,18 @@ def _pop_active_worker_engine_session(ctx: RunContext, worker_id: str) -> dict[s
     sessions = _load_active_worker_engine_sessions(ctx)
     info = dict(sessions.pop(worker_id, {}) or {})
     if sessions:
-        atomic_write_json(path, sessions)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, sessions)
+        except OSError:
+            logger.debug("Could not update active worker engine session marker %s", path, exc_info=True)
     else:
         try:
             path.unlink()
         except FileNotFoundError:
             pass
+        except OSError:
+            logger.debug("Could not remove active worker engine session marker %s", path, exc_info=True)
     return info
 
 
@@ -146,7 +152,11 @@ def _mark_active_worker_engine_session_cleanup_failed(
     current["cleanup_failed_at_ms"] = int(time.time() * 1000)
     current["cleanup_error"] = str(error or "session_delete_failed")[:500]
     sessions[worker_id] = current
-    atomic_write_json(path, sessions)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, sessions)
+    except OSError:
+        logger.debug("Could not record worker engine session cleanup failure in %s", path, exc_info=True)
 
 
 def _cancel_active_worker_engine_session(ctx: RunContext, worker_id: str, reason: str) -> None:
@@ -191,6 +201,7 @@ def _cancel_active_worker_engine_session(ctx: RunContext, worker_id: str, reason
                 repo={"path": ctx.repo.get("path")},
             )
         except Exception as exc:
+            _mark_active_worker_engine_session_cleanup_failed(ctx, worker_id, info, str(exc))
             append_event(
                 ctx.layout["events"],
                 "worker.engine_cancel_failed",
@@ -206,7 +217,6 @@ def _cancel_active_worker_engine_session(ctx: RunContext, worker_id: str, reason
                 role="worker",
                 repo={"path": ctx.repo.get("path")},
             )
-            _mark_active_worker_engine_session_cleanup_failed(ctx, worker_id, info, str(exc))
 
     thread = threading.Thread(
         target=_delete,

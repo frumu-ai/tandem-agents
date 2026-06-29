@@ -73,6 +73,7 @@ from src.tandem_agents.core.execution.runner_core import (
     _record_worker_result,
     _record_coding_run_contract,
     _record_review_policy,
+    run_qa,
     _run_integration_prompt,
     _run_start_preflight,
     _sticky_expected_repo_files,
@@ -109,6 +110,38 @@ class RunnerCoreDiscoveryTest(unittest.TestCase):
             encoding="utf-8",
         )
         return resolve_config(root)
+
+    def test_run_qa_records_selected_reviewer_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            cfg = self._config(root)
+            pr_info = {
+                "title": "Fix thing",
+                "body": "Review this change",
+                "head": {"ref": "feature"},
+                "base": {"ref": "main"},
+            }
+            command_result = SimpleNamespace(returncode=0, stdout="diff --git a/file b/file\n", stderr="")
+            with patch("src.tandem_agents.core.execution.runner_core.resolve_repository", return_value={"path": str(repo)}), \
+                patch("src.tandem_agents.core.execution.runner_core.ensure_github_mcp_connected"), \
+                patch("src.tandem_agents.core.execution.runner_core.get_pull_request", return_value=pr_info), \
+                patch("src.tandem_agents.core.execution.runner_core.run_command", return_value=command_result), \
+                patch(
+                    "src.tandem_agents.core.execution.runner_core.engine_session_provider_model",
+                    return_value={"provider": "openai", "model": "gpt-4.1-mini"},
+                ), \
+                patch("src.tandem_agents.core.execution.runner_core.engine_env", return_value={}), \
+                patch(
+                    "src.tandem_agents.core.execution.runner_core.stream_tandem_prompt",
+                    return_value={"returncode": 0, "stdout": "QA complete", "stderr": ""},
+                ), \
+                patch("src.tandem_agents.core.execution.runner_core.sync_worker_artifacts"):
+                result = run_qa(cfg, 123)
+
+            self.assertEqual(result["status"]["provider"]["id"], "openai")
+            self.assertEqual(result["status"]["provider"]["model"], "gpt-4.1-mini")
 
 
     def test_run_start_preflight_blocks_on_provider_smoke_failure_before_claim(self) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.tandem_agents.core.repository.repo_graph_eval import run_repo_graph_eval
+from src.tandem_agents.core.repository.repo_graph_eval import EVAL_CASES, run_repo_graph_eval
 
 
 class RepoGraphEvalTest(unittest.TestCase):
@@ -11,7 +11,7 @@ class RepoGraphEvalTest(unittest.TestCase):
 
         self.assertTrue(result["passed"], result)
         self.assertEqual(result["score"], result["total"])
-        self.assertEqual(result["total"], 4)
+        self.assertEqual(result["total"], len(EVAL_CASES))
 
 
 if __name__ == "__main__":

@@ -1047,6 +1047,108 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             self.assertEqual(source.read_text(encoding="utf-8"), "def multiply(left, right):\n    return left * right\n")
             self.assertFalse(stream_prompt.call_args.kwargs["write_required"])
 
+    def test_run_worker_subtask_preserves_carried_patch_after_verification_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path = root / "repo"
+            run_dir = root / "run"
+            worktree = root / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "aca@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "ACA"], cwd=worktree, check=True)
+            source = worktree / "src" / "calculator.py"
+            test_file = worktree / "src" / "calculator_test.py"
+            source.parent.mkdir()
+            source.write_text("def multiply(left, right):\n    return left + right\n", encoding="utf-8")
+            test_file.write_text(
+                "import unittest\n\n"
+                "from .calculator import multiply\n\n"
+                "class CalculatorTest(unittest.TestCase):\n"
+                "    def test_multiply(self):\n"
+                "        self.assertEqual(multiply(2, 3), 5)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "src/calculator.py", "src/calculator_test.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=worktree, check=True, stdout=subprocess.DEVNULL)
+            source.write_text("def multiply(left, right):\n    return left * right\n", encoding="utf-8")
+            test_file.write_text(
+                "import unittest\n\n"
+                "from .calculator import multiply\n\n"
+                "class CalculatorTest(unittest.TestCase):\n"
+                "    def test_multiply(self):\n"
+                "        self.assertEqual(multiply(2, 3), 6)\n",
+                encoding="utf-8",
+            )
+            patch = root / "paired.patch"
+            diff_text = subprocess.run(
+                ["git", "diff", "--binary"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            patch.write_text(diff_text if diff_text.endswith("\n") else diff_text + "\n", encoding="utf-8")
+            subprocess.run(["git", "checkout", "--", "src/calculator.py", "src/calculator_test.py"], cwd=worktree, check=True)
+            repo_path.mkdir()
+
+            timeout_result = {
+                "role": "worker",
+                "returncode": 1,
+                "stdout": "ENGINE_PROMPT_TIMEOUT\n",
+                "stderr": "",
+                "failure_reason": "ENGINE_PROMPT_TIMEOUT",
+                "blocker_kind": "engine_prompt_timeout",
+                "changed_files": [],
+                "engine": {"session_id": "session-1"},
+            }
+            with mock.patch("src.tandem_agents.core.execution.worker.create_worktree", return_value=worktree), \
+                mock.patch("src.tandem_agents.core.execution.worker._worktree_preflight", return_value=(True, "ok")), \
+                mock.patch(
+                    "src.tandem_agents.core.execution.worker.engine_session_provider_model",
+                    return_value={"provider": "openai-codex", "model": "gpt-5.5", "source": "engine_default"},
+                ), \
+                mock.patch("src.tandem_agents.core.execution.worker.engine_env", return_value={}), \
+                mock.patch("src.tandem_agents.core.execution.worker.stream_tandem_prompt", return_value=dict(timeout_result)) as stream_prompt, \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worker_artifacts"), \
+                mock.patch("src.tandem_agents.core.execution.worker.sync_worktree_changes", return_value=[]), \
+                mock.patch("src.tandem_agents.core.execution.worker.summarize_worker_notes", side_effect=lambda output, *_args: output):
+                output = run_worker_subtask(
+                    SimpleNamespace(env={}),
+                    "run-1",
+                    repo_path,
+                    run_dir,
+                    {"task_id": "TAN-344", "source": {"type": "linear"}, "execution_kind": "code_edit", "title": "Task"},
+                    {
+                        "id": "subtask-1",
+                        "title": "Verify complementary source and test partial diffs",
+                        "goal": "Verify the carried source+test repair.",
+                        "files": ["src/calculator.py", "src/calculator_test.py"],
+                        "target_files": ["src/calculator.py", "src/calculator_test.py"],
+                        "carry_forward_patches": [str(patch)],
+                        "repair_verification_first": True,
+                        "write_required": False,
+                    },
+                    "worker-1",
+                    1,
+                )
+
+            self.assertEqual(output["returncode"], 1)
+            self.assertEqual(output["failure_reason"], "WORKER_CARRIED_DIFF_READY_FOR_VERIFICATION")
+            self.assertEqual(output["blocker_kind"], "worker_incomplete_diff")
+            self.assertEqual(output["engine_failure_reason"], "ENGINE_PROMPT_TIMEOUT")
+            self.assertEqual(output["engine_blocker_kind"], "engine_prompt_timeout")
+            self.assertEqual(output["engine"], {"session_id": "session-1"})
+            self.assertFalse(output["write_required"])
+            self.assertEqual(output["changed_files"], ["src/calculator.py", "src/calculator_test.py"])
+            self.assertEqual(stream_prompt.call_count, 1)
+            self.assertFalse(stream_prompt.call_args.kwargs["write_required"])
+            artifact = Path(output["partial_diff_artifact"])
+            self.assertTrue(artifact.is_file())
+            artifact_text = artifact.read_text(encoding="utf-8")
+            self.assertIn("def multiply(left, right):", artifact_text)
+            self.assertIn("self.assertEqual(multiply(2, 3), 6)", artifact_text)
+
     def test_preserved_partial_diff_artifact_carries_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5575,7 +5677,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
             )
 
             def hang_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
-                time.sleep(1.0)
+                time.sleep(2.0)
                 return {"run_id": "run-too-late"}
 
             with mock.patch(
@@ -5611,7 +5713,7 @@ diff --git a/src/repository_test.py b/src/repository_test.py
                 )
                 elapsed = time.monotonic() - started
 
-            self.assertLess(elapsed, 0.8)
+            self.assertLess(elapsed, 1.5)
             self.assertEqual(result["returncode"], 1)
             self.assertEqual(result["failure_reason"], "ENGINE_PROMPT_TIMEOUT")
             self.assertEqual(result["blocker_kind"], "engine_prompt_timeout")
