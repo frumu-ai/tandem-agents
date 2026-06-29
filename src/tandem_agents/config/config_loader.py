@@ -643,8 +643,6 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             )
         ),
     )
-    linear_config_enabled_value = _nonempty(linear_mcp_data.get("enabled", linear_mcp_server.get("enabled")))
-    linear_config_enabled = _as_bool(linear_config_enabled_value, default=False)
     linear_task_source_selected = str(task_source.type or "").strip().lower() == "linear"
     linear_enabled_value = pick(
         "ACA_LINEAR_MCP_ENABLED",
@@ -654,7 +652,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         linear_enabled = linear_task_source_selected
     else:
         linear_enabled = _as_bool(linear_enabled_value, default=False)
-        if not linear_enabled and (linear_task_source_selected or linear_config_enabled):
+        if not linear_enabled and linear_task_source_selected:
             linear_enabled = True
     linear_mcp = LinearMcpConfig(
         enabled=linear_enabled,

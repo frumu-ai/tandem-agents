@@ -1618,6 +1618,27 @@ def _carried_diff_ready_for_verification_result(
     )
 
 
+def _preserve_carried_diff_after_nonzero_verification_result(
+    result: dict[str, Any],
+    worker_id: str,
+    subtask: dict[str, Any],
+    log_path: Path,
+    worktree: Path,
+) -> dict[str, Any] | None:
+    carried_result = _carried_diff_ready_for_verification_result(worker_id, subtask, log_path, worktree)
+    if carried_result is None:
+        return None
+    existing_blocker = str(result.get("blocker_kind") or "").strip()
+    existing_reason = str(result.get("failure_reason") or "").strip()
+    if existing_blocker:
+        carried_result["engine_blocker_kind"] = existing_blocker
+    if existing_reason:
+        carried_result["engine_failure_reason"] = existing_reason
+    if result.get("engine"):
+        carried_result["engine"] = result.get("engine")
+    return carried_result
+
+
 def _changed_files_have_substantive_content(worktree: Path, changed_files: list[str]) -> bool:
     """Return true when changed files contain reviewable content.
 
@@ -5116,7 +5137,27 @@ def run_worker_subtask(
         sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
     if result.get("returncode", 0) != 0 and _worktree_has_only_inherited_overlay_changes(worktree, baseline_metadata):
-        result = _inherited_overlay_no_fresh_changes_result(result, log_path, worktree, baseline_metadata)
+        carried_result = _preserve_carried_diff_after_nonzero_verification_result(
+            result,
+            worker_id,
+            subtask,
+            log_path,
+            worktree,
+        )
+        if carried_result is not None:
+            result = carried_result
+            _append_worker_event_if_run_active(
+                layout,
+                log_path,
+                "worker.carried_diff_ready_for_verification",
+                run_id,
+                _partial_diff_payload(result, worker_id, subtask),
+                task_id=task.get("task_id"),
+                role="worker",
+                repo={"path": str(repo_path)},
+            )
+        else:
+            result = _inherited_overlay_no_fresh_changes_result(result, log_path, worktree, baseline_metadata)
     else:
         result_before_terminalize = dict(result)
         result = _terminalize_worker_after_tool_loop(
@@ -5274,12 +5315,32 @@ def run_worker_subtask(
             sync_worker_artifacts(worktree, layout["artifacts"], run_id, worker_id, layout["events"])
 
         if retry_result.get("returncode", 0) != 0 and _worktree_has_only_inherited_overlay_changes(worktree, baseline_metadata):
-            retry_result = _inherited_overlay_no_fresh_changes_result(
+            carried_result = _preserve_carried_diff_after_nonzero_verification_result(
                 retry_result,
+                worker_id,
+                subtask,
                 log_path,
                 worktree,
-                baseline_metadata,
             )
+            if carried_result is not None:
+                retry_result = carried_result
+                _append_worker_event_if_run_active(
+                    layout,
+                    log_path,
+                    "worker.carried_diff_ready_for_verification",
+                    run_id,
+                    _partial_diff_payload(retry_result, worker_id, subtask),
+                    task_id=task.get("task_id"),
+                    role="worker",
+                    repo={"path": str(repo_path)},
+                )
+            else:
+                retry_result = _inherited_overlay_no_fresh_changes_result(
+                    retry_result,
+                    log_path,
+                    worktree,
+                    baseline_metadata,
+                )
         else:
             retry_before_terminalize = dict(retry_result)
             retry_result = _terminalize_worker_after_tool_loop(
