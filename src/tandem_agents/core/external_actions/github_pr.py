@@ -134,42 +134,81 @@ def _comment_body(run_id: str, task: dict[str, Any], pr: dict[str, Any], decisio
     ).strip()
 
 
+def _close_opt_in(task: dict[str, Any]) -> tuple[bool, set[int]]:
+    """Resolve explicit opt-in for the destructive ``close_pr`` action.
+
+    Closing a PR is never part of the default plan. A caller (e.g. a triage
+    step or task author) must opt in explicitly by setting
+    ``task["external_action"]``:
+
+    - ``allow_close_pr`` (bool): permit closing referenced PRs at all.
+    - ``close_pr_numbers`` (list[int], optional): restrict closing to these PR
+      numbers. When omitted (and ``allow_close_pr`` is true), all referenced
+      PRs are eligible.
+    """
+    policy = task.get("external_action")
+    if not isinstance(policy, dict):
+        return False, set()
+    allow = bool(policy.get("allow_close_pr"))
+    numbers: set[int] = set()
+    for entry in policy.get("close_pr_numbers") or []:
+        try:
+            numbers.add(int(entry))
+        except (TypeError, ValueError):
+            continue
+    return allow, numbers
+
+
 def default_action_plan(run_id: str, task: dict[str, Any], pr_contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the approval-gated external-action plan for referenced PRs.
+
+    The default plan is non-destructive: every referenced PR gets a review
+    ``comment_pr`` and is left open for an operator decision. ``close_pr`` is
+    only proposed when the task opts in via ``external_action.allow_close_pr``
+    (see :func:`_close_opt_in`).
+    """
+    allow_close, close_numbers = _close_opt_in(task)
     actions: list[dict[str, Any]] = []
     for pr in pr_contexts:
         number = int(pr.get("number") or 0)
         if number <= 0:
             continue
-        if number == 1400:
-            actions.append(
-                {
-                    "action_type": "leave_open",
-                    "target": {"pr_number": number, "base_repo": pr.get("base_repo")},
-                    "payload": {"reason": "Manual confirmation is required before closing this large PR."},
-                    "risk_level": "low",
-                    "verification_marker": "",
-                }
-            )
-            continue
         marker = f"aca:github-pr-action:{run_id}:pr-{number}"
+        close_requested = allow_close and (not close_numbers or number in close_numbers)
+        decision = (
+            "close as duplicate/stale generated PR"
+            if close_requested
+            else "reviewed; leaving open for operator decision"
+        )
         actions.append(
             {
                 "action_type": "comment_pr",
                 "target": {"pr_number": number, "base_repo": pr.get("base_repo")},
-                "payload": {"body": _comment_body(run_id, task, pr, "close as duplicate/stale generated PR")},
+                "payload": {"body": _comment_body(run_id, task, pr, decision)},
                 "risk_level": "medium",
                 "verification_marker": marker,
             }
         )
-        actions.append(
-            {
-                "action_type": "close_pr",
-                "target": {"pr_number": number, "base_repo": pr.get("base_repo")},
-                "payload": {"state": "closed"},
-                "risk_level": "high",
-                "verification_marker": marker,
-            }
-        )
+        if close_requested:
+            actions.append(
+                {
+                    "action_type": "close_pr",
+                    "target": {"pr_number": number, "base_repo": pr.get("base_repo")},
+                    "payload": {"state": "closed"},
+                    "risk_level": "high",
+                    "verification_marker": marker,
+                }
+            )
+        else:
+            actions.append(
+                {
+                    "action_type": "leave_open",
+                    "target": {"pr_number": number, "base_repo": pr.get("base_repo")},
+                    "payload": {"reason": "close_pr not opted in; leaving open for operator decision."},
+                    "risk_level": "low",
+                    "verification_marker": "",
+                }
+            )
     actions.append(
         {
             "action_type": "post_linear_summary",

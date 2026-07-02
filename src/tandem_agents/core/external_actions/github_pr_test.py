@@ -17,7 +17,7 @@ from src.tandem_agents.core.external_actions.github_pr import (
 
 
 class GithubPrExternalActionTest(unittest.TestCase):
-    def test_extracts_pr_numbers_and_default_plan_gates_writes(self) -> None:
+    def test_extracts_pr_numbers_and_default_plan_is_non_destructive(self) -> None:
         task = {
             "task_id": "TAN-110",
             "title": "Close duplicate or stale failing Bolt PRs",
@@ -33,11 +33,50 @@ class GithubPrExternalActionTest(unittest.TestCase):
         actions = default_action_plan("run-1", task, prs)
 
         action_types = [action["action_type"] for action in actions]
+        # Non-destructive by default: comment + leave_open for every PR, no close_pr.
         self.assertIn("comment_pr", action_types)
-        self.assertIn("close_pr", action_types)
         self.assertIn("leave_open", action_types)
         self.assertIn("post_linear_summary", action_types)
-        self.assertTrue(all(action["action_type"] != "close_pr" or action["target"]["pr_number"] != 1400 for action in actions))
+        self.assertNotIn("close_pr", action_types)
+        # Regression guard for TAN2-6: no destructive action in any default plan.
+        self.assertTrue(all(action["action_type"] != "close_pr" for action in actions))
+        self.assertFalse(any(action.get("risk_level") == "high" for action in actions))
+        # And no leftover hardcoded PR-number special-casing: both PRs treated identically.
+        left_open = sorted(
+            action["target"]["pr_number"] for action in actions if action["action_type"] == "leave_open"
+        )
+        self.assertEqual(left_open, [1400, 1457])
+
+    def test_default_plan_closes_only_when_opted_in(self) -> None:
+        task = {
+            "task_id": "TAN-110",
+            "title": "Close stale PRs",
+            "source": {"type": "linear", "identifier": "TAN-110"},
+            "external_action": {"allow_close_pr": True, "close_pr_numbers": [1457]},
+        }
+        prs = [
+            {"number": 1457, "base_repo": "frumu-ai/tandem"},
+            {"number": 1400, "base_repo": "frumu-ai/tandem"},
+        ]
+
+        actions = default_action_plan("run-1", task, prs)
+
+        # Only the opted-in PR gets a close_pr; the other is left open.
+        close_targets = [a["target"]["pr_number"] for a in actions if a["action_type"] == "close_pr"]
+        leave_targets = [a["target"]["pr_number"] for a in actions if a["action_type"] == "leave_open"]
+        self.assertEqual(close_targets, [1457])
+        self.assertEqual(leave_targets, [1400])
+
+    def test_default_plan_opt_in_all_prs_when_no_numbers_listed(self) -> None:
+        task = {
+            "task_id": "TAN-110",
+            "source": {"type": "linear", "identifier": "TAN-110"},
+            "external_action": {"allow_close_pr": True},
+        }
+        prs = [{"number": 1457, "base_repo": "frumu-ai/tandem"}]
+
+        actions = default_action_plan("run-1", task, prs)
+        self.assertIn("close_pr", [a["action_type"] for a in actions])
 
     def test_fetch_pr_contexts_records_tan_111_candidates(self) -> None:
         cfg = SimpleNamespace(repository=SimpleNamespace(slug="frumu-ai/tandem"))
