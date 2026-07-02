@@ -454,18 +454,82 @@ class CoderSupervisorTest(unittest.TestCase):
                 result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
 
             self.assertEqual(result["status"], "needs-repair")
-            self.assertEqual(result["repair"]["status"], "completed")
+            # "dispatched", not "completed": success is only confirmed on the
+            # next lifecycle refresh (TAN2-2 no longer claims unverified success).
+            self.assertEqual(result["repair"]["status"], "dispatched")
+            self.assertEqual(result["repair"]["breaker"]["attempts"], 1)
             create_run.assert_called_once()
             payload = create_run.call_args.args[1]
             self.assertEqual(payload["workflow_mode"], "pr_repair")
             self.assertEqual(payload["github_ref"]["head_branch"], "aca/run-pr")
             self.assertIn("Fix this boundary case", payload["objective"])
             execute_all.assert_called_once()
-            self.assertEqual(linear_comment.call_count, 2)
+            # Only the first-attempt "starting" comment — no per-pass finish
+            # comment, so a stuck PR no longer spams the issue each tick.
+            self.assertEqual(linear_comment.call_count, 1)
             status = load_status(cfg.output_root() / "run-pr" / "status.json")
             blackboard = load_blackboard(cfg.output_root() / "run-pr" / "blackboard.yaml")
-            self.assertEqual(status["pull_request_repair"]["status"], "completed")
+            self.assertEqual(status["pull_request_repair"]["status"], "dispatched")
             self.assertEqual(blackboard["pull_request_repair"]["context"]["feedback_items"][0]["path"], "src/app.py")
+
+    def test_needs_repair_does_not_redispatch_once_escalated(self) -> None:
+        # Once the circuit breaker has escalated a PR, a subsequent reconcile
+        # tick that still sees "needs-repair" must NOT spend tokens on another
+        # coder run — this is the core unbounded-spend fix (TAN2-2).
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(
+                cfg,
+                store,
+                source={"type": "linear", "issue_id": "lin-1", "identifier": "TAN-120", "team": "Tandem"},
+            )
+            # Pre-seed an already-escalated breaker state in run metadata.
+            run = store.get_run("run-pr") or {}
+            metadata = dict(run.get("metadata") or {})
+            metadata["pull_request_repair_state"] = {
+                "attempts": 5,
+                "last_attempt_ms": 1,
+                "last_signature": "old",
+                "escalated": True,
+                "reason": "max_attempts",
+            }
+            store.update_run("run-pr", metadata=metadata)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "review_state": "changes_requested",
+                "checks_state": "success",
+                "lifecycle_state": "needs-repair",
+                "terminal": False,
+            }
+            repair_context = {
+                "actionable": True,
+                "pull_request": refreshed,
+                "feedback_items": [{"kind": "review_comment", "body": "still broken", "path": "a.py", "line": 1}],
+                "truncated": False,
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "collect_pull_request_repair_context", return_value=repair_context),
+                patch.object(coder_supervisor, "sdk_coder_create_run", return_value={"ok": True}) as create_run,
+                patch.object(coder_supervisor, "sdk_coder_execute_all", return_value={}) as execute_all,
+                patch.object(coder_supervisor, "linear_add_comment", return_value=None) as linear_comment,
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            create_run.assert_not_called()
+            execute_all.assert_not_called()
+            linear_comment.assert_not_called()  # already escalated → stay silent
+            self.assertEqual(result["repair"]["status"], "escalated")
+            # Lifecycle is pinned to needs-human so the operator sees the handoff.
+            status = load_status(cfg.output_root() / "run-pr" / "status.json")
+            self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "needs-human")
 
     def test_ready_to_merge_auto_merge_persists_merge_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -606,6 +670,100 @@ class CoderSupervisorTest(unittest.TestCase):
             self.assertEqual(result["merge"]["status"], "pending_approval")
             status = load_status(cfg.output_root() / "run-pr" / "status.json")
             self.assertEqual(status["pull_request_merge"]["pending_approvals"][0]["key"], "merge")
+
+
+class RepairCircuitBreakerTest(unittest.TestCase):
+    COOLDOWN = 60_000
+
+    def _decide(self, state, signature, now, *, max_attempts=3):
+        return coder_supervisor._repair_gate_decision(
+            state,
+            signature,
+            now,
+            max_attempts=max_attempts,
+            cooldown_base_ms=self.COOLDOWN,
+        )
+
+    def test_first_attempt_proceeds_and_records_state(self) -> None:
+        decision, state, _ = self._decide({}, "sig-a", 1_000)
+        self.assertEqual(decision, "proceed")
+        self.assertEqual(state["attempts"], 1)
+        self.assertEqual(state["last_attempt_ms"], 1_000)
+        self.assertEqual(state["last_signature"], "sig-a")
+
+    def test_defers_within_cooldown_window(self) -> None:
+        prior = {"attempts": 1, "last_attempt_ms": 1_000, "last_signature": "sig-a"}
+        # New feedback, but only 30s later — under the 60s base cooldown.
+        decision, state, reason = self._decide(prior, "sig-b", 1_000 + 30_000)
+        self.assertEqual(decision, "defer")
+        self.assertEqual(reason, "cooldown")
+        self.assertEqual(state["attempts"], 1)  # not incremented
+
+    def test_proceeds_after_cooldown_with_new_feedback(self) -> None:
+        prior = {"attempts": 1, "last_attempt_ms": 1_000, "last_signature": "sig-a"}
+        decision, state, _ = self._decide(prior, "sig-b", 1_000 + 61_000)
+        self.assertEqual(decision, "proceed")
+        self.assertEqual(state["attempts"], 2)
+
+    def test_escalates_on_unchanged_feedback_after_cooldown(self) -> None:
+        prior = {"attempts": 1, "last_attempt_ms": 1_000, "last_signature": "sig-a"}
+        # Same signature after the pass = the last repair moved nothing.
+        decision, state, reason = self._decide(prior, "sig-a", 1_000 + 61_000)
+        self.assertEqual(decision, "escalate")
+        self.assertEqual(reason, "no_new_feedback")
+        self.assertTrue(state["escalated"])
+
+    def test_escalates_when_max_attempts_reached(self) -> None:
+        prior = {"attempts": 3, "last_attempt_ms": 1_000, "last_signature": "sig-a"}
+        decision, state, reason = self._decide(prior, "sig-z", 10_000_000, max_attempts=3)
+        self.assertEqual(decision, "escalate")
+        self.assertEqual(reason, "max_attempts")
+        self.assertTrue(state["escalated"])
+
+    def test_skips_once_already_escalated(self) -> None:
+        prior = {"attempts": 3, "escalated": True, "reason": "max_attempts", "last_attempt_ms": 1_000}
+        decision, _, reason = self._decide(prior, "sig-z", 10_000_000)
+        self.assertEqual(decision, "skip")
+        self.assertEqual(reason, "max_attempts")
+
+    def test_cooldown_grows_exponentially(self) -> None:
+        # attempts=2 → cooldown = base * 2**1 = 120s; 90s later still defers.
+        prior = {"attempts": 2, "last_attempt_ms": 0, "last_signature": "sig-a"}
+        decision, _, _ = self._decide(prior, "sig-b", 90_000, max_attempts=5)
+        self.assertEqual(decision, "defer")
+        # 121s later it proceeds.
+        decision2, _, _ = self._decide(prior, "sig-b", 121_000, max_attempts=5)
+        self.assertEqual(decision2, "proceed")
+
+    def test_signature_stable_and_sensitive(self) -> None:
+        ctx_a = {
+            "pull_request": {"head_branch": "feat"},
+            "feedback_items": [
+                {"kind": "review_comment", "url": "u1", "body": "fix this"},
+                {"kind": "failed_check", "url": "c1", "body": "ci red"},
+            ],
+        }
+        # Same content, different order → same signature.
+        ctx_a_reordered = {
+            "pull_request": {"head_branch": "feat"},
+            "feedback_items": list(reversed(ctx_a["feedback_items"])),
+        }
+        self.assertEqual(
+            coder_supervisor._repair_signature(ctx_a),
+            coder_supervisor._repair_signature(ctx_a_reordered),
+        )
+        # Changed body → different signature.
+        ctx_b = {
+            "pull_request": {"head_branch": "feat"},
+            "feedback_items": [
+                {"kind": "review_comment", "url": "u1", "body": "fix this differently"},
+                {"kind": "failed_check", "url": "c1", "body": "ci red"},
+            ],
+        }
+        self.assertNotEqual(
+            coder_supervisor._repair_signature(ctx_a),
+            coder_supervisor._repair_signature(ctx_b),
+        )
 
 
 if __name__ == "__main__":
