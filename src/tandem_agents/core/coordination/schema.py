@@ -141,6 +141,13 @@ CREATE TABLE IF NOT EXISTS scheduler_events (
 CREATE INDEX IF NOT EXISTS idx_leases_status_expires
     ON leases(status, expires_at_ms);
 
+-- At most one active lease per task_key: DB-level backstop against the
+-- check-then-insert double-claim race (TAN2-7). A concurrent claimer that
+-- slips past the active-lease check hits this constraint instead of creating
+-- a second active lease for the same task.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_task_key
+    ON leases(task_key) WHERE status = 'active';
+
 CREATE INDEX IF NOT EXISTS idx_runs_status
     ON runs(status, updated_at_ms);
 
@@ -285,6 +292,13 @@ CREATE TABLE IF NOT EXISTS scheduler_events (
 
 CREATE INDEX IF NOT EXISTS idx_leases_status_expires
     ON leases(status, expires_at_ms);
+
+-- At most one active lease per task_key: DB-level backstop against the
+-- check-then-insert double-claim race (TAN2-7). A concurrent claimer that
+-- slips past the active-lease check hits this constraint instead of creating
+-- a second active lease for the same task.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_task_key
+    ON leases(task_key) WHERE status = 'active';
 
 CREATE INDEX IF NOT EXISTS idx_runs_status
     ON runs(status, updated_at_ms);

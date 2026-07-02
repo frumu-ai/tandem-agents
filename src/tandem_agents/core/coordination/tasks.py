@@ -555,6 +555,9 @@ class CoordinationTasksMixin:
         with self.connection() as conn:
             self.ensure_schema()
             self._begin_transaction(conn)
+            # Serialize concurrent claimers of this task before the
+            # check-then-insert below so two hosts cannot both claim it (TAN2-7).
+            self._lock_task_key_locked(conn, task_key)
             self._reap_expired_leases_locked(conn, now)
             self._reap_stale_workers_locked(conn, now)
             task_row = conn.execute("SELECT * FROM tasks WHERE task_key = ?", (task_key,)).fetchone()
