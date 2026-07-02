@@ -705,5 +705,101 @@ class CoordinationStoreTest(unittest.TestCase):
             self.assertTrue(any("CREATE TABLE IF NOT EXISTS tasks" in sql for sql in recorded))
 
 
+class ClaimRaceTest(unittest.TestCase):
+    def _config(self, root: Path):
+        return CoordinationStoreTest._config(self, root)
+
+    def _task(self, root: Path) -> dict:
+        return {
+            "task_id": "task-race",
+            "title": "Race Task",
+            "source": {"type": "manual", "prompt": "Do the thing"},
+            "repo": {"slug": "frumu-ai/example", "path": str(root / "repo")},
+        }
+
+    def test_active_lease_unique_index_rejects_second_active_lease(self) -> None:
+        # DB-level backstop (TAN2-7): two active leases for the same task_key
+        # must be impossible even if the application check is bypassed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = CoordinationStore.from_config(self._config(root))
+            task = self._task(root)
+            store.register_task(task, repo=task["repo"])
+            claim = store.claim_task(task, run_id="run-1", worker_id="w1", host_id="h1", repo=task["repo"])
+            self.assertTrue(claim["claimed"])
+            task_key = claim["task"]["task_key"]
+
+            import sqlite3
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                with store.connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO leases (
+                            lease_id, task_key, task_id, run_id, worker_id, host_id, role, status,
+                            attempt, acquired_at_ms, heartbeat_at_ms, expires_at_ms, released_at_ms,
+                            release_reason, metadata_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, 0, 0, 9999999999999, NULL, NULL, '{}')
+                        """,
+                        ("lease-dup", task_key, "task-race", "run-x", "w2", "h2", "coordinator"),
+                    )
+
+    def test_advisory_lock_issued_only_for_postgres(self) -> None:
+        # The claim path must take a per-task advisory lock on Postgres and
+        # must not attempt it on SQLite.
+        calls: list = []
+
+        class _FakeConn:
+            def execute(self, sql, params=()):
+                calls.append((sql, params))
+
+        store = CoordinationStore(backend="postgres")
+        store._lock_task_key_locked(_FakeConn(), "manual:manual:x:task-1")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("pg_advisory_xact_lock", calls[0][0])
+        self.assertEqual(calls[0][1], ("manual:manual:x:task-1",))
+
+        calls.clear()
+        store_sqlite = CoordinationStore(backend="sqlite")
+        store_sqlite._lock_task_key_locked(_FakeConn(), "manual:manual:x:task-1")
+        self.assertEqual(calls, [])
+
+    def test_concurrent_claims_yield_single_winner(self) -> None:
+        # Sanity: many threads racing to claim the same task produce exactly one
+        # winner (on SQLite this holds via BEGIN IMMEDIATE; the advisory lock
+        # extends the same guarantee to Postgres).
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = CoordinationStore.from_config(self._config(root))
+            task = self._task(root)
+            store.register_task(task, repo=task["repo"])
+
+            results: list[bool] = []
+            lock = threading.Lock()
+            barrier = threading.Barrier(8)
+
+            def _claim(i: int) -> None:
+                barrier.wait()
+                try:
+                    claim = store.claim_task(
+                        task, run_id=f"run-{i}", worker_id=f"w{i}", host_id=f"h{i}", repo=task["repo"]
+                    )
+                    ok = bool(claim.get("claimed"))
+                except Exception:
+                    ok = False
+                with lock:
+                    results.append(ok)
+
+            threads = [threading.Thread(target=_claim, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(sum(1 for ok in results if ok), 1, f"expected exactly one winner, got {results}")
+
+
 if __name__ == "__main__":
     unittest.main()

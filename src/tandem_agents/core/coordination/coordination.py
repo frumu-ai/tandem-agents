@@ -176,6 +176,19 @@ class CoordinationStore(
     def _begin_transaction(self, conn: Any) -> None:
         conn.execute("BEGIN" if self.backend == "postgres" else "BEGIN IMMEDIATE")
 
+    def _lock_task_key_locked(self, conn: Any, task_key: str) -> None:
+        """Serialize concurrent claimers of a single task_key (TAN2-7).
+
+        On Postgres (READ COMMITTED, plain BEGIN) the check-then-insert claim is
+        racy: two hosts can both read "no active lease" and both insert. A
+        transaction-scoped advisory lock keyed on the task makes the whole claim
+        atomic per task_key, so the loser sees the winner's lease on its check.
+        On SQLite ``BEGIN IMMEDIATE`` already serializes writers, so this is a
+        no-op there.
+        """
+        if self.backend == "postgres":
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (str(task_key),))
+
     def ensure_schema(self) -> None:
         if self._schema_ready:
             return

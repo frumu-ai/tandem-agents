@@ -52,6 +52,25 @@ DEFAULT_CODER_SUPERVISOR_ENABLED = True
 DEFAULT_CODER_SUPERVISOR_INTERVAL_SECONDS = 30
 DEFAULT_CODER_SUPERVISOR_BATCH_SIZE = 100
 DEFAULT_CODER_CANCEL_ON_SOURCE_TERMINAL = True
+# Per-issue budget (TAN2-1). Defaults are a hard backstop against runaway
+# spend on a single stuck issue; 0 / empty means "unlimited" for that axis.
+# max_coder_executions is always enforceable ACA-side (it counts dispatched
+# coder passes, main + repairs); token/cost caps additionally apply whenever
+# the engine reports usage.
+DEFAULT_BUDGET_MAX_TOKENS = 0  # 0 = unlimited
+DEFAULT_BUDGET_MAX_COST_USD = 0.0  # 0 = unlimited
+DEFAULT_BUDGET_MAX_CODER_EXECUTIONS = 8
+# Repair-loop circuit breaker (TAN2-2).
+DEFAULT_MAX_REPAIR_ATTEMPTS = 5
+DEFAULT_REPAIR_COOLDOWN_BASE_MS = 60_000
+# Issue triage gate (TAN2-4). enabled computes+publishes a verdict for every
+# task (accepted / refused / needs_clarification); enforce additionally blocks
+# non-accepted tasks from admission and escalates them to a human. Default is
+# advisory (enabled, not enforcing) so verdicts/metrics surface without
+# changing admission behavior until the operator opts into enforcement.
+DEFAULT_TRIAGE_ENABLED = True
+DEFAULT_TRIAGE_ENFORCE = False
+DEFAULT_TRIAGE_ALLOWED_CLASSES = "bug_fix,dependency_bump,test_backfill,small_feature"
 DEFAULT_REVIEW_POLICY = "human_review"
 DEFAULT_AUTO_MERGE_STRATEGY = "squash"
 DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES = "squash"
@@ -282,6 +301,33 @@ class StorageConfig:
 
 
 @dataclass
+class BudgetConfig:
+    """Per-issue spend ceiling (TAN2-1).
+
+    Each axis is a hard cap; a value <= 0 disables that axis. When any enabled
+    axis is exceeded the issue is escalated to a human instead of continuing to
+    spend (escalate-don't-grind).
+    """
+
+    max_tokens: int = DEFAULT_BUDGET_MAX_TOKENS
+    max_cost_usd: float = DEFAULT_BUDGET_MAX_COST_USD
+    max_coder_executions: int = DEFAULT_BUDGET_MAX_CODER_EXECUTIONS
+
+
+@dataclass
+class TriageConfig:
+    """Issue triage gate (TAN2-4).
+
+    ``allowed_classes`` is a comma-separated allowlist of issue classes the
+    fleet will attempt autonomously; anything else is refused with a reason.
+    """
+
+    enabled: bool = DEFAULT_TRIAGE_ENABLED
+    enforce: bool = DEFAULT_TRIAGE_ENFORCE
+    allowed_classes: str = DEFAULT_TRIAGE_ALLOWED_CLASSES
+
+
+@dataclass
 class ReviewPolicyConfig:
     policy: str = DEFAULT_REVIEW_POLICY
     auto_merge_strategy: str = DEFAULT_AUTO_MERGE_STRATEGY
@@ -289,6 +335,8 @@ class ReviewPolicyConfig:
     merge_requires_approval: bool = DEFAULT_MERGE_REQUIRES_APPROVAL
     branch_delete_requires_approval: bool = DEFAULT_BRANCH_DELETE_REQUIRES_APPROVAL
     delete_branch_after_merge: bool = DEFAULT_DELETE_BRANCH_AFTER_MERGE
+    max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
+    repair_cooldown_base_ms: int = DEFAULT_REPAIR_COOLDOWN_BASE_MS
 
 
 @dataclass
@@ -373,6 +421,8 @@ class ResolvedConfig:
     execution: ExecutionConfig
     storage: StorageConfig
     review: ReviewPolicyConfig
+    budget: BudgetConfig
+    triage: TriageConfig
     artifact_store: ArtifactStoreConfig
     swarm: SwarmConfig
     output: OutputConfig

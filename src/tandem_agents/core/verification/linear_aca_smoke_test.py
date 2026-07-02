@@ -215,8 +215,11 @@ class LinearAcaCodingLoopSmokeTest(unittest.TestCase):
             ):
                 repair = coder_supervisor.reconcile_coder_run(cfg, run_id, coordination=store)
             self.assertEqual(repair["status"], "needs-repair")
-            self.assertEqual(repair["repair"]["status"], "completed")
-            self.assertEqual(linear_comment.call_count, 2)
+            # TAN2-2: a repair pass is "dispatched" (success confirmed on the
+            # next lifecycle refresh), and only the first-attempt "starting"
+            # comment is posted — no per-pass finish comment.
+            self.assertEqual(repair["repair"]["status"], "dispatched")
+            self.assertEqual(linear_comment.call_count, 1)
 
             ready = {
                 **pull_request,

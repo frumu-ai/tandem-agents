@@ -554,5 +554,77 @@ class SchedulerTest(unittest.TestCase):
             self.assertEqual(plan["blocked"][0]["repo_key"], "frumu-ai/shared")
 
 
+class SchedulerTriageTest(unittest.TestCase):
+    def _config(self, root: Path):
+        return SchedulerTest._config(self, root)
+
+    def _tasks(self, root: Path):
+        return [
+            {
+                "task_id": "task-bug",
+                "title": "Fix crash on empty input",
+                "labels": ["bug"],
+                "source": {"type": "manual", "prompt": "Fix crash on empty input", "source_name": "proj"},
+                "repo": {"slug": "frumu-ai/proj", "path": str(root / "repo-a")},
+            },
+            {
+                "task_id": "task-vague",
+                "title": "Rethink the product direction",
+                "source": {"type": "manual", "prompt": "Rethink the product direction", "source_name": "proj2"},
+                "repo": {"slug": "frumu-ai/proj2", "path": str(root / "repo-b")},
+            },
+        ]
+
+    def test_advisory_mode_records_metric_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 4
+            cfg.scheduler.max_active_tasks_per_project = 2
+            cfg.scheduler.max_active_tasks_per_repo = 2
+            cfg.triage.enabled = True
+            cfg.triage.enforce = False
+            store = CoordinationStore.from_config(cfg)
+            for task in self._tasks(root):
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            # Advisory: nothing blocked by triage, but the metric is present.
+            triage_reasons = [b for b in plan["blocked"] if str(b.get("reason", "")).startswith("triage_")]
+            self.assertEqual(triage_reasons, [])
+            self.assertEqual(plan["triage"]["total"], 2)
+            self.assertEqual(plan["triage"]["accepted"], 1)
+            self.assertEqual(plan["triage"]["escalated"], 1)
+            self.assertEqual(plan["triage"]["escalation_rate"], 0.5)
+            self.assertEqual(len(plan["admitted"]), 2)
+
+    def test_enforce_blocks_non_accepted_and_escalates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._config(root)
+            cfg.scheduler.max_active_tasks = 4
+            cfg.scheduler.max_active_tasks_per_project = 2
+            cfg.scheduler.max_active_tasks_per_repo = 2
+            cfg.triage.enabled = True
+            cfg.triage.enforce = True
+            store = CoordinationStore.from_config(cfg)
+            for task in self._tasks(root):
+                store.register_task(task, repo=task["repo"], status="queued")
+
+            plan = plan_task_admissions(cfg, coordination=store, limit=10)
+
+            admitted_ids = {item["task_key"] for item in plan["admitted"]}
+            self.assertEqual(len(admitted_ids), 1)  # only the bug fix
+            blocked_triage = [b for b in plan["blocked"] if str(b.get("reason", "")).startswith("triage_")]
+            self.assertEqual(len(blocked_triage), 1)
+            self.assertEqual(blocked_triage[0]["reason"], "triage_needs_clarification")
+            self.assertEqual(blocked_triage[0]["triage"]["verdict"], "needs_clarification")
+            # The accepted task carries its verdict too.
+            self.assertEqual(plan["admitted"][0]["triage"]["verdict"], "accepted")
+            # (Escalation delivery to a tracker is exercised in triage_test; the
+            # manual-source task here has no tracker to notify.)
+
+
 if __name__ == "__main__":
     unittest.main()

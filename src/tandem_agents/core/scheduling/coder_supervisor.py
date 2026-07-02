@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
 
 from src.tandem_agents.config.config_types import ResolvedConfig
+from src.tandem_agents.core.budget import budget_status, load_issue_spend, record_coder_spend
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import build_coder_summary
 from src.tandem_agents.core.engine.tandem_client_sdk import (
@@ -22,6 +24,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     github_remote_sync_mode,
     guarded_auto_merge,
     refresh_pull_request_lifecycle,
+    update_pull_request_branch,
 )
 from src.tandem_agents.core.integrations.linear_mcp import (
     build_linear_comment_body,
@@ -42,6 +45,116 @@ from src.tandem_agents.runtime.workspace_registry import load_workspace, record_
 from src.tandem_agents.utils.utils import now_ms
 
 logger = logging.getLogger("aca.coder_supervisor")
+
+# Circuit-breaker defaults for the PR repair loop (TAN2-2). The lifecycle
+# refresh runs on a ~30s cadence; without these bounds a PR stuck in
+# "needs-repair" (red CI, un-dismissed "changes requested") would dispatch a
+# fresh coder run every tick forever, burning tokens and spamming comments.
+_REPAIR_MAX_ATTEMPTS_DEFAULT = 5
+_REPAIR_COOLDOWN_BASE_MS_DEFAULT = 60_000  # 1 min, doubled per attempt (capped)
+_REPAIR_COOLDOWN_MAX_SHIFT = 6  # cap exponential backoff at base * 2**6 (~64 min)
+
+
+def _repair_max_attempts(cfg: ResolvedConfig) -> int:
+    value = getattr(getattr(cfg, "review", None), "max_repair_attempts", None)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return _REPAIR_MAX_ATTEMPTS_DEFAULT
+    return parsed if parsed > 0 else _REPAIR_MAX_ATTEMPTS_DEFAULT
+
+
+def _repair_cooldown_base_ms(cfg: ResolvedConfig) -> int:
+    value = getattr(getattr(cfg, "review", None), "repair_cooldown_base_ms", None)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return _REPAIR_COOLDOWN_BASE_MS_DEFAULT
+    return parsed if parsed > 0 else _REPAIR_COOLDOWN_BASE_MS_DEFAULT
+
+
+def _repair_signature(context: dict[str, Any]) -> str:
+    """Stable fingerprint of the actionable PR feedback.
+
+    Two refresh ticks that surface the *same* review comments and failing
+    checks produce the same signature. An unchanged signature after a repair
+    pass means the pass moved nothing — a strong "escalate, don't re-grind"
+    signal. Includes the head branch so a force-push that changes nothing else
+    still counts as unchanged.
+    """
+    items = context.get("feedback_items") or []
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        body_hash = hashlib.sha1(str(item.get("body") or "").encode("utf-8")).hexdigest()
+        parts.append(
+            "|".join(
+                [
+                    str(item.get("kind") or ""),
+                    str(item.get("url") or ""),
+                    str(item.get("path") or ""),
+                    str(item.get("line") or ""),
+                    body_hash,
+                ]
+            )
+        )
+    pr = context.get("pull_request") if isinstance(context.get("pull_request"), dict) else {}
+    head = str(pr.get("head_branch") or "")
+    joined = head + "\n" + "\n".join(sorted(parts))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def _repair_gate_decision(
+    state: dict[str, Any],
+    signature: str,
+    now_ms_value: int,
+    *,
+    max_attempts: int,
+    cooldown_base_ms: int,
+) -> tuple[str, dict[str, Any], str]:
+    """Decide whether to dispatch another repair pass.
+
+    Returns ``(decision, new_state, reason)`` where decision is one of:
+
+    - ``"proceed"``  — dispatch a pass; ``new_state`` has attempts incremented.
+    - ``"defer"``    — within the exponential cooldown window; try again later.
+    - ``"escalate"`` — cap reached or feedback unchanged since the last pass;
+                        hand off to a human, do not spend more tokens.
+    - ``"skip"``     — already escalated; do nothing.
+
+    Pure function (no I/O) so it is unit-testable in isolation.
+    """
+    new_state: dict[str, Any] = {
+        "attempts": int(state.get("attempts") or 0),
+        "last_attempt_ms": int(state.get("last_attempt_ms") or 0),
+        "last_signature": str(state.get("last_signature") or ""),
+        "escalated": bool(state.get("escalated") or False),
+        "reason": str(state.get("reason") or ""),
+    }
+    if new_state["escalated"]:
+        return "skip", new_state, new_state["reason"] or "already_escalated"
+
+    attempts = new_state["attempts"]
+    if attempts >= max_attempts:
+        new_state["escalated"] = True
+        new_state["reason"] = "max_attempts"
+        return "escalate", new_state, "max_attempts"
+
+    if attempts > 0:
+        shift = min(attempts - 1, _REPAIR_COOLDOWN_MAX_SHIFT)
+        cooldown = cooldown_base_ms * (2 ** shift)
+        if now_ms_value - new_state["last_attempt_ms"] < cooldown:
+            return "defer", new_state, "cooldown"
+        if signature and signature == new_state["last_signature"]:
+            new_state["escalated"] = True
+            new_state["reason"] = "no_new_feedback"
+            return "escalate", new_state, "no_new_feedback"
+
+    new_state["attempts"] = attempts + 1
+    new_state["last_attempt_ms"] = now_ms_value
+    new_state["last_signature"] = signature
+    return "proceed", new_state, ""
 
 TERMINAL_CODER_STATUSES = {"completed", "failed", "blocked", "cancelled", "canceled"}
 NON_TERMINAL_RUN_STATUSES = {"created", "running"}
@@ -417,23 +530,121 @@ def _start_pr_repair_pass(
         "completed_at_ms": None,
         "summary": "",
     }
-    blackboard["pull_request_repair"] = repair
-    status_payload["pull_request_repair"] = repair
-    save_blackboard(layout["blackboard"], blackboard)
-    write_status(layout["status"], status_payload)
-    if not context.get("actionable"):
-        repair["summary"] = str(context.get("reason") or "No actionable PR feedback.")
-        blackboard["pull_request_repair"] = repair
-        status_payload["pull_request_repair"] = repair
+
+    def _persist_repair(repair_state: dict[str, Any], breaker: dict[str, Any] | None = None) -> None:
+        blackboard["pull_request_repair"] = repair_state
+        status_payload["pull_request_repair"] = repair_state
         save_blackboard(layout["blackboard"], blackboard)
         write_status(layout["status"], status_payload)
+        run = coordination.get_run(run_id) or {}
+        metadata = dict(run.get("metadata") or {})
+        metadata["pull_request_repair"] = repair_state
+        if breaker is not None:
+            metadata["pull_request_repair_state"] = breaker
+        coordination.update_run(run_id, metadata=metadata)
+
+    if not context.get("actionable"):
+        repair["summary"] = str(context.get("reason") or "No actionable PR feedback.")
+        _persist_repair(repair)
         return repair
 
-    _maybe_add_linear_repair_comment(
-        cfg,
-        task,
-        f"ACA is starting a repair pass for PR feedback on {pull_request.get('url') or 'the linked PR'}.\n\nRepair run: `{repair['repair_run_id']}`",
-    )
+    # Circuit breaker: bound attempts, back off exponentially between passes,
+    # and escalate rather than re-dispatch when the feedback is unchanged (the
+    # last pass moved nothing). Without this the ~30s lifecycle refresh would
+    # dispatch a fresh coder run for a stuck PR every tick, forever (TAN2-2).
+    run_meta = dict((coordination.get_run(run_id) or {}).get("metadata") or {})
+    breaker_state = dict(run_meta.get("pull_request_repair_state") or {})
+    signature = _repair_signature(context)
+    max_attempts = _repair_max_attempts(cfg)
+
+    # Per-issue budget beats the attempt gate (TAN2-1): if the issue has already
+    # spent its token/cost/execution budget, escalate rather than dispatch — no
+    # matter how many repair attempts remain.
+    spend = load_issue_spend(coordination, run_id)
+    over_budget, budget_reason = budget_status(spend, cfg)
+    if over_budget:
+        already_escalated = bool(breaker_state.get("escalated"))
+        breaker_state = {
+            "attempts": int(breaker_state.get("attempts") or 0),
+            "last_attempt_ms": int(breaker_state.get("last_attempt_ms") or 0),
+            "last_signature": str(breaker_state.get("last_signature") or ""),
+            "escalated": True,
+            "reason": f"budget_exhausted ({budget_reason})",
+        }
+        decision = "skip" if already_escalated else "escalate"
+        reason = breaker_state["reason"]
+    else:
+        decision, breaker_state, reason = _repair_gate_decision(
+            breaker_state,
+            signature,
+            now_ms(),
+            max_attempts=max_attempts,
+            cooldown_base_ms=_repair_cooldown_base_ms(cfg),
+        )
+
+    if decision == "defer":
+        repair.update(
+            {
+                "status": "deferred",
+                "completed_at_ms": now_ms(),
+                "summary": f"Repair pass deferred (cooldown) after attempt {breaker_state['attempts']}.",
+                "breaker": breaker_state,
+            }
+        )
+        _persist_repair(repair, breaker_state)
+        append_event(layout["events"], "github_pull_request.repair_pass_deferred", run_id, repair)
+        return repair
+
+    if decision in {"escalate", "skip"}:
+        escalated_pr = {
+            **(context.get("pull_request") or pull_request),
+            "lifecycle_state": "needs-human",
+            "terminal": False,
+            "repair_escalated": True,
+            "repair_escalation_reason": reason,
+            "last_checked_at_ms": now_ms(),
+        }
+        _persist_pull_request_lifecycle(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=escalated_pr,
+        )
+        repair.update(
+            {
+                "status": "escalated",
+                "completed_at_ms": now_ms(),
+                "summary": f"Escalated to human after {breaker_state['attempts']} repair attempt(s): {reason}.",
+                "breaker": breaker_state,
+            }
+        )
+        _persist_repair(repair, breaker_state)
+        # Post the escalation comment only on the tick we first flip to
+        # escalated (decision == "escalate"); subsequent ticks return "skip"
+        # and stay silent so we don't re-spam the issue.
+        if decision == "escalate":
+            _maybe_add_linear_repair_comment(
+                cfg,
+                task,
+                f"ACA attempted {breaker_state['attempts']} repair pass(es) on "
+                f"{pull_request.get('url') or 'the linked PR'} without resolving the feedback "
+                f"(reason: {reason}). Pausing automated repairs and escalating for human review.",
+            )
+            append_event(layout["events"], "github_pull_request.repair_escalated", run_id, repair)
+        return repair
+
+    # decision == "proceed": dispatch a repair pass.
+    first_attempt = breaker_state["attempts"] <= 1
+    if first_attempt:
+        _maybe_add_linear_repair_comment(
+            cfg,
+            task,
+            f"ACA is starting repair passes for PR feedback on "
+            f"{pull_request.get('url') or 'the linked PR'} (up to {max_attempts} attempts).",
+        )
     # The Tandem coder endpoint accepts a generic payload; use a distinct
     # workflow_mode so the engine can route this as a same-branch PR repair.
     payload = {
@@ -455,16 +666,25 @@ def _start_pr_repair_pass(
         "source_client": "aca",
         "repair_context": context,
     }
+    create_response: Any = {}
+    execute_response: Any = {}
     try:
         create_response = sdk_coder_create_run(cfg, payload)
         execute_response = sdk_coder_execute_all(cfg, repair["repair_run_id"], {"max_steps": 16})
         repair.update(
             {
-                "status": "completed",
+                # "dispatched", not "completed": the pass was sent, but success
+                # (a new commit + CI transition) is only confirmable when the
+                # next lifecycle refresh moves the PR off "needs-repair".
+                "status": "dispatched",
                 "completed_at_ms": now_ms(),
-                "summary": "Repair pass dispatched to Tandem coder.",
+                "summary": (
+                    f"Repair pass {breaker_state['attempts']}/{max_attempts} dispatched to Tandem coder; "
+                    "outcome verified on next lifecycle refresh."
+                ),
                 "create_response": create_response if isinstance(create_response, dict) else {},
                 "execute_response": execute_response if isinstance(execute_response, dict) else {},
+                "breaker": breaker_state,
             }
         )
     except Exception as exc:
@@ -473,21 +693,21 @@ def _start_pr_repair_pass(
                 "status": "blocked",
                 "completed_at_ms": now_ms(),
                 "summary": str(exc).strip() or repr(exc),
+                "breaker": breaker_state,
             }
         )
-    blackboard["pull_request_repair"] = repair
-    status_payload["pull_request_repair"] = repair
-    save_blackboard(layout["blackboard"], blackboard)
-    write_status(layout["status"], status_payload)
-    run = coordination.get_run(run_id) or {}
-    metadata = dict(run.get("metadata") or {})
-    metadata["pull_request_repair"] = repair
-    coordination.update_run(run_id, metadata=metadata)
-    _maybe_add_linear_repair_comment(
-        cfg,
-        task,
-        f"ACA repair pass `{repair['repair_run_id']}` finished with status `{repair['status']}`.\n\n{repair.get('summary') or ''}".strip(),
+    # Fold this pass's usage into the per-issue spend ledger (counts one coder
+    # execution even on failure) so budget enforcement sees repair spend.
+    spend = record_coder_spend(
+        coordination,
+        run_id,
+        {
+            "create_response": create_response if isinstance(create_response, dict) else {},
+            "execute_response": execute_response if isinstance(execute_response, dict) else {},
+        },
     )
+    repair["issue_spend"] = spend
+    _persist_repair(repair, breaker_state)
     append_event(layout["events"], "github_pull_request.repair_pass_completed", run_id, repair)
     return repair
 
@@ -539,6 +759,34 @@ def _persist_pull_request_merge(
     metadata["pull_request_merge"] = merge
     coordination.update_run(run_id, metadata=metadata)
     return merge
+
+
+def _update_pr_branch_for_run(
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+    pull_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Update a behind-base PR branch and record the outcome (TAN2-3)."""
+    try:
+        result = update_pull_request_branch(cfg, pull_request)
+    except Exception as exc:
+        result = {"updated": False, "error": str(exc).strip() or repr(exc)}
+    result["completed_at_ms"] = now_ms()
+    blackboard["pull_request_rebase"] = result
+    status_payload["pull_request_rebase"] = result
+    save_blackboard(layout["blackboard"], blackboard)
+    write_status(layout["status"], status_payload)
+    run = coordination.get_run(run_id) or {}
+    metadata = dict(run.get("metadata") or {})
+    metadata["pull_request_rebase"] = result
+    coordination.update_run(run_id, metadata=metadata)
+    append_event(layout["events"], "github_pull_request.branch_update", run_id, result)
+    return result
 
 
 def _maybe_auto_merge_pr(
@@ -637,6 +885,8 @@ def _refresh_pr_lifecycle_for_run(
             "running",
             "waiting-for-review",
             "needs-repair",
+            "needs-rebase",
+            "conflicted",
             "ready-to-merge",
         } else "waiting-for-review"
         failed = {
@@ -667,8 +917,25 @@ def _refresh_pr_lifecycle_for_run(
         blackboard=blackboard,
         pull_request=refreshed,
     )
+    lifecycle_state = str(refreshed.get("lifecycle_state") or "").strip()
+    rebase = None
+    if lifecycle_state == "needs-rebase":
+        # Behind base but otherwise clean: update the branch (cheap, no coder
+        # tokens). The next refresh re-evaluates once CI re-runs (TAN2-3).
+        rebase = _update_pr_branch_for_run(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=refreshed,
+        )
     repair = None
-    if str(refreshed.get("lifecycle_state") or "").strip() == "needs-repair":
+    # A conflicted PR is routed through the same repair machinery so the agent
+    # attempts conflict resolution under the circuit breaker; the breaker
+    # escalates to a human if it can't be resolved (TAN2-2/TAN2-3).
+    if lifecycle_state in {"needs-repair", "conflicted"}:
         repair = _start_pr_repair_pass(
             cfg,
             coordination,
@@ -703,6 +970,8 @@ def _refresh_pr_lifecycle_for_run(
     }
     if repair is not None:
         result["repair"] = repair
+    if rebase is not None:
+        result["rebase"] = rebase
     if merge is not None:
         result["merge"] = merge
     return result
