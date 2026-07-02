@@ -606,6 +606,51 @@ class GitHubMcpIdempotenceTest(unittest.TestCase):
             "running",
         )
 
+    def test_pull_request_conflict_and_behind_states(self) -> None:
+        # GraphQL: mergeable=CONFLICTING → conflicted, even with green checks.
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {"state": "open", "number": 1, "reviewDecision": "APPROVED",
+                 "checks_status": "success", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"},
+                base_repo="frumu-ai/example",
+            )["lifecycle_state"],
+            "conflicted",
+        )
+        # GraphQL: behind base but clean → needs-rebase.
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {"state": "open", "number": 1, "reviewDecision": "APPROVED",
+                 "checks_status": "success", "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND"},
+                base_repo="frumu-ai/example",
+            )["lifecycle_state"],
+            "needs-rebase",
+        )
+        # REST: mergeable_state=dirty → conflicted.
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {"state": "open", "number": 1, "reviewDecision": "APPROVED",
+                 "checks_status": "success", "mergeable_state": "dirty"},
+                base_repo="frumu-ai/example",
+            )["lifecycle_state"],
+            "conflicted",
+        )
+        # Conflict takes precedence over a plain review-required wait.
+        self.assertEqual(
+            normalize_pull_request_metadata(
+                {"state": "open", "number": 1, "reviewDecision": "REVIEW_REQUIRED",
+                 "checks_status": "success", "mergeable": "CONFLICTING"},
+                base_repo="frumu-ai/example",
+            )["lifecycle_state"],
+            "conflicted",
+        )
+        # No mergeability info → unchanged behavior (ready-to-merge).
+        meta = normalize_pull_request_metadata(
+            {"state": "open", "number": 1, "reviewDecision": "APPROVED", "checks_status": "success"},
+            base_repo="frumu-ai/example",
+        )
+        self.assertEqual(meta["lifecycle_state"], "ready-to-merge")
+        self.assertEqual(meta["mergeable_state"], "")
+
     def test_collect_pull_request_repair_context_skips_stale_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

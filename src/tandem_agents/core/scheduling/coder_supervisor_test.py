@@ -472,6 +472,78 @@ class CoderSupervisorTest(unittest.TestCase):
             self.assertEqual(status["pull_request_repair"]["status"], "dispatched")
             self.assertEqual(blackboard["pull_request_repair"]["context"]["feedback_items"][0]["path"], "src/app.py")
 
+    def test_needs_rebase_updates_branch_without_coder_run(self) -> None:
+        # A behind-base PR should get its branch updated (cheap) and NOT spawn
+        # a coder run (TAN2-3).
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(cfg, store)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "needs-rebase",
+                "terminal": False,
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "update_pull_request_branch", return_value={"updated": True}) as update_branch,
+                patch.object(coder_supervisor, "sdk_coder_create_run", return_value={"ok": True}) as create_run,
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            update_branch.assert_called_once()
+            create_run.assert_not_called()
+            self.assertEqual(result["rebase"]["updated"], True)
+            self.assertEqual(result["status"], "needs-rebase")
+
+    def test_conflicted_routes_through_repair_pass(self) -> None:
+        # A conflicted PR goes through the repair machinery (agent attempts
+        # resolution under the circuit breaker) (TAN2-3).
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(
+                cfg, store,
+                source={"type": "linear", "issue_id": "lin-1", "identifier": "TAN-120", "team": "Tandem"},
+            )
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "review_state": "approved",
+                "checks_state": "success",
+                "lifecycle_state": "conflicted",
+                "terminal": False,
+            }
+            repair_context = {
+                "actionable": True,
+                "pull_request": refreshed,
+                "feedback_items": [{"kind": "review_comment", "body": "resolve conflicts", "path": "a.py", "line": 1}],
+                "truncated": False,
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "collect_pull_request_repair_context", return_value=repair_context),
+                patch.object(coder_supervisor, "sdk_coder_create_run", return_value={"ok": True}) as create_run,
+                patch.object(coder_supervisor, "sdk_coder_execute_all", return_value={}),
+                patch.object(coder_supervisor, "linear_add_comment", return_value=None),
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            create_run.assert_called_once()
+            self.assertEqual(result["repair"]["status"], "dispatched")
+
     def test_needs_repair_does_not_redispatch_once_escalated(self) -> None:
         # Once the circuit breaker has escalated a PR, a subsequent reconcile
         # tick that still sees "needs-repair" must NOT spend tokens on another

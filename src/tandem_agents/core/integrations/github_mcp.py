@@ -717,20 +717,61 @@ def _pull_request_checks_state(pr: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _pull_request_mergeable_state(pr: dict[str, Any]) -> str:
+    """Normalize GitHub's mergeability signals to a small vocabulary.
+
+    Returns one of "clean" | "conflicting" | "behind" | "blocked" |
+    "unstable" | "" (unknown/unavailable). Reads both the GraphQL fields
+    (``mergeable`` = MERGEABLE/CONFLICTING/UNKNOWN, ``mergeStateStatus`` =
+    BEHIND/DIRTY/CLEAN/...) and the REST fields (``mergeable`` bool,
+    ``mergeable_state`` = behind/dirty/clean/...).
+    """
+    mergeable_raw = normalize_status_key(str(pr.get("mergeable") if pr.get("mergeable") is not None else ""))
+    if mergeable_raw == "conflicting":
+        return "conflicting"
+    merge_state = normalize_status_key(
+        str(pr.get("mergeStateStatus") or pr.get("merge_state_status") or pr.get("mergeable_state") or "")
+    )
+    if merge_state == "dirty":
+        return "conflicting"
+    if merge_state == "behind":
+        return "behind"
+    if merge_state == "clean":
+        return "clean"
+    if merge_state in {"blocked", "draft", "has_hooks"}:
+        return "blocked"
+    if merge_state == "unstable":
+        return "unstable"
+    # REST reports mergeable=false with no usable state as a conflict.
+    if pr.get("mergeable") is False and not merge_state:
+        return "conflicting"
+    return ""
+
+
 def pull_request_lifecycle_state(pr: dict[str, Any]) -> str:
     state = normalize_status_key(str(pr.get("state") or "open"))
     merged = bool(pr.get("merged") or pr.get("merged_at") or pr.get("mergedAt"))
     draft = bool(pr.get("draft") or pr.get("isDraft"))
     review_state = _pull_request_reviews_state(pr)
     checks_state = _pull_request_checks_state(pr)
+    mergeable_state = _pull_request_mergeable_state(pr)
     if merged:
         return "merged"
     if state in {"closed", "cancelled", "canceled"}:
         return "blocked"
+    # A conflicted PR can't merge no matter what else is green — surface it so
+    # the supervisor attempts resolution (TAN2-3) instead of parking it in
+    # waiting-for-review forever.
+    if mergeable_state == "conflicting":
+        return "conflicted"
     if review_state == "changes_requested" or checks_state == "failure":
         return "needs-repair"
     if draft or checks_state == "pending":
         return "running"
+    # Behind base but otherwise clean: just needs the branch updated (cheap,
+    # no coder tokens) before it can merge.
+    if mergeable_state == "behind":
+        return "needs-rebase"
     if review_state == "approved" and checks_state == "success":
         return "ready-to-merge"
     return "waiting-for-review"
@@ -756,6 +797,7 @@ def normalize_pull_request_metadata(
         "merged": bool(pr.get("merged") or pr.get("merged_at") or pr.get("mergedAt")),
         "review_state": _pull_request_reviews_state(pr),
         "checks_state": _pull_request_checks_state(pr),
+        "mergeable_state": _pull_request_mergeable_state(pr),
     }
     normalized["lifecycle_state"] = pull_request_lifecycle_state(pr)
     normalized["terminal"] = normalized["lifecycle_state"] in {"merged", "blocked"}
@@ -1217,6 +1259,8 @@ query($owner: String!, $repo: String!, $number: Int!) {
       state
       isDraft
       merged
+      mergeable
+      mergeStateStatus
       reviewDecision
       statusCheckRollup {
         contexts(first: 50) {
@@ -1905,6 +1949,33 @@ def delete_remote_branch(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> d
         data = _parse_json_output(result)
         return data if isinstance(data, dict) else {"deleted": True}
     return {"deleted": False, "error": "Could not delete remote branch through GitHub MCP."}
+
+
+def update_pull_request_branch(cfg: ResolvedConfig, pull_request: dict[str, Any]) -> dict[str, Any]:
+    """Merge the base branch into a PR that is behind base (TAN2-3).
+
+    Cheap, no coder tokens — used when a PR is otherwise clean but "behind".
+    Returns ``{"updated": bool, ...}``.
+    """
+    base_repo = str(pull_request.get("base_repo") or cfg.repository.slug or "").strip()
+    number = pull_request.get("number")
+    if not base_repo or "/" not in base_repo or number in (None, ""):
+        return {"updated": False, "error": "Missing base repo or PR number."}
+    owner, repo_name = base_repo.split("/", 1)
+    attempts = [
+        ("mcp.github.update_pull_request_branch", {"owner": owner, "repo": repo_name, "pullNumber": int(number)}),
+        ("mcp.github.update_pull_request_branch", {"owner": owner, "repo": repo_name, "pull_number": int(number)}),
+    ]
+    for tool, args in attempts:
+        try:
+            result = execute_engine_tool(cfg, tool, args)
+        except RuntimeError:
+            continue
+        if _tool_failed(result):
+            continue
+        data = _parse_json_output(result)
+        return data if isinstance(data, dict) else {"updated": True}
+    return {"updated": False, "error": "Could not update PR branch through GitHub MCP."}
 
 
 def guarded_auto_merge(

@@ -24,6 +24,7 @@ from src.tandem_agents.core.integrations.github_mcp import (
     github_remote_sync_mode,
     guarded_auto_merge,
     refresh_pull_request_lifecycle,
+    update_pull_request_branch,
 )
 from src.tandem_agents.core.integrations.linear_mcp import (
     build_linear_comment_body,
@@ -760,6 +761,34 @@ def _persist_pull_request_merge(
     return merge
 
 
+def _update_pr_branch_for_run(
+    cfg: ResolvedConfig,
+    coordination: CoordinationStore,
+    *,
+    run_id: str,
+    layout: dict[str, Path],
+    status_payload: dict[str, Any],
+    blackboard: dict[str, Any],
+    pull_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Update a behind-base PR branch and record the outcome (TAN2-3)."""
+    try:
+        result = update_pull_request_branch(cfg, pull_request)
+    except Exception as exc:
+        result = {"updated": False, "error": str(exc).strip() or repr(exc)}
+    result["completed_at_ms"] = now_ms()
+    blackboard["pull_request_rebase"] = result
+    status_payload["pull_request_rebase"] = result
+    save_blackboard(layout["blackboard"], blackboard)
+    write_status(layout["status"], status_payload)
+    run = coordination.get_run(run_id) or {}
+    metadata = dict(run.get("metadata") or {})
+    metadata["pull_request_rebase"] = result
+    coordination.update_run(run_id, metadata=metadata)
+    append_event(layout["events"], "github_pull_request.branch_update", run_id, result)
+    return result
+
+
 def _maybe_auto_merge_pr(
     cfg: ResolvedConfig,
     coordination: CoordinationStore,
@@ -856,6 +885,8 @@ def _refresh_pr_lifecycle_for_run(
             "running",
             "waiting-for-review",
             "needs-repair",
+            "needs-rebase",
+            "conflicted",
             "ready-to-merge",
         } else "waiting-for-review"
         failed = {
@@ -886,8 +917,25 @@ def _refresh_pr_lifecycle_for_run(
         blackboard=blackboard,
         pull_request=refreshed,
     )
+    lifecycle_state = str(refreshed.get("lifecycle_state") or "").strip()
+    rebase = None
+    if lifecycle_state == "needs-rebase":
+        # Behind base but otherwise clean: update the branch (cheap, no coder
+        # tokens). The next refresh re-evaluates once CI re-runs (TAN2-3).
+        rebase = _update_pr_branch_for_run(
+            cfg,
+            coordination,
+            run_id=run_id,
+            layout=layout,
+            status_payload=status_payload,
+            blackboard=blackboard,
+            pull_request=refreshed,
+        )
     repair = None
-    if str(refreshed.get("lifecycle_state") or "").strip() == "needs-repair":
+    # A conflicted PR is routed through the same repair machinery so the agent
+    # attempts conflict resolution under the circuit breaker; the breaker
+    # escalates to a human if it can't be resolved (TAN2-2/TAN2-3).
+    if lifecycle_state in {"needs-repair", "conflicted"}:
         repair = _start_pr_repair_pass(
             cfg,
             coordination,
@@ -922,6 +970,8 @@ def _refresh_pr_lifecycle_for_run(
     }
     if repair is not None:
         result["repair"] = repair
+    if rebase is not None:
+        result["rebase"] = rebase
     if merge is not None:
         result["merge"] = merge
     return result
