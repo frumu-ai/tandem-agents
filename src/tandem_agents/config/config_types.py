@@ -63,6 +63,14 @@ DEFAULT_BUDGET_MAX_CODER_EXECUTIONS = 8
 # Repair-loop circuit breaker (TAN2-2).
 DEFAULT_MAX_REPAIR_ATTEMPTS = 5
 DEFAULT_REPAIR_COOLDOWN_BASE_MS = 60_000
+# Issue triage gate (TAN2-4). enabled computes+publishes a verdict for every
+# task (accepted / refused / needs_clarification); enforce additionally blocks
+# non-accepted tasks from admission and escalates them to a human. Default is
+# advisory (enabled, not enforcing) so verdicts/metrics surface without
+# changing admission behavior until the operator opts into enforcement.
+DEFAULT_TRIAGE_ENABLED = True
+DEFAULT_TRIAGE_ENFORCE = False
+DEFAULT_TRIAGE_ALLOWED_CLASSES = "bug_fix,dependency_bump,test_backfill,small_feature"
 DEFAULT_REVIEW_POLICY = "human_review"
 DEFAULT_AUTO_MERGE_STRATEGY = "squash"
 DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES = "squash"
@@ -307,6 +315,19 @@ class BudgetConfig:
 
 
 @dataclass
+class TriageConfig:
+    """Issue triage gate (TAN2-4).
+
+    ``allowed_classes`` is a comma-separated allowlist of issue classes the
+    fleet will attempt autonomously; anything else is refused with a reason.
+    """
+
+    enabled: bool = DEFAULT_TRIAGE_ENABLED
+    enforce: bool = DEFAULT_TRIAGE_ENFORCE
+    allowed_classes: str = DEFAULT_TRIAGE_ALLOWED_CLASSES
+
+
+@dataclass
 class ReviewPolicyConfig:
     policy: str = DEFAULT_REVIEW_POLICY
     auto_merge_strategy: str = DEFAULT_AUTO_MERGE_STRATEGY
@@ -401,6 +422,7 @@ class ResolvedConfig:
     storage: StorageConfig
     review: ReviewPolicyConfig
     budget: BudgetConfig
+    triage: TriageConfig
     artifact_store: ArtifactStoreConfig
     swarm: SwarmConfig
     output: OutputConfig

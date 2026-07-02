@@ -11,6 +11,7 @@ from src.tandem_agents.config.config_types import (
     ControlPanelConfig,
     CoordinationConfig,
     BudgetConfig,
+    TriageConfig,
     ExecutionConfig,
     GithubMcpConfig,
     LinearMcpConfig,
@@ -69,6 +70,9 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_BUDGET_MAX_CODER_EXECUTIONS,
     DEFAULT_MAX_REPAIR_ATTEMPTS,
     DEFAULT_REPAIR_COOLDOWN_BASE_MS,
+    DEFAULT_TRIAGE_ENABLED,
+    DEFAULT_TRIAGE_ENFORCE,
+    DEFAULT_TRIAGE_ALLOWED_CLASSES,
     DEFAULT_STARTUP_MODE,
     DEFAULT_UPDATE_POLICY,
     TASK_SOURCE_TYPES,
@@ -482,6 +486,23 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             ),
         ),
     )
+    triage = TriageConfig(
+        enabled=_as_bool(
+            pick("ACA_TRIAGE_ENABLED", yaml_value=data.get("triage", {}).get("enabled"), default=DEFAULT_TRIAGE_ENABLED),
+            default=DEFAULT_TRIAGE_ENABLED,
+        ),
+        enforce=_as_bool(
+            pick("ACA_TRIAGE_ENFORCE", yaml_value=data.get("triage", {}).get("enforce"), default=DEFAULT_TRIAGE_ENFORCE),
+            default=DEFAULT_TRIAGE_ENFORCE,
+        ),
+        allowed_classes=str(
+            pick(
+                "ACA_TRIAGE_ALLOWED_CLASSES",
+                yaml_value=data.get("triage", {}).get("allowed_classes"),
+                default=DEFAULT_TRIAGE_ALLOWED_CLASSES,
+            )
+        ),
+    )
     swarm = SwarmConfig(
         enabled=_as_bool(pick("ACA_ENABLE_SWARM", "AUTOCODER_ENABLE_SWARM", yaml_value=swarm_data.get("enabled"), default=False)),
         shared_model=_as_bool(pick("ACA_SHARED_MODEL", "AUTOCODER_SHARED_MODEL", yaml_value=swarm_data.get("shared_model"), default=False)),
@@ -827,6 +848,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         storage=storage,
         review=review,
         budget=budget,
+        triage=triage,
         artifact_store=artifact_store,
         swarm=swarm,
         output=output,

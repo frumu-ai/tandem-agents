@@ -16,6 +16,12 @@ from src.tandem_agents.core.engine.engine_runtime import engine_session_readines
 from src.tandem_agents.core.integrations.linear_mcp import get_mcp_server, linear_mcp_server_name
 from src.tandem_agents.core.task_contract import classify_task_execution_kind
 from src.tandem_agents.core.scheduling.coder_supervisor import list_active_coder_task_refs
+from src.tandem_agents.core.triage import (
+    ACCEPTED as TRIAGE_ACCEPTED,
+    escalate_triaged_task,
+    summarize_triage,
+    triage_task,
+)
 
 
 LINEAR_AUTH_CHALLENGE_MAX_AGE_MS = 4 * 60 * 1000
@@ -445,9 +451,41 @@ def plan_task_admissions(
         for item in active_coder_runs
         if _nonempty(item.get("task_id"))
     }
+    triage_enabled = bool(getattr(getattr(cfg, "triage", None), "enabled", False))
+    triage_enforce = bool(getattr(getattr(cfg, "triage", None), "enforce", False))
+    triage_verdicts: list[dict[str, Any]] = []
+    triage_by_key: dict[str, dict[str, Any]] = {}
     for task in queued:
         blocked_reason = None
         dependency_status = task.get("dependency_status") or {}
+        # Triage gate (TAN2-4): decide accept vs escalate-to-human before any
+        # capacity/dependency checks. In advisory mode we only record the
+        # verdict (for the metric); when enforcing, non-accepted tasks are
+        # withheld from admission and escalated to a human.
+        triage_verdict: dict[str, Any] | None = None
+        if triage_enabled:
+            triage_verdict = triage_task(task, cfg)
+            triage_verdicts.append(triage_verdict)
+            _tk = _nonempty(task.get("task_key"))
+            if _tk:
+                triage_by_key[_tk] = triage_verdict
+            if triage_enforce and triage_verdict.get("verdict") != TRIAGE_ACCEPTED:
+                try:
+                    escalate_triaged_task(cfg, store, task, triage_verdict)
+                except Exception:
+                    pass
+                blocked.append(
+                    {
+                        "task_key": task.get("task_key"),
+                        "project_key": task_project_key(task),
+                        "repo_key": task_repo_key(task),
+                        "reason": f"triage_{triage_verdict.get('verdict')}",
+                        "triage": triage_verdict,
+                        "scope_mode": _scope_mode(task),
+                        "task": task,
+                    }
+                )
+                continue
         if linear_mcp_blocker is not None and _task_source_type(task) == "linear":
             blocked.append(
                 {
@@ -599,6 +637,7 @@ def plan_task_admissions(
                     "execution_backend": task_execution_backend(cfg, candidate),
                     "scope_mode": _scope_mode(candidate),
                     "scope_paths": ["/".join(parts) for parts in candidate_scopes],
+                    "triage": triage_by_key.get(_nonempty(candidate.get("task_key"))),
                     "task": candidate,
                 }
             )
@@ -649,6 +688,11 @@ def plan_task_admissions(
         },
         "queued_tasks": len(queued),
         "active_tasks": len(active),
+        "triage": {
+            "enabled": triage_enabled,
+            "enforce": triage_enforce,
+            **summarize_triage(triage_verdicts),
+        },
         "admitted": admitted,
         "blocked": blocked,
         "remaining": [
