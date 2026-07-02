@@ -531,6 +531,60 @@ class CoderSupervisorTest(unittest.TestCase):
             status = load_status(cfg.output_root() / "run-pr" / "status.json")
             self.assertEqual(status["pull_request_lifecycle"]["lifecycle_state"], "needs-human")
 
+    def test_needs_repair_escalates_when_issue_budget_exhausted(self) -> None:
+        # A PR still in needs-repair whose issue has blown its per-issue budget
+        # must escalate instead of dispatching another coder run (TAN2-1),
+        # regardless of how many repair attempts remain.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp))
+            # Force a tiny execution budget so one prior pass exhausts it.
+            object.__setattr__(cfg.budget, "max_coder_executions", 1)
+            store = CoordinationStore.from_config(cfg)
+            _seed_completed_run_with_pr(
+                cfg,
+                store,
+                source={"type": "linear", "issue_id": "lin-1", "identifier": "TAN-120", "team": "Tandem"},
+            )
+            run = store.get_run("run-pr") or {}
+            metadata = dict(run.get("metadata") or {})
+            metadata["issue_spend"] = {"total_tokens": 0, "cost_usd": 0.0, "coder_executions": 1}
+            store.update_run("run-pr", metadata=metadata)
+
+            refreshed = {
+                "url": "https://github.com/acme/demo/pull/7",
+                "number": 7,
+                "head_branch": "aca/run-pr",
+                "base_branch": "main",
+                "base_repo": "acme/demo",
+                "state": "open",
+                "review_state": "changes_requested",
+                "checks_state": "success",
+                "lifecycle_state": "needs-repair",
+                "terminal": False,
+            }
+            repair_context = {
+                "actionable": True,
+                "pull_request": refreshed,
+                "feedback_items": [{"kind": "review_comment", "body": "fix", "path": "a.py", "line": 1}],
+                "truncated": False,
+            }
+            with (
+                patch.object(coder_supervisor, "refresh_pull_request_lifecycle", return_value=refreshed),
+                patch.object(coder_supervisor, "collect_pull_request_repair_context", return_value=repair_context),
+                patch.object(coder_supervisor, "sdk_coder_create_run", return_value={"ok": True}) as create_run,
+                patch.object(coder_supervisor, "sdk_coder_execute_all", return_value={}) as execute_all,
+                patch.object(coder_supervisor, "linear_add_comment", return_value=None) as linear_comment,
+            ):
+                result = coder_supervisor.reconcile_coder_run(cfg, "run-pr", coordination=store)
+
+            create_run.assert_not_called()
+            execute_all.assert_not_called()
+            self.assertEqual(result["repair"]["status"], "escalated")
+            self.assertIn("budget_exhausted", result["repair"]["summary"])
+            # The escalation comment names the budget reason.
+            self.assertTrue(linear_comment.called)
+            self.assertIn("budget_exhausted", linear_comment.call_args.args[2])
+
     def test_ready_to_merge_auto_merge_persists_merge_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _config(Path(tmp), review_policy="auto_merge")

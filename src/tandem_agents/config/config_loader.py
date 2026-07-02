@@ -10,6 +10,7 @@ from src.tandem_agents.config.config_types import (
     AgentConfig,
     ControlPanelConfig,
     CoordinationConfig,
+    BudgetConfig,
     ExecutionConfig,
     GithubMcpConfig,
     LinearMcpConfig,
@@ -63,6 +64,11 @@ from src.tandem_agents.config.config_types import (
     DEFAULT_REVIEW_POLICY,
     DEFAULT_AUTO_MERGE_ALLOWED_STRATEGIES,
     DEFAULT_AUTO_MERGE_STRATEGY,
+    DEFAULT_BUDGET_MAX_TOKENS,
+    DEFAULT_BUDGET_MAX_COST_USD,
+    DEFAULT_BUDGET_MAX_CODER_EXECUTIONS,
+    DEFAULT_MAX_REPAIR_ATTEMPTS,
+    DEFAULT_REPAIR_COOLDOWN_BASE_MS,
     DEFAULT_STARTUP_MODE,
     DEFAULT_UPDATE_POLICY,
     TASK_SOURCE_TYPES,
@@ -418,6 +424,63 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
             ),
             default=DEFAULT_DELETE_BRANCH_AFTER_MERGE,
         ),
+        max_repair_attempts=max(
+            1,
+            _as_int(
+                pick(
+                    "ACA_MAX_REPAIR_ATTEMPTS",
+                    yaml_value=data.get("review", {}).get("max_repair_attempts"),
+                    default=DEFAULT_MAX_REPAIR_ATTEMPTS,
+                ),
+                DEFAULT_MAX_REPAIR_ATTEMPTS,
+            ),
+        ),
+        repair_cooldown_base_ms=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_REPAIR_COOLDOWN_BASE_MS",
+                    yaml_value=data.get("review", {}).get("repair_cooldown_base_ms"),
+                    default=DEFAULT_REPAIR_COOLDOWN_BASE_MS,
+                ),
+                DEFAULT_REPAIR_COOLDOWN_BASE_MS,
+            ),
+        ),
+    )
+    budget = BudgetConfig(
+        max_tokens=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_BUDGET_MAX_TOKENS",
+                    yaml_value=data.get("budget", {}).get("max_tokens"),
+                    default=DEFAULT_BUDGET_MAX_TOKENS,
+                ),
+                DEFAULT_BUDGET_MAX_TOKENS,
+            ),
+        ),
+        max_cost_usd=max(
+            0.0,
+            _as_float_or_none(
+                pick(
+                    "ACA_BUDGET_MAX_COST_USD",
+                    yaml_value=data.get("budget", {}).get("max_cost_usd"),
+                    default=DEFAULT_BUDGET_MAX_COST_USD,
+                )
+            )
+            or DEFAULT_BUDGET_MAX_COST_USD,
+        ),
+        max_coder_executions=max(
+            0,
+            _as_int(
+                pick(
+                    "ACA_BUDGET_MAX_CODER_EXECUTIONS",
+                    yaml_value=data.get("budget", {}).get("max_coder_executions"),
+                    default=DEFAULT_BUDGET_MAX_CODER_EXECUTIONS,
+                ),
+                DEFAULT_BUDGET_MAX_CODER_EXECUTIONS,
+            ),
+        ),
     )
     swarm = SwarmConfig(
         enabled=_as_bool(pick("ACA_ENABLE_SWARM", "AUTOCODER_ENABLE_SWARM", yaml_value=swarm_data.get("enabled"), default=False)),
@@ -763,6 +826,7 @@ def resolve_config(root_dir: Path, env: Mapping[str, str] | None = None) -> Reso
         execution=execution,
         storage=storage,
         review=review,
+        budget=budget,
         artifact_store=artifact_store,
         swarm=swarm,
         output=output,

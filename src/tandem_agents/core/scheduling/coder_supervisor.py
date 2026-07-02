@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from src.tandem_agents.config.config_types import ResolvedConfig
+from src.tandem_agents.core.budget import budget_status, load_issue_spend, record_coder_spend
 from src.tandem_agents.core.coordination.coordination import CoordinationStore
 from src.tandem_agents.core.engine.coder_backend import build_coder_summary
 from src.tandem_agents.core.engine.tandem_client_sdk import (
@@ -554,13 +555,31 @@ def _start_pr_repair_pass(
     breaker_state = dict(run_meta.get("pull_request_repair_state") or {})
     signature = _repair_signature(context)
     max_attempts = _repair_max_attempts(cfg)
-    decision, breaker_state, reason = _repair_gate_decision(
-        breaker_state,
-        signature,
-        now_ms(),
-        max_attempts=max_attempts,
-        cooldown_base_ms=_repair_cooldown_base_ms(cfg),
-    )
+
+    # Per-issue budget beats the attempt gate (TAN2-1): if the issue has already
+    # spent its token/cost/execution budget, escalate rather than dispatch — no
+    # matter how many repair attempts remain.
+    spend = load_issue_spend(coordination, run_id)
+    over_budget, budget_reason = budget_status(spend, cfg)
+    if over_budget:
+        already_escalated = bool(breaker_state.get("escalated"))
+        breaker_state = {
+            "attempts": int(breaker_state.get("attempts") or 0),
+            "last_attempt_ms": int(breaker_state.get("last_attempt_ms") or 0),
+            "last_signature": str(breaker_state.get("last_signature") or ""),
+            "escalated": True,
+            "reason": f"budget_exhausted ({budget_reason})",
+        }
+        decision = "skip" if already_escalated else "escalate"
+        reason = breaker_state["reason"]
+    else:
+        decision, breaker_state, reason = _repair_gate_decision(
+            breaker_state,
+            signature,
+            now_ms(),
+            max_attempts=max_attempts,
+            cooldown_base_ms=_repair_cooldown_base_ms(cfg),
+        )
 
     if decision == "defer":
         repair.update(
@@ -646,6 +665,8 @@ def _start_pr_repair_pass(
         "source_client": "aca",
         "repair_context": context,
     }
+    create_response: Any = {}
+    execute_response: Any = {}
     try:
         create_response = sdk_coder_create_run(cfg, payload)
         execute_response = sdk_coder_execute_all(cfg, repair["repair_run_id"], {"max_steps": 16})
@@ -674,6 +695,17 @@ def _start_pr_repair_pass(
                 "breaker": breaker_state,
             }
         )
+    # Fold this pass's usage into the per-issue spend ledger (counts one coder
+    # execution even on failure) so budget enforcement sees repair spend.
+    spend = record_coder_spend(
+        coordination,
+        run_id,
+        {
+            "create_response": create_response if isinstance(create_response, dict) else {},
+            "execute_response": execute_response if isinstance(execute_response, dict) else {},
+        },
+    )
+    repair["issue_spend"] = spend
     _persist_repair(repair, breaker_state)
     append_event(layout["events"], "github_pull_request.repair_pass_completed", run_id, repair)
     return repair

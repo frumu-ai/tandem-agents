@@ -88,6 +88,7 @@ from src.tandem_agents.core.execution.run_lifecycle import (
     build_swarm_config_dict,
     make_run_result,
 )
+from src.tandem_agents.core.budget import budget_status, load_issue_spend, record_coder_spend
 from src.tandem_agents.core.external_actions.github_pr import (
     default_action_plan,
     enqueue_approvals_for_plan,
@@ -5977,6 +5978,39 @@ def _run_coder_backend(ctx: "_PhaseRunContext") -> dict[str, Any]:
                  {"workflow_mode": "issue_fix"}, task_id=ctx.task.get("task_id"),
                  role="manager", repo={"path": ctx.repo.get("path")})
 
+    # Per-issue budget pre-flight (TAN2-1): if prior passes (e.g. repairs on a
+    # resumed run) already spent the budget, escalate to a human instead of
+    # dispatching another coder run.
+    _spend = load_issue_spend(ctx.coordination, ctx.run_id)
+    _over_budget, _budget_reason = budget_status(_spend, ctx.cfg)
+    if _over_budget:
+        _msg = (
+            f"Per-issue budget exhausted before coder execution ({_budget_reason}); "
+            "escalating to a human instead of spending more."
+        )
+        ctx.status = set_status(
+            ctx.status, ctx.layout, phase="coder_execution", phase_detail=_msg,
+            run_status="blocked", blocker=(True, "coder", _msg, "manager"), run_completed=True,
+        )
+        _touch_coordination(
+            ctx.coordination, run_id=ctx.run_id, lease_id=ctx.lease_id,
+            lease_ttl_seconds=ctx.cfg.coordination.lease_ttl_seconds,
+            status="blocked", phase="coder_execution", error=_msg, completed=True,
+        )
+        _move_task_card_if_present(board, ctx.task, "blocked", "manager", "per-issue budget exhausted")
+        save_board(board_path, board)
+        write_board_snapshot(ctx.run_dir, board)
+        save_run_text(ctx.layout["summary"], build_blocked_summary(task_title=ctx.task["title"], message=_msg))
+        _finalize_github_sync(
+            cfg=ctx.cfg, task=ctx.task, run_id=ctx.run_id, layout=ctx.layout,
+            status=ctx.status, blackboard=ctx.blackboard,
+            outcome="blocked", summary=_msg, coordination=ctx.coordination,
+        )
+        if ctx.lease_id:
+            ctx.coordination.release_lease(str(ctx.lease_id), status="blocked", reason="budget exhausted")
+        append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "budget_exhausted", "reason": _budget_reason})
+        return ctx.make_result()
+
     try:
         coder_result = execute_coder_run(ctx.cfg, run_id=ctx.run_id, repo=ctx.repo, task=ctx.task)
     except Exception as exc:
@@ -5999,6 +6033,10 @@ def _run_coder_backend(ctx: "_PhaseRunContext") -> dict[str, Any]:
             ctx.coordination.release_lease(str(ctx.lease_id), status="blocked", reason="coder execution failed")
         append_event(ctx.layout["events"], "run.blocked", ctx.run_id, {"kind": "coder"})
         return ctx.make_result()
+
+    # Record this run's token/cost usage into the per-issue spend ledger so
+    # subsequent passes (repairs) and the pre-flight check above see it (TAN2-1).
+    record_coder_spend(ctx.coordination, ctx.run_id, coder_result)
 
     ctx.blackboard["coder_run"] = coder_result.get("coder_run") or {}
     ctx.blackboard["artifacts"] = coder_result.get("artifacts") or []
