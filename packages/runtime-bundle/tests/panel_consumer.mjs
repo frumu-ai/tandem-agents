@@ -1,4 +1,4 @@
-// Execute the released panel's real reader without launching its HTTP server.
+// Execute the pinned panel source's real reader without launching its HTTP server.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -31,4 +31,4 @@ for (const operation of ['exchange', 'refresh']) {
   assert.equal(endpoint.origin, 'https://identity.example.com');
   assert.ok(endpoint.pathname.endsWith(`/panel/${operation}`));
 }
-console.log('Released panel auth reader and endpoint validation passed.');
+console.log('Pinned panel auth reader and endpoint validation passed.');

@@ -78,8 +78,8 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_keyring(keyring(), ORGANIZATION, DEPLOYMENT)
 
-    @unittest.skipUnless(os.environ.get("TANDEM_TEST_PANEL"), "released panel package required")
-    def test_released_panel_consumes_auth_configuration(self):
+    @unittest.skipUnless(os.environ.get("TANDEM_TEST_PANEL"), "pinned panel source required")
+    def test_pinned_panel_consumes_auth_configuration(self):
         values = inputs()
         values["HOSTED_LOGIN_BASE_URL"] = "https://login.example.com"
         config = {"hosted": build_security_bundle(values)["panel_hosted"]}

@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
 FROM node:22-bookworm-slim AS panel-build
+ENV CI=true
 
 # npm 0.7.2 predates the merged hosted identity hardening. Build the reviewed
 # source instead; the runtime contract requires this revision in release metadata.
