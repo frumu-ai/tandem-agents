@@ -115,14 +115,18 @@ class HostedMemoryTests(unittest.TestCase):
                         wait_for(ready)
                         ids = {}
                         for actor, name, private, metadata in [
-                            ("alice", "alice-private", True, {}), ("bob", "bob-private", True, {}),
+                            # Personal notes are subject-owned across the tenant;
+                            # department-private notes deliberately require both axes.
+                            ("alice", "alice-private", True, {"tenant_shared": True}),
+                            ("bob", "bob-private", True, {"tenant_shared": True}),
+                            ("bob", "bob-department-private", True, {"owner_org_unit_id": "eng"}),
                             ("alice", "engineering-shared", False, {"owner_org_unit_id": "eng"}),
                             ("alice", "tenant-shared", False, {"tenant_shared": True})]:
                             status, body = put(actor, f"acceptance lantern {name}", private, metadata)
                             self.assertEqual(status, 200, body)
                             ids[name] = json.loads(body)["id"]
-                        visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private"])
-                        visible("bob", ["bob-private", "engineering-shared", "tenant-shared"], ["alice-private"])
+                        visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private", "bob-department-private"])
+                        visible("bob", ["bob-private", "bob-department-private", "engineering-shared", "tenant-shared"], ["alice-private"])
                         # Private subject authority cannot be changed by request metadata,
                         # selecting a partition or asking to mutate the known record ID.
                         self.assertIn(session_request(engine, token("bob"), "DELETE", f"/memory/{ids['alice-private']}")[0], (403, 404))
@@ -138,7 +142,7 @@ class HostedMemoryTests(unittest.TestCase):
                         fetch()
                         wait_for(lambda: engine.request(token=old_bob)[0] == 403)
                         visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private"])
-                        visible("bob", ["bob-private", "tenant-shared"], ["alice-private", "engineering-shared"])
+                        visible("bob", ["bob-private", "tenant-shared"], ["alice-private", "engineering-shared", "bob-department-private"])
                         status, body = put("bob", "acceptance lantern operations-shared", metadata={"owner_org_unit_id": "ops"})
                         self.assertEqual(status, 200, body)
                         visible("alice", ["engineering-shared"], ["operations-shared", "bob-private"])
@@ -148,7 +152,7 @@ class HostedMemoryTests(unittest.TestCase):
                         fetch()
                         wait_for(ready)
                         visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private", "operations-shared"])
-                        visible("bob", ["bob-private", "operations-shared", "tenant-shared"], ["alice-private", "engineering-shared"])
+                        visible("bob", ["bob-private", "operations-shared", "tenant-shared"], ["alice-private", "engineering-shared", "bob-department-private"])
                     finally:
                         engine.stop()
 
