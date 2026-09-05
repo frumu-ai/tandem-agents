@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 
 # Candidate source must pass the exact-source engine integration before release.
 # Version 0.7.2 alone is insufficient: its released binary predates policy sync.
-POLICY_ENGINE_REVISION = "838102a2ce64b86008ed5eed8cadafb3218cca69"
+POLICY_ENGINE_REVISION = "251b97068149e711344950549d368f6c412da716"
 POLICY_CONTAINER_DIR = "/run/tandem-hosted-policy"
 
 
