@@ -126,12 +126,15 @@ class HostedMemoryTests(unittest.TestCase):
                                 "resource_ref": resource, "data_class": "internal",
                                 "allowed_write_tiers": ["session"]}, **(metadata or {})}, **changes}
                         return session_request(engine, token(actor), "POST", "/memory/put", body)
+                    last_recall = {}
                     def recall(actor):
                         status, body = session_request(engine, token(actor), "POST", "/memory/search",
                             {"run_id": "memory-acceptance", "partition": partition, "read_scopes": ["session"],
                              "query": "acceptance lantern", "limit": 20})
                         self.assertEqual(status, 200, body)
-                        return json.loads(body)["results"]
+                        last_recall.clear()
+                        last_recall.update(json.loads(body))
+                        return last_recall["results"]
                     def visible(actor, include, exclude):
                         body = json.dumps(recall(actor))
                         for marker in include:
@@ -202,6 +205,7 @@ class HostedMemoryTests(unittest.TestCase):
                                     counts["matching_text_rows"] = connection.execute(
                                         "SELECT count(*) FROM memory_records WHERE content LIKE '%acceptance lantern%'").fetchone()[0]
                         error.add_note("Synthetic memory row counts: " + json.dumps(counts))
+                        error.add_note("Synthetic recall response: " + json.dumps(last_recall))
                         log = (home / "engine.log").read_text()[-6000:]
                         error.add_note(log.replace(TOKEN, "[redacted]").replace(engine.token, "[redacted]"))
                         raise
