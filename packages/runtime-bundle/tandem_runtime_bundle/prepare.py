@@ -50,6 +50,11 @@ def _write(path, value, uid, gid):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -109,7 +114,8 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
             if (security / ".initialized").exists() or any(replay.iterdir()) or any(anchor.iterdir()):
                 raise ValueError("audit key is missing from initialized storage; authorized recovery is required")
             _write(audit_key, secrets.token_hex(32).encode(), uid, gid)
-        _write(security / "context-keyring.json", json.dumps(keyring, sort_keys=True).encode(), uid, gid)
+        from .keyring_lifecycle import install_keyring
+        install_keyring(bundle, keyring, initialize=not marker.exists())
         _write(panel_auth / "host-agent-token", host_token, uid, gid)
         config = copy.deepcopy(panel_config or {"version": 1})
         config.setdefault("hosted", {}).update(bundle["panel_hosted"])

@@ -17,7 +17,7 @@ def install_policy_service(bundle, management_dir, token_file, *, activate=False
     retained_token = management / "agent-token"
     _write(retained_token, token, 0, 0)
     module = _directory(management / "tandem_runtime_bundle", 0, 0)
-    for name in ("__init__.py", "contract.py", "prepare.py", "policy_contract.py", "policy_sync.py", "policy_service.py"):
+    for name in ("__init__.py", "contract.py", "prepare.py", "policy_contract.py", "policy_sync.py", "policy_service.py", "keyring_lifecycle.py"):
         _write(module / name, Path(__file__).with_name(name).read_bytes(), 0, 0)
     files = service_files(bundle, management, retained_token)
     _write(Path(files["config_path"]), json.dumps(files["config"]).encode(), 0, 0)

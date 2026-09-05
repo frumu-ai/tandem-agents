@@ -4,6 +4,9 @@ This directory contains the setup, schema, and workflow docs for the local
 Tandem Agents stack: Tandem engine, control panel, ACA runtime, KB MCP, and
 supporting operator scripts.
 
+- [RUNTIME_KEY_ROTATION.md](RUNTIME_KEY_ROTATION.md) - scoped public verifier
+  overlap, retirement, operator staging and runtime reload.
+
 ACA smoke harness documentation:
 
 - [ACA_SMOKE_HARNESS.md](ACA_SMOKE_HARNESS.md) - contract for the ACA smoke
