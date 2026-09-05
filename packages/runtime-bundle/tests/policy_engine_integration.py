@@ -36,7 +36,8 @@ def assertion(key, actor, version, assertion_id):
             "deployment_id": DEPLOYMENT, "actor_id": actor, "source": "explicit"},
         "human_actor": {"actor_id": actor, "provider": "tandem"},
         "authority_chain": {"initiated_by": principal, "executed_as": {"kind": "request", **principal}},
-        "roles": ["hosted:role:member"], "capabilities": ["hosted.use"], "policy_version": version}
+        "roles": ["hosted:role:member"], "capabilities": ["hosted.use"], "policy_version": version,
+        "org_units": ["eng" if actor == "alice" else "ops"]}
     header = {"alg": "EdDSA", "typ": "tandem-tenant-context+jws", "kid": "test-key"}
     content = ".".join(encode(json.dumps(value, separators=(",", ":")).encode()) for value in (header, claims))
     return content + "." + encode(key.sign(content.encode()))
@@ -48,7 +49,12 @@ def policy_document(version, actors):
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "users": [{"id": actor, "email": None, "username": None, "role": "member",
             "capabilities": ["hosted.use"], "is_active": True, "email_verified": True} for actor in actors],
-        "org_units": [], "org_unit_memberships": [], "deployment_grants": []}).encode()
+        "org_units": [{"id": unit, "slug": unit, "display_name": label, "kind": "department", "state": "active"}
+            for unit, label in [("eng", "Engineering"), ("ops", "Operations")]],
+        "org_unit_memberships": [{"unit_id": "eng" if actor == "alice" else "ops", "user_id": actor} for actor in actors],
+        "deployment_grants": [{"id": "unit-" + unit, "deployment_id": DEPLOYMENT,
+            "principal_kind": "org_unit", "principal_id": unit, "resource_kind": "deployment",
+            "resource_id": DEPLOYMENT, "permissions": ["hosted.use"]} for unit in ["eng", "ops"]]}).encode()
 
 
 def wait_for(predicate, seconds=15):
@@ -122,6 +128,15 @@ class PolicyEngineTests(unittest.TestCase):
                     wait_for(ready)
                     alice = assertion(key, "alice", 1, "alice-1")
                     bob = assertion(key, "bob", 1, "bob-1")
+                    status, body = engine.request("/enterprise/org-units", token=alice)
+                    self.assertEqual(status, 200, body)
+                    units = json.loads(body)["org_units"]
+                    self.assertEqual({row["unit_id"] for row in units}, {"eng", "ops"})
+                    self.assertTrue(all(row["taxonomy_id"] == "hosted-control-plane" for row in units))
+                    status, body = engine.request("/enterprise/org-unit-memberships", token=alice)
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual({(row["unit"]["id"], row["member"]["id"]) for row in json.loads(body)["memberships"]},
+                        {("hosted-control-plane/eng", "alice"), ("hosted-control-plane/ops", "bob")})
                     status, body = session_request(engine, alice, "POST", "/session", {"title": "Alice private note"})
                     self.assertEqual(status, 200, body)
                     session = json.loads(body)
@@ -135,6 +150,9 @@ class PolicyEngineTests(unittest.TestCase):
                     self.assertEqual(engine.request(token=bob)[0], 403)
                     bob_fresh = assertion(key, "bob", 2, "bob-2")
                     self.assertEqual(engine.request(token=bob_fresh)[0], 200)
+                    status, body = engine.request("/enterprise/org-unit-memberships", token=bob_fresh)
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual([row["member"]["id"] for row in json.loads(body)["memberships"]], ["bob"])
                     engine.stop()
                     time.sleep(0.01)
                     engine.start(wait_ready=False)
