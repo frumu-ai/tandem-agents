@@ -92,10 +92,38 @@ class HostedMemoryTests(unittest.TestCase):
                     ready = lambda: json.loads(engine.request("/global/health")[1])["ready"]
                     partition = {"org_id": organization, "workspace_id": deployment,
                                  "project_id": "company-brain-text", "tier": "session"}
+                    resource = {"organization_id": organization, "workspace_id": deployment,
+                        "project_id": partition["project_id"], "resource_kind": "memory_space",
+                        "resource_id": "company-brain-notes"}
+                    # Trusted operator setup of the existing persisted registry,
+                    # before the non-root engine starts. HostedUse is not DataRead.
+                    # This isolated fixture does not claim encrypted storage or a
+                    # production grant-provisioning flow.
+                    registry = {}
+                    now = int(time.time() * 1000)
+                    for unit in ("eng", "ops"):
+                        grant_id = "acceptance-notes-" + unit
+                        registry[f"{organization}::{deployment}::{deployment}::{grant_id}"] = {
+                            "grant_id": grant_id, "tenant_context": {"org_id": organization,
+                                "workspace_id": deployment, "deployment_id": deployment, "source": "explicit"},
+                            "unit": {"kind": "organization_unit", "id": "hosted-control-plane/" + unit},
+                            "resource": resource, "effect": "allow", "permissions": ["read"],
+                            "data_classes": ["internal"], "state": "active",
+                            "created_at_ms": now, "updated_at_ms": now}
+                    data = Path(engine.env["TANDEM_STATE_DIR"]) / "data"
+                    for directory in (data, data / "enterprise"):
+                        directory.mkdir(mode=0o700, exist_ok=True)
+                        os.chown(directory, 1000, 1000)
+                    grants = data / "enterprise" / "org_unit_access_grants.json"
+                    grants.write_text(json.dumps(registry))
+                    grants.chmod(0o600)
+                    os.chown(grants, 1000, 1000)
                     def put(actor, content, private=False, metadata=None, **changes):
                         body = {"run_id": "memory-acceptance", "partition": partition, "kind": "note",
                             "content": content, "classification": "internal", "private": private,
-                            "metadata": metadata or {}, **changes}
+                            "metadata": {"knowledge_scope_registry": {"registry_id": "acceptance-notes",
+                                "resource_ref": resource, "data_class": "internal",
+                                "allowed_write_tiers": ["session"]}, **(metadata or {})}, **changes}
                         return session_request(engine, token(actor), "POST", "/memory/put", body)
                     def recall(actor):
                         status, body = session_request(engine, token(actor), "POST", "/memory/search",

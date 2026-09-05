@@ -18,8 +18,13 @@ subject and department predicates:
 `tenant_shared` broadens the department axis only. It cannot override a private
 owner predicate or the verified tenant boundary. Omitting department labels on
 a write still stamps the collector's active department; it does not declare an
-unrestricted personal space. Source-bound knowledge has additional enterprise
-grants and is outside this initial tenant-local note fixture.
+unrestricted personal space. Hosted writes require knowledge-scope metadata.
+The fixture supplies a tenant/project-bound memory resource and explicitly
+provisions read grants for the two departments in the existing persisted
+org-unit access registry before starting the runtime. These grants are
+additional to the owner and department predicates; `hosted.use` alone cannot
+grant knowledge access. Production grant provisioning and external source
+connector grants remain separate work.
 
 `packages/runtime-bundle/tests/memory_engine_integration.py` starts the pinned
 enterprise engine as UID1000, writes and recalls notes as two synthetic users,
@@ -28,6 +33,9 @@ old assertions and repeats recall after restart. It checks known-ID mutation,
 foreign tenant/department spoofing and unsupported tiers. The same fixture runs
 for a second organization using the same artifact and repeated actor names.
 
-CI must pass before claiming this evidence. This test does not implement the
+The first CI run rejected the initial write because the fixture omitted required
+knowledge-scope metadata. CI must pass with the corrected setup before claiming
+privacy evidence. This fixture uses the default local storage crypto mode and
+does not claim encryption acceptance. This test does not implement the
 customer-configuration schema, sanitized export, source-connector grants,
 encrypted off-site backup or clean-host recovery. Those remain separate gates.
