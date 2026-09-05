@@ -2,9 +2,9 @@
 import json
 from pathlib import PurePosixPath
 
-# Replace only after rebuilding and testing the selected engine source. Version
-# 0.7.2 alone is insufficient: its released binary predates hosted policy sync.
-POLICY_ENGINE_REVISION = "8e7354af781b212a6afcfe511456df152589ddff"
+# Candidate source must pass the exact-source engine integration before release.
+# Version 0.7.2 alone is insufficient: its released binary predates policy sync.
+POLICY_ENGINE_REVISION = "1773825f0865962ba5e080e71944bc8a75597389"
 POLICY_CONTAINER_DIR = "/run/tandem-hosted-policy"
 
 

@@ -15,20 +15,24 @@ from cryptography.x509.oid import NameOID
 
 
 @contextmanager
-def tls_endpoint(body, *, status=200, headers=None):
+def tls_endpoint(body, *, status=200, headers=None, required_token=None):
     seen = []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
         def do_GET(self):
             seen.append((self.path, self.headers.get("Authorization")))
-            self.send_response(status)
-            response_headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), **(headers or {})}
+            data = body() if callable(body) else body
+            response_status = status() if callable(status) else status
+            if required_token is not None and self.headers.get("Authorization") != f"Bearer {required_token}":
+                response_status, data = 403, b""
+            self.send_response(response_status)
+            response_headers = {"Content-Type": "application/json", "Content-Length": str(len(data)), **(headers or {})}
             for name, value in response_headers.items():
                 self.send_header(name, value)
             self.end_headers()
             try:
-                self.wfile.write(body)
+                self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
                 pass
     with tempfile.TemporaryDirectory() as temporary:
