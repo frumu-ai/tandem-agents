@@ -216,6 +216,7 @@ jobs:
             "kb_image_ref": "${IMAGE_REGISTRY}/tandem-kb-mcp@$(cat image-digests/tandem-kb-mcp)",
             "manifest_json": {
               "runtime_security_version": 1,
+              "tandem_control_panel_source_revision": "3ee2d83d76497565680538ef00f1616f55650524",
               "runtime_security_profile": "hosted-single-node-v1",
               "platform": "linux/amd64",
               "tandem_engine_release_version": "${RELEASE_VERSION}",

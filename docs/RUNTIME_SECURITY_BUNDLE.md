@@ -7,7 +7,8 @@ service topology remains in the existing renderers. `runtime-security.json` and
 release metadata carry `runtime_security_version: 1`. Consumers must pin the
 package revision and reject unknown versions.
 
-The supported test target is Linux amd64, engine and panel 0.7.2, local storage,
+The supported test target is Linux amd64, engine 0.7.2 and the panel built from
+Tandem commit `3ee2d83d76497565680538ef00f1616f55650524`, local storage,
 and `hosted_single_tenant` authentication with bound replay. This is centrally
 authenticated: existing accounts and organizations remain in the control plane.
 It does not promise disconnected login. Shared/Postgres storage, a separate
@@ -23,6 +24,10 @@ Required non-secret inputs:
 - `HOSTED_LOGIN_BASE_URL`: optional website URL when separate from the API.
 - `HOSTED_TANDEM_ENGINE_RELEASE_VERSION` and
   `HOSTED_TANDEM_CONTROL_PANEL_RELEASE_VERSION`: `0.7.2`.
+- `HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION`:
+  `3ee2d83d76497565680538ef00f1616f55650524`. npm panel 0.7.2 predates merged
+  identity hardening and is insufficient. The panel Dockerfile builds the
+  pinned source with its frozen dependency lockfile.
 - `HOSTED_ENGINE_IMAGE`, `HOSTED_CONTROL_PANEL_IMAGE`, `HOSTED_PROXY_IMAGE`,
   and selected `HOSTED_ACA_IMAGE` / `HOSTED_KB_IMAGE`: `repository@sha256:digest`.
 - `HOSTED_HOST_UID` / `HOSTED_HOST_GID`: nonzero runtime owner, default 1000.

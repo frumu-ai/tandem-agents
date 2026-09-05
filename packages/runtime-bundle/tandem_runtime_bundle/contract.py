@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 CONTRACT_VERSION = 1
 ENGINE_VERSION = "0.7.2"
+PANEL_REVISION = "3ee2d83d76497565680538ef00f1616f55650524"
 PROFILE = "hosted-single-node-v1"
 STATE_DIR = "/home/node/.local/share/tandem/data"
 SECURITY_DIR = "/run/tandem-security"
@@ -85,6 +86,8 @@ def validate_release(values):
         raise ValueError("unsupported runtime security contract version")
     if values.get("HOSTED_PLATFORM", "linux/amd64") != "linux/amd64":
         raise ValueError("runtime security v1 supports linux/amd64 only")
+    if values.get("HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION") != PANEL_REVISION:
+        raise ValueError("runtime security v1 requires the reviewed panel source revision; npm 0.7.2 is insufficient")
     for key in ("HOSTED_TANDEM_ENGINE_RELEASE_VERSION", "HOSTED_TANDEM_CONTROL_PANEL_RELEASE_VERSION"):
         if _required(values, key) != ENGINE_VERSION:
             raise ValueError(f"{key} must be the tested version {ENGINE_VERSION}")
@@ -145,6 +148,7 @@ def build_security_bundle(values):
     return {
         "schema_version": CONTRACT_VERSION, "profile": PROFILE, "platform": "linux/amd64",
         "engine_version": ENGINE_VERSION, "control_panel_version": ENGINE_VERSION,
+        "control_panel_source_revision": PANEL_REVISION,
         "deployment_id": deployment_id, "organization_id": organization_id,
         "images": images, "uid": uid, "gid": gid,
         "ordinary_paths": ordinary_paths,

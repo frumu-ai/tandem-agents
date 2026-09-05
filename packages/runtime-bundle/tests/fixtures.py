@@ -17,6 +17,7 @@ def inputs(root="/srv/tandem/test", anchor="/var/lib/tandem-audit/test"):
         "HOSTED_CONTROL_PLANE_URL": "https://identity.example.com",
         "HOSTED_TANDEM_ENGINE_RELEASE_VERSION": "0.7.2",
         "HOSTED_TANDEM_CONTROL_PANEL_RELEASE_VERSION": "0.7.2",
+        "HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION": "3ee2d83d76497565680538ef00f1616f55650524",
         "HOSTED_RELEASE_TAG": "v0.7.2", "HOSTED_RELEASE_VERSION": "0.7.2",
         "HOSTED_DEPLOYMENT_SLUG": "test", "HOSTED_STORAGE_PROFILE": "local",
         "HOSTED_HOST_UID": str(os.getuid()) if os.name == "posix" and os.getuid() else "1000",

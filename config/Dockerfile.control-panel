@@ -1,5 +1,21 @@
 # syntax=docker/dockerfile:1.7
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim AS panel-build
+
+# npm 0.7.2 predates the merged hosted identity hardening. Build the reviewed
+# source instead; the runtime contract requires this revision in release metadata.
+ARG TANDEM_CONTROL_PANEL_SOURCE_REVISION=3ee2d83d76497565680538ef00f1616f55650524
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init /src && git -C /src remote add origin https://github.com/frumu-ai/tandem.git \
+    && git -C /src fetch --depth 1 origin "$TANDEM_CONTROL_PANEL_SOURCE_REVISION" \
+    && git -C /src checkout --detach FETCH_HEAD \
+    && test "$(git -C /src rev-parse HEAD)" = "$TANDEM_CONTROL_PANEL_SOURCE_REVISION"
+RUN npm install -g pnpm@10.34.5
+RUN pnpm -C /src/packages/tandem-control-panel install --frozen-lockfile \
+    && pnpm -C /src/packages/tandem-control-panel build \
+    && pnpm -C /src/packages/tandem-control-panel prune --prod
+
+FROM node:22-bookworm-slim
 
 ARG TANDEM_RELEASE_VERSION=latest
 ARG TANDEM_CONTROL_PANEL_RELEASE_VERSION=${TANDEM_RELEASE_VERSION}
@@ -19,8 +35,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     git \
   && rm -rf /var/lib/apt/lists/*
 
-RUN --mount=type=cache,target=/root/.npm \
-    npm install -g "@frumu/tandem-panel@${TANDEM_CONTROL_PANEL_RELEASE_VERSION}"
+COPY --from=panel-build /src/packages/tandem-control-panel /opt/tandem-panel
+RUN ln -s /opt/tandem-panel/bin/cli.js /usr/local/bin/tandem-control-panel
+ARG TANDEM_CONTROL_PANEL_SOURCE_REVISION=3ee2d83d76497565680538ef00f1616f55650524
+LABEL ac.tandem.control-panel.source-revision="${TANDEM_CONTROL_PANEL_SOURCE_REVISION}"
 
 COPY scripts/tandem-control-panel-serve.sh /usr/local/bin/tandem-control-panel-serve.sh
 RUN chmod +x /usr/local/bin/tandem-control-panel-serve.sh

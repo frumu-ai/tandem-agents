@@ -43,6 +43,7 @@ class ContractTests(unittest.TestCase):
             "HOSTED_INSTALL_ROOT": "/srv/tandem/../test",
             "HOSTED_REPOS_ROOT": "/var/lib/tandem-audit/test",
             "HOSTED_PANEL_AUTH_ROOT": "/srv/tandem/test/tandem-data/auth",
+            "HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION": "",
         }
         for name, value in cases.items():
             with self.subTest(name=name):

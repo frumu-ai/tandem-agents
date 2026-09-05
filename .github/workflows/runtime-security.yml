@@ -4,6 +4,7 @@ on:
     paths:
       - 'packages/runtime-bundle/**'
       - 'scripts/hosted/**'
+      - 'config/Dockerfile.control-panel'
       - '.github/workflows/runtime-security.yml'
   workflow_dispatch:
 permissions:
@@ -18,10 +19,16 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install ./packages/runtime-bundle PyYAML==6.0.2 cryptography==44.0.3
-      - name: Install pinned panel consumer
+      - name: Check out pinned panel consumer
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: frumu-ai/tandem
+          ref: 3ee2d83d76497565680538ef00f1616f55650524
+          path: .test-tandem
+      - name: Select panel consumer
         run: |
-          npm install --prefix "$RUNNER_TEMP/panel-consumer" --ignore-scripts --no-audit --no-fund @frumu/tandem-panel@0.7.2
-          echo "TANDEM_TEST_PANEL=$RUNNER_TEMP/panel-consumer/node_modules/@frumu/tandem-panel" >> "$GITHUB_ENV"
+          test "$(git -C .test-tandem rev-parse HEAD)" = "3ee2d83d76497565680538ef00f1616f55650524"
+          echo "TANDEM_TEST_PANEL=$GITHUB_WORKSPACE/.test-tandem/packages/tandem-control-panel" >> "$GITHUB_ENV"
       - name: Shared contract, renderer parity and Linux permissions
         run: |
           for script in scripts/hosted/*.sh; do bash -n "$script"; done
@@ -39,3 +46,7 @@ jobs:
           echo "TANDEM_TEST_ENGINE=$engine_path" >> "$GITHUB_ENV"
       - name: Real engine startup, denial and durable bound replay
         run: python packages/runtime-bundle/tests/engine_integration.py
+      - name: Build the pinned panel container
+        run: docker build -f config/Dockerfile.control-panel -t tandem-panel-security-test .
+      - name: Run panel with the rendered restrictions
+        run: python packages/runtime-bundle/tests/panel_container.py
