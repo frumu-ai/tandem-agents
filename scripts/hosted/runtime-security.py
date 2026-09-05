@@ -31,6 +31,10 @@ def main():
             with open(os.environ["HOSTED_CONTROL_PANEL_CONFIG_FILE"], encoding="utf-8") as handle:
                 panel_config = json.load(handle)
             prepare_security(bundle, keyring, token_path, panel_config)
+            if bundle["schema_version"] == 2:
+                from tandem_runtime_bundle.policy_service import install_policy_service
+                install_policy_service(bundle, Path(os.environ["HOSTED_INSTALL_ROOT"]) / "hosted-agent",
+                                       token_path, activate=True)
             print("Runtime security storage prepared; no key material emitted.")
         elif args.output:
             Path(args.output).write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")

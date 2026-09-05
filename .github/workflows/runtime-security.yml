@@ -7,6 +7,8 @@ on:
       - 'config/Dockerfile.control-panel'
       - '.github/workflows/runtime-security.yml'
   workflow_dispatch:
+  push:
+    branches: ['codex/tan-834-policy-agent']
 permissions:
   contents: read
 jobs:
@@ -33,7 +35,9 @@ jobs:
         run: |
           for script in scripts/hosted/*.sh; do bash -n "$script"; done
           python -m unittest discover -s packages/runtime-bundle/tests -p 'test_*.py' -v
-      - name: Verify released engine artifact
+      - name: Policy service Linux ownership and atomic TLS snapshots
+        run: sudo env PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" -m unittest discover -s packages/runtime-bundle/tests -p 'test_policy_provision.py' -v
+      - name: Verify released v1 engine artifact
         run: |
           mkdir -p "$RUNNER_TEMP/tandem-security-engine"
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/tandem-security-engine/engine.tar.gz" https://github.com/frumu-ai/tandem/releases/download/v0.7.2/tandem-engine-enterprise-linux-x64.tar.gz

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tandem-runtime-bundle"
-version = "1.0.0"
+version = "1.1.0"
 description = "Shared hosted runtime security contract for Tandem deployment tooling"
 requires-python = ">=3.10"
 

@@ -77,3 +77,27 @@ existing hosted health smoke remains service liveness evidence only.
 Full user recovery, membership revocation, policy synchronization, two-user
 privacy, encrypted backup/key recovery and clean-host restoration remain
 separate acceptance gates. This contract does not close TAN-836 or TAN-840.
+
+## Policy synchronization profile v2
+
+The v2 profile adds a separate read-only engine policy mount and an independent
+host timer. Set `HOSTED_RUNTIME_SECURITY_VERSION=2` and explicitly pin
+`HOSTED_TANDEM_ENGINE_SOURCE_REVISION` to the source supported in
+`policy_contract.py`. The historical 0.7.2 release binary does not support this
+profile. A source pin in a manifest is not proof of image contents; build and
+verify the corresponding image before publishing a v2 release.
+
+The authorized Linux operator installs the policy service using the same
+shared package. Its host token source must be root-owned with mode 0600. A
+root-only retained copy stays in the management directory; the engine receives
+only the policy snapshot. The timer runs independently of deployment updates,
+with a 15-second service timeout and a 30-second interval. Fetches verify TLS,
+do not follow redirects, bound response size and retain the source timestamp.
+The engine remains responsible for complete semantic validation, revision
+rollback protection, effective grants and the 120-second freshness limit.
+Failed fetches leave the last complete file intact, while expiry blocks use.
+
+Policy files are replaced atomically with mode 0600 and the runtime UID. A
+policy-enabled installation rejects a downgrade to v1. This code is still
+under cross-repository integration: complete grant projection, source-built
+engine image validation and end-to-end acceptance are required before rollout.
