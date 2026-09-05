@@ -64,7 +64,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory={quoted(management)}
+WorkingDirectory={str(management).replace('%', '%%')}
 ExecStart=/usr/bin/python3 -s -m tandem_runtime_bundle.policy_sync --config {quoted(config_path)}
 TimeoutStartSec=15
 TimeoutStopSec=5
