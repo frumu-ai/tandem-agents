@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import ssl
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -97,6 +98,12 @@ class PolicyEngineTests(unittest.TestCase):
                 ca = root / "synthetic-ca.pem"
                 ca.write_text(ssl.DER_cert_to_PEM_cert(context.get_ca_certs(binary_form=True)[0]))
                 engine = Engine(home, bundle)
+                # The runner's checkout ancestors may be private to its UID.
+                # Install the exact built binary into the disposable host.
+                executable = root / "tandem-engine"
+                shutil.copyfile(engine.binary, executable)
+                executable.chmod(0o755)
+                engine.binary = str(executable)
                 os.chown(bundle["host_paths"]["state"], 1000, 1000)
                 os.chown(engine.env["TANDEM_STATE_DIR"], 1000, 1000)
                 engine.process_options = {"user": 1000, "group": 1000, "extra_groups": []}

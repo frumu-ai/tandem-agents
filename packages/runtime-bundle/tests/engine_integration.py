@@ -63,11 +63,12 @@ class Engine:
         Path(self.env["TANDEM_STATE_DIR"]).mkdir(parents=True, exist_ok=True)
         self.process = None
         self.process_options = {}
+        self.binary = os.environ["TANDEM_TEST_ENGINE"]
 
     def start(self, failure=False, wait_ready=True):
         self.log = open(self.root / "engine.log", "w+")
         self.process = subprocess.Popen(
-            [os.environ["TANDEM_TEST_ENGINE"], "serve", "--hostname", "127.0.0.1", "--port", str(self.port)],
+            [self.binary, "serve", "--hostname", "127.0.0.1", "--port", str(self.port)],
             env=self.env, cwd=self.root, stdout=self.log, stderr=subprocess.STDOUT,
             **self.process_options,
         )
