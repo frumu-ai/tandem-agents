@@ -52,6 +52,8 @@ Project files live one level up in the repository tree:
 
 ## Files
 
+- `RUNTIME_SECURITY_BUNDLE.md` - shared versioned hosted security inputs, mounts and verification
+
 - `PORTABLE_AUTOCODER_AGENT_PLAN.md` - design note for the portable auto-coder
 - `LOCAL_QUICKSTART.md` - first-time local Docker Compose setup and run guide
 - `TASK_SOURCES.md` - task source contract and examples

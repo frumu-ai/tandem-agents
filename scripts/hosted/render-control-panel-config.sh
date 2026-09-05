@@ -44,10 +44,11 @@ done
 
 source <("${SCRIPT_DIR}/release-manifest.sh")
 
-content="$(python3 - "$deployment_name" "$public_url" <<'PY'
+content="$(PYTHONPATH="${SCRIPT_DIR}/../../packages/runtime-bundle:${SCRIPT_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 - "$deployment_name" "$public_url" <<'PY'
 import json
 import os
 import sys
+from tandem_runtime_bundle import build_security_bundle
 
 deployment_name = sys.argv[1]
 public_url = sys.argv[2]
@@ -175,6 +176,8 @@ elif github_enabled in {"0", "false", "no", "n", "off"}:
 
 if public_url:
     config["control_panel"]["public_url"] = public_url
+
+config["hosted"].update(build_security_bundle(os.environ)["panel_hosted"])
 
 json.dump(config, sys.stdout, indent=2)
 sys.stdout.write("\n")

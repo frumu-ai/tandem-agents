@@ -68,6 +68,9 @@ payload = {
     "proxy_image_ref": os.environ["HOSTED_PROXY_IMAGE"],
     "kb_image_ref": os.environ["HOSTED_KB_IMAGE"],
     "manifest_json": {
+        "runtime_security_version": 1,
+        "runtime_security_profile": "hosted-single-node-v1",
+        "platform": "linux/amd64",
         "release_version": os.environ["HOSTED_RELEASE_VERSION"],
         "release_tag": os.environ["HOSTED_RELEASE_TAG"],
         "git_sha": os.environ["HOSTED_GIT_SHA"],

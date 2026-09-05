@@ -55,9 +55,14 @@ fi
 
 source <("${SCRIPT_DIR}/release-manifest.sh")
 
+
 if [[ -z "$install_root" ]]; then
   install_root="/srv/tandem/${deployment_slug}"
 fi
+
+export HOSTED_INSTALL_ROOT="$install_root"
+export HOSTED_CONTROL_PANEL_PUBLIC_URL="$public_url"
+python3 "${SCRIPT_DIR}/runtime-security.py" render >/dev/null
 
 bundle_dir="${HOSTED_BUNDLE_DIR:-$(hosted::bundle_dir)}"
 
@@ -168,6 +173,15 @@ content="$(
       emit HOSTED_CONTEXT_ASSERTION_PUBLIC_KEYS "${context_assertion_public_keys}"
     fi
     emit HOSTED_ENABLE_OUTBOX "${HOSTED_ENABLE_OUTBOX}"
+    emit HOSTED_RUNTIME_SECURITY_VERSION "1"
+    emit HOSTED_PLATFORM "linux/amd64"
+    emit HOSTED_DEPLOYMENT_ID "${HOSTED_DEPLOYMENT_ID}"
+    emit HOSTED_ORGANIZATION_ID "${HOSTED_ORGANIZATION_ID}"
+    emit HOSTED_CONTROL_PLANE_URL "${HOSTED_CONTROL_PLANE_URL}"
+    emit HOSTED_LOGIN_BASE_URL "${HOSTED_LOGIN_BASE_URL:-${HOSTED_CONTROL_PLANE_URL}}"
+    emit HOSTED_SECURITY_ROOT "${HOSTED_SECURITY_ROOT:-${install_root}/runtime-security}"
+    emit HOSTED_REPLAY_ROOT "${HOSTED_REPLAY_ROOT:-${install_root}/context-replay}"
+    emit HOSTED_AUDIT_ANCHOR_ROOT "${HOSTED_AUDIT_ANCHOR_ROOT}"
   } | sed '/^$/d'
 )"
 

@@ -112,6 +112,7 @@ ensure_optional_secret() {
 
 ensure_secret "${secrets_root%/}/tandem_api_token" "$tandem_token_override" "tandem"
 ensure_secret "${secrets_root%/}/aca_api_token" "$aca_token_override" "aca"
+chown "${host_uid}:${host_gid}" "${secrets_root%/}/tandem_api_token" "${secrets_root%/}/aca_api_token"
 ensure_secret "${secrets_root%/}/kb_admin_api_key" "$kb_token_override" "kb-admin"
 chmod 600 "${secrets_root%/}/kb_admin_api_key" 2>/dev/null || true
 chown "${host_uid}:${host_gid}" "${secrets_root%/}/kb_admin_api_key" 2>/dev/null || true

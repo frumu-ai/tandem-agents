@@ -144,12 +144,20 @@ stage_executable "$bootstrap_copy" "${install_root}/bootstrap-server.sh"
 stage_executable "$prereqs_copy" "${install_root}/install-prereqs.sh"
 stage_executable "$secrets_copy" "${install_root}/generate-secrets.sh"
 stage_file "$lib_copy" "${install_root}/lib.sh"
+stage_file "${bundle_dir}/runtime-security.json" "${install_root}/runtime-security.json"
+stage_executable "${bundle_dir}/runtime-security.py" "${install_root}/runtime-security.py"
+stage_file "${bundle_dir}/compose.py" "${install_root}/compose.py"
+hosted::as_root install -d -m 0755 "${install_root}/tandem_runtime_bundle"
+for module in "${bundle_dir}/tandem_runtime_bundle/"*.py; do
+  stage_file "$module" "${install_root}/tandem_runtime_bundle/$(basename "$module")"
+done
 
 if [[ "$skip_prereqs" == false ]]; then
   "${install_root}/install-prereqs.sh"
 fi
 
 "${install_root}/generate-secrets.sh" --secrets-root "$secrets_root"
+python3 "${install_root}/runtime-security.py" prepare
 
 if [[ -n "${HOSTED_REGISTRY_USERNAME:-}" && -n "${HOSTED_REGISTRY_TOKEN:-}" ]]; then
   hosted::log "logging in to ghcr.io as ${HOSTED_REGISTRY_USERNAME}"
