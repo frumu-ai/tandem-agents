@@ -98,6 +98,15 @@ rollback protection, effective grants and the 120-second freshness limit.
 Failed fetches leave the last complete file intact, while expiry blocks use.
 
 Policy files are replaced atomically with mode 0600 and the runtime UID. A
-policy-enabled installation rejects a downgrade to v1. This code is still
-under cross-repository integration: complete grant projection, source-built
-engine image validation and end-to-end acceptance are required before rollout.
+policy-enabled installation rejects a downgrade to v1. The engine projects
+current memberships and narrowly scoped operation grants into its existing
+enterprise authorization. Source-built engine image validation and the broader
+deployment acceptance gates are still required before rollout.
+
+The `policy-engine` CI job builds the exact enterprise engine source recorded
+by `POLICY_ENGINE_REVISION` and runs it as a non-root user with the copied policy
+agent and synthetic authenticated TLS. Its process test covers private session
+isolation, membership removal, fresh identity after revision changes, restart,
+failed fetches, real wall-clock expiry and recovery. Registry projection is
+exercised through the existing enterprise HTTP APIs. This test does not publish
+an image or establish encrypted clean-host recovery or governed-memory privacy.
