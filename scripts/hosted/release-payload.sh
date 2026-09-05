@@ -50,10 +50,13 @@ fi
 
 source <("${SCRIPT_DIR}/release-manifest.sh")
 
-python3 - "${channel}" "${published}" "${release_notes}" <<'PY'
+PYTHONPATH="${SCRIPT_DIR}/../../packages/runtime-bundle:${SCRIPT_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 - "${channel}" "${published}" "${release_notes}" <<'PY'
 import json
 import os
 import sys
+from tandem_runtime_bundle.contract import validate_release
+
+validate_release(os.environ)
 
 channel = sys.argv[1].strip()
 published = sys.argv[2].strip().lower() == "true"
@@ -68,6 +71,10 @@ payload = {
     "proxy_image_ref": os.environ["HOSTED_PROXY_IMAGE"],
     "kb_image_ref": os.environ["HOSTED_KB_IMAGE"],
     "manifest_json": {
+        "runtime_security_version": 1,
+        "tandem_control_panel_source_revision": os.environ["HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION"],
+        "runtime_security_profile": "hosted-single-node-v1",
+        "platform": "linux/amd64",
         "release_version": os.environ["HOSTED_RELEASE_VERSION"],
         "release_tag": os.environ["HOSTED_RELEASE_TAG"],
         "git_sha": os.environ["HOSTED_GIT_SHA"],

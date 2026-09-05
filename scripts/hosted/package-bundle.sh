@@ -118,6 +118,7 @@ set +a
 
 "${SCRIPT_DIR}/render-control-panel-config.sh" --deployment-name "$deployment_name" --public-url "$public_url" --output "${bundle_dir}/control-panel-config.json"
 "${SCRIPT_DIR}/render-compose.sh" --output "${bundle_dir}/docker-compose.hosted.yml"
+python3 "${SCRIPT_DIR}/runtime-security.py" render --output "${bundle_dir}/runtime-security.json"
 "${SCRIPT_DIR}/release-manifest.sh" > "${bundle_dir}/release-manifest.env"
 
 python3 - "${bundle_dir}/release-manifest.json" <<'PY'
@@ -127,6 +128,10 @@ import sys
 
 target = sys.argv[1]
 data = {
+    "runtime_security_version": 1,
+    "tandem_control_panel_source_revision": os.environ["HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION"],
+    "runtime_security_profile": "hosted-single-node-v1",
+    "platform": "linux/amd64",
     "release_tag": os.environ["HOSTED_RELEASE_TAG"],
     "git_sha": os.environ["HOSTED_GIT_SHA"],
     "git_short_sha": os.environ["HOSTED_GIT_SHORT_SHA"],
@@ -182,6 +187,12 @@ stage_exec "${SCRIPT_DIR}/render-cloud-init.sh" "${bundle_dir}/render-cloud-init
 stage_exec "${SCRIPT_DIR}/host-hardening.sh" "${bundle_dir}/host-hardening.sh"
 stage_exec "${SCRIPT_DIR}/release-manifest.sh" "${bundle_dir}/release-manifest.sh"
 stage_copy "${SCRIPT_DIR}/lib.sh" "${bundle_dir}/lib.sh"
+stage_exec "${SCRIPT_DIR}/runtime-security.py" "${bundle_dir}/runtime-security.py"
+stage_copy "${SCRIPT_DIR}/compose.py" "${bundle_dir}/compose.py"
+mkdir -p "${bundle_dir}/tandem_runtime_bundle"
+for module in "${SCRIPT_DIR}/../../packages/runtime-bundle/tandem_runtime_bundle/"*.py; do
+  stage_copy "$module" "${bundle_dir}/tandem_runtime_bundle/$(basename "$module")"
+done
 
 "${SCRIPT_DIR}/render-caddyfile.sh" --public-url "$public_url" --upstream "${HOSTED_CONTROL_PANEL_UPSTREAM:-http://tandem-control-panel:${HOSTED_CONTROL_PANEL_PORT:-39734}}" --output "${bundle_dir}/Caddyfile"
 

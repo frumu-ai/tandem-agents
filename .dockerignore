@@ -14,5 +14,6 @@ runs/
 tandem-data/
 tandem-engine-state/
 test-repos/
+.test-tandem/
 docs/
 out/

@@ -144,12 +144,25 @@ stage_executable "$bootstrap_copy" "${install_root}/bootstrap-server.sh"
 stage_executable "$prereqs_copy" "${install_root}/install-prereqs.sh"
 stage_executable "$secrets_copy" "${install_root}/generate-secrets.sh"
 stage_file "$lib_copy" "${install_root}/lib.sh"
+stage_file "${bundle_dir}/runtime-security.json" "${install_root}/runtime-security.json"
+stage_executable "${bundle_dir}/runtime-security.py" "${install_root}/runtime-security.py"
+stage_file "${bundle_dir}/compose.py" "${install_root}/compose.py"
+hosted::as_root install -d -m 0755 "${install_root}/tandem_runtime_bundle"
+for module in "${bundle_dir}/tandem_runtime_bundle/"*.py; do
+  stage_file "$module" "${install_root}/tandem_runtime_bundle/$(basename "$module")"
+done
 
 if [[ "$skip_prereqs" == false ]]; then
   "${install_root}/install-prereqs.sh"
 fi
 
 "${install_root}/generate-secrets.sh" --secrets-root "$secrets_root"
+# Pass paths and non-secret configuration explicitly through sudo; token bytes
+# stay in their source file and never become arguments or environment values.
+hosted::as_root env \
+  HOSTED_CONTEXT_KEYRING_SOURCE_FILE="${HOSTED_CONTEXT_KEYRING_SOURCE_FILE:?required}" \
+  HOSTED_HOST_AGENT_TOKEN_SOURCE_FILE="${HOSTED_HOST_AGENT_TOKEN_SOURCE_FILE:?required}" \
+  bash -c 'set -a; source "$1/hosted.env"; set +a; python3 "$1/runtime-security.py" prepare' _ "$install_root"
 
 if [[ -n "${HOSTED_REGISTRY_USERNAME:-}" && -n "${HOSTED_REGISTRY_TOKEN:-}" ]]; then
   hosted::log "logging in to ghcr.io as ${HOSTED_REGISTRY_USERNAME}"

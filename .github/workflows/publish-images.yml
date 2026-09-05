@@ -138,10 +138,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6
+        id: image
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             TANDEM_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
@@ -154,6 +156,19 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
+      - name: Record immutable image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_NAME: ${{ matrix.image }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p image-digests
+          printf '%s' "$IMAGE_DIGEST" > "image-digests/$IMAGE_NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hosted-image-digest-${{ matrix.image }}
+          path: image-digests/
+
 
   register-hosted-release:
     name: Register Hosted Release
@@ -163,6 +178,11 @@ jobs:
       - publish
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.register_hosted_release }}
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hosted-image-digest-*
+          merge-multiple: true
+          path: image-digests
       - name: Register release in Tandem Web
         shell: bash
         env:
@@ -180,16 +200,27 @@ jobs:
           fi
 
           payload="$(mktemp)"
+          test "$RELEASE_VERSION" = "0.7.2" || { echo "Runtime security v1 requires tested version 0.7.2" >&2; exit 1; }
+          for image in engine-enterprise aca-enterprise tandem-control-panel tandem-proxy tandem-kb-mcp; do
+            digest="$(cat "image-digests/$image")"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
+          done
           cat >"$payload" <<JSON
           {
             "version": "${RELEASE_VERSION}",
             "channel": "stable",
-            "engine_image_ref": "${IMAGE_REGISTRY}/engine-enterprise:${RELEASE_TAG}",
-            "aca_image_ref": "${IMAGE_REGISTRY}/aca-enterprise:${RELEASE_TAG}",
-            "control_panel_image_ref": "${IMAGE_REGISTRY}/tandem-control-panel:${RELEASE_TAG}",
-            "proxy_image_ref": "${IMAGE_REGISTRY}/tandem-proxy:${RELEASE_TAG}",
-            "kb_image_ref": "${IMAGE_REGISTRY}/tandem-kb-mcp:${RELEASE_TAG}",
+            "engine_image_ref": "${IMAGE_REGISTRY}/engine-enterprise@$(cat image-digests/engine-enterprise)",
+            "aca_image_ref": "${IMAGE_REGISTRY}/aca-enterprise@$(cat image-digests/aca-enterprise)",
+            "control_panel_image_ref": "${IMAGE_REGISTRY}/tandem-control-panel@$(cat image-digests/tandem-control-panel)",
+            "proxy_image_ref": "${IMAGE_REGISTRY}/tandem-proxy@$(cat image-digests/tandem-proxy)",
+            "kb_image_ref": "${IMAGE_REGISTRY}/tandem-kb-mcp@$(cat image-digests/tandem-kb-mcp)",
             "manifest_json": {
+              "runtime_security_version": 1,
+              "tandem_control_panel_source_revision": "3ee2d83d76497565680538ef00f1616f55650524",
+              "runtime_security_profile": "hosted-single-node-v1",
+              "platform": "linux/amd64",
+              "tandem_engine_release_version": "${RELEASE_VERSION}",
+              "tandem_control_panel_release_version": "${RELEASE_VERSION}",
               "source": "tandem-agents publish-images",
               "image_registry": "${IMAGE_REGISTRY}",
               "image_tag": "${RELEASE_TAG}"
