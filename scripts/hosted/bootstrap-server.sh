@@ -157,7 +157,12 @@ if [[ "$skip_prereqs" == false ]]; then
 fi
 
 "${install_root}/generate-secrets.sh" --secrets-root "$secrets_root"
-python3 "${install_root}/runtime-security.py" prepare
+# Pass paths and non-secret configuration explicitly through sudo; token bytes
+# stay in their source file and never become arguments or environment values.
+hosted::as_root env \
+  HOSTED_CONTEXT_KEYRING_SOURCE_FILE="${HOSTED_CONTEXT_KEYRING_SOURCE_FILE:?required}" \
+  HOSTED_HOST_AGENT_TOKEN_SOURCE_FILE="${HOSTED_HOST_AGENT_TOKEN_SOURCE_FILE:?required}" \
+  bash -c 'set -a; source "$1/hosted.env"; set +a; python3 "$1/runtime-security.py" prepare' _ "$install_root"
 
 if [[ -n "${HOSTED_REGISTRY_USERNAME:-}" && -n "${HOSTED_REGISTRY_TOKEN:-}" ]]; then
   hosted::log "logging in to ghcr.io as ${HOSTED_REGISTRY_USERNAME}"

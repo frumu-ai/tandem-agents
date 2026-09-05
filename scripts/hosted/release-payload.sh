@@ -50,10 +50,13 @@ fi
 
 source <("${SCRIPT_DIR}/release-manifest.sh")
 
-python3 - "${channel}" "${published}" "${release_notes}" <<'PY'
+PYTHONPATH="${SCRIPT_DIR}/../../packages/runtime-bundle:${SCRIPT_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 - "${channel}" "${published}" "${release_notes}" <<'PY'
 import json
 import os
 import sys
+from tandem_runtime_bundle.contract import validate_release
+
+validate_release(os.environ)
 
 channel = sys.argv[1].strip()
 published = sys.argv[2].strip().lower() == "true"

@@ -115,7 +115,7 @@ class CurrentEngineTests(unittest.TestCase):
         values, bundle, source = provisioned_paths(root)
         private_key = Ed25519PrivateKey.generate()
         public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-        prepare_security(bundle, keyring(public_key), source, values["HOSTED_SECRETS_ROOT"])
+        prepare_security(bundle, keyring(public_key), source)
         return bundle, private_key, Engine(root, bundle)
 
     def test_signed_context_and_bound_replay_survive_process_restart(self):

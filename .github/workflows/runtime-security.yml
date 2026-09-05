@@ -18,6 +18,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install ./packages/runtime-bundle PyYAML==6.0.2 cryptography==44.0.3
+      - name: Install pinned panel consumer
+        run: |
+          npm install --prefix "$RUNNER_TEMP/panel-consumer" --ignore-scripts --no-audit --no-fund @frumu/tandem-panel@0.7.2
+          echo "TANDEM_TEST_PANEL=$RUNNER_TEMP/panel-consumer/node_modules/@frumu/tandem-panel" >> "$GITHUB_ENV"
       - name: Shared contract, renderer parity and Linux permissions
         run: |
           for script in scripts/hosted/*.sh; do bash -n "$script"; done

@@ -1,6 +1,5 @@
 """Pure rendering: no credentials, filesystem reads, network, or auth authority."""
 import base64
-import ipaddress
 import re
 import uuid
 from pathlib import PurePosixPath
@@ -13,6 +12,7 @@ STATE_DIR = "/home/node/.local/share/tandem/data"
 SECURITY_DIR = "/run/tandem-security"
 REPLAY_DIR = "/var/lib/tandem-replay"
 ANCHOR_DIR = "/var/lib/tandem-audit"
+PANEL_AUTH_DIR = "/run/tandem-panel-auth"
 
 
 def _required(values, name):
@@ -43,10 +43,7 @@ def _url(value, name):
                 or "\\" in value or any(char.isspace() for char in value)
                 or not re.fullmatch(r"(?:\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9.-]+)(?::[0-9]+)?", parsed.netloc)):
             raise ValueError()
-        try:
-            loopback = ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            loopback = host == "localhost"
+        loopback = host in {"127.0.0.1", "::1"}
         if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
             raise ValueError()
         if port == 0:
@@ -68,7 +65,7 @@ def validate_keyring(keyring, deployment_id, organization_id, audience="tandem-r
                 or entry.get("deployment_id") != deployment_id
                 or entry.get("organization_id") != organization_id
                 or entry.get("allowed_audiences") != [audience]
-                or entry.get("status") not in {"active", "retired", "revoked"}):
+                or entry.get("status") not in ("active", "retired", "revoked")):
             raise ValueError("context keyring has an invalid purpose, status or deployment scope")
         try:
             public_key = entry["public_key"]
@@ -82,20 +79,10 @@ def validate_keyring(keyring, deployment_id, organization_id, audience="tandem-r
         raise ValueError("context keyring requires an active key")
 
 
-def build_security_bundle(values):
-    """Return v1 non-secret runtime paths, environment and panel authentication settings.
-
-    Both Python callers and shell adapters pass the same HOSTED_* mapping.
-    Image digests are operator/release inputs; the renderer never resolves latest.
-    """
+def validate_release(values):
+    """Validate immutable image inputs before advertising contract compatibility."""
     if str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION)) != "1":
         raise ValueError("unsupported runtime security contract version")
-    if values.get("HOSTED_RUNTIME_AUTH_MODE", "hosted_single_tenant") != "hosted_single_tenant":
-        raise ValueError("this profile requires hosted_single_tenant auth")
-    if values.get("HOSTED_STORAGE_PROFILE", "local") != "local":
-        raise ValueError("runtime security v1 supports local storage only")
-    if str(values.get("HOSTED_ENABLE_OUTBOX", "false")).lower() != "false":
-        raise ValueError("runtime security v1 does not support a separate outbox")
     if values.get("HOSTED_PLATFORM", "linux/amd64") != "linux/amd64":
         raise ValueError("runtime security v1 supports linux/amd64 only")
     for key in ("HOSTED_TANDEM_ENGINE_RELEASE_VERSION", "HOSTED_TANDEM_CONTROL_PANEL_RELEASE_VERSION"):
@@ -109,14 +96,39 @@ def build_security_bundle(values):
         if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}", value):
             raise ValueError(f"HOSTED_{name}_IMAGE must be pinned by sha256 digest")
         images[name.lower()] = value
+    return images
+
+
+def build_security_bundle(values):
+    """Render the versioned contract shared by Python and shell callers."""
+    images = validate_release(values)
+    if values.get("HOSTED_RUNTIME_AUTH_MODE", values.get("TANDEM_RUNTIME_AUTH_MODE", "hosted_single_tenant")) != "hosted_single_tenant":
+        raise ValueError("this profile requires hosted_single_tenant auth")
+    if values.get("HOSTED_STORAGE_PROFILE", "local") != "local":
+        raise ValueError("runtime security v1 supports local storage only")
+    if str(values.get("HOSTED_ENABLE_OUTBOX", "false")).lower() != "false":
+        raise ValueError("runtime security v1 does not support a separate outbox")
     deployment_id = str(uuid.UUID(_required(values, "HOSTED_DEPLOYMENT_ID")))
     organization_id = str(uuid.UUID(_required(values, "HOSTED_ORGANIZATION_ID")))
     root = _path(_required(values, "HOSTED_INSTALL_ROOT"), "HOSTED_INSTALL_ROOT")
     state = _path(values.get("HOSTED_ENGINE_STATE_ROOT", f"{root}/tandem-engine-state"), "engine state")
     security = _path(values.get("HOSTED_SECURITY_ROOT", f"{root}/runtime-security"), "security root")
     replay = _path(values.get("HOSTED_REPLAY_ROOT", f"{root}/context-replay"), "replay root")
+    panel_auth = _path(values.get("HOSTED_PANEL_AUTH_ROOT", f"{root}/panel-auth"), "panel auth root")
     anchor = _path(_required(values, "HOSTED_AUDIT_ANCHOR_ROOT"), "audit anchor root")
-    roots = [state, security, replay, anchor]
+    roots = [state, security, replay, anchor, panel_auth]
+    ordinary_paths = {
+        name: str(_path(values.get(f"HOSTED_{name}_ROOT", f"{root}/{suffix}"), name))
+        for name, suffix in {
+            "DATA": "tandem-data", "REPOS": "repos", "RUNS": "runs", "SECRETS": "secrets",
+            "PANEL_STATE": "tandem-panel-state", "KB_DOCS": "kb-docs", "KB_INDEX": "kb-index",
+            "PROXY_DATA": "proxy/data", "PROXY_CONFIG": "proxy/config",
+        }.items()
+    }
+    for path in roots:
+        for ordinary in map(PurePosixPath, ordinary_paths.values()):
+            if path == ordinary or path in ordinary.parents or ordinary in path.parents:
+                raise ValueError("security storage must be independent of ordinary workload mounts")
     for index, path in enumerate(roots):
         for other in roots[index + 1:]:
             if path == other or path in other.parents or other in path.parents:
@@ -135,7 +147,9 @@ def build_security_bundle(values):
         "engine_version": ENGINE_VERSION, "control_panel_version": ENGINE_VERSION,
         "deployment_id": deployment_id, "organization_id": organization_id,
         "images": images, "uid": uid, "gid": gid,
-        "host_paths": {"state": str(state), "security": str(security), "replay": str(replay), "anchor": str(anchor)},
+        "ordinary_paths": ordinary_paths,
+        "host_paths": {"state": str(state), "security": str(security), "replay": str(replay),
+                       "anchor": str(anchor), "panel_auth": str(panel_auth)},
         "engine_environment": {
             "TANDEM_RUNTIME_AUTH_MODE": "hosted_single_tenant",
             "TANDEM_STATE_DIR": STATE_DIR,
@@ -153,18 +167,25 @@ def build_security_bundle(values):
             {"type": "bind", "source": str(replay), "target": REPLAY_DIR, "bind": {"create_host_path": False}},
             {"type": "bind", "source": str(anchor), "target": ANCHOR_DIR, "bind": {"create_host_path": False}},
         ],
+        "panel_mounts": [
+            {"type": "bind", "source": str(panel_auth), "target": PANEL_AUTH_DIR,
+             "read_only": True, "bind": {"create_host_path": False}},
+        ],
         "container_security": {
             "user": f"{uid}:{gid}", "read_only": True,
             "security_opt": ["no-new-privileges:true"], "cap_drop": ["ALL"],
             "tmpfs": ["/tmp:rw,nosuid,nodev,size=256m"], "pids_limit": 512,
         },
         "panel_hosted": {
-            "managed": True, "access_mode": "managed", "auth_mode": "hosted",
+            "managed": True, "access_mode": "managed",
             "deployment_id": deployment_id, "organization_id": organization_id,
             "public_url": public_url, "control_plane_url": control_plane,
-            "panel_login_url": f"{login_base}/hosted/panel/authorize",
-            "panel_exchange_url": f"{control_plane}/api/v1/hosted/deployments/{deployment_id}/panel/exchange",
-            "panel_refresh_url": f"{control_plane}/api/v1/hosted/deployments/{deployment_id}/panel/refresh",
-            "host_agent_token_file": "/run/secrets/host_agent_token",
+            "auth": {
+                "mode": "hosted", "control_plane_url": control_plane,
+                "panel_login_url": f"{login_base}/hosted/panel/authorize",
+                "panel_exchange_url": f"{control_plane}/api/v1/hosted/deployments/{deployment_id}/panel/exchange",
+                "panel_refresh_url": f"{control_plane}/api/v1/hosted/deployments/{deployment_id}/panel/refresh",
+                "host_agent_token_file": f"{PANEL_AUTH_DIR}/host-agent-token",
+            },
         },
     }

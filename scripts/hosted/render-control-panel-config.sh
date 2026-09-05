@@ -42,6 +42,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+export HOSTED_CONTROL_PANEL_PUBLIC_URL="$public_url"
 source <("${SCRIPT_DIR}/release-manifest.sh")
 
 content="$(PYTHONPATH="${SCRIPT_DIR}/../../packages/runtime-bundle:${SCRIPT_DIR}${PYTHONPATH:+:$PYTHONPATH}" python3 - "$deployment_name" "$public_url" <<'PY'

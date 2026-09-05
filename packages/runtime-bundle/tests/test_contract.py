@@ -26,7 +26,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(bundle["container_security"]["cap_drop"], ["ALL"])
         self.assertTrue(bundle["container_security"]["read_only"])
         self.assertEqual(bundle["panel_hosted"]["deployment_id"], DEPLOYMENT)
-        self.assertEqual(bundle["panel_hosted"]["panel_exchange_url"],
+        self.assertEqual(bundle["panel_hosted"]["auth"]["panel_exchange_url"],
                          f"https://identity.example.com/api/v1/hosted/deployments/{DEPLOYMENT}/panel/exchange")
 
     def test_unsupported_and_incomplete_profiles_fail_closed(self):
@@ -41,6 +41,8 @@ class ContractTests(unittest.TestCase):
             "HOSTED_AUDIT_ANCHOR_ROOT": "/srv/tandem/test/anchors", "HOSTED_HOST_UID": "0",
             "HOSTED_REPLAY_ROOT": "/srv/tandem/test/tandem-engine-state/data",
             "HOSTED_INSTALL_ROOT": "/srv/tandem/../test",
+            "HOSTED_REPOS_ROOT": "/var/lib/tandem-audit/test",
+            "HOSTED_PANEL_AUTH_ROOT": "/srv/tandem/test/tandem-data/auth",
         }
         for name, value in cases.items():
             with self.subTest(name=name):
@@ -48,6 +50,21 @@ class ContractTests(unittest.TestCase):
                 values[name] = value
                 with self.assertRaises(ValueError):
                     build_security_bundle(values)
+
+    def test_auth_schema_and_supported_loopback_addresses(self):
+        values = inputs()
+        values["HOSTED_LOGIN_BASE_URL"] = "https://login.example.com"
+        hosted = build_security_bundle(values)["panel_hosted"]
+        self.assertEqual(hosted["auth"]["mode"], "hosted")
+        self.assertEqual(hosted["auth"]["panel_login_url"], "https://login.example.com/hosted/panel/authorize")
+        self.assertEqual(hosted["auth"]["host_agent_token_file"], "/run/tandem-panel-auth/host-agent-token")
+        for origin in ("http://localhost", "http://127.0.0.2"):
+            values["HOSTED_CONTROL_PLANE_URL"] = origin
+            with self.assertRaises(ValueError):
+                build_security_bundle(values)
+        for origin in ("http://127.0.0.1", "http://[::1]"):
+            values["HOSTED_CONTROL_PLANE_URL"] = origin
+            self.assertEqual(build_security_bundle(values)["panel_hosted"]["auth"]["control_plane_url"], origin)
 
     def test_keyring_requires_explicit_deployment_scope(self):
         validate_keyring(keyring(), DEPLOYMENT, ORGANIZATION)
@@ -60,39 +77,55 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_keyring(keyring(), ORGANIZATION, DEPLOYMENT)
 
+    @unittest.skipUnless(os.environ.get("TANDEM_TEST_PANEL"), "released panel package required")
+    def test_released_panel_consumes_auth_configuration(self):
+        values = inputs()
+        values["HOSTED_LOGIN_BASE_URL"] = "https://login.example.com"
+        config = {"hosted": build_security_bundle(values)["panel_hosted"]}
+        subprocess.run([os.environ.get("TANDEM_TEST_NODE", "node"), str(Path(__file__).with_name("panel_consumer.mjs"))],
+                       input=json.dumps(config), text=True, check=True)
+
     @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "Linux non-root provisioning required")
     def test_provision_preserves_keys_and_replay_and_rejects_missing_audit_key(self):
         with tempfile.TemporaryDirectory() as temp:
             values, bundle, source = provisioned_paths(temp)
-            prepare_security(bundle, keyring(), source, values["HOSTED_SECRETS_ROOT"])
+            prepare_security(bundle, keyring(), source)
             security = Path(bundle["host_paths"]["security"])
             audit = security / "audit-hmac-key"
             initial = audit.read_bytes()
             self.assertEqual(audit.stat().st_mode & 0o777, 0o600)
             self.assertEqual(security.stat().st_mode & 0o777, 0o700)
             self.assertEqual(list(Path(bundle["host_paths"]["replay"]).iterdir()), [])
-            prepare_security(bundle, keyring(), source, values["HOSTED_SECRETS_ROOT"])
+            panel_auth = Path(bundle["host_paths"]["panel_auth"])
+            self.assertEqual((panel_auth / "host-agent-token").read_bytes(), source.read_bytes())
+            config = json.loads((panel_auth / "control-panel-config.json").read_text())
+            self.assertEqual(config["hosted"], bundle["panel_hosted"])
+            prepare_security(bundle, keyring(), source)
             self.assertEqual(audit.read_bytes(), initial)
             audit.unlink()
             with self.assertRaisesRegex(ValueError, "authorized recovery"):
-                prepare_security(bundle, keyring(), source, values["HOSTED_SECRETS_ROOT"])
+                prepare_security(bundle, keyring(), source)
 
     @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "Linux non-root provisioning required")
     def test_provision_rejects_symlinks_and_insecure_existing_permissions(self):
         with tempfile.TemporaryDirectory() as temp:
             values, bundle, source = provisioned_paths(temp)
-            prepare_security(bundle, keyring(), source, values["HOSTED_SECRETS_ROOT"])
+            prepare_security(bundle, keyring(), source)
             anchor = Path(bundle["host_paths"]["anchor"])
             anchor.chmod(0o755)
             with self.assertRaises(ValueError):
-                prepare_security(bundle, keyring(), source, values["HOSTED_SECRETS_ROOT"])
+                prepare_security(bundle, keyring(), source)
             anchor.chmod(0o700)
             linked = Path(temp) / "linked"
             linked.symlink_to(anchor)
             altered = copy.deepcopy(bundle)
             altered["host_paths"]["anchor"] = str(linked)
             with self.assertRaises(ValueError):
-                prepare_security(altered, keyring(), source, values["HOSTED_SECRETS_ROOT"])
+                prepare_security(altered, keyring(), source)
+            altered = copy.deepcopy(bundle)
+            altered["ordinary_paths"]["REPOS"] = str(linked)
+            with self.assertRaises(ValueError):
+                prepare_security(altered, keyring(), source)
 
     @unittest.skipUnless(os.name == "posix", "packaged Bash renderers require Linux")
     def test_shell_renderers_consume_the_shared_contract(self):
@@ -114,6 +147,17 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(panel["hosted"][name], value)
         for name, value in bundle["container_security"].items():
             self.assertEqual(engine[name], value)
+        panel_service = compose["services"]["tandem-control-panel"]
+        self.assertEqual(panel_service["environment"]["TANDEM_CONTROL_PANEL_CONFIG_FILE"],
+                         "/run/tandem-panel-auth/control-panel-config.json")
+        for mount in bundle["panel_mounts"]:
+            self.assertIn(mount, panel_service["volumes"])
+            self.assertNotIn(mount, engine["volumes"])
+        for name, value in {"HOSTED_RUNTIME_SECURITY_VERSION": "2", "HOSTED_PLATFORM": "linux/arm64"}.items():
+            for renderer in ("render-compose.sh", "render-runtime-env.sh", "render-control-panel-config.sh"):
+                result = subprocess.run(["bash", str(script / renderer)], env={**env, name: value},
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, (name, renderer))
 
     @unittest.skipUnless(os.name == "posix", "packaged Bash renderers require Linux")
     def test_packaged_bundle_keeps_shared_module_and_valid_compose(self):

@@ -1,5 +1,6 @@
 """Provision only runtime security files; never generate human signing authority."""
 import json
+import copy
 import os
 import secrets
 import stat
@@ -54,7 +55,7 @@ def _write(path, value, uid, gid):
             os.unlink(temp_name)
 
 
-def prepare_security(bundle, keyring, host_agent_token_file, secrets_root):
+def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
     """Called by authorized Linux bootstrap. Repeated calls preserve audit/replay state."""
     if os.name != "posix":
         raise ValueError("runtime security provisioning requires Linux")
@@ -74,6 +75,11 @@ def prepare_security(bundle, keyring, host_agent_token_file, secrets_root):
         raise ValueError("a provisioned host agent token is required")
     paths = {name: _plain_path(path) for name, path in bundle["host_paths"].items()}
     roots = list(paths.values())
+    for ordinary in bundle["ordinary_paths"].values():
+        ordinary = _plain_path(ordinary)
+        for path in roots:
+            if path == ordinary or path in ordinary.parents or ordinary in path.parents:
+                raise ValueError("security storage must remain independent of workload mounts")
     for index, path in enumerate(roots):
         for other in roots[index + 1:]:
             if path == other or path in other.parents or other in path.parents:
@@ -83,8 +89,7 @@ def prepare_security(bundle, keyring, host_agent_token_file, secrets_root):
         security = _directory(paths["security"], uid, gid)
         replay = _directory(paths["replay"], uid, gid)
         anchor = _directory(paths["anchor"], uid, gid)
-        target_secrets = _plain_path(secrets_root)
-        target_secrets.mkdir(parents=True, exist_ok=True)
+        panel_auth = _directory(paths["panel_auth"], uid, gid)
         audit_key = security / "audit-hmac-key"
         if audit_key.exists() or audit_key.is_symlink():
             _check_file(audit_key, uid)
@@ -95,7 +100,10 @@ def prepare_security(bundle, keyring, host_agent_token_file, secrets_root):
                 raise ValueError("audit key is missing from initialized storage; authorized recovery is required")
             _write(audit_key, secrets.token_hex(32).encode(), uid, gid)
         _write(security / "context-keyring.json", json.dumps(keyring, sort_keys=True).encode(), uid, gid)
-        _write(target_secrets / "host_agent_token", host_token, uid, gid)
+        _write(panel_auth / "host-agent-token", host_token, uid, gid)
+        config = copy.deepcopy(panel_config or {"version": 1})
+        config.setdefault("hosted", {}).update(bundle["panel_hosted"])
+        _write(panel_auth / "control-panel-config.json", json.dumps(config).encode(), uid, gid)
         _write(security / ".initialized", b"runtime-security-v1\n", uid, gid)
         # The engine must create the replay database; an empty placeholder is invalid.
     finally:

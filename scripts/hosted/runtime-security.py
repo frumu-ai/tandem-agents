@@ -28,7 +28,9 @@ def main():
                 raise ValueError("HOSTED_CONTEXT_KEYRING_SOURCE_FILE and HOSTED_HOST_AGENT_TOKEN_SOURCE_FILE are required")
             with open(keyring_path, encoding="utf-8") as handle:
                 keyring = json.load(handle)
-            prepare_security(bundle, keyring, token_path, os.environ["HOSTED_SECRETS_ROOT"])
+            with open(os.environ["HOSTED_CONTROL_PANEL_CONFIG_FILE"], encoding="utf-8") as handle:
+                panel_config = json.load(handle)
+            prepare_security(bundle, keyring, token_path, panel_config)
             print("Runtime security storage prepared; no key material emitted.")
         elif args.output:
             Path(args.output).write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")

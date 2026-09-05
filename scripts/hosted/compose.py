@@ -48,6 +48,7 @@ context_assertion_env = "\n".join(
     if key != "TANDEM_STATE_DIR"
 )
 security_mounts = "\n".join(f"      - {json.dumps(mount)}" for mount in security["engine_mounts"])
+panel_mounts = "\n".join(f"      - {json.dumps(mount)}" for mount in security["panel_mounts"])
 container_security = "\n".join(f"    {key}: {json.dumps(value)}" for key, value in security["container_security"].items())
 
 control_panel_healthcheck = f"""\
@@ -198,7 +199,7 @@ control_panel_service = f"""\
       TANDEM_CONTROL_PANEL_AUTO_START_ENGINE: "0"
       TANDEM_STATE_DIR: /var/lib/tandem/panel
       TANDEM_CONTROL_PANEL_STATE_DIR: /var/lib/tandem/panel/control-panel
-      TANDEM_CONTROL_PANEL_CONFIG_FILE: /workspace/tandem-data/control-panel-config.json
+      TANDEM_CONTROL_PANEL_CONFIG_FILE: /run/tandem-panel-auth/control-panel-config.json
       TANDEM_CONTROL_PANEL_MODE: auto
       TANDEM_API_TOKEN_FILE: /run/secrets/tandem_api_token
       ACA_BASE_URL: http://aca:{aca_port}
@@ -209,6 +210,7 @@ control_panel_service = f"""\
       TANDEM_CONTROL_PANEL_WORKSPACE_ROOT: /workspace/repos
     volumes:
       - {panel_state_root}:/var/lib/tandem/panel
+{panel_mounts}
       - {data_root}:/workspace/tandem-data:ro
       - {repos_root}:/workspace/repos
       - {secrets_root}:/run/secrets:ro

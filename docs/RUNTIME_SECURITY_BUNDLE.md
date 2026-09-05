@@ -49,6 +49,12 @@ Symlinks and insecure existing ownership/modes reject. Audit anchors have an
 independent mount outside engine state. Engine and panel run without root,
 with read-only roots, dropped capabilities and no new privileges.
 
+The panel host-agent token and trusted configuration are provisioned together
+in a separate owner-only directory mounted read-only only into the panel.
+The shared data directory is not an authentication configuration authority.
+Security roots cannot overlap ordinary workload mounts; provisioning rejects
+symlink aliases. HTTP development origins must use literal 127.0.0.1 or [::1].
+
 Validation:
 
 ```sh

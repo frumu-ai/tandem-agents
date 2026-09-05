@@ -143,6 +143,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             TANDEM_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
