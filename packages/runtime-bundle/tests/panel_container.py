@@ -1,5 +1,6 @@
 """Run the source-pinned panel image under the rendered security restrictions."""
 import json
+import http.client
 import os
 import socket
 import subprocess
@@ -39,7 +40,7 @@ with tempfile.TemporaryDirectory() as temp:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/system/health", timeout=3) as response:
                     assert json.load(response)["ok"] is True
                 break
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
                 time.sleep(1)
         else:
             raise AssertionError("source-pinned panel did not start under container restrictions")
