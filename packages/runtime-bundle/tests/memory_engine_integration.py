@@ -145,6 +145,9 @@ class HostedMemoryTests(unittest.TestCase):
                         status, body = engine.request("/enterprise/org-unit-access-grants", token=token("alice"))
                         self.assertEqual(status, 200, body)
                         self.assertEqual(json.loads(body)["count"], 2, "operator data grants must load")
+                        status, body = engine.request("/enterprise/org-unit-access-grants/effective?member_kind=human_user&member_id=alice", token=token("alice"))
+                        self.assertEqual(status, 200, body)
+                        self.assertEqual(json.loads(body)["count"], 1, "current membership must project the knowledge grant")
                         ids = {}
                         for actor, name, private, metadata in [
                             # Personal notes are subject-owned across the tenant;
@@ -194,6 +197,10 @@ class HostedMemoryTests(unittest.TestCase):
                                 tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                                 if "memory_records" in tables:
                                     counts[str(database.relative_to(root))] = connection.execute("SELECT count(*) FROM memory_records").fetchone()[0]
+                                    counts["synthetic_scope_rows"] = connection.execute(
+                                        "SELECT tenant_org_id,tenant_workspace_id,tenant_deployment_id,user_id,owner_subject,owner_org_unit_id,private,project_tag FROM memory_records").fetchall()
+                                    counts["matching_text_rows"] = connection.execute(
+                                        "SELECT count(*) FROM memory_records WHERE content LIKE '%acceptance lantern%'").fetchone()[0]
                         error.add_note("Synthetic memory row counts: " + json.dumps(counts))
                         log = (home / "engine.log").read_text()[-6000:]
                         error.add_note(log.replace(TOKEN, "[redacted]").replace(engine.token, "[redacted]"))
