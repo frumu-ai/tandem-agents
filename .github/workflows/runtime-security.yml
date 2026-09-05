@@ -87,3 +87,5 @@ jobs:
         run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-policy-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/policy_engine_integration.py
       - name: Non-root engine key overlap, retirement, protected reload and restart
         run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-policy-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/keyring_engine_integration.py
+      - name: Actual hosted memory isolation for two users and two customers
+        run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-policy-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/memory_engine_integration.py
