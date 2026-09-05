@@ -76,14 +76,16 @@ class Engine:
                     return detail
                 raise AssertionError("Engine exited unexpectedly: " + detail[-5000:])
             try:
-                if self.request("/global/health")[0] == 200:
+                status, body = self.request("/global/health")
+                if status == 200 and json.loads(body).get("ready") is True:
                     if failure:
                         raise AssertionError("Invalid hosted configuration became healthy")
                     return
             except (urllib.error.URLError, TimeoutError):
                 pass
             time.sleep(0.1)
-        raise AssertionError("Engine did not resolve startup within 60 seconds")
+        self.log.seek(0)
+        raise AssertionError("Engine did not resolve startup within 60 seconds: " + self.log.read()[-5000:])
 
     def request(self, path="/session", token=None):
         headers = {"Authorization": "Bearer " + self.token}

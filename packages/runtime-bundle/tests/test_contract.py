@@ -115,6 +115,30 @@ class ContractTests(unittest.TestCase):
         for name, value in bundle["container_security"].items():
             self.assertEqual(engine[name], value)
 
+    @unittest.skipUnless(os.name == "posix", "packaged Bash renderers require Linux")
+    def test_packaged_bundle_keeps_shared_module_and_valid_compose(self):
+        import yaml
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            values = inputs(root / "install", root / "anchors")
+            values["HOSTED_BUNDLE_DIR"] = str(root / "bundle")
+            env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], **values}
+            subprocess.run(["bash", str(REPO / "scripts/hosted/package-bundle.sh")],
+                           env=env, capture_output=True, text=True, check=True)
+            manifest = json.loads((root / "bundle/runtime-security.json").read_text())
+            self.assertEqual(manifest, build_security_bundle(values))
+            self.assertTrue((root / "bundle/tandem_runtime_bundle/prepare.py").is_file())
+            self.assertFalse((root / "bundle/audit-hmac-key").exists())
+            self.assertFalse((root / "bundle/host_agent_token").exists())
+            compose = root / "bundle/docker-compose.hosted.yml"
+            self.assertEqual(yaml.safe_load(compose.read_text())["services"]["tandem-engine"]["user"],
+                             manifest["container_security"]["user"])
+            subprocess.run(["docker", "compose", "-f", str(compose), "config", "--quiet"],
+                           env=env, capture_output=True, text=True, check=True)
+            # The copy shipped in the archive imports its own module without a pip install.
+            subprocess.run(["python3", str(root / "bundle/runtime-security.py"), "render"],
+                           env=env, cwd=root, capture_output=True, text=True, check=True)
+
 
 if __name__ == "__main__":
     unittest.main()
