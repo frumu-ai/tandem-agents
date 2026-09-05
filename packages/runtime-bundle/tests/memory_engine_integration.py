@@ -83,6 +83,7 @@ class HostedMemoryTests(unittest.TestCase):
                             capture_output=True, text=True, timeout=20)
                         self.assertEqual(result.returncode, 0, result.stderr)
                     engine = Engine(home, bundle)
+                    engine.env["RUST_LOG"] = "warn,tandem_memory::governed_read=debug"
                     executable = root / "tandem-engine"
                     shutil.copyfile(engine.binary, executable)
                     executable.chmod(0o755)
