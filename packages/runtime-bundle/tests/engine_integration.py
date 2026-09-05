@@ -54,18 +54,23 @@ class Engine:
                         "/var/lib/tandem-replay": paths["replay"],
                         "/var/lib/tandem-audit": paths["anchor"],
                         "/home/node/.local/share/tandem": paths["state"]}
+        if "policy" in paths:
+            translations["/run/tandem-hosted-policy"] = paths["policy"]
         for name, value in bundle["engine_environment"].items():
             for container, host in translations.items():
                 value = value.replace(container, host)
             self.env[name] = value
         Path(self.env["TANDEM_STATE_DIR"]).mkdir(parents=True, exist_ok=True)
         self.process = None
+        self.process_options = {}
+        self.binary = os.environ["TANDEM_TEST_ENGINE"]
 
-    def start(self, failure=False):
+    def start(self, failure=False, wait_ready=True):
         self.log = open(self.root / "engine.log", "w+")
         self.process = subprocess.Popen(
-            [os.environ["TANDEM_TEST_ENGINE"], "serve", "--hostname", "127.0.0.1", "--port", str(self.port)],
+            [self.binary, "serve", "--hostname", "127.0.0.1", "--port", str(self.port)],
             env=self.env, cwd=self.root, stdout=self.log, stderr=subprocess.STDOUT,
+            **self.process_options,
         )
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -77,7 +82,7 @@ class Engine:
                 raise AssertionError("Engine exited unexpectedly: " + detail[-5000:])
             try:
                 status, body = self.request("/global/health")
-                if status == 200 and json.loads(body).get("ready") is True:
+                if status == 200 and (json.loads(body).get("ready") is True or not wait_ready):
                     if failure:
                         raise AssertionError("Invalid hosted configuration became healthy")
                     return
