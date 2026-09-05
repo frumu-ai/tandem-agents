@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -141,6 +142,9 @@ class HostedMemoryTests(unittest.TestCase):
                         engine.start(wait_ready=False)
                         fetch()
                         wait_for(ready)
+                        status, body = engine.request("/enterprise/org-unit-access-grants", token=token("alice"))
+                        self.assertEqual(status, 200, body)
+                        self.assertEqual(json.loads(body)["count"], 2, "operator data grants must load")
                         ids = {}
                         for actor, name, private, metadata in [
                             # Personal notes are subject-owned across the tenant;
@@ -181,6 +185,19 @@ class HostedMemoryTests(unittest.TestCase):
                         wait_for(ready)
                         visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private", "operations-shared"])
                         visible("bob", ["bob-private", "operations-shared", "tenant-shared"], ["alice-private", "engineering-shared", "bob-department-private"])
+                    except AssertionError as error:
+                        # Diagnostic data belongs only to this disposable synthetic
+                        # host. Print row counts, never record contents or tokens.
+                        counts = {}
+                        for database in root.rglob("*.sqlite"):
+                            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                                if "memory_records" in tables:
+                                    counts[str(database.relative_to(root))] = connection.execute("SELECT count(*) FROM memory_records").fetchone()[0]
+                        error.add_note("Synthetic memory row counts: " + json.dumps(counts))
+                        log = (home / "engine.log").read_text()[-6000:]
+                        error.add_note(log.replace(TOKEN, "[redacted]").replace(engine.token, "[redacted]"))
+                        raise
                     finally:
                         engine.stop()
 
