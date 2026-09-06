@@ -1,5 +1,8 @@
 # Tandem Agents Docs
 
+- [HOSTED_MEMORY_ACCEPTANCE.md](HOSTED_MEMORY_ACCEPTANCE.md) - verified personal,
+  department and tenant memory mappings and actual-engine acceptance.
+
 This directory contains the setup, schema, and workflow docs for the local
 Tandem Agents stack: Tandem engine, control panel, ACA runtime, KB MCP, and
 supporting operator scripts.
