@@ -112,7 +112,11 @@ class HostedMemoryTests(unittest.TestCase):
                             "resource": resource, "effect": "allow", "permissions": ["read"],
                             "data_classes": ["internal"], "state": "active",
                             "created_at_ms": now, "updated_at_ms": now}
-                    data = Path(engine.env["TANDEM_STATE_DIR"]) / "data"
+                    # The shared bundle selects the canonical data directory,
+                    # not the Tandem root. Appending "data" silently seeds a
+                    # different store from the one the engine actually reads.
+                    data = Path(engine.env["TANDEM_STATE_DIR"])
+                    self.assertEqual(data.name, "data", "bundle must select the canonical data directory")
                     for directory in (data, data / "enterprise"):
                         directory.mkdir(mode=0o700, exist_ok=True)
                         os.chown(directory, 1000, 1000)
