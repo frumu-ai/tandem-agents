@@ -83,7 +83,7 @@ class HostedMemoryTests(unittest.TestCase):
                             capture_output=True, text=True, timeout=20)
                         self.assertEqual(result.returncode, 0, result.stderr)
                     engine = Engine(home, bundle)
-                    engine.env["RUST_LOG"] = "warn,tandem_memory::governed_read=debug"
+                    engine.env["RUST_LOG"] = "warn,tandem_memory::governed_read=debug,tandem_server::state=debug"
                     executable = root / "tandem-engine"
                     shutil.copyfile(engine.binary, executable)
                     executable.chmod(0o755)
@@ -215,9 +215,12 @@ class HostedMemoryTests(unittest.TestCase):
                                         "SELECT count(*) FROM memory_records WHERE content LIKE '%acceptance lantern%'").fetchone()[0]
                         error.add_note("Synthetic memory row counts: " + json.dumps(counts))
                         error.add_note("Synthetic recall response: " + json.dumps(last_recall))
+                        error.add_note("Synthetic seeded grant file: " + str(grants)
+                            + "; present=" + str(grants.is_file()))
                         full_log = (home / "engine.log").read_text()
                         startup = "\n".join(line for line in full_log.splitlines()
-                            if "startup data grant registry" in line)
+                            if "startup data grant registry" in line
+                            or "org_unit_access_grants" in line)
                         log = startup + "\n" + full_log[-6000:]
                         error.add_note(log.replace(TOKEN, "[redacted]").replace(engine.token, "[redacted]"))
                         raise
