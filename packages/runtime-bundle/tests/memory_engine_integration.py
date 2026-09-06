@@ -148,10 +148,18 @@ class HostedMemoryTests(unittest.TestCase):
                         wait_for(ready)
                         status, body = engine.request("/enterprise/org-unit-access-grants", token=token("alice"))
                         self.assertEqual(status, 200, body)
-                        self.assertEqual(json.loads(body)["count"], 2, "operator data grants must load")
+                        loaded = {row["grant_id"]: row for row in json.loads(body)["access_grants"]}
+                        for unit in ("eng", "ops"):
+                            grant_id = "acceptance-notes-" + unit
+                            self.assertIn(grant_id, loaded, "the operator data grant itself must load")
+                            self.assertEqual(loaded[grant_id]["resource"], resource)
+                            self.assertEqual(loaded[grant_id]["permissions"], ["read"])
                         status, body = engine.request("/enterprise/org-unit-access-grants/effective?member_kind=human_user&member_id=alice", token=token("alice"))
                         self.assertEqual(status, 200, body)
-                        self.assertEqual(json.loads(body)["count"], 1, "current membership must project the knowledge grant")
+                        effective = json.loads(body)["grants"]
+                        self.assertTrue(any(row["grant_id"].endswith("::acceptance-notes-eng")
+                            and row["permissions"] == ["read"] and row["resource"] == resource
+                            for row in effective), "current membership must project the exact knowledge-read grant")
                         ids = {}
                         for actor, name, private, metadata in [
                             # Personal notes are subject-owned across the tenant;
@@ -207,7 +215,10 @@ class HostedMemoryTests(unittest.TestCase):
                                         "SELECT count(*) FROM memory_records WHERE content LIKE '%acceptance lantern%'").fetchone()[0]
                         error.add_note("Synthetic memory row counts: " + json.dumps(counts))
                         error.add_note("Synthetic recall response: " + json.dumps(last_recall))
-                        log = (home / "engine.log").read_text()[-6000:]
+                        full_log = (home / "engine.log").read_text()
+                        startup = "\n".join(line for line in full_log.splitlines()
+                            if "startup data grant registry" in line)
+                        log = startup + "\n" + full_log[-6000:]
                         error.add_note(log.replace(TOKEN, "[redacted]").replace(engine.token, "[redacted]"))
                         raise
                     finally:
