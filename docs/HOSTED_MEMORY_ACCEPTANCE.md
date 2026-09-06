@@ -16,9 +16,9 @@ subject and department predicates:
 | Tenant knowledge | `private: false`, `tenant_shared: true` | Current authorized users of the tenant |
 
 `tenant_shared` broadens the department axis only. It cannot override a private
-owner predicate or the verified tenant boundary. Omitting department labels on
-a write still stamps the collector's active department; it does not declare an
-unrestricted personal space. Hosted writes require knowledge-scope metadata.
+owner predicate or the verified tenant boundary. Without an explicit `tenant_shared: true` label, omitting department labels
+still stamps the collector's active department. An explicit department always
+remains required, including when combined with the tenant-sharing label. Hosted writes require knowledge-scope metadata.
 The fixture supplies a tenant/project-bound memory resource and explicitly
 provisions read grants for the two departments in the existing persisted
 org-unit access registry before starting the runtime. These grants are
@@ -33,9 +33,11 @@ old assertions and repeats recall after restart. It checks known-ID mutation,
 foreign tenant/department spoofing and unsupported tiers. The same fixture runs
 for a second organization using the same artifact and repeated actor names.
 
-The first CI run rejected the initial write because the fixture omitted required
-knowledge-scope metadata. CI must pass with the corrected setup before claiming
-privacy evidence. This fixture uses the default local storage crypto mode and
+Earlier actual-engine evidence reached the department change and exposed
+a storage scope defect. The pinned candidate now persists explicit sharing and
+keeps it independent of private ownership. Current CI must pass the complete
+scenario, including restart and the second organization, before claiming privacy
+evidence. This fixture uses the default local storage crypto mode and
 does not claim encryption acceptance. This test does not implement the
 customer-configuration schema, sanitized export, source-connector grants,
 encrypted off-site backup or clean-host recovery. Those remain separate gates.
