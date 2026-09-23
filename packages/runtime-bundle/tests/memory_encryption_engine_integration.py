@@ -88,8 +88,12 @@ class MemoryEncryptionEngineTests(unittest.TestCase):
             # inputs but uses local authorization so the test isolates crypto.
             with synthetic_v3_provenance():
                 values = inputs(install, root / "independent-anchors")
+                # The install root belongs to the non-root engine. KMS command
+                # ancestors must remain root-owned so that user cannot replace
+                # the executable before a later bind mount.
                 values.update(HOSTED_RUNTIME_SECURITY_VERSION="3",
-                              HOSTED_TANDEM_ENGINE_SOURCE_REVISION=MEMORY_ENGINE_REVISION)
+                              HOSTED_TANDEM_ENGINE_SOURCE_REVISION=MEMORY_ENGINE_REVISION,
+                              HOSTED_MEMORY_KMS_COMMAND_ROOT=str(root / "memory-kms-commands"))
                 bundle = build_security_bundle(values)
                 for location in (bundle["host_paths"]["state"], bundle["ordinary_paths"]["DATA"]):
                     directory = Path(location)
