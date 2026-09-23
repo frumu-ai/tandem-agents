@@ -188,6 +188,13 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
             if previous_number == 2 and bundle["schema_version"] == 1:
                 raise ValueError("runtime security downgrade would disable policy synchronization")
             if previous_number == 3:
+                # Neither the bound replay database nor the independent audit
+                # anchor can be regenerated from a copied workload directory.
+                # In particular, do not let _directory silently create an empty
+                # replay/anchor root on an initialized v3 installation.
+                for name in ("replay", "anchor"):
+                    if not paths[name].exists():
+                        raise ValueError(f"v3 {name} root is missing; authorized recovery is required")
                 binding = security / "storage-roots.json"
                 try:
                     _check_file(binding, uid)
