@@ -9,17 +9,23 @@ POLICY_ENGINE_REVISION = "364d20926455e3154a6bed623945b8d9e3d464e5"
 # Candidate for v3 crypto acceptance, independent of the v2 source pin. Its
 # global-record/WAL plaintext regression must be fixed before image release.
 MEMORY_ENGINE_REVISION = "774b990e781eaea76eaa1b20ec5d350488bba19e"
-# Add a digest only after independently verifying the published image was built
-# from MEMORY_ENGINE_REVISION. An empty map keeps v3 nondeployable by default.
+# Add an entry only after independently verifying the published image was built
+# from MEMORY_ENGINE_REVISION. Each entry binds source, in-image binary checksum
+# and the reviewed build observation's canonical SHA-256. Empty fails closed.
 VERIFIED_MEMORY_ENGINE_IMAGES = {}
 POLICY_CONTAINER_DIR = "/run/tandem-hosted-policy"
 MEMORY_COMMAND_DIR = PurePosixPath("/run/tandem-memory-kms")
 
 
-def verify_memory_engine_image(image, revision):
-    if (not isinstance(image, str) or VERIFIED_MEMORY_ENGINE_IMAGES.get(image) != MEMORY_ENGINE_REVISION
-            or revision != MEMORY_ENGINE_REVISION):
-        raise ValueError("runtime security v3 requires a verified exact-source engine image digest")
+def verify_memory_engine_image(image, revision, binary_sha256=None, attestation_sha256=None):
+    approved = VERIFIED_MEMORY_ENGINE_IMAGES.get(image) if isinstance(image, str) else None
+    if (revision != MEMORY_ENGINE_REVISION or not isinstance(approved, dict)
+            or approved.get("source_revision") != revision
+            or not isinstance(binary_sha256, str)
+            or approved.get("binary_sha256") != binary_sha256
+            or not isinstance(attestation_sha256, str)
+            or approved.get("attestation_sha256") != attestation_sha256):
+        raise ValueError("runtime security v3 requires a verified exact-source engine image digest and attestation")
 
 
 def _memory_encryption(bundle, values):
@@ -93,6 +99,11 @@ def apply_policy_profile(bundle, values, version=2):
         bundle["host_paths"]["memory_kms_commands"] = str(command_root)
         memory = _memory_encryption(bundle, values)
         bundle["memory_encryption"] = memory
+        bundle["engine_provenance"] = {
+            "source_revision": revision,
+            "binary_sha256": values["HOSTED_ENGINE_BINARY_SHA256"],
+            "attestation_sha256": values["HOSTED_ENGINE_ATTESTATION_SHA256"],
+        }
         bundle["engine_environment"].update({
             "TANDEM_MEMORY_ENCRYPTION_REQUIRED": "true",
             "TANDEM_MEMORY_DECRYPT_PROVIDER": memory["provider"],

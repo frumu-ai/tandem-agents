@@ -1,4 +1,5 @@
 .git
+.v3-tandem-source/
 .gitignore
 .env
 .secrets/

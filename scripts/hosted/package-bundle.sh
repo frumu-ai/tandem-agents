@@ -121,12 +121,13 @@ set +a
 python3 "${SCRIPT_DIR}/runtime-security.py" render --output "${bundle_dir}/runtime-security.json"
 "${SCRIPT_DIR}/release-manifest.sh" > "${bundle_dir}/release-manifest.env"
 
-python3 - "${bundle_dir}/release-manifest.json" <<'PY'
+python3 - "${bundle_dir}/release-manifest.json" "${bundle_dir}/runtime-security.json" <<'PY'
 import json
 import os
 import sys
 
 target = sys.argv[1]
+runtime_security = json.load(open(sys.argv[2], encoding="utf-8"))
 data = {
     "runtime_security_version": int(os.environ["HOSTED_RUNTIME_SECURITY_VERSION"]),
     "tandem_control_panel_source_revision": os.environ["HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION"],
@@ -159,6 +160,8 @@ data = {
     "bundle_archive": os.environ.get("HOSTED_BUNDLE_ARCHIVE", ""),
     "public_url": os.environ.get("HOSTED_CONTROL_PANEL_PUBLIC_URL", ""),
 }
+if runtime_security["schema_version"] == 3:
+    data["engine_provenance"] = runtime_security["engine_provenance"]
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(data, handle, indent=2)
     handle.write("\n")

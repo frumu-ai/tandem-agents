@@ -166,3 +166,18 @@ the trusted image digest map can advance. The current red CI check and empty
 image map deliberately prevent v3 release. Live KMS, authorized encrypted
 migration, off-site backup, clean-host recovery, and hosted two-user privacy
 still require separate acceptance evidence.
+
+The image publisher has a distinct v3 lane. For a `-v3` tag it checks out the
+exact `MEMORY_ENGINE_REVISION`, rejects a dirty checkout, compiles the hosted
+enterprise engine with the release `browser,enterprise-full` features from that
+named source context on the runtime libc baseline with BuildKit provenance,
+then reads
+the source marker and binary SHA-256 back from the published digest image. A
+versioned observation binds that source, binary, image, builder commit and run
+ID. The reviewed production allowlist must independently bind all three
+hashes: image digest, binary digest and canonical observation digest. Release
+registration requires the matching observation file and the code-owned
+allowlist entry. The map remains empty while the WAL repair and image proof are
+outstanding, so publishing a candidate image does not enable v3 deployment.
+The local `build-images.sh` v3 path can smoke-build an exact clean checkout but
+cannot push or register it; the published workflow owns the attested path.

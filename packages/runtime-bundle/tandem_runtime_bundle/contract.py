@@ -107,7 +107,11 @@ def validate_release(values):
         images[name.lower()] = value
     if version == "3":
         from .policy_contract import verify_memory_engine_image
-        verify_memory_engine_image(images["engine"], required_revision)
+        verify_memory_engine_image(
+            images["engine"], required_revision,
+            values.get("HOSTED_ENGINE_BINARY_SHA256"),
+            values.get("HOSTED_ENGINE_ATTESTATION_SHA256"),
+        )
     return images
 
 

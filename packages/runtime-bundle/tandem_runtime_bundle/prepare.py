@@ -122,8 +122,13 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
         raise ValueError("unsupported runtime security contract")
     if bundle["schema_version"] == 3:
         from .policy_contract import verify_memory_engine_image
+        provenance = bundle.get("engine_provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError("v3 engine provenance must be an object")
         verify_memory_engine_image(bundle.get("images", {}).get("engine"),
-                                   bundle.get("engine_source_revision"))
+                                   bundle.get("engine_source_revision"),
+                                   provenance.get("binary_sha256"),
+                                   provenance.get("attestation_sha256"))
     validate_keyring(keyring, bundle["deployment_id"], bundle["organization_id"])
     uid, gid = bundle["uid"], bundle["gid"]
     if os.geteuid() not in (0, uid):
