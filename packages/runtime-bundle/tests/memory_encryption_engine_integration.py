@@ -74,7 +74,10 @@ def memory_request(engine, method, path, body):
 
 class MemoryEncryptionEngineTests(unittest.TestCase):
     def test_encrypted_write_cold_restart_and_missing_or_wrong_key(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        # GitHub Actions may set TMPDIR under a runner-owned workspace. The
+        # production KMS guard correctly rejects that writable ancestor, so
+        # stage this root-only fixture beneath the sticky, root-owned /tmp.
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             root = Path(temporary)
             root.chmod(0o755)
             home, install = root / "runtime-home", root / "install"
