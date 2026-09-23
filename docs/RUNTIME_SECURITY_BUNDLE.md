@@ -171,6 +171,20 @@ The image publisher has a distinct v3 lane. Manual publication runs only from
 `main`; tag pushes and other workflow refs cannot publish. Release registration
 uses the `hosted-release` environment, which operators must configure with
 required reviewers, main-only deployment protection and the publish token.
+Before any registry publication, operators must also create the
+`hosted-image-publish` environment with required reviewers, prevent self-review,
+restrict deployment branches to `main`, and set environment-only
+`HOSTED_IMAGE_PUBLISH_ARMED=true`, `HOSTED_IMAGE_PUBLISH_USERNAME`, and
+`HOSTED_IMAGE_PUBLISH_TOKEN` (a GHCR account credential with package-write
+access). An environment referenced only by a workflow is created without
+protection or secrets; this lane exits before login when those settings are
+absent. Keep the credential out of repository and organization secrets. Remove
+the Tandem Agents repository's inherited GHCR package-write/Actions access for
+every published package, and disable automatic permission inheritance for new
+packages before the first publish. Otherwise a branch-modified workflow can
+request its own package-write `GITHUB_TOKEN` and bypass this workflow's gate.
+Until the protected environment and granular package permissions are verified,
+do not arm this lane or publish images.
 For a `-v3` tag the workflow checks out the exact `MEMORY_ENGINE_REVISION`,
 rejects a dirty checkout and stages its tracked Git archive without the
 source repository's restrictive `.dockerignore` (which excludes Rust sources).

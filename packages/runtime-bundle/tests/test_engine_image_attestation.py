@@ -97,6 +97,13 @@ class EngineImageAttestationTests(unittest.TestCase):
         self.assertIn("engine_image_attestation", workflow)
         self.assertIn("scripts/hosted/release-payload.sh", workflow)
         self.assertIn("environment: hosted-release", workflow)
+        self.assertIn("environment: hosted-image-publish", workflow)
+        self.assertIn("secrets.HOSTED_IMAGE_PUBLISH_TOKEN", workflow)
+        self.assertIn("vars.HOSTED_IMAGE_PUBLISH_ARMED", workflow)
+        self.assertNotIn("secrets.GITHUB_TOKEN", workflow)
+        self.assertNotIn("packages: write", workflow)
+        publish_section = workflow.split("\n  publish:\n", 1)[1].split("\n  register-hosted-release:\n", 1)[0]
+        self.assertIn("Require configured protected publisher", publish_section)
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn("TANDEM_WEB_BASE_URL: https://tandem.ac", workflow)
         self.assertIn("IMAGE_REGISTRY: ghcr.io/frumu-ai/tandem-agents", workflow)
@@ -173,8 +180,10 @@ class EngineImageAttestationTests(unittest.TestCase):
         self.assertEqual(publisher["permissions"], {"contents": "read"})
         jobs = publisher["jobs"]
         self.assertIn("refs/heads/main", jobs["resolve"]["if"])
-        self.assertEqual(jobs["publish"]["permissions"],
-                         {"contents": "read", "packages": "write"})
+        self.assertEqual(jobs["publish"]["permissions"], {"contents": "read"})
+        self.assertEqual(jobs["publish"]["environment"], "hosted-image-publish")
+        self.assertIn("Require configured protected publisher",
+                      [step.get("name") for step in jobs["publish"]["steps"]])
         self.assertEqual(jobs["register-hosted-release"]["environment"], "hosted-release")
         self.assertEqual(jobs["register-hosted-release"]["permissions"], {"contents": "read"})
         security = yaml.safe_load((repo / ".github/workflows/runtime-security.yml").read_text())
