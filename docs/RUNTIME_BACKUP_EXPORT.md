@@ -3,8 +3,8 @@
 `scripts/hosted/export-runtime-backup.py` is an **export-only** Linux operator
 command. It cannot restore data, rebind `storage-roots.json`, authorize a new
 host, or turn the tandem-web legacy snapshot/restore jobs back on. The v3 image
-allowlist remains empty and tandem-web currently supports only v1/v2 bundle
-rendering, so this is not live hosted backup or clean-host recovery evidence.
+allowlist remains empty. A v3 tandem-web consumer is under review, but there
+is no live v3 hosting, off-site backup, or clean-host recovery evidence yet.
 
 The command uses the installed `runtime-security.json` as the path inventory
 contract. It rejects any version other than initialized v3, missing roots,
