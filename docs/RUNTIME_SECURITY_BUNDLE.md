@@ -116,8 +116,9 @@ an image or establish encrypted clean-host recovery or governed-memory privacy.
 The v3 profile retains the v2 policy, replay and audit protections and requires
 envelope encryption for hosted memory. Set `HOSTED_RUNTIME_SECURITY_VERSION=3`
 and pin `MEMORY_ENGINE_REVISION` from `policy_contract.py`. Its source includes
-the external KMS interface while the v2 source pin remains unchanged. This
-candidate is blocked by the global-memory plaintext regression described below.
+the external KMS interface, hosted grant authority and encrypted global-record
+repair while the v2 source pin remains unchanged. Exact-source v3 integration
+and verified image evidence are still pending.
 Consumers must opt in to v3 and supply all of these non-secret references:
 
 - `HOSTED_MEMORY_ENCRYPTION_REQUIRED=true`
@@ -156,16 +157,15 @@ host-agent adapter must add these values before it can consume v3.
 The `memory-engine` CI job builds the pinned source and runs a non-root process
 with a disposable external-command KMS. The test uses synthetic local-mode
 authorization only to isolate the crypto path; it does not establish hosted
-policy/grant behavior. The current candidate fails its at-rest check: a
-`/memory/put` global record leaves the content canary in `memory.sqlite-wal`.
-The source inserts global-record content, metadata and provenance directly into
-`memory_records`, and its FTS trigger copies content. A tandem engine fix must
-seal those fields without retaining plaintext in the DB, WAL or FTS, then pass
-the cold-read and wrong/missing-key checks before `MEMORY_ENGINE_REVISION` and
-the trusted image digest map can advance. The current red CI check and empty
-image map deliberately prevent v3 release. Live KMS, authorized encrypted
-migration, off-site backup, clean-host recovery, and hosted two-user privacy
-still require separate acceptance evidence.
+policy/grant behavior. The previous 0.7.2 source left a `/memory/put`
+global-record canary in `memory.sqlite-wal`. The pinned integration candidate
+seals global content, metadata and provenance in ordinary and atomic writes,
+and removes readable FTS tokens. Its exact-source DB, WAL, backup, cold-read
+and wrong/missing-key checks must pass before a source-built image can be
+reviewed. Indexed and structural columns remain plaintext, so this is not
+whole-store encryption. The empty trusted image map prevents v3 release. Live
+KMS, authorized encrypted migration, off-site backup, clean-host recovery, and
+hosted two-user privacy still require separate acceptance evidence.
 
 The image publisher has a distinct v3 lane. Manual publication runs only from
 `main`; tag pushes and other workflow refs cannot publish. Release registration
@@ -196,8 +196,8 @@ versioned observation binds that source, binary, image, builder commit and run
 ID. The reviewed production allowlist must independently bind all three
 hashes: image digest, binary digest and canonical observation digest. Release
 registration requires the matching observation file and the code-owned
-allowlist entry. The map remains empty while the WAL repair and image proof are
-outstanding, so publishing a candidate image does not enable v3 deployment.
+allowlist entry. The map remains empty while integrated-engine and image proof
+are outstanding, so publishing a candidate image does not enable v3 deployment.
 The local `build-images.sh` v3 path can smoke-build an exact clean checkout but
 cannot push or register it; the published workflow owns the attested path.
 The v3 `aca-enterprise` image omits the legacy npm enterprise engine binary.

@@ -6,9 +6,10 @@ from pathlib import PurePosixPath
 # Candidate source must pass the exact-source engine integration before release.
 # Version 0.7.2 alone is insufficient: its released binary predates policy sync.
 POLICY_ENGINE_REVISION = "364d20926455e3154a6bed623945b8d9e3d464e5"
-# Candidate for v3 crypto acceptance, independent of the v2 source pin. Its
-# global-record/WAL plaintext regression must be fixed before image release.
-MEMORY_ENGINE_REVISION = "774b990e781eaea76eaa1b20ec5d350488bba19e"
+# Combined hosted-grant and encrypted-global-memory source candidate for v3,
+# independent of the v2 source pin. Exact-source integration and a verified
+# published image remain required before release.
+MEMORY_ENGINE_REVISION = "57f21af64766a7bbe3c2f018ddc1a3c3e9fce638"
 # Add an entry only after independently verifying the published image was built
 # from MEMORY_ENGINE_REVISION. Each entry binds source, in-image binary checksum
 # and the reviewed build observation's canonical SHA-256. Empty fails closed.
