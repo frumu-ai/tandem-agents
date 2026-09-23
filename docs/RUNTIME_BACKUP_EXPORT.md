@@ -5,6 +5,11 @@ command. It cannot restore data, rebind `storage-roots.json`, authorize a new
 host, or turn the tandem-web legacy snapshot/restore jobs back on. The v3 image
 allowlist remains empty. A v3 tandem-web consumer is under review, but there
 is no live v3 hosting, off-site backup, or clean-host recovery evidence yet.
+The `tandem-agents` packaged-host bootstrap installs this command and its
+modules. The tandem-web private-host installer currently ships only the
+runtime security, policy and keyring modules; it does not install the backup
+command. A separate pinned distribution path is required before a web-managed
+host can use this exporter.
 
 The command uses the installed `runtime-security.json` as the path inventory
 contract. It rejects any version other than initialized v3, missing roots,
