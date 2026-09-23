@@ -73,9 +73,10 @@ def provision_kms_commands(secrets):
 
 
 def write_kms_key(path, material):
-    path.chmod(0o600)
+    if path.exists():
+        path.chmod(0o600)
     if material is None:
-        path.unlink()
+        path.unlink(missing_ok=True)
     else:
         path.write_bytes(material)
         path.chmod(0o440)
