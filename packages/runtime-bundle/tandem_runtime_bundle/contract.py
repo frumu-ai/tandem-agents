@@ -86,9 +86,9 @@ def validate_release(values):
     if version not in ("1", "2", "3"):
         raise ValueError("unsupported runtime security contract version")
     if version in ("2", "3"):
-        from .policy_contract import MEMORY_ENGINE_REVISION, POLICY_ENGINE_REVISION
-        required_revision = MEMORY_ENGINE_REVISION if version == "3" else POLICY_ENGINE_REVISION
-        if values.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION") != required_revision:
+        from .policy_contract import MEMORY_ENGINE_REVISION, SUPPORTED_POLICY_ENGINE_REVISIONS
+        required_revisions = (MEMORY_ENGINE_REVISION,) if version == "3" else SUPPORTED_POLICY_ENGINE_REVISIONS
+        if values.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION") not in required_revisions:
             raise ValueError(f"runtime security v{version} requires its tested engine source revision")
     if values.get("HOSTED_PLATFORM", "linux/amd64") != "linux/amd64":
         raise ValueError("runtime security v1 supports linux/amd64 only")
@@ -108,7 +108,7 @@ def validate_release(values):
     if version == "3":
         from .policy_contract import verify_memory_engine_image
         verify_memory_engine_image(
-            images["engine"], required_revision,
+            images["engine"], MEMORY_ENGINE_REVISION,
             values.get("HOSTED_ENGINE_BINARY_SHA256"),
             values.get("HOSTED_ENGINE_ATTESTATION_SHA256"),
         )

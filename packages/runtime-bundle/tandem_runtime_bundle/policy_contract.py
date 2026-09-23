@@ -6,10 +6,14 @@ from pathlib import PurePosixPath
 # Candidate source must pass the exact-source engine integration before release.
 # Version 0.7.2 alone is insufficient: its released binary predates policy sync.
 POLICY_ENGINE_REVISION = "364d20926455e3154a6bed623945b8d9e3d464e5"
+# Existing v2 releases were accepted by the previous shared bundle. Keep
+# rendering those immutable manifests during the v3 consumer upgrade.
+PREVIOUS_POLICY_ENGINE_REVISION = "774b990e781eaea76eaa1b20ec5d350488bba19e"
+SUPPORTED_POLICY_ENGINE_REVISIONS = (POLICY_ENGINE_REVISION, PREVIOUS_POLICY_ENGINE_REVISION)
 # Combined hosted-grant and encrypted-global-memory source candidate for v3,
 # independent of the v2 source pin. Exact-source integration and a verified
 # published image remain required before release.
-MEMORY_ENGINE_REVISION = "57f21af64766a7bbe3c2f018ddc1a3c3e9fce638"
+MEMORY_ENGINE_REVISION = "aa1e8588cf91c8cf2e861067171c574270e131f6"
 # Add an entry only after independently verifying the published image was built
 # from MEMORY_ENGINE_REVISION. Each entry binds source, in-image binary checksum
 # and the reviewed build observation's canonical SHA-256. Empty fails closed.
@@ -81,7 +85,9 @@ def apply_policy_profile(bundle, values, version=2):
         raise ValueError("runtime policy synchronization requires HTTPS")
     if version not in (2, 3):
         raise ValueError("unsupported policy profile")
-    revision = MEMORY_ENGINE_REVISION if version == 3 else POLICY_ENGINE_REVISION
+    revision = MEMORY_ENGINE_REVISION if version == 3 else values.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION")
+    if version == 2 and revision not in SUPPORTED_POLICY_ENGINE_REVISIONS:
+        raise ValueError("runtime security v2 requires a tested engine source revision")
     bundle.update(schema_version=version, profile=f"hosted-single-node-v{version}",
                   engine_source_revision=revision)
     bundle["host_paths"]["policy"] = str(policy)

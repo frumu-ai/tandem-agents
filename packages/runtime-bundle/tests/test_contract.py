@@ -10,7 +10,8 @@ import unittest
 from pathlib import Path
 
 from tandem_runtime_bundle import build_security_bundle, validate_keyring
-from tandem_runtime_bundle.policy_contract import MEMORY_ENGINE_REVISION, POLICY_ENGINE_REVISION
+from tandem_runtime_bundle.policy_contract import (MEMORY_ENGINE_REVISION, POLICY_ENGINE_REVISION,
+                                                   PREVIOUS_POLICY_ENGINE_REVISION)
 from tandem_runtime_bundle.prepare import prepare_security
 from fixtures import DEPLOYMENT, ORGANIZATION, inputs, keyring, provisioned_paths, synthetic_v3_provenance
 
@@ -18,6 +19,16 @@ REPO = Path(__file__).resolve().parents[3]
 
 
 class ContractTests(unittest.TestCase):
+    def test_existing_v2_release_revision_still_renders_after_v3_bundle_upgrade(self):
+        old = build_security_bundle({**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "2",
+                                     "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": PREVIOUS_POLICY_ENGINE_REVISION})
+        self.assertEqual(old["schema_version"], 2)
+        self.assertEqual(old["engine_source_revision"], PREVIOUS_POLICY_ENGINE_REVISION)
+        self.assertNotIn("memory_encryption", old)
+        with self.assertRaisesRegex(ValueError, "tested engine source revision"):
+            build_security_bundle({**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "2",
+                                   "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": "0" * 40})
+
     def test_v3_production_requires_verified_engine_image(self):
         values = {**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "3",
                   "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION}
