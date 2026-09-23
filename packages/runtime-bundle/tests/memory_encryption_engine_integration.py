@@ -79,6 +79,7 @@ def write_kms_key(path, material):
         path.unlink(missing_ok=True)
     else:
         path.write_bytes(material)
+        os.chown(path, 0, 1000)
         path.chmod(0o440)
 
 
