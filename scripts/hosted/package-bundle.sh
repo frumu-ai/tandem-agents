@@ -191,6 +191,7 @@ stage_exec "${SCRIPT_DIR}/host-hardening.sh" "${bundle_dir}/host-hardening.sh"
 stage_exec "${SCRIPT_DIR}/release-manifest.sh" "${bundle_dir}/release-manifest.sh"
 stage_copy "${SCRIPT_DIR}/lib.sh" "${bundle_dir}/lib.sh"
 stage_exec "${SCRIPT_DIR}/runtime-security.py" "${bundle_dir}/runtime-security.py"
+stage_exec "${SCRIPT_DIR}/export-runtime-backup.py" "${bundle_dir}/export-runtime-backup.py"
 stage_copy "${SCRIPT_DIR}/compose.py" "${bundle_dir}/compose.py"
 mkdir -p "${bundle_dir}/tandem_runtime_bundle"
 for module in "${SCRIPT_DIR}/../../packages/runtime-bundle/tandem_runtime_bundle/"*.py; do

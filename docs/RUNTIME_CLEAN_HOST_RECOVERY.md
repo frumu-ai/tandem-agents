@@ -24,7 +24,10 @@ local tar archive and adjacent SHA-256 metadata do not establish an encrypted,
 off-site, independently authenticated backup. A v3 backup/restore procedure
 must be a separate path, not an extension that enables the legacy archive.
 
-The next backup slice belongs in tandem-web's host-agent and control plane:
+An export-only operator candidate is described in
+`RUNTIME_BACKUP_EXPORT.md`. It does not enable hosted jobs or any rebind. The
+remaining backup integration belongs in tandem-web's host-agent and control
+plane:
 
 1. Quiesce writes and policy synchronization, then capture a consistent set of
    all v3 data and security roots, including replay and audit anchors. Record
