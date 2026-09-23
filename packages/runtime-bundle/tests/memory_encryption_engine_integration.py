@@ -35,6 +35,22 @@ def contains(path, needle):
     return False
 
 
+def memory_write_warning(log_path, secret):
+    """Expose only a bounded storage warning, never the memory test payload."""
+    try:
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 8192))
+            tail = log.read(8192).decode("utf-8", errors="replace")
+    except OSError:
+        return "unavailable"
+    warnings = [line[line.index("global memory store write failed"):]
+                .replace(secret, "[redacted]")[:400]
+                for line in tail.splitlines()
+                if "global memory store write failed" in line]
+    return " | ".join(warnings[-3:]) or "none"
+
+
 def provision_kms_commands(secrets):
     secrets.mkdir(mode=0o750, parents=True)
     os.chown(secrets, 0, 1000)
@@ -138,9 +154,18 @@ class MemoryEncryptionEngineTests(unittest.TestCase):
                 try:
                     start()
                     status, body = memory_request(engine, "POST", "/memory/put", payload)
-                    self.assertEqual(status, 200, body)
+                    self.assertEqual(status, 200,
+                                     f"{body}; write_warning={memory_write_warning(home / 'engine.log', secret)}")
+                    memory_db = Path(bundle["host_paths"]["state"]) / "data/memory.sqlite"
+                    with sqlite3.connect(f"file:{memory_db}?mode=ro", uri=True) as connection:
+                        stored_rows = connection.execute(
+                            "SELECT COUNT(*) FROM memory_records WHERE run_id = ?",
+                            ("encrypted-memory-acceptance",)).fetchone()[0]
+                    self.assertEqual(stored_rows, 1,
+                                     "memory/put returned 200 without persisting its record; "
+                                     f"write_warning={memory_write_warning(home / 'engine.log', secret)}")
                     self.assertEqual(recall()[0], 200)
-                    self.assertIn(marker, recall()[1])
+                    self.assertIn(marker, recall()[1], f"persisted_rows={stored_rows}")
                     engine.stop()
                     persisted = [path for mount in (bundle["host_paths"]["state"],
                         bundle["ordinary_paths"]["DATA"]) for path in Path(mount).rglob("*")
@@ -152,7 +177,6 @@ class MemoryEncryptionEngineTests(unittest.TestCase):
                                        if contains(path, secret.encode())]
                     self.assertEqual(plaintext_paths, [],
                                      "memory must not persist plaintext in: " + ", ".join(plaintext_paths))
-                    memory_db = Path(bundle["host_paths"]["state"]) / "data/memory.sqlite"
                     self.assertTrue(memory_db.is_file())
                     with sqlite3.connect(f"file:{memory_db}?mode=ro", uri=True) as connection:
                         stored_contents = connection.execute(
