@@ -324,6 +324,16 @@ def export_backup(install_root, staging_root, kms, uploader, *, quiescence=None,
         # on failure and must never be interpreted as a restorable backup.
         digest, size = _file_digest(commit_path)
         guard(root, deployment_id)
-        uri = uploader.put_verified(commit_path, f"{prefix}/manifest.json", digest, size)
+        manifest_key = f"{prefix}/manifest.json"
+        try:
+            uri = uploader.put_verified(commit_path, manifest_key, digest, size)
+        except (OSError, ValueError) as exc:
+            # The remote PUT might have committed even when its acknowledgement
+            # or read-back verification failed. Never imply that it did not.
+            raise ValueError(
+                f"backup manifest completion unconfirmed for backup {backup_id}; "
+                f"reconcile {manifest_key} (sha256={digest}, size={size}) "
+                "remotely before retry"
+            ) from exc
     return {"backup_id": backup_id, "manifest_uri": uri, "manifest_sha256": digest,
             "organization_id": organization_id, "deployment_id": deployment_id}

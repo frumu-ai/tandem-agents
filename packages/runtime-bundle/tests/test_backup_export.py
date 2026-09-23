@@ -32,10 +32,11 @@ class FakeKms:
 
 
 class FakeUploader:
-    def __init__(self, *, fail_on=None):
+    def __init__(self, *, fail_on=None, fail_after_write_on=None):
         self.objects = {}
         self.order = []
         self.fail_on = fail_on
+        self.fail_after_write_on = fail_after_write_on
 
     def put_verified(self, source_path, object_key, sha256, size):
         if self.fail_on and object_key.endswith(self.fail_on):
@@ -46,6 +47,8 @@ class FakeUploader:
         assert object_key not in self.objects
         self.objects[object_key] = payload
         self.order.append(object_key)
+        if self.fail_after_write_on and object_key.endswith(self.fail_after_write_on):
+            raise ValueError("synthetic acknowledgement failure")
         return "https://private-backups.example/" + object_key
 
 
@@ -243,10 +246,20 @@ class BackupExportTests(unittest.TestCase):
         self.assertEqual(self.uploader.objects, {})
 
         self.uploader = FakeUploader(fail_on="manifest.json")
-        with self.assertRaisesRegex(ValueError, "synthetic off-site failure"):
+        with self.assertRaisesRegex(ValueError, "manifest completion unconfirmed"):
             self.export()
         self.assertEqual(len(self.uploader.order), 2)
         self.assertFalse(any(key.endswith("manifest.json") for key in self.uploader.order))
+
+    def test_unacknowledged_manifest_commit_requires_remote_reconciliation(self):
+        self.uploader = FakeUploader(fail_after_write_on="manifest.json")
+        with self.assertRaisesRegex(ValueError, "manifest completion unconfirmed.*reconcile") as raised:
+            self.export()
+        self.assertEqual(len(self.uploader.order), 3)
+        self.assertTrue(self.uploader.order[-1].endswith("/manifest.json"))
+        manifest = self.uploader.objects[self.uploader.order[-1]]
+        self.assertIn(f"sha256={hashlib.sha256(manifest).hexdigest()}", str(raised.exception))
+        self.assertIn(f"size={len(manifest)}", str(raised.exception))
 
     def test_invalid_replay_and_kms_failure_never_upload(self):
         replay = Path(self.bundle["host_paths"]["replay"]) / "assertions.sqlite3"

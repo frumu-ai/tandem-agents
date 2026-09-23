@@ -87,6 +87,12 @@ be interpreted as backups. The exporter never edits the source roots or
 `storage-roots.json`. Its command result reports only the backup ID, manifest
 URI and SHA-256, and tenant scope.
 
+If the final manifest PUT succeeds remotely but its acknowledgement or
+verification fails, the command reports **completion unconfirmed** with the
+backup ID, manifest object key, SHA-256 and size. An operator must reconcile
+that exact object and its integrity in the remote store before retrying;
+command failure alone does not prove the manifest is absent.
+
 This slice does not prove the protected audit ledger's semantic chain or
 historical audit-key availability, memory KMS access from a new host, control-
 plane policy continuity, remote storage immutability, or restorable recovery.
