@@ -13,7 +13,7 @@ SUPPORTED_POLICY_ENGINE_REVISIONS = (POLICY_ENGINE_REVISION, PREVIOUS_POLICY_ENG
 # Combined hosted-grant and encrypted-global-memory source candidate for v3,
 # independent of the v2 source pin. Exact-source integration and a verified
 # published image remain required before release.
-MEMORY_ENGINE_REVISION = "aa1e8588cf91c8cf2e861067171c574270e131f6"
+MEMORY_ENGINE_REVISION = "bf84a1ed65b426a9ebf5f8a1fa69cf9b8171d53b"
 # Add an entry only after independently verifying the published image was built
 # from MEMORY_ENGINE_REVISION. Each entry binds source, in-image binary checksum
 # and the reviewed build observation's canonical SHA-256. Empty fails closed.
