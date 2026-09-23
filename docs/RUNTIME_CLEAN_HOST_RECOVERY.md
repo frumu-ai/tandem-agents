@@ -1,11 +1,15 @@
 # V3 clean-host recovery gate
 
 Runtime security v3 has no authorized storage-root rebind operation. An
-initialized installation records the state and data path, device, and inode in
-`storage-roots.json`. Repeated provisioning rejects copied state or data at a
-different identity. It also rejects a missing replay or independent audit-anchor
-root instead of silently replacing either with an empty directory. Do not edit
-`storage-roots.json` to make a copied installation start.
+initialized installation records the state, data, replay, and independent
+audit-anchor path, device, and inode in `storage-roots.json`. The replay and
+anchor roots also hold a per-root provisioning sentinel. Repeated provisioning
+rejects copied directories, empty replacements, and roots whose sentinel was
+removed instead of silently accepting a new empty history directory. This
+sentinel does not authenticate the mutable replay database or individual audit
+anchors; selective deletion or rollback still needs independent evidence and
+engine verification. Do not edit `storage-roots.json` to make a copied
+installation start.
 
 The Tandem web host-agent snapshot reviewed at commit
 `02edded32762eba4e7b9f4b47cc18b2414a62fc4` explicitly rejects both legacy

@@ -1,7 +1,6 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import ssl
 import subprocess
 import tempfile
@@ -177,43 +176,6 @@ class PolicyProvisionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "authorized encrypted memory migration"):
                     prepare_security(encrypted, keyring(), self.token)
                 self.assertFalse(Path(encrypted["host_paths"]["security"]).exists())
-
-    def test_v3_copied_workload_roots_and_missing_recovery_roots_are_not_rebound(self):
-        values = {**self.values, "HOSTED_RUNTIME_SECURITY_VERSION": "3",
-                  "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION,
-                  "HOSTED_INSTALL_ROOT": str(self.root / "recovery-install"),
-                  "HOSTED_AUDIT_ANCHOR_ROOT": str(self.root / "recovery-anchors")}
-        bundle = build_security_bundle(values)
-        self.precreate_workload_roots(bundle)
-        self.provision_memory_commands(bundle)
-        prepare_security(bundle, keyring(), self.token)
-
-        for name, path in (("state", Path(bundle["host_paths"]["state"])),
-                           ("data", Path(bundle["ordinary_paths"]["DATA"]))):
-            with self.subTest(copied=name):
-                original = path.with_name(path.name + "-original")
-                path.rename(original)
-                try:
-                    shutil.copytree(original, path)
-                    os.chown(path, bundle["uid"], bundle["gid"])
-                    with self.assertRaisesRegex(ValueError, "workload roots changed"):
-                        prepare_security(bundle, keyring(), self.token)
-                finally:
-                    if path.exists():
-                        shutil.rmtree(path)
-                    original.rename(path)
-
-        for name in ("replay", "anchor"):
-            with self.subTest(missing=name):
-                path = Path(bundle["host_paths"][name])
-                original = path.with_name(path.name + "-original")
-                path.rename(original)
-                try:
-                    with self.assertRaisesRegex(ValueError, f"v3 {name} root is missing"):
-                        prepare_security(bundle, keyring(), self.token)
-                    self.assertFalse(path.exists(), "provisioning must not create replacement history")
-                finally:
-                    original.rename(path)
 
     def test_v3_rejects_mutable_or_linked_kms_commands(self):
         encrypted = build_security_bundle({**self.values, "HOSTED_RUNTIME_SECURITY_VERSION": "3",

@@ -60,11 +60,17 @@ def _write(path, value, uid, gid):
             os.unlink(temp_name)
 
 
-def _v3_storage_identity(bundle, uid):
-    """Bind an initialized v3 security root to the exact workload mounts."""
+_V3_ROOT_SENTINEL = ".runtime-security-v3-root"
+
+
+def _v3_storage_identity(bundle, uid, include_history=False):
+    """Bind workload mounts and, once initialized, non-regenerable history roots."""
     identity = {}
-    for name, value in (("state", bundle["host_paths"]["state"]),
-                        ("data", bundle["ordinary_paths"]["DATA"])):
+    roots = [("state", bundle["host_paths"]["state"]),
+             ("data", bundle["ordinary_paths"]["DATA"])]
+    if include_history:
+        roots.extend((name, bundle["host_paths"][name]) for name in ("replay", "anchor"))
+    for name, value in roots:
         path = _plain_path(value)
         try:
             info = path.lstat()
@@ -74,6 +80,16 @@ def _v3_storage_identity(bundle, uid):
                 or stat.S_IMODE(info.st_mode) & 0o022):
             raise ValueError("v3 workload roots must be runtime-owned directories without group or world write")
         identity[name] = {"path": str(path), "device": info.st_dev, "inode": info.st_ino}
+        if name in ("replay", "anchor"):
+            sentinel = path / _V3_ROOT_SENTINEL
+            try:
+                _check_file(sentinel, uid)
+                value = sentinel.read_bytes()
+            except OSError:
+                raise ValueError(f"v3 {name} root sentinel is missing; authorized recovery is required") from None
+            if len(value) != 64 or any(byte not in b"0123456789abcdef" for byte in value):
+                raise ValueError(f"v3 {name} root sentinel is invalid; authorized recovery is required")
+            identity[name]["sentinel"] = value.decode("ascii")
     return identity
 
 
@@ -188,13 +204,13 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
             if previous_number == 2 and bundle["schema_version"] == 1:
                 raise ValueError("runtime security downgrade would disable policy synchronization")
             if previous_number == 3:
-                # Neither the bound replay database nor the independent audit
-                # anchor can be regenerated from a copied workload directory.
-                # In particular, do not let _directory silently create an empty
-                # replay/anchor root on an initialized v3 installation.
+                # Replay and audit history cannot be reconstructed from a copied
+                # workload directory. Require their original directories and
+                # provisioning sentinels before any helper could recreate them.
                 for name in ("replay", "anchor"):
                     if not paths[name].exists():
                         raise ValueError(f"v3 {name} root is missing; authorized recovery is required")
+                v3_identity = _v3_storage_identity(bundle, uid, include_history=True)
                 binding = security / "storage-roots.json"
                 try:
                     _check_file(binding, uid)
@@ -223,7 +239,13 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
         config.setdefault("hosted", {}).update(bundle["panel_hosted"])
         _write(panel_auth / "control-panel-config.json", json.dumps(config).encode(), uid, gid)
         if v3_identity is not None:
-            _write(security / "storage-roots.json", json.dumps(v3_identity, sort_keys=True).encode(), uid, gid)
+            if not marker.exists():
+                for name in ("replay", "anchor"):
+                    _write(paths[name] / _V3_ROOT_SENTINEL, secrets.token_hex(32).encode(), uid, gid)
+                v3_identity = _v3_storage_identity(bundle, uid, include_history=True)
+                _write(security / "storage-roots.json", json.dumps(v3_identity, sort_keys=True).encode(), uid, gid)
+            elif _v3_storage_identity(bundle, uid, include_history=True) != v3_identity:
+                raise ValueError("v3 workload roots changed during provisioning; authorized recovery is required")
         _write(marker, f"runtime-security-v{bundle['schema_version']}\n".encode(), uid, gid)
         # The engine must create the replay database; an empty placeholder is invalid.
     finally:
