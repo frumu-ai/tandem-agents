@@ -30,6 +30,11 @@ only services that were running before maintenance. A host outside this
 maintenance boundary must not invoke the export.
 
 Create a root-owned mode `0700` staging directory outside every captured root.
+Every ancestor through the filesystem root must be root-owned and deny group
+and other writes; a staging path under a writable parent such as `/tmp` is
+rejected. The exporter creates private temporary files by directory descriptor
+with exclusive, no-follow creation.
+
 Provision two separate root-owned mode `0500` or `0700` executable commands
 with ancestors that non-root users cannot replace: a backup KMS **wrap** command and a private
 off-site uploader. Neither executable or its credentials belong in the

@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -16,7 +18,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
 from fixtures import DEPLOYMENT, ORGANIZATION, keyring
-from tandem_runtime_bundle.backup_archive import MAGIC, canonical_json
+from tandem_runtime_bundle.backup_archive import MAGIC, canonical_json, open_no_symlink
 from tandem_runtime_bundle.backup_commands import BackupKms, OffsiteUploader
 from tandem_runtime_bundle import backup_export
 
@@ -288,6 +290,59 @@ class BackupExportTests(unittest.TestCase):
                 strict_host=False)
         self.assertEqual(self.uploader.objects, {})
         self.assertFalse(hasattr(self.kms, "dek"))
+
+    def test_policy_or_release_change_during_quiescence_fails_before_kms(self):
+        policy_path = Path(self.bundle["host_paths"]["policy"]) / "current.json"
+        release_path = self.install / "release-manifest.json"
+        for target, change in (
+                (policy_path, lambda value: {**value, "policy_version": 8}),
+                (release_path, lambda value: {**value, "release_tag": "changed"})):
+            original = target.read_bytes()
+            calls = 0
+
+            def quiescence(*_):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    target.write_text(json.dumps(change(json.loads(original))))
+
+            try:
+                with self.subTest(target=target.name), self.assertRaisesRegex(
+                        ValueError, "source changed during quiescence"):
+                    backup_export.export_backup(
+                        self.install, self.staging, self.kms, self.uploader,
+                        quiescence=quiescence, strict_host=False)
+                self.assertEqual(calls, 1)
+                self.assertEqual(self.uploader.objects, {})
+                self.assertFalse(hasattr(self.kms, "dek"))
+            finally:
+                target.write_bytes(original)
+
+    def test_staging_rejects_writable_ancestor_and_preplanted_output(self):
+        unsafe = SimpleNamespace(st_mode=stat.S_IFDIR | 0o777, st_uid=0)
+        with self.assertRaisesRegex(ValueError, "ancestor permits non-root replacement"):
+            backup_export._safe_staging_ancestor(unsafe)
+        not_root = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=1000)
+        with self.assertRaisesRegex(ValueError, "ancestor permits non-root replacement"):
+            backup_export._safe_staging_ancestor(not_root)
+
+        output = self.staging / "preplanted"
+        output.mkdir()
+        target = output / "target"
+        target.write_bytes(b"must stay unchanged")
+        planted = output / "manifest.json"
+        try:
+            planted.symlink_to(target)
+        except OSError:
+            os.link(target, planted)
+        directory_fd = open_no_symlink(output, directory=True) if os.name == "posix" else None
+        try:
+            with self.assertRaises(FileExistsError):
+                backup_export._new_output_file(output, directory_fd, "manifest.json")
+            self.assertEqual(target.read_bytes(), b"must stay unchanged")
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
 
 class AuthorityProtocolTests(unittest.TestCase):

@@ -234,9 +234,16 @@ class EncryptingWriter(io.RawIOBase):
                 "chunks": self._index, "nonce_prefix": self._prefix.hex()}
 
 
-def write_encrypted_tar(output_path, entries, key, nonce_prefix, context):
-    with open(output_path, "xb", buffering=0) as output:
-        os.chmod(output_path, 0o600)
+def write_encrypted_tar(output_path, entries, key, nonce_prefix, context, *, output_fd=None):
+    # The strict-host exporter creates this descriptor relative to its private
+    # directory fd with O_EXCL | O_NOFOLLOW. Keep that inode open while writing.
+    output = (os.fdopen(output_fd, "wb", buffering=0) if output_fd is not None
+              else open(output_path, "xb", buffering=0))
+    with output:
+        if output_fd is not None and os.name == "posix":
+            os.fchmod(output.fileno(), 0o600)
+        elif output_fd is None:
+            os.chmod(output_path, 0o600)
         writer = EncryptingWriter(output, key, nonce_prefix, context)
         with tarfile.open(fileobj=writer, mode="w|") as archive:
             for entry in entries:
