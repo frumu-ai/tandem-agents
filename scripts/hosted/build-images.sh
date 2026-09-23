@@ -87,6 +87,7 @@ preflight_npm_package "@frumu/tandem" "${HOSTED_TANDEM_ENGINE_RELEASE_VERSION}"
 if [[ "${HOSTED_RUNTIME_SECURITY_VERSION:-1}" == "3" ]]; then
   [[ "$push" == false ]] || hosted::die "publish v3 source-built images through the attested publish-images workflow"
   [[ "$HOSTED_RELEASE_TAG" == *-v3 ]] || hosted::die "v3 image builds require a distinct -v3 tag"
+  [[ "$platforms" == "linux/amd64" ]] || hosted::die "v3 source-built images require linux/amd64"
   hosted::require python3
   hosted::require git
   expected_engine_revision="$(PYTHONPATH="${HOSTED_REPO_ROOT}/packages/runtime-bundle" python3 -c \
@@ -95,10 +96,11 @@ if [[ "${HOSTED_RUNTIME_SECURITY_VERSION:-1}" == "3" ]]; then
     hosted::die "v3 engine source revision must match the canonical contract"
   engine_source_dir="${HOSTED_TANDEM_ENGINE_SOURCE_DIR:-}"
   [[ -d "$engine_source_dir" ]] || hosted::die "HOSTED_TANDEM_ENGINE_SOURCE_DIR is required for a v3 local build"
-  [[ "$(git -C "$engine_source_dir" rev-parse HEAD)" == "$expected_engine_revision" ]] || \
-    hosted::die "v3 engine source checkout is not the tested revision"
-  [[ -z "$(git -C "$engine_source_dir" status --porcelain)" ]] || \
-    hosted::die "v3 engine source checkout must be clean"
+  engine_source_context="$(mktemp -d)"
+  trap 'rm -rf -- "$engine_source_context"' EXIT
+  PYTHONPATH="${HOSTED_REPO_ROOT}/packages/runtime-bundle" python3 -m tandem_runtime_bundle.source_context \
+    --source "$engine_source_dir" --revision "$expected_engine_revision" \
+    --output "$engine_source_context/source"
 else
   preflight_npm_package "@frumu/tandem-enterprise" "${HOSTED_TANDEM_ENGINE_RELEASE_VERSION}"
 fi
@@ -174,14 +176,20 @@ build_image() {
 build_image "engine" "config/Dockerfile.engine" "${public_engine_image_repository}" --build-arg "TANDEM_ENGINE_PACKAGE=@frumu/tandem"
 if [[ "${HOSTED_RUNTIME_SECURITY_VERSION:-1}" == "3" ]]; then
   build_image "engine-enterprise" "config/Dockerfile.engine-v3" "${engine_image_repository}" \
-    --build-context "tandem-source=${engine_source_dir}" \
+    --build-context "tandem-source=${engine_source_context}/source" \
     --build-arg "TANDEM_ENGINE_SOURCE_REVISION=${expected_engine_revision}"
 else
   build_image "engine-enterprise" "config/Dockerfile.engine" "${engine_image_repository}" \
     --build-arg "TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise"
 fi
 build_image "aca" "config/Dockerfile" "${public_aca_image_repository}" --build-arg "TANDEM_ENGINE_PACKAGE=@frumu/tandem"
-build_image "aca-enterprise" "config/Dockerfile" "${aca_image_repository}" --build-arg "TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise"
+if [[ "${HOSTED_RUNTIME_SECURITY_VERSION:-1}" == "3" ]]; then
+  build_image "aca-enterprise" "config/Dockerfile" "${aca_image_repository}" \
+    --build-arg "TANDEM_ENGINE_INSTALL_MODE=omit"
+else
+  build_image "aca-enterprise" "config/Dockerfile" "${aca_image_repository}" \
+    --build-arg "TANDEM_ENGINE_PACKAGE=@frumu/tandem-enterprise"
+fi
 build_image "control-panel" "config/Dockerfile.control-panel" "${control_panel_image_repository}"
 build_image "proxy" "config/Dockerfile.proxy" "${proxy_image_repository}" --build-arg "HOSTED_PROXY_BASE_IMAGE=${proxy_base_image}"
 build_image "kb-mcp" "config/Dockerfile.kb" "${kb_image_repository}"

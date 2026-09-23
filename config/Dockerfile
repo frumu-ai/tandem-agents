@@ -6,6 +6,7 @@ ARG HOST_GID=1000
 ARG TANDEM_RELEASE_VERSION=latest
 ARG TANDEM_ENGINE_RELEASE_VERSION=${TANDEM_RELEASE_VERSION}
 ARG TANDEM_ENGINE_PACKAGE=@frumu/tandem
+ARG TANDEM_ENGINE_INSTALL_MODE=package
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_PREFIX=/home/node/npm \
@@ -31,7 +32,14 @@ RUN groupadd --gid "${HOST_GID}" tandem \
   && chown -R "${HOST_UID}:${HOST_GID}" /home/node
 
 RUN --mount=type=cache,target=/root/.npm \
-    npm install -g "${TANDEM_ENGINE_PACKAGE}@${TANDEM_ENGINE_RELEASE_VERSION}" pnpm@10.23.0
+    if [ "${TANDEM_ENGINE_INSTALL_MODE}" = "omit" ]; then \
+      npm install -g pnpm@10.23.0; \
+      test ! -e /home/node/npm/bin/tandem-engine; \
+    elif [ "${TANDEM_ENGINE_INSTALL_MODE}" = "package" ]; then \
+      npm install -g "${TANDEM_ENGINE_PACKAGE}@${TANDEM_ENGINE_RELEASE_VERSION}" pnpm@10.23.0; \
+    else \
+      echo "Unsupported Tandem engine install mode" >&2; exit 1; \
+    fi
 
 RUN mkdir -p /workspace/tandem-agents/runs /workspace/repos /workspace/tandem-data
 

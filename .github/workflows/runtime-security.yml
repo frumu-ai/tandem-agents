@@ -5,6 +5,10 @@ on:
       - 'packages/runtime-bundle/**'
       - 'scripts/hosted/**'
       - 'config/Dockerfile.control-panel'
+      - 'config/Dockerfile.engine-v3'
+      - 'config/Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/publish-images.yml'
       - '.github/workflows/runtime-security.yml'
   workflow_dispatch:
   push:
@@ -105,6 +109,16 @@ jobs:
           repository: frumu-ai/tandem
           ref: ${{ steps.engine-source.outputs.revision }}
           path: .test-memory-engine
+      - name: Verify pinned Rust source survives Docker context staging
+        env:
+          EXPECTED_REVISION: ${{ steps.engine-source.outputs.revision }}
+        run: |
+          python -m tandem_runtime_bundle.source_context \
+            --source .test-memory-engine --revision "$EXPECTED_REVISION" \
+            --output "$RUNNER_TEMP/v3-engine-context"
+          test -s "$RUNNER_TEMP/v3-engine-context/Cargo.toml"
+          test -s "$RUNNER_TEMP/v3-engine-context/engine/Cargo.toml"
+          test ! -e "$RUNNER_TEMP/v3-engine-context/.dockerignore"
       - uses: ./.test-memory-engine/.github/actions/setup-rust-ci
         with:
           cache-profile: hosted-memory-engine

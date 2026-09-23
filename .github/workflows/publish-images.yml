@@ -17,11 +17,6 @@ on:
         default: '1'
         type: choice
         options: ['1', '3']
-      registry:
-        description: "Container registry/repository prefix"
-        required: true
-        default: ghcr.io/frumu-ai/tandem-agents
-        type: string
       push_latest:
         description: "Also push latest tags"
         required: true
@@ -32,27 +27,17 @@ on:
         required: true
         default: false
         type: boolean
-      tandem_web_base_url:
-        description: "Tandem Web base URL used when registering a hosted release"
-        required: false
-        default: https://tandem.ac
-        type: string
-  push:
-    tags:
-      - "v*"
-
 permissions:
   contents: read
-  packages: write
 
 env:
-  IMAGE_REGISTRY: ${{ github.event.inputs.registry || 'ghcr.io/frumu-ai/tandem-agents' }}
+  IMAGE_REGISTRY: ghcr.io/frumu-ai/tandem-agents
 
 jobs:
   resolve:
     name: Resolve Version
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || !endsWith(github.ref_name, '-v3') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
@@ -63,52 +48,28 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - id: resolve
         shell: bash
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ inputs.tandem_release_version }}
+          SECURITY_VERSION: ${{ inputs.runtime_security_version }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           set -euo pipefail
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            tag="${{ inputs.tag }}"
-            version="${{ inputs.tandem_release_version }}"
-            push_latest="${{ inputs.push_latest }}"
-            security_version="${{ inputs.runtime_security_version }}"
-          else
-            tag="${GITHUB_REF_NAME}"
-            version="${tag#v}"
-            push_latest="false"
-            security_version="1"
-          fi
-
-          if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid image tag: $tag" >&2
-            exit 1
-          fi
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid Tandem release version: $version" >&2
-            exit 1
-          fi
-          if [[ "$security_version" != "1" && "$security_version" != "3" ]]; then
-            echo "Unsupported runtime security version: $security_version" >&2
-            exit 1
-          fi
-          if [[ "$security_version" == "3" ]]; then
-            [[ "$tag" == "v${version}-v3" ]] || { echo "v3 images require tag v${version}-v3" >&2; exit 1; }
-            [[ "$push_latest" == "false" ]] || { echo "v3 may not replace latest images" >&2; exit 1; }
-            engine_revision="$(PYTHONPATH=packages/runtime-bundle python3 -c 'from tandem_runtime_bundle.policy_contract import MEMORY_ENGINE_REVISION; print(MEMORY_ENGINE_REVISION)')"
-            [[ "$engine_revision" =~ ^[a-f0-9]{40}$ ]] || exit 1
-          else
-            engine_revision=""
-          fi
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "push_latest=$push_latest" >> "$GITHUB_OUTPUT"
-          echo "security_version=$security_version" >> "$GITHUB_OUTPUT"
-          echo "engine_revision=$engine_revision" >> "$GITHUB_OUTPUT"
+          PYTHONPATH=packages/runtime-bundle python3 -m tandem_runtime_bundle.release_lane \
+            --event "$RELEASE_EVENT" --ref "$RELEASE_REF" \
+            --tag "$RELEASE_TAG" --version "$RELEASE_VERSION" \
+            --security-version "$SECURITY_VERSION" --push-latest "$PUSH_LATEST" \
+            >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish ${{ matrix.image }}
     runs-on: ubuntu-latest
     needs: resolve
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -139,7 +100,7 @@ jobs:
             dockerfile: config/Dockerfile.proxy
             latest_alias: tandem-proxy:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Check out exact Tandem engine source for v3
         if: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' }}
@@ -149,17 +110,18 @@ jobs:
           ref: ${{ needs.resolve.outputs.engine_revision }}
           path: .v3-tandem-source
 
-      - name: Verify exact clean Tandem source for v3
+      - name: Stage exact tracked Tandem source for v3
         if: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' }}
         env:
           EXPECTED_REVISION: ${{ needs.resolve.outputs.engine_revision }}
         run: |
-          test "$(git -C .v3-tandem-source rev-parse HEAD)" = "$EXPECTED_REVISION"
-          test -z "$(git -C .v3-tandem-source status --porcelain)"
+          PYTHONPATH=packages/runtime-bundle python3 -m tandem_runtime_bundle.source_context \
+            --source .v3-tandem-source --revision "$EXPECTED_REVISION" \
+            --output .v3-engine-context
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -179,12 +141,12 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: image
         with:
           context: .
           file: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' && 'config/Dockerfile.engine-v3' || matrix.dockerfile }}
-          build-contexts: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' && 'tandem-source=./.v3-tandem-source' || '' }}
+          build-contexts: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' && 'tandem-source=./.v3-engine-context' || '' }}
           push: true
           provenance: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' && 'mode=max' || '' }}
           platforms: linux/amd64
@@ -194,6 +156,7 @@ jobs:
             TANDEM_ENGINE_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
             TANDEM_CONTROL_PANEL_RELEASE_VERSION=${{ needs.resolve.outputs.version }}
             TANDEM_ENGINE_PACKAGE=${{ matrix.engine_package || '@frumu/tandem' }}
+            TANDEM_ENGINE_INSTALL_MODE=${{ matrix.image == 'aca-enterprise' && needs.resolve.outputs.security_version == '3' && 'omit' || 'package' }}
             TANDEM_ENGINE_SOURCE_REVISION=${{ needs.resolve.outputs.engine_revision }}
             VERSION=${{ needs.resolve.outputs.tag }}
             VCS_REF=${{ github.sha }}
@@ -209,6 +172,18 @@ jobs:
           [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           mkdir -p image-digests
           printf '%s' "$IMAGE_DIGEST" > "image-digests/$IMAGE_NAME"
+
+      - name: Verify v3 ACA cannot start a bundled legacy engine
+        if: ${{ matrix.image == 'aca-enterprise' && needs.resolve.outputs.security_version == '3' }}
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image_ref="${IMAGE_REGISTRY}/aca-enterprise@${IMAGE_DIGEST}"
+          docker pull "$image_ref"
+          docker run --rm --entrypoint /bin/sh "$image_ref" -c \
+            'test ! -e /home/node/npm/bin/tandem-engine && ! command -v tandem-engine'
 
       - name: Verify published v3 binary and record source/image observation
         if: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' }}
@@ -233,12 +208,12 @@ jobs:
             --workflow-run-id "$GITHUB_RUN_ID" \
             --output engine-attestation/engine-image-attestation.json \
             > engine-attestation/engine-image-attestation.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hosted-image-digest-${{ matrix.image }}
           path: image-digests/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ matrix.image == 'engine-enterprise' && needs.resolve.outputs.security_version == '3' }}
         with:
           name: hosted-engine-v3-attestation
@@ -248,18 +223,21 @@ jobs:
   register-hosted-release:
     name: Register Hosted Release
     runs-on: ubuntu-latest
+    environment: hosted-release
+    permissions:
+      contents: read
     needs:
       - resolve
       - publish
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.register_hosted_release }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.register_hosted_release }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: hosted-image-digest-*
           merge-multiple: true
           path: image-digests
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         if: ${{ needs.resolve.outputs.security_version == '3' }}
         with:
           name: hosted-engine-v3-attestation
@@ -313,7 +291,7 @@ jobs:
       - name: Register release in Tandem Web
         shell: bash
         env:
-          TANDEM_WEB_BASE_URL: ${{ inputs.tandem_web_base_url }}
+          TANDEM_WEB_BASE_URL: https://tandem.ac
           HOSTED_RELEASE_PUBLISH_TOKEN: ${{ secrets.TANDEM_WEB_HOSTED_RELEASE_PUBLISH_TOKEN }}
         run: |
           set -euo pipefail
@@ -329,7 +307,7 @@ jobs:
           # attestation file. Until a repaired engine digest is approved, it fails.
           scripts/hosted/release-payload.sh --channel stable --published true > "$payload"
 
-          curl -fsS \
+          curl -fsS --proto '=https' \
             -X POST "${TANDEM_WEB_BASE_URL%/}/api/v1/internal/hosted/releases" \
             -H "Authorization: Bearer ${HOSTED_RELEASE_PUBLISH_TOKEN}" \
             -H "Content-Type: application/json" \
