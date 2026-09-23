@@ -110,3 +110,59 @@ isolation, membership removal, fresh identity after revision changes, restart,
 failed fetches, real wall-clock expiry and recovery. Registry projection is
 exercised through the existing enterprise HTTP APIs. This test does not publish
 an image or establish encrypted clean-host recovery or governed-memory privacy.
+
+## Encrypted hosted-memory profile v3
+
+The v3 profile retains the v2 policy, replay and audit protections and requires
+envelope encryption for hosted memory. Set `HOSTED_RUNTIME_SECURITY_VERSION=3`
+and pin `MEMORY_ENGINE_REVISION` from `policy_contract.py`. Its source includes
+the external KMS interface while the v2 source pin remains unchanged. This
+candidate is blocked by the global-memory plaintext regression described below.
+Consumers must opt in to v3 and supply all of these non-secret references:
+
+- `HOSTED_MEMORY_ENCRYPTION_REQUIRED=true`
+- `HOSTED_MEMORY_KMS_PROVIDER=google_cloud_kms`
+- `HOSTED_MEMORY_KMS_RUNTIME_PRINCIPAL_ID`, scoped to the deployment ID
+- `HOSTED_MEMORY_KMS_ENCRYPT_COMMAND` and `HOSTED_MEMORY_KMS_DECRYPT_COMMAND`,
+  direct executable paths in the dedicated `/run/tandem-memory-kms` engine mount
+- `HOSTED_MEMORY_KMS_COMMAND_ROOT`, the independent host source for that mount
+- `HOSTED_MEMORY_KEK_ID`, `HOSTED_MEMORY_KEK_VERSION`, and
+  `HOSTED_MEMORY_KEK_ROTATION_EPOCH`
+
+Production v3 rendering and provisioning currently reject all images: the
+code-owned verified image digest map is empty. A separate release PR must add
+an independently verified digest built from `MEMORY_ENGINE_REVISION` before v3
+can be packaged or deployed. A caller-supplied source revision alone is not
+image provenance. The engine receives the corresponding `TANDEM_MEMORY_*`
+settings. The operator must preprovision the command root as root-owned,
+runtime-group-owned mode 0750, with direct regular single-link command files
+mode 0550 and no secret bytes in those executables. Its parent path must also
+prevent non-root replacement. Only the engine mounts this
+root, read-only; the shared `/run/secrets` mount remains separate. This bundle
+does not install KMS credentials or provision a KMS key.
+
+The host bootstrap creates and chowns the state and data roots before security
+provisioning. It never stages or chowns the dedicated KMS command root. No
+product container except the non-root engine mounts that root, and the engine's
+bind is read-only. The root-owned 0550 files cannot be changed by the engine's
+UID/GID through these product mounts.
+
+An initialized v1/v2 store cannot be relabeled v3 without an authorized memory
+migration. A new security root rejects existing engine state or workload data
+beyond the bootstrap panel config, and v3 binds the exact state/data directory
+identities on every repeated provision. V3 cannot be downgraded. The web
+host-agent adapter must add these values before it can consume v3.
+
+The `memory-engine` CI job builds the pinned source and runs a non-root process
+with a disposable external-command KMS. The test uses synthetic local-mode
+authorization only to isolate the crypto path; it does not establish hosted
+policy/grant behavior. The current candidate fails its at-rest check: a
+`/memory/put` global record leaves the content canary in `memory.sqlite-wal`.
+The source inserts global-record content, metadata and provenance directly into
+`memory_records`, and its FTS trigger copies content. A tandem engine fix must
+seal those fields without retaining plaintext in the DB, WAL or FTS, then pass
+the cold-read and wrong/missing-key checks before `MEMORY_ENGINE_REVISION` and
+the trusted image digest map can advance. The current red CI check and empty
+image map deliberately prevent v3 release. Live KMS, authorized encrypted
+migration, off-site backup, clean-host recovery, and hosted two-user privacy
+still require separate acceptance evidence.

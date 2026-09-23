@@ -83,12 +83,13 @@ def validate_keyring(keyring, deployment_id, organization_id, audience="tandem-r
 def validate_release(values):
     """Validate immutable image inputs before advertising contract compatibility."""
     version = str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION))
-    if version not in ("1", "2"):
+    if version not in ("1", "2", "3"):
         raise ValueError("unsupported runtime security contract version")
-    if version == "2":
-        from .policy_contract import POLICY_ENGINE_REVISION
-        if values.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION") != POLICY_ENGINE_REVISION:
-            raise ValueError("runtime security v2 requires the tested policy-capable engine source revision")
+    if version in ("2", "3"):
+        from .policy_contract import MEMORY_ENGINE_REVISION, POLICY_ENGINE_REVISION
+        required_revision = MEMORY_ENGINE_REVISION if version == "3" else POLICY_ENGINE_REVISION
+        if values.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION") != required_revision:
+            raise ValueError(f"runtime security v{version} requires its tested engine source revision")
     if values.get("HOSTED_PLATFORM", "linux/amd64") != "linux/amd64":
         raise ValueError("runtime security v1 supports linux/amd64 only")
     if values.get("HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION") != PANEL_REVISION:
@@ -104,6 +105,9 @@ def validate_release(values):
         if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}", value):
             raise ValueError(f"HOSTED_{name}_IMAGE must be pinned by sha256 digest")
         images[name.lower()] = value
+    if version == "3":
+        from .policy_contract import verify_memory_engine_image
+        verify_memory_engine_image(images["engine"], required_revision)
     return images
 
 
@@ -198,7 +202,8 @@ def build_security_bundle(values):
             },
         },
     }
-    if str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION)) == "2":
+    version = str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION))
+    if version in ("2", "3"):
         from .policy_contract import apply_policy_profile
-        return apply_policy_profile(bundle, values)
+        return apply_policy_profile(bundle, values, int(version))
     return bundle

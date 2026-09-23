@@ -1,14 +1,67 @@
-"""Version 2 policy synchronization overlay and independent service definition."""
+"""Version 2/3 policy overlay; version 3 requires hosted memory encryption."""
 import json
+import re
 from pathlib import PurePosixPath
 
 # Candidate source must pass the exact-source engine integration before release.
 # Version 0.7.2 alone is insufficient: its released binary predates policy sync.
 POLICY_ENGINE_REVISION = "364d20926455e3154a6bed623945b8d9e3d464e5"
+# Candidate for v3 crypto acceptance, independent of the v2 source pin. Its
+# global-record/WAL plaintext regression must be fixed before image release.
+MEMORY_ENGINE_REVISION = "774b990e781eaea76eaa1b20ec5d350488bba19e"
+# Add a digest only after independently verifying the published image was built
+# from MEMORY_ENGINE_REVISION. An empty map keeps v3 nondeployable by default.
+VERIFIED_MEMORY_ENGINE_IMAGES = {}
 POLICY_CONTAINER_DIR = "/run/tandem-hosted-policy"
+MEMORY_COMMAND_DIR = PurePosixPath("/run/tandem-memory-kms")
 
 
-def apply_policy_profile(bundle, values):
+def verify_memory_engine_image(image, revision):
+    if (not isinstance(image, str) or VERIFIED_MEMORY_ENGINE_IMAGES.get(image) != MEMORY_ENGINE_REVISION
+            or revision != MEMORY_ENGINE_REVISION):
+        raise ValueError("runtime security v3 requires a verified exact-source engine image digest")
+
+
+def _memory_encryption(bundle, values):
+    """Require the complete, non-secret KMS references used by hosted memory."""
+    from .contract import _path, _required
+
+    if _required(values, "HOSTED_MEMORY_ENCRYPTION_REQUIRED") != "true":
+        raise ValueError("runtime security v3 requires hosted memory encryption")
+    provider = _required(values, "HOSTED_MEMORY_KMS_PROVIDER")
+    if provider != "google_cloud_kms":
+        raise ValueError("runtime security v3 requires the supported Google Cloud KMS provider")
+    principal = _required(values, "HOSTED_MEMORY_KMS_RUNTIME_PRINCIPAL_ID")
+    if (not re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", principal)
+            or not principal.endswith(":" + bundle["deployment_id"])):
+        raise ValueError("hosted memory principal must be bound to this deployment")
+    commands = {}
+    for operation in ("ENCRYPT", "DECRYPT"):
+        name = f"HOSTED_MEMORY_KMS_{operation}_COMMAND"
+        command = _path(_required(values, name), name)
+        if (command.parent != MEMORY_COMMAND_DIR
+                or not re.fullmatch(r"/run/tandem-memory-kms/[A-Za-z0-9._-]+", str(command))):
+            raise ValueError(f"{name} must use the dedicated read-only memory KMS mount")
+        commands[operation.lower() + "_command"] = str(command)
+    kek_id = _required(values, "HOSTED_MEMORY_KEK_ID")
+    if not re.fullmatch(
+            r"projects/[A-Za-z0-9._-]+/locations/[A-Za-z0-9._-]+/"
+            r"keyRings/[A-Za-z0-9._-]+/cryptoKeys/[A-Za-z0-9._-]+", kek_id):
+        raise ValueError("hosted memory KEK id must be a complete Google KMS key resource")
+    version = _required(values, "HOSTED_MEMORY_KEK_VERSION")
+    version_prefix = kek_id + "/cryptoKeyVersions/"
+    short_version = version.removeprefix(version_prefix)
+    if not re.fullmatch(r"[1-9][0-9]*", short_version):
+        raise ValueError("hosted memory KEK version must belong to the configured key")
+    epoch = _required(values, "HOSTED_MEMORY_KEK_ROTATION_EPOCH")
+    if not re.fullmatch(r"0|[1-9][0-9]*", epoch) or int(epoch) >= 2**64:
+        raise ValueError("hosted memory KEK rotation epoch must be an unsigned integer")
+    return {"schema_version": 1, "provider": provider, "runtime_principal_id": principal,
+            **commands, "kek_id": kek_id, "kek_version": version,
+            "rotation_epoch": int(epoch)}
+
+
+def apply_policy_profile(bundle, values, version=2):
     from .contract import _path
 
     root = _path(values["HOSTED_INSTALL_ROOT"], "installation root")
@@ -19,13 +72,40 @@ def apply_policy_profile(bundle, values):
     control_plane = bundle["panel_hosted"]["control_plane_url"]
     if not control_plane.startswith("https://"):
         raise ValueError("runtime policy synchronization requires HTTPS")
-    bundle.update(schema_version=2, profile="hosted-single-node-v2", engine_source_revision=POLICY_ENGINE_REVISION)
+    if version not in (2, 3):
+        raise ValueError("unsupported policy profile")
+    revision = MEMORY_ENGINE_REVISION if version == 3 else POLICY_ENGINE_REVISION
+    bundle.update(schema_version=version, profile=f"hosted-single-node-v{version}",
+                  engine_source_revision=revision)
     bundle["host_paths"]["policy"] = str(policy)
     bundle["engine_environment"].update({
         "TANDEM_HOSTED_ORGANIZATION_ID": bundle["organization_id"],
         "TANDEM_HOSTED_DEPLOYMENT_ID": bundle["deployment_id"],
         "TANDEM_HOSTED_POLICY_FILE": f"{POLICY_CONTAINER_DIR}/current.json",
     })
+    if version == 3:
+        command_root = _path(values.get("HOSTED_MEMORY_KMS_COMMAND_ROOT",
+            f"{root}/memory-kms-commands"), "hosted memory KMS command root")
+        for other in map(PurePosixPath, [*bundle["host_paths"].values(),
+                                         *bundle["ordinary_paths"].values()]):
+            if command_root == other or command_root in other.parents or other in command_root.parents:
+                raise ValueError("memory KMS command storage must be independent of other mounts")
+        bundle["host_paths"]["memory_kms_commands"] = str(command_root)
+        memory = _memory_encryption(bundle, values)
+        bundle["memory_encryption"] = memory
+        bundle["engine_environment"].update({
+            "TANDEM_MEMORY_ENCRYPTION_REQUIRED": "true",
+            "TANDEM_MEMORY_DECRYPT_PROVIDER": memory["provider"],
+            "TANDEM_MEMORY_DECRYPT_PRINCIPAL_ID": memory["runtime_principal_id"],
+            "TANDEM_MEMORY_GOOGLE_KMS_ENCRYPT_COMMAND": memory["encrypt_command"],
+            "TANDEM_MEMORY_GOOGLE_KMS_DECRYPT_COMMAND": memory["decrypt_command"],
+            "TANDEM_MEMORY_KEK_ID": memory["kek_id"],
+            "TANDEM_MEMORY_KEK_VERSION": memory["kek_version"],
+            "TANDEM_MEMORY_KEK_ROTATION_EPOCH": str(memory["rotation_epoch"]),
+        })
+        bundle["engine_mounts"].append({"type": "bind", "source": str(command_root),
+            "target": str(MEMORY_COMMAND_DIR), "read_only": True,
+            "bind": {"create_host_path": False}})
     bundle["engine_mounts"].append({"type": "bind", "source": str(policy), "target": POLICY_CONTAINER_DIR,
         "read_only": True, "bind": {"create_host_path": False}})
     bundle["policy_sync"] = {
@@ -39,8 +119,9 @@ def apply_policy_profile(bundle, values):
 
 def service_files(bundle, management_dir, token_file):
     """Render root-owned host files. No credentials are embedded in any unit."""
-    if bundle.get("schema_version") != 2 or bundle.get("profile") != "hosted-single-node-v2":
-        raise ValueError("policy service requires runtime security v2")
+    version = bundle.get("schema_version")
+    if version not in (2, 3) or bundle.get("profile") != f"hosted-single-node-v{version}":
+        raise ValueError("policy service requires runtime security v2 or v3")
     from .contract import _path
 
     management = _path(str(management_dir), "management directory")

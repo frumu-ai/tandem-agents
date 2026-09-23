@@ -128,9 +128,9 @@ import sys
 
 target = sys.argv[1]
 data = {
-    "runtime_security_version": 1,
+    "runtime_security_version": int(os.environ["HOSTED_RUNTIME_SECURITY_VERSION"]),
     "tandem_control_panel_source_revision": os.environ["HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION"],
-    "runtime_security_profile": "hosted-single-node-v1",
+    "runtime_security_profile": f"hosted-single-node-v{os.environ['HOSTED_RUNTIME_SECURITY_VERSION']}",
     "platform": "linux/amd64",
     "release_tag": os.environ["HOSTED_RELEASE_TAG"],
     "git_sha": os.environ["HOSTED_GIT_SHA"],
