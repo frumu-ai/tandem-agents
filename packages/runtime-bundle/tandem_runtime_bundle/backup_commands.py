@@ -151,6 +151,9 @@ class OffsiteUploader:
         return uri
 
     def put_verified(self, source_path, object_key, sha256, size):
+        return self.put_verified_receipt(source_path, object_key, sha256, size)["remote_uri"]
+
+    def put_verified_receipt(self, source_path, object_key, sha256, size):
         if not _HEX256.fullmatch(sha256) or size <= 0:
             raise ValueError("invalid off-site object digest or length")
         source = plain_path(source_path)
@@ -165,10 +168,26 @@ class OffsiteUploader:
         if put.get("created") is not True:
             raise ValueError("off-site uploader did not create an immutable object")
         uri = self._check_receipt(put, object_key, sha256, size, verified=False)
-        check = call_command(self.command, {
+        has_generation = "remote_generation" in put
+        generation = put.get("remote_generation")
+        if has_generation and (type(generation) is not int
+                               or not 0 < generation < 2**64):
+            raise ValueError("off-site uploader returned an invalid object generation")
+        verify_request = {
             "schema_version": 1, "operation": "verify", "object_key": object_key,
             "sha256": sha256, "size": size, "private": True,
-        }, timeout=300)
+        }
+        if has_generation:
+            verify_request["expected_generation"] = generation
+        check = call_command(self.command, verify_request, timeout=300)
         if self._check_receipt(check, object_key, sha256, size, verified=True) != uri:
             raise ValueError("off-site verifier returned a different object URI")
-        return uri
+        if ("remote_generation" in check) != has_generation or (
+                has_generation and (type(check["remote_generation"]) is not int
+                                    or check["remote_generation"] != generation)):
+            raise ValueError("off-site verifier returned a different object generation")
+        receipt = {"object_key": object_key, "remote_uri": uri,
+                   "sha256": sha256, "size": size}
+        if has_generation:
+            receipt["remote_generation"] = generation
+        return receipt

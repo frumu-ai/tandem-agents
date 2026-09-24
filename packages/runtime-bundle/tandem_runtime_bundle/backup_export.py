@@ -19,6 +19,15 @@ from .backup_archive import canonical_json, plain_path, read_file, write_encrypt
 from .backup_source import _check_source, _uuid, collect_inventory
 
 
+def _put_offsite_receipt(uploader, source_path, object_key, sha256, size):
+    method = getattr(uploader, "put_verified_receipt", None)
+    if method is not None:
+        return method(source_path, object_key, sha256, size)
+    uri = uploader.put_verified(source_path, object_key, sha256, size)
+    return {"object_key": object_key, "remote_uri": uri,
+            "sha256": sha256, "size": size}
+
+
 def _service_inactive(unit):
     result = subprocess.run(["systemctl", "is-active", unit], capture_output=True,
                             text=True, timeout=10, check=False)
@@ -227,9 +236,11 @@ def export_backup(install_root, staging_root, kms, uploader, *, quiescence=None,
             output.write(canonical_json(commit))
             output.flush()
             os.fsync(output.fileno())
+        offsite_receipts = {}
         for name, path in (("archive", archive_path), ("anchors", anchor_path)):
             details = object_metadata[name]
-            uploader.put_verified(path, details["object_key"], details["sha256"], details["size"])
+            offsite_receipts[name] = _put_offsite_receipt(
+                uploader, path, details["object_key"], details["sha256"], details["size"])
         # This object is the only completion marker. Earlier objects are orphans
         # on failure and must never be interpreted as a restorable backup.
         digest, size = _file_digest(commit_path)
@@ -238,7 +249,9 @@ def export_backup(install_root, staging_root, kms, uploader, *, quiescence=None,
             raise ValueError("backup source changed before commit")
         manifest_key = f"{prefix}/manifest.json"
         try:
-            uri = uploader.put_verified(commit_path, manifest_key, digest, size)
+            manifest_receipt = _put_offsite_receipt(
+                uploader, commit_path, manifest_key, digest, size)
+            uri = manifest_receipt["remote_uri"]
         except (OSError, ValueError) as exc:
             # The remote PUT might have committed even when its acknowledgement
             # or read-back verification failed. Never imply that it did not.
@@ -247,5 +260,12 @@ def export_backup(install_root, staging_root, kms, uploader, *, quiescence=None,
                 f"reconcile {manifest_key} (sha256={digest}, size={size}) "
                 "remotely before retry"
             ) from exc
-    return {"backup_id": backup_id, "manifest_uri": uri, "manifest_sha256": digest,
-            "organization_id": organization_id, "deployment_id": deployment_id}
+        offsite_receipts["manifest"] = manifest_receipt
+    result = {"backup_id": backup_id, "manifest_uri": uri, "manifest_sha256": digest,
+              "organization_id": organization_id, "deployment_id": deployment_id}
+    if all("remote_generation" in receipt for receipt in offsite_receipts.values()):
+        result["offsite_objects"] = offsite_receipts
+    elif any("remote_generation" in receipt for receipt in offsite_receipts.values()):
+        raise ValueError("backup off-site generation receipts incomplete; reconcile "
+                         f"{manifest_key} remotely before retry")
+    return result
