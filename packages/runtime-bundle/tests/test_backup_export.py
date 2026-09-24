@@ -174,6 +174,7 @@ class BackupExportTests(unittest.TestCase):
         self.assertEqual(inner["policy_version"], 7)
         self.assertEqual(inner["storage_identity"]["anchor"]["sentinel"], "a" * 64)
         self.assertEqual(inner["memory_kms"]["kek_version"], "1")
+
         archive = commit["objects"]["archive"]
         ciphertext = self.uploader.objects[archive["object_key"]]
         payload = decrypt_chunks(ciphertext, self.kms.dek, archive,
@@ -208,6 +209,23 @@ class BackupExportTests(unittest.TestCase):
             self.assertIn("host-anchor/anchor-0001.json", tar.getnames())
             self.assertEqual(tar.extractfile("host-anchor/anchor-0001.json").read(),
                              b"anchor-canary")
+
+    def test_export_reports_verified_object_generations_when_available(self):
+        class GenerationalUploader(FakeUploader):
+            def put_verified_receipt(self, source_path, object_key, sha256, size):
+                uri = self.put_verified(source_path, object_key, sha256, size)
+                return {"object_key": object_key, "remote_uri": uri,
+                        "sha256": sha256, "size": size,
+                        "remote_generation": 40 + len(self.order)}
+
+        self.uploader = GenerationalUploader()
+        result = self.export()
+        objects = result["offsite_objects"]
+        self.assertEqual(set(objects), {"archive", "anchors", "manifest"})
+        self.assertEqual([objects[name]["remote_generation"]
+                          for name in ("archive", "anchors", "manifest")], [41, 42, 43])
+        self.assertEqual(objects["manifest"]["remote_uri"], result["manifest_uri"])
+        self.assertEqual(objects["manifest"]["sha256"], result["manifest_sha256"])
 
     def test_missing_history_and_unsafe_files_never_publish(self):
         sentinel = Path(self.bundle["host_paths"]["anchor"]) / ".runtime-security-v3-root"

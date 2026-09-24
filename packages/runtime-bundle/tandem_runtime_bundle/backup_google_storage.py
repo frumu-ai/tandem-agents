@@ -145,6 +145,8 @@ def _request(request, config):
     fields = {"schema_version", "operation", "object_key", "sha256", "size", "private"}
     if operation == "put_if_absent":
         fields.add("source_path")
+    if operation == "verify" and "expected_generation" in request:
+        fields.add("expected_generation")
     if (operation not in ("put_if_absent", "verify") or set(request) != fields
             or type(request["schema_version"]) is not int
             or request["schema_version"] != 1 or request["private"] is not True
@@ -153,6 +155,10 @@ def _request(request, config):
             or type(request["size"]) is not int
             or not 0 < request["size"] < 2**63):
         raise ValueError("backup storage request fields are invalid")
+    if ("expected_generation" in request and (
+            type(request["expected_generation"]) is not int
+            or not 0 < request["expected_generation"] < 2**64)):
+        raise ValueError("backup storage generation is invalid")
     organization_id, deployment_id, _ = _object_key(request["object_key"])
     if (organization_id != config["organization_id"]
             or deployment_id != config["deployment_id"]):
@@ -251,7 +257,8 @@ def execute(request, config, client):
         _checked_bucket(client, config)
         verified = False
     else:
-        generation = _verify(bucket, request)
+        generation = _verify(bucket, request,
+                             generation=request.get("expected_generation"))
         _checked_bucket(client, config)
         verified = True
     response = {name: request[name] for name in ("schema_version", "object_key",

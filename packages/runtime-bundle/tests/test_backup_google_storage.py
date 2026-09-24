@@ -117,6 +117,8 @@ def request(operation="verify", payload=PAYLOAD):
 class StorageProtocolTests(unittest.TestCase):
     def test_exact_scope_and_request_fields(self):
         self.assertEqual(gcs._request(request(), CONFIG), "verify")
+        self.assertEqual(gcs._request({**request(), "expected_generation": 42}, CONFIG),
+                         "verify")
         for altered in (
                 {**request(), "object_key": KEY.replace(ORGANIZATION, "../../other")},
                 {**request(), "object_key": KEY.replace(BACKUP, BACKUP[:-1] + "A")},
@@ -125,6 +127,9 @@ class StorageProtocolTests(unittest.TestCase):
                 {**request(), "size": True},
                 {**request(), "private": False},
                 {**request(), "extra": "ignored"},
+                {**request(), "expected_generation": True},
+                {**request(), "expected_generation": 0},
+                {**request("put_if_absent"), "expected_generation": 42},
                 {**request(), "sha256": "A" * 64}):
             with self.subTest(altered=altered), self.assertRaises(ValueError):
                 gcs._request(altered, CONFIG)
@@ -179,6 +184,104 @@ class StorageProtocolTests(unittest.TestCase):
         bucket.switch_generation_after_download = True
         with self.assertRaisesRegex(ValueError, "live object changed"):
             gcs.execute(request(), CONFIG, client)
+
+    def test_verify_rejects_generation_other_than_created_one(self):
+        client = FakeClient()
+        client.bucket_value.objects[KEY] = (43, PAYLOAD)
+        with self.assertRaisesRegex(ValueError, "metadata differs"):
+            gcs.execute({**request(), "expected_generation": 42}, CONFIG, client)
+        self.assertEqual(client.bucket_value.download_options, [])
+
+    def test_uploader_preserves_generation_in_verify_and_export_receipt(self):
+        client = FakeClient()
+        source = Path.cwd() / "archive.aead"
+
+        def command(_command, payload, **_kwargs):
+            if payload["operation"] == "put_if_absent":
+                with patch.object(gcs, "_put", return_value=42):
+                    result = gcs.execute(payload, CONFIG, client)
+                client.bucket_value.objects[KEY] = (42, PAYLOAD)
+                return result
+            self.assertEqual(payload["expected_generation"], 42)
+            return gcs.execute(payload, CONFIG, client)
+
+        with (patch("tandem_runtime_bundle.backup_commands.validate_operator_command",
+                    return_value=Path("/operator/upload")),
+              patch("tandem_runtime_bundle.backup_commands.call_command",
+                    side_effect=command)):
+            protocol = OffsiteUploader("/operator/upload",
+                                       "private-tandem-backups.storage.googleapis.com")
+            receipt = protocol.put_verified_receipt(
+                source, KEY, request()["sha256"], len(PAYLOAD))
+        self.assertEqual(receipt["remote_generation"], 42)
+        self.assertEqual(receipt["object_key"], KEY)
+
+    def test_uploader_rejects_same_hash_from_different_generation(self):
+        client = FakeClient()
+        with patch.object(gcs, "_put", return_value=42):
+            put = gcs.execute(request("put_if_absent"), CONFIG, client)
+        client.bucket_value.objects[KEY] = (43, PAYLOAD)
+
+        def command(_command, payload, **_kwargs):
+            if payload["operation"] == "put_if_absent":
+                return put
+            self.assertEqual(payload["expected_generation"], 42)
+            return gcs.execute(payload, CONFIG, client)
+
+        with (patch("tandem_runtime_bundle.backup_commands.validate_operator_command",
+                    return_value=Path("/operator/upload")),
+              patch("tandem_runtime_bundle.backup_commands.call_command",
+                    side_effect=command)):
+            protocol = OffsiteUploader("/operator/upload",
+                                       "private-tandem-backups.storage.googleapis.com")
+            with self.assertRaisesRegex(ValueError, "metadata differs"):
+                protocol.put_verified_receipt(
+                    Path.cwd() / "archive.aead", KEY, request()["sha256"], len(PAYLOAD))
+
+    def test_other_uploader_remains_compatible_without_generation(self):
+        seen = []
+
+        def command(_command, payload, **_kwargs):
+            seen.append(payload)
+            result = {name: payload[name] for name in (
+                "schema_version", "object_key", "sha256", "size", "private")}
+            result.update({"if_absent": True, "verified": payload["operation"] == "verify",
+                           "remote_uri": "https://private.example/" + payload["object_key"]})
+            if payload["operation"] == "put_if_absent":
+                result["created"] = True
+            return result
+
+        with (patch("tandem_runtime_bundle.backup_commands.validate_operator_command",
+                    return_value=Path("/operator/upload")),
+              patch("tandem_runtime_bundle.backup_commands.call_command",
+                    side_effect=command)):
+            protocol = OffsiteUploader("/operator/upload", "private.example")
+            uri = protocol.put_verified(Path.cwd() / "archive.aead", KEY,
+                                        request()["sha256"], len(PAYLOAD))
+        self.assertEqual(uri, "https://private.example/" + KEY)
+        self.assertNotIn("expected_generation", seen[1])
+
+    def test_shared_protocol_rejects_different_generation_receipt(self):
+        responses = []
+        for verified, generation in ((False, 42), (True, 43)):
+            result = {name: request()[name] for name in (
+                "schema_version", "object_key", "sha256", "size", "private")}
+            result.update({"if_absent": True, "verified": verified,
+                           "remote_uri": "https://private.example/" + KEY,
+                           "remote_generation": generation})
+            if not verified:
+                result["created"] = True
+            responses.append(result)
+
+        with (patch("tandem_runtime_bundle.backup_commands.validate_operator_command",
+                    return_value=Path("/operator/upload")),
+              patch("tandem_runtime_bundle.backup_commands.call_command",
+                    side_effect=responses) as call):
+            protocol = OffsiteUploader("/operator/upload", "private.example")
+            with self.assertRaisesRegex(ValueError, "different object generation"):
+                protocol.put_verified_receipt(Path.cwd() / "archive.aead", KEY,
+                                              request()["sha256"], len(PAYLOAD))
+        self.assertEqual(call.call_args_list[1].args[1]["expected_generation"], 42)
 
     def test_put_receipt_requires_created_generation(self):
         client = FakeClient()

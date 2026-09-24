@@ -32,6 +32,11 @@ container receives them. The config has exactly these fields:
 
 The credential file must be beside the config, outside captured roots. The
 configured organization and deployment IDs bind every accepted object key.
+Provision the bucket in the region or dual-region approved for the
+organization's data-residency and legal jurisdiction requirements. Verify its
+actual location and any replication policy independently during provisioning
+and include that evidence in the recovery authority's protected receipt; this
+adapter does not enforce or attest bucket location.
 The bucket name must be a DNS-safe name without dots. The resulting URI is
 `https://<bucket>.storage.googleapis.com/v3/...`, so pass
 `--offsite-host <bucket>.storage.googleapis.com` to the exporter. This is an
@@ -52,9 +57,14 @@ metadata, create objects, and read objects. Do not grant bucket update/delete,
 object update/delete, or public policy administration to that credential. The
 adapter first hashes the root-only encrypted staging file, creates the object
 with `if_generation_match=0`, and checks the created generation. A separate
-`verify` call downloads that live generation with a generation precondition,
-streams its SHA-256, and compares exact size and digest. The adapter returns
-the generation as additional receipt data. A failed or unacknowledged
+`verify` call receives the generation returned by `put_if_absent`, downloads
+that live generation with a generation precondition, streams its SHA-256, and
+compares exact size and digest. The exporter rejects a different generation
+even if the bytes and URL match. When the uploader attests generations for all
+three objects, export output includes their keys, hashes, sizes, URLs and
+generations in `offsite_objects`. This output is evidence to submit to the
+independent recovery authority; local export output is not itself that
+authority's durable receipt. A failed or unacknowledged
 manifest upload requires reconciliation before retrying; the export command
 does not interpret an exception as proof that no object was created.
 
