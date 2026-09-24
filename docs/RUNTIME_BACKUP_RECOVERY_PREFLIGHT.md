@@ -68,8 +68,14 @@ a runtime reload acknowledgment for every keyring transition.
 
 The backup KMS receives `operation: "unwrap"`, its exact key ID and version,
 the three scoped UUIDs, and the encrypted `wrapped_dek_base64`; it returns
-the same key/scope plus `plaintext_dek_base64` (exactly 32 bytes). It must
-authorize unwrapping for that scope and must never log or persist the DEK.
+the same key/scope plus `plaintext_dek_base64` (exactly 32 bytes). The
+preflight verifies the independent recovery receipt and fenced authorization
+before calling this command. An adapter may enforce an additional scoped
+authorization, but the command protocol does not convey the authorization ID
+or manifest digest and cannot by itself attest that decision. Provision its
+decrypt credential only for an authorized recovery window; root holding that
+credential can call the provider directly. The command must never log or
+persist the DEK.
 
 The memory KMS command receives `operation: "decrypt_recovery_challenge"`,
 the scoped UUIDs, the sealed memory KMS references, and the independent
