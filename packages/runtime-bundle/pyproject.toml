@@ -11,5 +11,8 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 backup = ["cryptography>=3.4"]
 
+[project.scripts]
+tandem-runtime-backup-export = "tandem_runtime_bundle.backup_cli:main"
+
 [tool.setuptools]
 packages = ["tandem_runtime_bundle"]

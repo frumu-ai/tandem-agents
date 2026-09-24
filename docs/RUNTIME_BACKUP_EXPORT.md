@@ -1,8 +1,11 @@
 # Runtime security v3 backup export candidate
 
 `scripts/hosted/export-runtime-backup.py` is an **export-only** Linux operator
-command. It cannot restore data, rebind `storage-roots.json`, authorize a new
-host, or turn the tandem-web legacy snapshot/restore jobs back on. The v3 image
+command backed by the shared `tandem_runtime_bundle.backup_cli` entry point.
+The package also exposes `tandem-runtime-backup-export` for deployments that
+install its optional backup dependencies. The command cannot restore data,
+rebind `storage-roots.json`, authorize a new host, or turn the tandem-web legacy
+snapshot/restore jobs back on. The v3 image
 allowlist remains empty. A v3 tandem-web consumer is under review, but there
 is no live v3 hosting, off-site backup, or clean-host recovery evidence yet.
 The `tandem-agents` packaged-host bootstrap installs this command and its

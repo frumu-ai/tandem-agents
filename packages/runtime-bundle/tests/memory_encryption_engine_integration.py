@@ -73,11 +73,13 @@ def provision_kms_commands(secrets):
 
 
 def write_kms_key(path, material):
-    path.chmod(0o600)
+    if path.exists():
+        path.chmod(0o600)
     if material is None:
-        path.unlink()
+        path.unlink(missing_ok=True)
     else:
         path.write_bytes(material)
+        os.chown(path, 0, 1000)
         path.chmod(0o440)
 
 
@@ -93,13 +95,19 @@ def memory_request(engine, assertion_token, method, path, body):
         return error.code, error.read().decode()
 
 
+def memory_policy_document():
+    policy = json.loads(policy_document(1, ["alice"]))
+    policy["users"][0].update(role="admin", capabilities=["hosted.use", "hosted.admin"])
+    return json.dumps(policy).encode()
+
+
 class MemoryEncryptionEngineTests(unittest.TestCase):
     def test_encrypted_write_cold_restart_and_missing_or_wrong_key(self):
         # GitHub Actions may set TMPDIR under a runner-owned workspace. The
         # production KMS guard correctly rejects that writable ancestor, so
         # stage this root-only fixture beneath the sticky, root-owned /tmp.
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary, \
-                tls_endpoint(lambda: policy_document(1, ["alice"]), required_token=TOKEN) as (url, tls_context, seen):
+                tls_endpoint(memory_policy_document, required_token=TOKEN) as (url, tls_context, seen):
             root = Path(temporary)
             root.chmod(0o755)
             home, install = root / "runtime-home", root / "install"
@@ -138,14 +146,21 @@ class MemoryEncryptionEngineTests(unittest.TestCase):
                 os.chown(bundle["host_paths"]["state"], 1000, 1000)
                 os.chown(engine.env["TANDEM_STATE_DIR"], 1000, 1000)
                 engine.process_options = {"user": 1000, "group": 1000, "extra_groups": []}
-                assertion_token = assertion(signer, "alice", 1, "alice-encrypted-memory")
+                assertion_token = assertion(signer, "alice", 1, "alice-encrypted-memory", role="admin")
                 partition = {"org_id": ORGANIZATION, "workspace_id": DEPLOYMENT,
                              "project_id": "encrypted-memory", "tier": "session"}
+                resource = {"organization_id": ORGANIZATION, "workspace_id": DEPLOYMENT,
+                            "project_id": "encrypted-memory", "resource_kind": "memory_space",
+                            "resource_id": "encrypted-memory"}
                 secret = uuid.uuid4().hex
                 marker = "recovery lantern " + secret
                 payload = {"run_id": "encrypted-memory-acceptance", "partition": partition,
                            "kind": "note", "content": marker, "classification": "internal",
-                           "private": True}
+                           "private": True,
+                           "metadata": {"knowledge_scope_registry": {
+                               "registry_id": "encrypted-memory-acceptance",
+                               "resource_ref": resource, "data_class": "internal",
+                               "allowed_write_tiers": ["session"]}}}
 
                 def start():
                     engine.start(wait_ready=False)
@@ -164,6 +179,13 @@ class MemoryEncryptionEngineTests(unittest.TestCase):
 
                 try:
                     start()
+                    grant = {"grant_id": "encrypted-memory-read", "unit_id": "eng",
+                        "taxonomy_id": "hosted-control-plane", "resource_kind": "memory_space",
+                        "resource_id": "encrypted-memory", "project_id": "encrypted-memory",
+                        "permissions": ["read"], "data_classes": ["internal"]}
+                    grant_status, grant_body = memory_request(engine, assertion_token, "POST",
+                        "/enterprise/org-unit-access-grants", grant)
+                    self.assertEqual(grant_status, 200, grant_body)
                     status, body = memory_request(engine, assertion_token, "POST", "/memory/put", payload)
                     self.assertEqual(status, 200,
                                      f"{body}; write_warning={memory_write_warning(home / 'engine.log', secret)}")
