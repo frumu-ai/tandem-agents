@@ -226,6 +226,34 @@ class RecoveryPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "replay schema"):
             self.verify()
 
+    def test_replay_namespace_above_pinned_engine_limit_fails(self):
+        # The engine rejects this database at startup even though its SQLite
+        # schema and total row count are valid. The preflight must agree.
+        self.db.executemany(
+            "INSERT INTO replay_entries VALUES (?, ?, ?, ?)",
+            ((f"{index:064x}", "b" * 64, "c" * 64, 9999999999999)
+             for index in range(10000)),
+        )
+        self.db.commit()
+        self.uploader.objects.clear()
+        self.uploader.order.clear()
+        result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in self.scope}
+        for key, payload in self.uploader.objects.items():
+            (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt.update(
+            **self.scope,
+            manifest_object_key=self.uploader.order[-1],
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            manifest_size=len(manifest),
+            archive_sha256=commit["objects"]["archive"]["sha256"],
+            anchors_sha256=commit["objects"]["anchors"]["sha256"],
+        )
+        with self.assertRaisesRegex(ValueError, "replay rows"):
+            self.verify()
+
 
 class AuthorityProtocolTests(unittest.TestCase):
     def test_unwrap_requires_exact_key_scope(self):

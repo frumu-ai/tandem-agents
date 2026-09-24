@@ -235,7 +235,12 @@ def _replay(image):
                 "SELECT COUNT(*) FROM replay_entries WHERE length(replay_key)!=64 "
                 "OR length(namespace_hash)!=64 OR length(fingerprint_hex)!=64 "
                 "OR expires_at_ms<0").fetchone()[0]
-            if invalid or count > 100000:
+            # Match the pinned engine's total and per-namespace replay bounds.
+            # A structurally valid database above either bound cannot start.
+            overfull_namespace = connection.execute(
+                "SELECT 1 FROM replay_entries GROUP BY namespace_hash "
+                "HAVING COUNT(*) > 10000 LIMIT 1").fetchone() is not None
+            if invalid or count > 100000 or overfull_namespace:
                 raise ValueError("durable replay rows are invalid")
             return count
     except sqlite3.DatabaseError:
