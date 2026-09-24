@@ -11,10 +11,12 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 backup = ["cryptography>=3.4"]
 google-backup-kms = ["google-cloud-kms==3.16.0"]
+google-backup-storage = ["google-cloud-storage==3.14.1"]
 
 [project.scripts]
 tandem-runtime-backup-export = "tandem_runtime_bundle.backup_cli:main"
 tandem-backup-google-kms = "tandem_runtime_bundle.backup_google_kms:main"
+tandem-backup-google-storage = "tandem_runtime_bundle.backup_google_storage:main"
 
 [tool.setuptools]
 packages = ["tandem_runtime_bundle"]
