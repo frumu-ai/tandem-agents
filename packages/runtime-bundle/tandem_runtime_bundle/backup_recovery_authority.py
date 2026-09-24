@@ -90,3 +90,33 @@ class MemoryKmsChallenge:
         plaintext = _decode(result.get("plaintext_base64"), "memory KMS plaintext", 32, 128)
         if hashlib.sha256(plaintext).hexdigest() != challenge["plaintext_sha256"]:
             raise ValueError("memory KMS challenge did not match independent authority")
+
+
+class LatestKeyringAuthority:
+    """Read the latest runtime-acknowledged keyring from a separate recovery ledger."""
+
+    def __init__(self, command):
+        self.command = validate_operator_command(command)
+
+    def attest(self, scope, authorization_id):
+        result = call_command(self.command, {
+            "schema_version": 1, "operation": "attest_latest_runtime_keyring",
+            **scope, "authorization_id": authorization_id,
+        })
+        if (not isinstance(result, dict) or set(result) != {
+                "schema_version", "backup_id", "organization_id", "deployment_id",
+                "authorization_id", "generation", "document_sha256",
+                "runtime_acknowledged", "old_host_fenced", "latest"}
+                or type(result["schema_version"]) is not int
+                or result["schema_version"] != 1
+                or any(result[field] != scope[field] for field in scope)
+                or result["authorization_id"] != authorization_id
+                or type(result["generation"]) is not int
+                or not 0 < result["generation"] < 2**64
+                or not isinstance(result["document_sha256"], str)
+                or not _HEX.fullmatch(result["document_sha256"])
+                or result["runtime_acknowledged"] is not True
+                or result["old_host_fenced"] is not True
+                or result["latest"] is not True):
+            raise ValueError("latest keyring authority did not attest the fenced recovery scope")
+        return result

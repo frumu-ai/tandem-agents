@@ -19,7 +19,7 @@ from .backup_archive import CHUNK_SIZE, canonical_json, read_file
 from .backup_decrypt import DecryptingReader
 from .backup_source import (CONFIG_FILES, REQUIRED_HOST_ROOTS,
                             REQUIRED_ORDINARY_ROOTS, _unique_object, _uuid)
-from .contract import validate_keyring
+from .keyring_lifecycle import fingerprint, validate_document
 
 
 _HEX = re.compile(r"[a-f0-9]{64}\Z")
@@ -247,7 +247,7 @@ def _replay(image):
         raise ValueError("durable replay database cannot be read") from None
 
 
-def _controls(inner, captured, by_name, scope):
+def _controls(inner, captured, by_name, scope, latest_keyring):
     def parsed(name):
         return _json(captured[name], name)
 
@@ -290,8 +290,10 @@ def _controls(inner, captured, by_name, scope):
                 or captured[f"host-{key}/.runtime-security-v3-root"] !=
                 prior["sentinel"].encode("ascii")):
             raise ValueError("recovery history sentinel differs from storage binding")
-    validate_keyring(parsed("host-security/context-keyring.json"),
-                     scope["deployment_id"], scope["organization_id"])
+    keyring = parsed("host-security/context-keyring.json")
+    validate_document(keyring, scope["deployment_id"], scope["organization_id"])
+    if fingerprint(keyring) != latest_keyring["document_sha256"]:
+        raise ValueError("backup verifier keyring differs from independent latest authority")
     memory = inner.get("memory_kms")
     fields = {"provider", "runtime_principal_id", "kek_id", "kek_version",
               "rotation_epoch"}
@@ -310,11 +312,12 @@ def _controls(inner, captured, by_name, scope):
 
 
 def verify_recovery_candidate(manifest_path, archive_path, anchors_path,
-                              scope, authority, backup_kms, memory_kms):
+                              scope, authority, keyring_authority, backup_kms, memory_kms):
     """Return evidence only after all independent and captured checks pass."""
     scope = {field: _uuid(scope[field]) for field in (
         "backup_id", "organization_id", "deployment_id")}
     receipt = authority.attest(scope)
+    checkpoint = keyring_authority.attest(scope, receipt["authorization_id"])
     inner, objects, dek = _manifest(manifest_path, receipt, backup_kms, scope)
     entries, by_name = _inventory(inner)
     anchors = [entry for entry in entries
@@ -327,12 +330,14 @@ def verify_recovery_candidate(manifest_path, archive_path, anchors_path,
     if any(anchor_controls.get(name) != controls.get(name) for name in
            _CONTROL if name.startswith("host-anchor/")):
         raise ValueError("independent anchor copy differs from full archive")
-    memory = _controls(inner, controls, by_name, scope)
+    memory = _controls(inner, controls, by_name, scope, checkpoint)
     replay_entries = _replay(replay_image)
     memory_kms.verify(scope, memory, receipt["memory_challenge"])
     return {"scope": scope, "authorization_id": receipt["authorization_id"],
             "manifest_sha256": receipt["manifest_sha256"],
             "anchors_sha256": receipt["anchors_sha256"],
+            "keyring_generation": checkpoint["generation"],
+            "keyring_document_sha256": checkpoint["document_sha256"],
             "policy_version": inner["policy_version"],
             "replay_entries": replay_entries,
             "anchor_members": len(anchors),
