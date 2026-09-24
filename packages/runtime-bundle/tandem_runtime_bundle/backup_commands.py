@@ -86,6 +86,37 @@ class BackupKms:
             raise ValueError("backup KMS returned an invalid wrapped DEK length")
         return base64.b64encode(wrapped).decode("ascii")
 
+    def unwrap(self, wrapped_dek_base64, scope):
+        """Ask the independent backup authority for this exact scoped DEK."""
+        if not isinstance(wrapped_dek_base64, str):
+            raise ValueError("backup KMS ciphertext is missing")
+        try:
+            wrapped = base64.b64decode(wrapped_dek_base64, validate=True)
+        except (ValueError, base64.binascii.Error):
+            raise ValueError("backup KMS ciphertext is invalid") from None
+        if not 32 <= len(wrapped) <= 8192:
+            raise ValueError("backup KMS ciphertext length is invalid")
+        result = call_command(self.command, {
+            "schema_version": 1, "operation": "unwrap", "key_id": self.key_id,
+            "key_version": self.key_version, **scope,
+            "wrapped_dek_base64": wrapped_dek_base64,
+        })
+        if (type(result.get("schema_version")) is not int or result["schema_version"] != 1
+                or result.get("key_id") != self.key_id
+                or result.get("key_version") != self.key_version
+                or any(result.get(key) != value for key, value in scope.items())):
+            raise ValueError("backup KMS unwrap did not attest key and scope")
+        encoded = result.get("plaintext_dek_base64")
+        if not isinstance(encoded, str):
+            raise ValueError("backup KMS unwrap omitted the DEK")
+        try:
+            dek = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error):
+            raise ValueError("backup KMS unwrap returned invalid DEK") from None
+        if len(dek) != 32:
+            raise ValueError("backup KMS unwrap returned an invalid DEK length")
+        return dek
+
 
 class OffsiteUploader:
     def __init__(self, command, remote_host):
