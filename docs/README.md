@@ -8,6 +8,8 @@ supporting operator scripts.
   overlap, retirement, operator staging and runtime reload.
 - [RUNTIME_CLEAN_HOST_RECOVERY.md](RUNTIME_CLEAN_HOST_RECOVERY.md) - v3 recovery
   blockers and the evidence required before storage-root rebind.
+- [RUNTIME_BACKUP_EXPORT.md](RUNTIME_BACKUP_EXPORT.md) - export-only encrypted
+  off-site v3 backup candidate, operator prerequisites and residual limits.
 
 ACA smoke harness documentation:
 
