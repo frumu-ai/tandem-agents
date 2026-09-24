@@ -1,11 +1,25 @@
 import base64
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from tandem_runtime_bundle import build_security_bundle
+from tandem_runtime_bundle.policy_contract import MEMORY_ENGINE_REVISION, VERIFIED_MEMORY_ENGINE_IMAGES
 
 DEPLOYMENT = "b3a60fb8-2b41-43b3-9c9e-88bccfc37c15"
 ORGANIZATION = "9faebcf0-2b32-482f-82b8-df032d154abc"
+SYNTHETIC_ENGINE_IMAGE = f"ghcr.io/example/engine@sha256:{'a' * 64}"
+SYNTHETIC_BINARY_SHA256 = "b" * 64
+SYNTHETIC_ATTESTATION_SHA256 = "c" * 64
+
+
+def synthetic_v3_provenance():
+    """In-process test authority only; no runtime environment or CLI bypass."""
+    return patch.dict(VERIFIED_MEMORY_ENGINE_IMAGES, {SYNTHETIC_ENGINE_IMAGE: {
+        "source_revision": MEMORY_ENGINE_REVISION,
+        "binary_sha256": SYNTHETIC_BINARY_SHA256,
+        "attestation_sha256": SYNTHETIC_ATTESTATION_SHA256,
+    }})
 
 
 def inputs(root="/srv/tandem/test", anchor="/var/lib/tandem-audit/test"):
@@ -20,6 +34,15 @@ def inputs(root="/srv/tandem/test", anchor="/var/lib/tandem-audit/test"):
         "HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION": "3ee2d83d76497565680538ef00f1616f55650524",
         "HOSTED_RELEASE_TAG": "v0.7.2", "HOSTED_RELEASE_VERSION": "0.7.2",
         "HOSTED_DEPLOYMENT_SLUG": "test", "HOSTED_STORAGE_PROFILE": "local",
+        "HOSTED_MEMORY_ENCRYPTION_REQUIRED": "true",
+        "HOSTED_MEMORY_KMS_PROVIDER": "google_cloud_kms",
+        "HOSTED_MEMORY_KMS_RUNTIME_PRINCIPAL_ID": f"tandem-hosted-memory-decryptor:{DEPLOYMENT}",
+        "HOSTED_MEMORY_KMS_ENCRYPT_COMMAND": "/run/tandem-memory-kms/memory-kms-encrypt",
+        "HOSTED_MEMORY_KMS_DECRYPT_COMMAND": "/run/tandem-memory-kms/memory-kms-decrypt",
+        "HOSTED_MEMORY_KEK_ID": "projects/test/locations/global/keyRings/memory/cryptoKeys/hosted",
+        "HOSTED_MEMORY_KEK_VERSION": "1", "HOSTED_MEMORY_KEK_ROTATION_EPOCH": "0",
+        "HOSTED_ENGINE_BINARY_SHA256": SYNTHETIC_BINARY_SHA256,
+        "HOSTED_ENGINE_ATTESTATION_SHA256": SYNTHETIC_ATTESTATION_SHA256,
         "HOSTED_HOST_UID": str(os.getuid()) if os.name == "posix" and os.getuid() else "1000",
         "HOSTED_HOST_GID": str(os.getgid()) if os.name == "posix" and os.getgid() else "1000",
     }

@@ -6,6 +6,8 @@ supporting operator scripts.
 
 - [RUNTIME_KEY_ROTATION.md](RUNTIME_KEY_ROTATION.md) - scoped public verifier
   overlap, retirement, operator staging and runtime reload.
+- [RUNTIME_CLEAN_HOST_RECOVERY.md](RUNTIME_CLEAN_HOST_RECOVERY.md) - v3 recovery
+  blockers and the evidence required before storage-root rebind.
 
 ACA smoke harness documentation:
 

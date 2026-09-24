@@ -1,19 +1,116 @@
 import copy
+from contextlib import redirect_stdout
+import io
 import json
 import os
+import runpy
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from tandem_runtime_bundle import build_security_bundle, validate_keyring
+from tandem_runtime_bundle.policy_contract import (MEMORY_ENGINE_REVISION, POLICY_ENGINE_REVISION,
+                                                   PREVIOUS_POLICY_ENGINE_REVISION)
 from tandem_runtime_bundle.prepare import prepare_security
-from fixtures import DEPLOYMENT, ORGANIZATION, inputs, keyring, provisioned_paths
+from fixtures import DEPLOYMENT, ORGANIZATION, inputs, keyring, provisioned_paths, synthetic_v3_provenance
 
 REPO = Path(__file__).resolve().parents[3]
 
 
 class ContractTests(unittest.TestCase):
+    def test_existing_v2_release_revision_still_renders_after_v3_bundle_upgrade(self):
+        old = build_security_bundle({**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "2",
+                                     "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": PREVIOUS_POLICY_ENGINE_REVISION})
+        self.assertEqual(old["schema_version"], 2)
+        self.assertEqual(old["engine_source_revision"], PREVIOUS_POLICY_ENGINE_REVISION)
+        self.assertNotIn("memory_encryption", old)
+        with self.assertRaisesRegex(ValueError, "tested engine source revision"):
+            build_security_bundle({**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "2",
+                                   "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": "0" * 40})
+
+    def test_v3_production_requires_verified_engine_image(self):
+        values = {**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "3",
+                  "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION}
+        with self.assertRaisesRegex(ValueError, "verified exact-source engine image digest"):
+            build_security_bundle(values)
+
+    @unittest.skipUnless(os.name == "posix", "Linux provisioning required")
+    def test_v3_provisioning_rejects_synthetic_bundle_without_a_verified_image(self):
+        values = {**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "3",
+                  "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION}
+        with synthetic_v3_provenance():
+            bundle = build_security_bundle(values)
+        with self.assertRaisesRegex(ValueError, "verified exact-source engine image digest"):
+            prepare_security(bundle, keyring(), "/nonexistent/operator-token")
+
+    @synthetic_v3_provenance()
+    def test_v3_requires_complete_hosted_memory_encryption_without_changing_v2(self):
+        values = inputs()
+        values.update(HOSTED_RUNTIME_SECURITY_VERSION="3",
+                      HOSTED_TANDEM_ENGINE_SOURCE_REVISION=MEMORY_ENGINE_REVISION)
+        bundle = build_security_bundle(values)
+        memory = bundle["memory_encryption"]
+        env = bundle["engine_environment"]
+        self.assertEqual(bundle["engine_source_revision"], MEMORY_ENGINE_REVISION)
+        self.assertEqual(memory["runtime_principal_id"],
+                         f"tandem-hosted-memory-decryptor:{DEPLOYMENT}")
+        self.assertEqual(memory["rotation_epoch"], 0)
+        self.assertEqual(env["TANDEM_MEMORY_ENCRYPTION_REQUIRED"], "true")
+        self.assertEqual(env["TANDEM_MEMORY_DECRYPT_PROVIDER"], "google_cloud_kms")
+        self.assertEqual(env["TANDEM_MEMORY_KEK_ID"], values["HOSTED_MEMORY_KEK_ID"])
+        self.assertEqual(env["TANDEM_MEMORY_KEK_VERSION"], "1")
+        self.assertEqual(env["TANDEM_MEMORY_KEK_ROTATION_EPOCH"], "0")
+        for operation in ("ENCRYPT", "DECRYPT"):
+            self.assertEqual(env[f"TANDEM_MEMORY_GOOGLE_KMS_{operation}_COMMAND"],
+                             values[f"HOSTED_MEMORY_KMS_{operation}_COMMAND"])
+        self.assertEqual(env["TANDEM_CONTEXT_ASSERTION_REPLAY_MODE"], "bound")
+        self.assertEqual(env["TANDEM_AUDIT_ANCHOR_DIR"], "/var/lib/tandem-audit")
+        command_root = bundle["host_paths"]["memory_kms_commands"]
+        self.assertEqual(command_root, "/srv/tandem/test/memory-kms-commands")
+        self.assertIn({"type": "bind", "source": command_root,
+            "target": "/run/tandem-memory-kms", "read_only": True,
+            "bind": {"create_host_path": False}}, bundle["engine_mounts"])
+        self.assertNotIn(command_root, str(bundle["panel_mounts"]))
+        self.assertNotIn("memory_encryption", build_security_bundle(inputs()))
+        old = build_security_bundle({**values, "HOSTED_RUNTIME_SECURITY_VERSION": "2",
+                                     "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": POLICY_ENGINE_REVISION,
+                                     **{name: "" for name in values if name.startswith("HOSTED_MEMORY_")}})
+        self.assertEqual(old["schema_version"], 2)
+        self.assertEqual(old["profile"], "hosted-single-node-v2")
+        self.assertEqual(old["engine_source_revision"], POLICY_ENGINE_REVISION)
+        self.assertNotIn("memory_encryption", old)
+        self.assertNotIn("TANDEM_MEMORY_ENCRYPTION_REQUIRED", old["engine_environment"])
+        with self.assertRaisesRegex(ValueError, "source revision"):
+            build_security_bundle({**values, "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": POLICY_ENGINE_REVISION})
+
+        for name in ("HOSTED_MEMORY_ENCRYPTION_REQUIRED", "HOSTED_MEMORY_KMS_PROVIDER",
+                     "HOSTED_MEMORY_KMS_RUNTIME_PRINCIPAL_ID",
+                     "HOSTED_MEMORY_KMS_ENCRYPT_COMMAND", "HOSTED_MEMORY_KMS_DECRYPT_COMMAND",
+                     "HOSTED_MEMORY_KEK_ID", "HOSTED_MEMORY_KEK_VERSION",
+                     "HOSTED_MEMORY_KEK_ROTATION_EPOCH"):
+            with self.subTest(missing=name):
+                incomplete = values.copy()
+                del incomplete[name]
+                with self.assertRaises(ValueError):
+                    build_security_bundle(incomplete)
+        invalid = {
+            "HOSTED_MEMORY_ENCRYPTION_REQUIRED": ["false", "TRUE"],
+            "HOSTED_MEMORY_KMS_PROVIDER": ["local", "*", "google_kms"],
+            "HOSTED_MEMORY_KMS_RUNTIME_PRINCIPAL_ID": ["*", "cross-deployment", "principal:foreign"],
+            "HOSTED_MEMORY_KMS_ENCRYPT_COMMAND": ["kms-encrypt", "/bin/sh", "/run/secrets/legacy"],
+            "HOSTED_MEMORY_KMS_DECRYPT_COMMAND": ["", "/tmp/decrypt", "/run/tandem-memory-kms/a;echo"],
+            "HOSTED_MEMORY_KMS_COMMAND_ROOT": ["/srv/tandem/test/secrets", "/srv/tandem/test/tandem-data", "/tmp/../tmp/kms"],
+            "HOSTED_MEMORY_KEK_ID": ["test-key", "projects/p/locations/l/keyRings/r/cryptoKeys/*"],
+            "HOSTED_MEMORY_KEK_VERSION": ["0", "2/other", "projects/p/locations/l/keyRings/r/cryptoKeys/other/cryptoKeyVersions/1"],
+            "HOSTED_MEMORY_KEK_ROTATION_EPOCH": ["", "-1", "01", str(2**64)],
+        }
+        for name, cases in invalid.items():
+            for value in cases:
+                with self.subTest(invalid=name, value=value):
+                    with self.assertRaises(ValueError):
+                        build_security_bundle({**values, name: value})
+
     def test_current_profile_has_all_runtime_prerequisites(self):
         bundle = build_security_bundle(inputs())
         env = bundle["engine_environment"]
@@ -154,11 +251,38 @@ class ContractTests(unittest.TestCase):
         for mount in bundle["panel_mounts"]:
             self.assertIn(mount, panel_service["volumes"])
             self.assertNotIn(mount, engine["volumes"])
+        unverified_v3 = {**env, "HOSTED_RUNTIME_SECURITY_VERSION": "3",
+                         "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION}
+        for renderer in ("render-compose.sh", "render-runtime-env.sh", "render-control-panel-config.sh"):
+            result = subprocess.run(["bash", str(script / renderer)], env=unverified_v3,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, renderer)
+            self.assertIn("verified exact-source engine image digest", result.stderr)
         for name, value in {"HOSTED_RUNTIME_SECURITY_VERSION": "2", "HOSTED_PLATFORM": "linux/arm64"}.items():
             for renderer in ("render-compose.sh", "render-runtime-env.sh", "render-control-panel-config.sh"):
                 result = subprocess.run(["bash", str(script / renderer)], env={**env, name: value},
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, (name, renderer))
+
+    @unittest.skipUnless(os.name == "posix", "Compose consumer requires Linux test dependencies")
+    @synthetic_v3_provenance()
+    def test_v3_compose_mounts_kms_commands_only_into_engine(self):
+        import yaml
+        from unittest.mock import patch
+
+        values = {**inputs(), "HOSTED_RUNTIME_SECURITY_VERSION": "3",
+                  "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION}
+        command_root = build_security_bundle(values)["host_paths"]["memory_kms_commands"]
+        rendered = io.StringIO()
+        with patch.dict(os.environ, values, clear=True), redirect_stdout(rendered):
+            runpy.run_path(str(REPO / "scripts/hosted/compose.py"), run_name="__main__")
+        services = yaml.safe_load(rendered.getvalue())["services"]
+        self.assertIn({"type": "bind", "source": command_root,
+            "target": "/run/tandem-memory-kms", "read_only": True,
+            "bind": {"create_host_path": False}}, services["tandem-engine"]["volumes"])
+        for name, service in services.items():
+            if name != "tandem-engine":
+                self.assertNotIn(command_root, str(service.get("volumes", [])), name)
 
     @unittest.skipUnless(os.name == "posix", "packaged Bash renderers require Linux")
     def test_packaged_bundle_keeps_shared_module_and_valid_compose(self):
@@ -166,23 +290,28 @@ class ContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             values = inputs(root / "install", root / "anchors")
+            values.update(HOSTED_RUNTIME_SECURITY_VERSION="2",
+                          HOSTED_TANDEM_ENGINE_SOURCE_REVISION=POLICY_ENGINE_REVISION)
             values["HOSTED_BUNDLE_DIR"] = str(root / "bundle")
             env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], **values}
             subprocess.run(["bash", str(REPO / "scripts/hosted/package-bundle.sh")],
                            env=env, capture_output=True, text=True, check=True)
             manifest = json.loads((root / "bundle/runtime-security.json").read_text())
             self.assertEqual(manifest, build_security_bundle(values))
+            release = json.loads((root / "bundle/release-manifest.json").read_text())
+            self.assertEqual(release["runtime_security_version"], 2)
+            self.assertEqual(release["runtime_security_profile"], "hosted-single-node-v2")
             self.assertTrue((root / "bundle/tandem_runtime_bundle/prepare.py").is_file())
             self.assertFalse((root / "bundle/audit-hmac-key").exists())
             self.assertFalse((root / "bundle/host_agent_token").exists())
             compose = root / "bundle/docker-compose.hosted.yml"
             self.assertEqual(yaml.safe_load(compose.read_text())["services"]["tandem-engine"]["user"],
                              manifest["container_security"]["user"])
-            subprocess.run(["docker", "compose", "-f", str(compose), "config", "--quiet"],
-                           env=env, capture_output=True, text=True, check=True)
             # The copy shipped in the archive imports its own module without a pip install.
             subprocess.run(["python3", str(root / "bundle/runtime-security.py"), "render"],
                            env=env, cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["docker", "compose", "-f", str(compose), "config", "--quiet"],
+                           env=env, capture_output=True, text=True, check=True)
 
 
 if __name__ == "__main__":

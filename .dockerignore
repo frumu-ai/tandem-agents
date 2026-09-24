@@ -1,4 +1,6 @@
 .git
+.v3-tandem-source/
+.v3-engine-context/
 .gitignore
 .env
 .secrets/
