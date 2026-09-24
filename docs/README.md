@@ -12,6 +12,8 @@ supporting operator scripts.
   off-site v3 backup candidate, operator prerequisites and residual limits.
 - [RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md](RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md) - read-only
   v3 encrypted archive and independent authority preflight candidate.
+- [RUNTIME_BACKUP_GOOGLE_KMS.md](RUNTIME_BACKUP_GOOGLE_KMS.md) - scoped
+  Google Cloud KMS backup-key command and separate recovery credentials.
 
 ACA smoke harness documentation:
 
