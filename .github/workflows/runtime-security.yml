@@ -25,6 +25,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install ./packages/runtime-bundle PyYAML==6.0.2 cryptography==44.0.3
+      - name: Packaged backup command and hosted wrapper use the shared entry point
+        run: |
+          tandem-runtime-backup-export --help > /dev/null
+          python -m tandem_runtime_bundle.backup_cli --help > /dev/null
+          python scripts/hosted/export-runtime-backup.py --help > /dev/null
       - name: Check out pinned panel consumer
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
