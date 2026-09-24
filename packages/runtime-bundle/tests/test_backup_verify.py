@@ -14,12 +14,13 @@ from unittest.mock import patch
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from fixtures import DEPLOYMENT, ORGANIZATION
+from fixtures import DEPLOYMENT, ORGANIZATION, keyring
 import test_backup_export
 from tandem_runtime_bundle.backup_archive import canonical_json
+from tandem_runtime_bundle.keyring_lifecycle import fingerprint
 from tandem_runtime_bundle.backup_commands import BackupKms, validate_operator_command
 from tandem_runtime_bundle.backup_recovery_authority import (
-    MemoryKmsChallenge, RecoveryAuthority)
+    LatestKeyringAuthority, MemoryKmsChallenge, RecoveryAuthority)
 from tandem_runtime_bundle.backup_verify import (
     _ENTRIES_SQL, _INDEX_SQL, _METADATA_SQL, verify_recovery_candidate)
 
@@ -40,6 +41,17 @@ class FakeRecoveryAuthority:
         if any(self.receipt[key] != value for key, value in scope.items()):
             raise ValueError("wrong independent scope")
         return self.receipt
+
+
+class FakeKeyringAuthority:
+    def __init__(self, checkpoint):
+        self.checkpoint = checkpoint
+
+    def attest(self, scope, authorization_id):
+        if (any(self.checkpoint[field] != scope[field] for field in scope)
+                or self.checkpoint["authorization_id"] != authorization_id):
+            raise ValueError("wrong latest keyring authority scope")
+        return self.checkpoint
 
 
 class FakeMemoryKms:
@@ -98,12 +110,22 @@ class RecoveryPreflightTests(unittest.TestCase):
             "remote_uri": "https://private-backups.example/" + self.uploader.order[-1],
             "schema_version": 1,
         }
+        self.checkpoint = {
+            "schema_version": 1, "backup_id": self.scope["backup_id"],
+            "organization_id": self.scope["organization_id"],
+            "deployment_id": self.scope["deployment_id"],
+            "authorization_id": self.receipt["authorization_id"],
+            "generation": 1, "document_sha256": fingerprint(keyring()),
+            "runtime_acknowledged": True, "old_host_fenced": True,
+            "latest": True,
+        }
 
-    def verify(self, receipt=None):
+    def verify(self, receipt=None, checkpoint=None):
         return verify_recovery_candidate(
             self.paths["manifest.json"], self.paths["archive.aead"],
             self.paths["anchors.aead"], self.scope,
             FakeRecoveryAuthority(receipt or self.receipt),
+            FakeKeyringAuthority(checkpoint or self.checkpoint),
             self.kms, FakeMemoryKms())
 
     def test_verified_archive_replay_anchor_and_binding_are_read_only(self):
@@ -115,6 +137,21 @@ class RecoveryPreflightTests(unittest.TestCase):
         self.assertGreaterEqual(report["anchor_members"], 2)
         self.assertEqual((Path(self.bundle["host_paths"]["security"]) /
                           "storage-roots.json").read_bytes(), original)
+
+    def test_newer_retirement_checkpoint_rejects_stale_backup_keyring(self):
+        later = keyring()
+        later["test-key"]["status"] = "retired"
+        later["next-key"] = {
+            **later["test-key"], "public_key": base64.b64encode(b"n" * 32).decode(),
+            "status": "active",
+        }
+        checkpoint = {**self.checkpoint, "generation": 2,
+                      "document_sha256": fingerprint(later)}
+        with self.assertRaisesRegex(ValueError, "differs from independent latest authority"):
+            self.verify(checkpoint=checkpoint)
+        self.assertEqual(self.verify()["keyring_generation"], 1)
+        self.assertEqual(self.verify()["keyring_document_sha256"],
+                         fingerprint(keyring()))
 
     def test_missing_or_changed_independent_receipt_fails(self):
         for key, value in (
@@ -185,6 +222,7 @@ class RecoveryPreflightTests(unittest.TestCase):
         self.uploader.order.clear()
         result = test_backup_export.BackupExportTests.export(self)
         self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
         for key, payload in self.uploader.objects.items():
             (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
         manifest = self.paths["manifest.json"].read_bytes()
@@ -212,6 +250,7 @@ class RecoveryPreflightTests(unittest.TestCase):
         self.uploader.order.clear()
         result = test_backup_export.BackupExportTests.export(self)
         self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
         for key, payload in self.uploader.objects.items():
             (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
         manifest = self.paths["manifest.json"].read_bytes()
@@ -239,6 +278,7 @@ class RecoveryPreflightTests(unittest.TestCase):
         self.uploader.order.clear()
         result = test_backup_export.BackupExportTests.export(self)
         self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
         for key, payload in self.uploader.objects.items():
             (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
         manifest = self.paths["manifest.json"].read_bytes()
@@ -306,6 +346,43 @@ class AuthorityProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "fenced scope"):
                 authority.attest(scope)
 
+    def test_latest_keyring_authority_requires_scope_fence_and_acknowledgment(self):
+        scope = {"backup_id": DEPLOYMENT, "organization_id": ORGANIZATION,
+                 "deployment_id": DEPLOYMENT}
+        authorization_id = "test-authority-1"
+        checkpoint = {
+            "schema_version": 1, **scope,
+            "authorization_id": authorization_id, "generation": 1,
+            "document_sha256": fingerprint(keyring()),
+            "runtime_acknowledged": True, "old_host_fenced": True,
+            "latest": True,
+        }
+        with patch("tandem_runtime_bundle.backup_recovery_authority.validate_operator_command",
+                   return_value=Path("/operator/keyring-authority")):
+            authority = LatestKeyringAuthority("/operator/keyring-authority")
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value=checkpoint) as call:
+            self.assertEqual(authority.attest(scope, authorization_id), checkpoint)
+            self.assertEqual(call.call_args.args[1]["operation"],
+                             "attest_latest_runtime_keyring")
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value={key: value for key, value in checkpoint.items()
+                                 if key != "document_sha256"}):
+            with self.assertRaisesRegex(ValueError, "latest keyring authority"):
+                authority.attest(scope, authorization_id)
+        for field, value in (
+                ("backup_id", ORGANIZATION), ("organization_id", DEPLOYMENT),
+                ("deployment_id", ORGANIZATION),
+                ("authorization_id", "another-authorization"),
+                ("generation", True), ("generation", 0),
+                ("document_sha256", "not-a-digest"),
+                ("runtime_acknowledged", False),
+                ("old_host_fenced", False), ("latest", False)):
+            with self.subTest(field=field, value=value):
+                with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                           return_value={**checkpoint, field: value}):
+                    with self.assertRaisesRegex(ValueError, "latest keyring authority"):
+                        authority.attest(scope, authorization_id)
     def test_memory_challenge_requires_exact_digest(self):
         with patch("tandem_runtime_bundle.backup_recovery_authority.validate_operator_command",
                    return_value=Path("/operator/memory-kms")):

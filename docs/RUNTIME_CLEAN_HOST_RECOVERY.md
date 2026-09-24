@@ -42,9 +42,10 @@ plane:
    key version without exposing key bytes.
 3. Before any rebind, verify the backup signature and contents against that
    independent authority, compare the external anchor with the restored audit
-   ledger, prove replay continuity, and verify the KMS challenge. Require an
-   explicit operator decision and fence the old host. Atomically compare the
-   old `storage-roots.json` identity before writing a new one, then sync the
+   ledger, prove replay continuity, verify the KMS challenge, and compare the
+   archived verifier keyring with the latest runtime-acknowledged checkpoint
+   from a separate recovery ledger. Require an explicit operator decision and
+   fence the old host. Atomically compare the old `storage-roots.json` identity before writing a new one, then sync the
    file and parent directory. Start the engine only after its own audit and
    memory checks pass, and record the decision outside the restored volume.
 

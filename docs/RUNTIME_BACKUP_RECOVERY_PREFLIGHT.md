@@ -16,6 +16,15 @@ preflight requires all of those fields and a private, immutable, verified HTTPS
 object receipt for the exact organization/deployment/backup scope. A copied
 local directory or a caller-provided manifest hash is not an authority.
 
+A separate keyring authority must return the **latest runtime-acknowledged
+verifier-keyring checkpoint** from a protected, monotonic ledger. It must update that
+ledger after every staged rotation/retirement/revocation is acknowledged by the
+runtime, independent of backup creation. The preflight compares the authenticated
+archived keyring's canonical document SHA-256 with the latest checkpoint; an
+older backup is rejected, even when its encrypted archive and original receipt
+are valid. A later recovery design would need separately authorized installation
+of the current keyring before using older data. This preflight never does that.
+
 Example invocation with **operator-provisioned** adapters (none are bundled):
 
 ```sh
@@ -25,6 +34,7 @@ python3 scripts/hosted/verify-runtime-backup.py \
   --archive-path /var/lib/tandem-recovery-input/archive.aead \
   --anchors-path /var/lib/tandem-recovery-input/anchors.aead \
   --recovery-authority-command /usr/local/libexec/tandem-recovery-authority \
+  --keyring-authority-command /usr/local/libexec/tandem-keyring-authority \
   --offsite-host private-backups.example \
   --backup-kms-command /usr/local/libexec/tandem-backup-kms \
   --backup-key-id projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key> \
@@ -32,7 +42,7 @@ python3 scripts/hosted/verify-runtime-backup.py \
   --memory-kms-command /usr/local/libexec/tandem-memory-recovery-challenge
 ```
 
-All three commands must be root-owned, root-only executables under ancestors a
+All four commands must be root-owned, root-only executables under ancestors a
 non-root user cannot replace. The recovery authority receives one JSON object
 on stdin with `schema_version: 1`, `operation: "authorize_recovery_preflight"`,
 and the three scoped UUIDs. It returns the
@@ -45,10 +55,22 @@ same scope, `schema_version: 1`, `manifest_object_key`, `manifest_sha256`,
 fence and authorization from an external record; echoing the request is not
 acceptable.
 
+The separately provisioned keyring authority receives `schema_version: 1`,
+`operation: "attest_latest_runtime_keyring"`, the three scoped UUIDs and this
+recovery `authorization_id` on stdin. It returns exactly those scope and
+identity fields, plus a positive `generation`, `document_sha256` (lowercase
+SHA-256 of the canonical scoped public keyring JSON),
+`runtime_acknowledged: true`, `old_host_fenced: true`, and `latest: true`.
+It must query a protected, monotonic ledger outside the old host, its backups,
+and the backup receipt store. A copied `context-keyring.json` or archive-time
+receipt cannot establish the latest generation. Advance this ledger only after
+a runtime reload acknowledgment for every keyring transition.
+
 The backup KMS receives `operation: "unwrap"`, its exact key ID and version,
 the three scoped UUIDs, and the encrypted `wrapped_dek_base64`; it returns
 the same key/scope plus `plaintext_dek_base64` (exactly 32 bytes). It must
 authorize unwrapping for that scope and must never log or persist the DEK.
+
 The memory KMS command receives `operation: "decrypt_recovery_challenge"`,
 the scoped UUIDs, the sealed memory KMS references, and the independent
 challenge ciphertext. It returns those same references and scope plus
@@ -64,7 +86,8 @@ deserializes a bounded replay SQLite database in memory to run integrity,
 pinned-schema, version, and row checks. The exact pinned engine uses SQLite
 DELETE journal mode, so an uncheckpointed replay WAL is rejected. The replay
 database is capped at 128 MiB; no plaintext archive file is staged on disk.
-The output is a non-secret preflight report.
+The output is a non-secret preflight report, including the independent keyring
+generation and document digest.
 
 This **does not prove** the external adapters are correctly implemented, the
 audit ledger's semantic HMAC chain, historical audit keys, replay continuity

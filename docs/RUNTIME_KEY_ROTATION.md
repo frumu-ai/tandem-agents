@@ -45,6 +45,13 @@ the replay store, issuer/audience, lifetime settings and other runtime services.
    reload and probes. New requests signed by the old key must fail; new-key
    requests and the unaffected user must succeed. Test again after restart.
 
+After each runtime-acknowledged overlap, retirement or revocation, advance the
+latest scoped public-keyring checkpoint in an independent, monotonic recovery
+ledger. Record the document SHA-256, a generation and the runtime reload
+receipt outside the host and its backups. The read-only v3 recovery preflight
+requires this externally attested checkpoint and rejects an older backup
+keyring, preventing a valid historical archive from reviving a retired key.
+
 Changing key material under an existing ID, extending its declared validity,
 dropping old metadata, or reactivating retired/revoked keys is rejected. Existing
 bootstrap uses the same transition checks, preventing a stale deployment update
