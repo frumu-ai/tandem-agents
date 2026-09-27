@@ -40,6 +40,7 @@ printf 'export HOSTED_CONTROL_PANEL_IMAGE=%q\n' "${HOSTED_CONTROL_PANEL_IMAGE:-$
 printf 'export HOSTED_PROXY_IMAGE=%q\n' "${HOSTED_PROXY_IMAGE:-$(hosted::image_ref tandem-proxy "$release_tag")}"
 printf 'export HOSTED_KB_IMAGE=%q\n' "${HOSTED_KB_IMAGE:-$(hosted::image_ref tandem-kb-mcp "$release_tag")}"
 printf 'export HOSTED_RUNTIME_SECURITY_VERSION=%q\n' "${HOSTED_RUNTIME_SECURITY_VERSION:-1}"
+printf 'export HOSTED_TANDEM_ENGINE_SOURCE_REVISION=%q\n' "${HOSTED_TANDEM_ENGINE_SOURCE_REVISION:-}"
 printf 'export HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION=%q\n' "${HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION:-3ee2d83d76497565680538ef00f1616f55650524}"
 printf 'export HOSTED_PLATFORM=%q\n' "${HOSTED_PLATFORM:-linux/amd64}"
 printf 'export HOSTED_DEFAULT_PROVIDER=%q\n' "${HOSTED_DEFAULT_PROVIDER:-openai}"

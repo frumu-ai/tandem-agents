@@ -7,7 +7,7 @@ import stat
 import tempfile
 from pathlib import Path
 
-from .contract import CONTRACT_VERSION, validate_keyring
+from .contract import validate_keyring
 
 
 def _plain_path(path):
@@ -59,7 +59,7 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
     """Called by authorized Linux bootstrap. Repeated calls preserve audit/replay state."""
     if os.name != "posix":
         raise ValueError("runtime security provisioning requires Linux")
-    if bundle.get("schema_version") != CONTRACT_VERSION:
+    if bundle.get("schema_version") not in (1, 2):
         raise ValueError("unsupported runtime security contract")
     validate_keyring(keyring, bundle["deployment_id"], bundle["organization_id"])
     uid, gid = bundle["uid"], bundle["gid"]
@@ -87,6 +87,16 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
     previous_mask = os.umask(0o077)
     try:
         security = _directory(paths["security"], uid, gid)
+        marker = security / ".initialized"
+        if marker.exists():
+            _check_file(marker, uid)
+            previous_version = marker.read_bytes()
+            if previous_version not in (b"runtime-security-v1\n", b"runtime-security-v2\n"):
+                raise ValueError("unknown initialized runtime security version")
+            if previous_version == b"runtime-security-v2\n" and bundle["schema_version"] != 2:
+                raise ValueError("runtime security downgrade would disable policy synchronization")
+        if bundle["schema_version"] == 2:
+            _directory(paths["policy"], uid, gid)
         replay = _directory(paths["replay"], uid, gid)
         anchor = _directory(paths["anchor"], uid, gid)
         panel_auth = _directory(paths["panel_auth"], uid, gid)
@@ -104,7 +114,7 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
         config = copy.deepcopy(panel_config or {"version": 1})
         config.setdefault("hosted", {}).update(bundle["panel_hosted"])
         _write(panel_auth / "control-panel-config.json", json.dumps(config).encode(), uid, gid)
-        _write(security / ".initialized", b"runtime-security-v1\n", uid, gid)
+        _write(marker, f"runtime-security-v{bundle['schema_version']}\n".encode(), uid, gid)
         # The engine must create the replay database; an empty placeholder is invalid.
     finally:
         os.umask(previous_mask)

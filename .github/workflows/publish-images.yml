@@ -227,7 +227,7 @@ jobs:
             },
             "published": true
           }
-JSON
+          JSON
 
           curl -fsS \
             -X POST "${TANDEM_WEB_BASE_URL%/}/api/v1/internal/hosted/releases" \

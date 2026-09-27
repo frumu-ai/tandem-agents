@@ -82,8 +82,13 @@ def validate_keyring(keyring, deployment_id, organization_id, audience="tandem-r
 
 def validate_release(values):
     """Validate immutable image inputs before advertising contract compatibility."""
-    if str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION)) != "1":
+    version = str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION))
+    if version not in ("1", "2"):
         raise ValueError("unsupported runtime security contract version")
+    if version == "2":
+        from .policy_contract import POLICY_ENGINE_REVISION
+        if values.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION") != POLICY_ENGINE_REVISION:
+            raise ValueError("runtime security v2 requires the tested policy-capable engine source revision")
     if values.get("HOSTED_PLATFORM", "linux/amd64") != "linux/amd64":
         raise ValueError("runtime security v1 supports linux/amd64 only")
     if values.get("HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION") != PANEL_REVISION:
@@ -145,7 +150,7 @@ def build_security_bundle(values):
     control_plane = _url(_required(values, "HOSTED_CONTROL_PLANE_URL"), "control plane URL")
     login_base = _url(values.get("HOSTED_LOGIN_BASE_URL", control_plane), "login base URL")
     public_url = _url(_required(values, "HOSTED_CONTROL_PANEL_PUBLIC_URL"), "panel public URL")
-    return {
+    bundle = {
         "schema_version": CONTRACT_VERSION, "profile": PROFILE, "platform": "linux/amd64",
         "engine_version": ENGINE_VERSION, "control_panel_version": ENGINE_VERSION,
         "control_panel_source_revision": PANEL_REVISION,
@@ -193,3 +198,7 @@ def build_security_bundle(values):
             },
         },
     }
+    if str(values.get("HOSTED_RUNTIME_SECURITY_VERSION", CONTRACT_VERSION)) == "2":
+        from .policy_contract import apply_policy_profile
+        return apply_policy_profile(bundle, values)
+    return bundle

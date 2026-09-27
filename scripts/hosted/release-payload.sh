@@ -71,9 +71,10 @@ payload = {
     "proxy_image_ref": os.environ["HOSTED_PROXY_IMAGE"],
     "kb_image_ref": os.environ["HOSTED_KB_IMAGE"],
     "manifest_json": {
-        "runtime_security_version": 1,
+        "runtime_security_version": int(os.environ.get("HOSTED_RUNTIME_SECURITY_VERSION", "1")),
+        "tandem_engine_source_revision": os.environ.get("HOSTED_TANDEM_ENGINE_SOURCE_REVISION"),
         "tandem_control_panel_source_revision": os.environ["HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION"],
-        "runtime_security_profile": "hosted-single-node-v1",
+        "runtime_security_profile": f"hosted-single-node-v{os.environ.get('HOSTED_RUNTIME_SECURITY_VERSION', '1')}",
         "platform": "linux/amd64",
         "release_version": os.environ["HOSTED_RELEASE_VERSION"],
         "release_tag": os.environ["HOSTED_RELEASE_TAG"],
