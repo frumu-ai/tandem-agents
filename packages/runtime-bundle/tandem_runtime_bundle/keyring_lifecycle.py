@@ -158,7 +158,7 @@ def main():
     try:
         bundle = parse_document(_operator_file(args.bundle, MAX_DOCUMENT_BYTES))
         proposed = parse_document(_operator_file(args.keyring, MAX_DOCUMENT_BYTES))
-        if bundle.get("schema_version") not in (1, 2):
+        if bundle.get("schema_version") not in (1, 2, 3):
             raise ValueError("unsupported runtime security contract")
         result = install_keyring(bundle, proposed, expected_fingerprint=args.expected, apply=args.apply)
     except (ValueError, OSError, KeyError, TypeError):

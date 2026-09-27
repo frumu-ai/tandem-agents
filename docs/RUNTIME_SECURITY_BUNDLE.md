@@ -110,3 +110,97 @@ isolation, membership removal, fresh identity after revision changes, restart,
 failed fetches, real wall-clock expiry and recovery. Registry projection is
 exercised through the existing enterprise HTTP APIs. This test does not publish
 an image or establish encrypted clean-host recovery or governed-memory privacy.
+
+## Encrypted hosted-memory profile v3
+
+The v3 profile retains the v2 policy, replay and audit protections and requires
+envelope encryption for hosted memory. Set `HOSTED_RUNTIME_SECURITY_VERSION=3`
+and pin `MEMORY_ENGINE_REVISION` from `policy_contract.py`. Its source includes
+the external KMS interface, hosted grant authority and encrypted global-record
+repair while the v2 source pin remains unchanged. Exact-source v3 integration
+and verified image evidence are still pending.
+Consumers must opt in to v3 and supply all of these non-secret references:
+
+- `HOSTED_MEMORY_ENCRYPTION_REQUIRED=true`
+- `HOSTED_MEMORY_KMS_PROVIDER=google_cloud_kms`
+- `HOSTED_MEMORY_KMS_RUNTIME_PRINCIPAL_ID`, scoped to the deployment ID
+- `HOSTED_MEMORY_KMS_ENCRYPT_COMMAND` and `HOSTED_MEMORY_KMS_DECRYPT_COMMAND`,
+  direct executable paths in the dedicated `/run/tandem-memory-kms` engine mount
+- `HOSTED_MEMORY_KMS_COMMAND_ROOT`, the independent host source for that mount
+- `HOSTED_MEMORY_KEK_ID`, `HOSTED_MEMORY_KEK_VERSION`, and
+  `HOSTED_MEMORY_KEK_ROTATION_EPOCH`
+
+Production v3 rendering and provisioning currently reject all images: the
+code-owned verified image digest map is empty. A separate release PR must add
+an independently verified digest built from `MEMORY_ENGINE_REVISION` before v3
+can be packaged or deployed. A caller-supplied source revision alone is not
+image provenance. The engine receives the corresponding `TANDEM_MEMORY_*`
+settings. The operator must preprovision the command root as root-owned,
+runtime-group-owned mode 0750, with direct regular single-link command files
+mode 0550 and no secret bytes in those executables. Its parent path must also
+prevent non-root replacement. Only the engine mounts this
+root, read-only; the shared `/run/secrets` mount remains separate. This bundle
+does not install KMS credentials or provision a KMS key.
+
+The host bootstrap creates and chowns the state and data roots before security
+provisioning. It never stages or chowns the dedicated KMS command root. No
+product container except the non-root engine mounts that root, and the engine's
+bind is read-only. The root-owned 0550 files cannot be changed by the engine's
+UID/GID through these product mounts.
+
+An initialized v1/v2 store cannot be relabeled v3 without an authorized memory
+migration. A new security root rejects existing engine state or workload data
+beyond the bootstrap panel config, and v3 binds the exact state/data directory
+identities on every repeated provision. V3 cannot be downgraded. The web
+host-agent adapter must add these values before it can consume v3.
+
+The `memory-engine` CI job builds the pinned source and runs a non-root process
+with a disposable external-command KMS. The test uses synthetic local-mode
+authorization only to isolate the crypto path; it does not establish hosted
+policy/grant behavior. The previous 0.7.2 source left a `/memory/put`
+global-record canary in `memory.sqlite-wal`. The pinned integration candidate
+seals global content, metadata and provenance in ordinary and atomic writes,
+and removes readable FTS tokens. Its exact-source DB, WAL, backup, cold-read
+and wrong/missing-key checks must pass before a source-built image can be
+reviewed. Indexed and structural columns remain plaintext, so this is not
+whole-store encryption. The empty trusted image map prevents v3 release. Live
+KMS, authorized encrypted migration, off-site backup, clean-host recovery, and
+hosted two-user privacy still require separate acceptance evidence.
+
+The image publisher has a distinct v3 lane. Manual publication runs only from
+`main`; tag pushes and other workflow refs cannot publish. Release registration
+uses the `hosted-release` environment, which operators must configure with
+required reviewers, main-only deployment protection and the publish token.
+Before any registry publication, operators must also create the
+`hosted-image-publish` environment with required reviewers, prevent self-review,
+restrict deployment branches to `main`, and set environment-only
+`HOSTED_IMAGE_PUBLISH_ARMED=true`, `HOSTED_IMAGE_PUBLISH_USERNAME`, and
+`HOSTED_IMAGE_PUBLISH_TOKEN` (a GHCR account credential with package-write
+access). An environment referenced only by a workflow is created without
+protection or secrets; this lane exits before login when those settings are
+absent. Keep the credential out of repository and organization secrets. Remove
+the Tandem Agents repository's inherited GHCR package-write/Actions access for
+every published package, and disable automatic permission inheritance for new
+packages before the first publish. Otherwise a branch-modified workflow can
+request its own package-write `GITHUB_TOKEN` and bypass this workflow's gate.
+Until the protected environment and granular package permissions are verified,
+do not arm this lane or publish images.
+For a `-v3` tag the workflow checks out the exact `MEMORY_ENGINE_REVISION`,
+rejects a dirty checkout and stages its tracked Git archive without the
+source repository's restrictive `.dockerignore` (which excludes Rust sources).
+It compiles the hosted enterprise engine with the release
+`browser,enterprise-full` features from that named context on the runtime libc
+baseline with BuildKit provenance, then reads the source marker and binary
+SHA-256 back from the published digest image. A
+versioned observation binds that source, binary, image, builder commit and run
+ID. The reviewed production allowlist must independently bind all three
+hashes: image digest, binary digest and canonical observation digest. Release
+registration requires the matching observation file and the code-owned
+allowlist entry. The map remains empty while integrated-engine and image proof
+are outstanding, so publishing a candidate image does not enable v3 deployment.
+The local `build-images.sh` v3 path can smoke-build an exact clean checkout but
+cannot push or register it; the published workflow owns the attested path.
+The v3 `aca-enterprise` image omits the legacy npm enterprise engine binary.
+ACA still runs in `reuse_only` mode against the separate digest-pinned engine
+container, and the publisher checks the ACA image for absence of that binary.
+The v1 ACA image retains its existing npm package behavior.

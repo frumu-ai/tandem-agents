@@ -55,8 +55,19 @@ import json
 import os
 import sys
 from tandem_runtime_bundle.contract import validate_release
+from tandem_runtime_bundle.engine_image_attestation import load_attestation
 
-validate_release(os.environ)
+images = validate_release(os.environ)
+attestation = None
+if os.environ.get("HOSTED_RUNTIME_SECURITY_VERSION", "1") == "3":
+    source = os.environ.get("HOSTED_ENGINE_ATTESTATION_FILE")
+    if not source:
+        raise ValueError("v3 release publication requires the engine attestation file")
+    attestation, digest = load_attestation(
+        source, images["engine"], os.environ["HOSTED_TANDEM_ENGINE_SOURCE_REVISION"])
+    if (digest != os.environ["HOSTED_ENGINE_ATTESTATION_SHA256"]
+            or attestation["engine_binary_sha256"] != os.environ["HOSTED_ENGINE_BINARY_SHA256"]):
+        raise ValueError("v3 release attestation does not match the approved engine provenance")
 
 channel = sys.argv[1].strip()
 published = sys.argv[2].strip().lower() == "true"
@@ -87,12 +98,23 @@ payload = {
         "tandem_control_panel_release_version": os.environ["HOSTED_TANDEM_CONTROL_PANEL_RELEASE_VERSION"],
         "public_engine_image_ref": os.environ.get("HOSTED_PUBLIC_ENGINE_IMAGE"),
         "public_aca_image_ref": os.environ.get("HOSTED_PUBLIC_ACA_IMAGE"),
-        "hosted_engine_package": "@frumu/tandem-enterprise",
+        "hosted_engine_package": (
+            "source-built" if attestation is not None else "@frumu/tandem-enterprise"
+        ),
         "public_engine_package": "@frumu/tandem",
     },
     "release_notes": release_notes or None,
     "published": published,
 }
+if attestation is not None:
+    payload["manifest_json"]["engine_provenance"] = {
+        "source_revision": attestation["engine_source_revision"],
+        "binary_sha256": attestation["engine_binary_sha256"],
+        "image_ref": attestation["engine_image_ref"],
+        "attestation_sha256": digest,
+        "builder_revision": attestation["builder_revision"],
+        "workflow_run_id": attestation["workflow_run_id"],
+    }
 
 print(json.dumps(payload, indent=2))
 PY

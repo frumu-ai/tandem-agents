@@ -53,9 +53,12 @@ class Engine:
         translations = {"/run/tandem-security": paths["security"],
                         "/var/lib/tandem-replay": paths["replay"],
                         "/var/lib/tandem-audit": paths["anchor"],
+                        "/run/secrets": bundle["ordinary_paths"]["SECRETS"],
                         "/home/node/.local/share/tandem": paths["state"]}
         if "policy" in paths:
             translations["/run/tandem-hosted-policy"] = paths["policy"]
+        if "memory_kms_commands" in paths:
+            translations["/run/tandem-memory-kms"] = paths["memory_kms_commands"]
         for name, value in bundle["engine_environment"].items():
             for container, host in translations.items():
                 value = value.replace(container, host)
