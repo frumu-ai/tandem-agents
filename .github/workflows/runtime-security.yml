@@ -46,6 +46,8 @@ jobs:
           python -m unittest discover -s packages/runtime-bundle/tests -p 'test_*.py' -v
       - name: Policy service Linux ownership and atomic TLS snapshots
         run: sudo env PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" -m unittest discover -s packages/runtime-bundle/tests -p 'test_policy_provision.py' -v
+      - name: Recovery preflight Linux root operator paths
+        run: sudo env PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" -m unittest discover -s packages/runtime-bundle/tests -p 'test_backup_verify.py' -v
       - name: Verify released v1 engine artifact
         run: |
           mkdir -p "$RUNNER_TEMP/tandem-security-engine"

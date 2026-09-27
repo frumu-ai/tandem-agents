@@ -25,8 +25,9 @@ off-site, independently authenticated backup. A v3 backup/restore procedure
 must be a separate path, not an extension that enables the legacy archive.
 
 An export-only operator candidate is described in
-`RUNTIME_BACKUP_EXPORT.md`. It does not enable hosted jobs or any rebind. The
-remaining backup integration belongs in tandem-web's host-agent and control
+`RUNTIME_BACKUP_EXPORT.md`. A read-only encrypted recovery preflight candidate
+is described in `RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md`. Neither enables hosted
+jobs, extraction, or any rebind. The remaining backup integration belongs in tandem-web's host-agent and control
 plane:
 
 1. Quiesce writes and policy synchronization, then capture a consistent set of
