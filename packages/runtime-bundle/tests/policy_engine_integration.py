@@ -27,7 +27,7 @@ from policy_tls_fixture import tls_endpoint
 TOKEN = "synthetic-policy-agent-token-" + "p" * 48
 
 
-def assertion(key, actor, version, assertion_id):
+def assertion(key, actor, version, assertion_id, *, role="member"):
     now = int(time.time() * 1000)
     principal = {"actor_id": actor, "source": "tandem-web"}
     claims = {"version": "v1", "issuer": "tandem-web", "audience": "tandem-runtime",
@@ -36,7 +36,9 @@ def assertion(key, actor, version, assertion_id):
             "deployment_id": DEPLOYMENT, "actor_id": actor, "source": "explicit"},
         "human_actor": {"actor_id": actor, "provider": "tandem"},
         "authority_chain": {"initiated_by": principal, "executed_as": {"kind": "request", **principal}},
-        "roles": ["hosted:role:member"], "capabilities": ["hosted.use"], "policy_version": version,
+        "roles": [f"hosted:role:{role}"],
+        "capabilities": ["hosted.use", "hosted.admin"] if role == "admin" else ["hosted.use"],
+        "policy_version": version,
         "org_units": ["eng" if actor == "alice" else "ops"]}
     header = {"alg": "EdDSA", "typ": "tandem-tenant-context+jws", "kid": "test-key"}
     content = ".".join(encode(json.dumps(value, separators=(",", ":")).encode()) for value in (header, claims))

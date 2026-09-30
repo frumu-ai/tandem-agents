@@ -1,0 +1,528 @@
+"""Disposable Linux preflight checks for encrypted v3 export artifacts."""
+
+import base64
+from contextlib import closing
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import tempfile
+import sys
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from fixtures import DEPLOYMENT, ORGANIZATION, keyring
+import test_backup_export
+from tandem_runtime_bundle.backup_archive import canonical_json
+from tandem_runtime_bundle import backup_export
+from tandem_runtime_bundle.backup_source import _check_source
+from tandem_runtime_bundle.keyring_lifecycle import fingerprint
+from tandem_runtime_bundle.backup_commands import BackupKms, validate_operator_command
+from tandem_runtime_bundle.backup_recovery_authority import (
+    LatestKeyringAuthority, MemoryKmsChallenge, RecoveryAuthority)
+from tandem_runtime_bundle.backup_verify import (
+    _ENTRIES_SQL, _INDEX_SQL, _METADATA_SQL, verify_recovery_candidate)
+
+
+class RecoveryKms(test_backup_export.FakeKms):
+    def unwrap(self, wrapped, scope):
+        if scope != self.scope or wrapped != base64.b64encode(
+                b"wrapped-by-test-authority-" + b"x" * 48).decode():
+            raise ValueError("wrong recovery KMS scope")
+        return self.dek
+
+
+class FakeRecoveryAuthority:
+    def __init__(self, receipt):
+        self.receipt = receipt
+
+    def attest(self, scope):
+        if any(self.receipt[key] != value for key, value in scope.items()):
+            raise ValueError("wrong independent scope")
+        return self.receipt
+
+
+class FakeKeyringAuthority:
+    def __init__(self, checkpoint):
+        self.checkpoint = checkpoint
+
+    def attest(self, scope, authorization_id):
+        if (any(self.checkpoint[field] != scope[field] for field in scope)
+                or self.checkpoint["authorization_id"] != authorization_id):
+            raise ValueError("wrong latest keyring authority scope")
+        return self.checkpoint
+
+
+class FakeMemoryKms:
+    def verify(self, scope, memory, challenge):
+        if memory["kek_id"] != ("projects/test/locations/global/"
+                                "keyRings/memory/cryptoKeys/hosted"):
+            raise ValueError("wrong memory KMS key")
+        if challenge["plaintext_sha256"] != hashlib.sha256(b"m" * 32).hexdigest():
+            raise ValueError("wrong memory KMS challenge")
+
+
+class RecoveryPreflightTests(unittest.TestCase):
+    def setUp(self):
+        test_backup_export.BackupExportTests.setUp(self)
+        self.kms = RecoveryKms()
+        self.db.close()
+        replay = Path(self.bundle["host_paths"]["replay"]) / "assertions.sqlite3"
+        for suffix in ("", "-wal", "-shm"):
+            (Path(str(replay) + suffix)).unlink(missing_ok=True)
+        self.db = sqlite3.connect(replay)
+        self.addCleanup(self.db.close)
+        self.db.execute("PRAGMA journal_mode=DELETE")
+        self.db.execute(_METADATA_SQL)
+        self.db.execute(_ENTRIES_SQL)
+        self.db.execute(_INDEX_SQL)
+        self.db.execute("INSERT INTO replay_metadata VALUES (1, 1)")
+        self.db.execute("INSERT INTO replay_entries VALUES (?, ?, ?, ?)",
+                        ("a" * 64, "b" * 64, "c" * 64, 9999999999999))
+        self.db.commit()
+        result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in (
+            "backup_id", "organization_id", "deployment_id")}
+        base = self.install.parent / "download"
+        base.mkdir()
+        self.paths = {}
+        for key, payload in self.uploader.objects.items():
+            path = base / key.rsplit("/", 1)[-1]
+            path.write_bytes(payload)
+            self.paths[path.name] = path
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt = {
+            **self.scope,
+            "manifest_object_key": self.uploader.order[-1],
+            "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            "manifest_size": len(manifest),
+            "archive_sha256": commit["objects"]["archive"]["sha256"],
+            "anchors_sha256": commit["objects"]["anchors"]["sha256"],
+            "memory_challenge": {
+                "ciphertext_base64": base64.b64encode(b"c" * 64).decode(),
+                "plaintext_sha256": hashlib.sha256(b"m" * 32).hexdigest(),
+            },
+            "authorization_id": "test-operator-authorization",
+            "old_host_fenced": True, "operator_authorized": True,
+            "private": True, "immutable": True, "verified": True,
+            "remote_uri": "https://private-backups.example/" + self.uploader.order[-1],
+            "schema_version": 1,
+        }
+        self.checkpoint = {
+            "schema_version": 1, "backup_id": self.scope["backup_id"],
+            "organization_id": self.scope["organization_id"],
+            "deployment_id": self.scope["deployment_id"],
+            "authorization_id": self.receipt["authorization_id"],
+            "generation": 1, "document_sha256": fingerprint(keyring()),
+            "runtime_acknowledged": True, "old_host_fenced": True,
+            "latest": True,
+        }
+
+    def verify(self, receipt=None, checkpoint=None):
+        return verify_recovery_candidate(
+            self.paths["manifest.json"], self.paths["archive.aead"],
+            self.paths["anchors.aead"], self.scope,
+            FakeRecoveryAuthority(receipt or self.receipt),
+            FakeKeyringAuthority(checkpoint or self.checkpoint),
+            self.kms, FakeMemoryKms())
+
+    def reexport_control(self, path, value, *, unchecked=False):
+        # Model an independently receipted artifact from another exporter.
+        # Only the producer's source checks are bypassed for malformed controls;
+        # encryption, sealed inventory, hashes and the recovery verifier are real.
+        prior = _check_source(self.install, strict_host=False)
+        if path.name == "current.json":
+            prior = (*prior[:3], value, prior[4])
+        path.write_text(json.dumps(value))
+        self.uploader.objects.clear()
+        self.uploader.order.clear()
+        if unchecked:
+            with patch.object(backup_export, "_check_source", return_value=prior):
+                result = test_backup_export.BackupExportTests.export(self)
+        else:
+            result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
+        for key, payload in self.uploader.objects.items():
+            self.paths[key.rsplit("/", 1)[-1]].write_bytes(payload)
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt.update(
+            **self.scope, manifest_object_key=self.uploader.order[-1],
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            manifest_size=len(manifest),
+            archive_sha256=commit["objects"]["archive"]["sha256"],
+            anchors_sha256=commit["objects"]["anchors"]["sha256"])
+
+    def test_exported_engine_keyring_metadata_remains_recoverable(self):
+        document = keyring()
+        document["test-key"]["operator_metadata"] = "m" * (257 * 1024)
+        self.reexport_control(Path(self.bundle["host_paths"]["security"]) /
+                              "context-keyring.json", document)
+        self.checkpoint["document_sha256"] = fingerprint(document)
+        self.assertEqual(self.verify()["keyring_document_sha256"], fingerprint(document))
+        with self.assertRaisesRegex(ValueError, "independent latest authority"):
+            self.verify(checkpoint={**self.checkpoint, "document_sha256": "0" * 64})
+
+    def test_authenticated_captured_configuration_must_mount_sealed_roots(self):
+        original = json.loads((self.install / "runtime-security.json").read_text())
+        for section, name in (("host_paths", "state"), ("host_paths", "replay"),
+                              ("host_paths", "anchor"), ("ordinary_paths", "DATA")):
+            altered = json.loads(json.dumps(original))
+            altered[section][name] += "-uncaptured"
+            self.reexport_control(self.install / "runtime-security.json", altered,
+                                  unchecked=True)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "inventory roots differ"):
+                self.verify()
+            (self.install / "runtime-security.json").write_text(json.dumps(original))
+
+    def test_authenticated_policy_requires_schema_and_positive_integer_version(self):
+        path = Path(self.bundle["host_paths"]["policy"]) / "current.json"
+        original = json.loads(path.read_text())
+        for schema, version in ((None, 7), (True, 7), (1, 0), (1, True), (1, "7")):
+            altered = {**original, "schema_version": schema, "policy_version": version}
+            # The sealed inventory intentionally repeats the malformed version.
+            self.reexport_control(path, altered, unchecked=True)
+            with self.subTest(schema=schema, version=version), self.assertRaisesRegex(
+                    ValueError, "recovery controls differ"):
+                self.verify()
+            path.write_text(json.dumps(original))
+
+    def test_candidate_reusing_backup_key_for_memory_is_rejected(self):
+        commit = json.loads(self.paths["manifest.json"].read_bytes())
+        outer = {key: value for key, value in commit.items()
+                 if key not in ("manifest_nonce_base64", "manifest_ciphertext_base64")}
+        nonce = base64.b64decode(commit["manifest_nonce_base64"])
+        inner = AESGCM(self.kms.dek).decrypt(
+            nonce, base64.b64decode(commit["manifest_ciphertext_base64"]), canonical_json(outer))
+        key_id = self.bundle["memory_encryption"]["kek_id"]
+        key_version = key_id + "/cryptoKeyVersions/1"
+        outer["backup_kms"] = {**outer["backup_kms"], "key_id": key_id,
+                               "key_version": key_version}
+        commit.update(outer)
+        commit["manifest_ciphertext_base64"] = base64.b64encode(
+            AESGCM(self.kms.dek).encrypt(nonce, inner, canonical_json(outer))).decode()
+        manifest = canonical_json(commit)
+        self.paths["manifest.json"].write_bytes(manifest)
+        self.receipt.update(manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+                            manifest_size=len(manifest))
+        with (patch.object(self.kms, "key_id", key_id),
+              patch.object(self.kms, "key_version", key_version),
+              patch.object(FakeMemoryKms, "verify") as challenge):
+            with self.assertRaisesRegex(ValueError, "must be separate"):
+                self.verify()
+            challenge.assert_not_called()
+
+    def test_verified_archive_replay_anchor_and_binding_are_read_only(self):
+        original = (Path(self.bundle["host_paths"]["security"]) /
+                    "storage-roots.json").read_bytes()
+        report = self.verify()
+        self.assertEqual(report["verdict"], "verified_read_only_preflight")
+        self.assertEqual(report["replay_entries"], 1)
+        self.assertGreaterEqual(report["anchor_members"], 2)
+        self.assertEqual((Path(self.bundle["host_paths"]["security"]) /
+                          "storage-roots.json").read_bytes(), original)
+
+    def test_newer_retirement_checkpoint_rejects_stale_backup_keyring(self):
+        later = keyring()
+        later["test-key"]["status"] = "retired"
+        later["next-key"] = {
+            **later["test-key"], "public_key": base64.b64encode(b"n" * 32).decode(),
+            "status": "active",
+        }
+        checkpoint = {**self.checkpoint, "generation": 2,
+                      "document_sha256": fingerprint(later)}
+        with self.assertRaisesRegex(ValueError, "differs from independent latest authority"):
+            self.verify(checkpoint=checkpoint)
+        self.assertEqual(self.verify()["keyring_generation"], 1)
+        self.assertEqual(self.verify()["keyring_document_sha256"],
+                         fingerprint(keyring()))
+
+    def test_missing_or_changed_independent_receipt_fails(self):
+        for key, value in (
+                ("manifest_sha256", "0" * 64), ("archive_sha256", "0" * 64),
+                ("anchors_sha256", "0" * 64)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.verify({**self.receipt, key: value})
+
+    def test_ciphertext_tamper_or_missing_anchor_fails(self):
+        for name in ("archive.aead", "anchors.aead"):
+            path = self.paths[name]
+            original = path.read_bytes()
+            try:
+                changed = bytearray(original)
+                changed[-1] ^= 1
+                path.write_bytes(changed)
+                with self.subTest(name=name), self.assertRaises(Exception):
+                    self.verify()
+            finally:
+                path.write_bytes(original)
+        self.paths["anchors.aead"].unlink()
+        with self.assertRaises(OSError):
+            self.verify()
+
+    def test_wrong_kms_scope_and_wrong_challenge_fail(self):
+        original = self.kms.scope
+        self.kms.scope = {**self.scope, "deployment_id": ORGANIZATION}
+        try:
+            with self.assertRaisesRegex(ValueError, "scope"):
+                self.verify()
+        finally:
+            self.kms.scope = original
+        bad = json.loads(json.dumps(self.receipt))
+        bad["memory_challenge"]["plaintext_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "challenge"):
+            self.verify(bad)
+
+    def test_empty_sealed_memory_kms_rejects_before_challenge(self):
+        commit = json.loads(self.paths["manifest.json"].read_bytes())
+        outer = {key: value for key, value in commit.items()
+                 if key not in ("manifest_nonce_base64", "manifest_ciphertext_base64")}
+        nonce = base64.b64decode(commit["manifest_nonce_base64"])
+        inner = json.loads(AESGCM(self.kms.dek).decrypt(
+            nonce, base64.b64decode(commit["manifest_ciphertext_base64"]),
+            canonical_json(outer)))
+        inner["memory_kms"] = {}
+        commit["manifest_ciphertext_base64"] = base64.b64encode(
+            AESGCM(self.kms.dek).encrypt(nonce, canonical_json(inner),
+                                         canonical_json(outer))).decode()
+        manifest = canonical_json(commit)
+        self.paths["manifest.json"].write_bytes(manifest)
+        self.receipt["manifest_sha256"] = hashlib.sha256(manifest).hexdigest()
+        self.receipt["manifest_size"] = len(manifest)
+        with self.assertRaisesRegex(ValueError, "memory KMS references"):
+            self.verify()
+
+    def test_uncheckpointed_replay_wal_rejected(self):
+        self.db.close()
+        replay = Path(self.bundle["host_paths"]["replay"]) / "assertions.sqlite3"
+        self.db = sqlite3.connect(replay)
+        self.addCleanup(self.db.close)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("INSERT INTO replay_entries VALUES (?, ?, ?, ?)",
+                        ("d" * 64, "e" * 64, "f" * 64, 9999999999999))
+        self.db.commit()
+        self.assertTrue(Path(str(replay) + "-wal").exists())
+        self.uploader.objects.clear()
+        self.uploader.order.clear()
+        result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
+        for key, payload in self.uploader.objects.items():
+            (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt.update(
+            **self.scope,
+            manifest_object_key=self.uploader.order[-1],
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            manifest_size=len(manifest),
+            archive_sha256=commit["objects"]["archive"]["sha256"],
+            anchors_sha256=commit["objects"]["anchors"]["sha256"])
+        with self.assertRaisesRegex(ValueError, "uncheckpointed WAL"):
+            self.verify()
+
+    def test_invalid_replay_schema_inside_valid_export_fails(self):
+        # The exporter checks the SQLite header; the recovery preflight also
+        # demands the exact pinned engine schema and version.
+        self.db.close()
+        replay = Path(self.bundle["host_paths"]["replay"]) / "assertions.sqlite3"
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(replay) + suffix).unlink(missing_ok=True)
+        with closing(sqlite3.connect(replay)) as wrong:
+            wrong.execute("CREATE TABLE replay(token TEXT)")
+        self.uploader.objects.clear()
+        self.uploader.order.clear()
+        result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
+        for key, payload in self.uploader.objects.items():
+            (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt.update(
+            **self.scope,
+            manifest_object_key=self.uploader.order[-1],
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            manifest_size=len(manifest),
+            archive_sha256=commit["objects"]["archive"]["sha256"],
+            anchors_sha256=commit["objects"]["anchors"]["sha256"])
+        with self.assertRaisesRegex(ValueError, "replay schema"):
+            self.verify()
+
+    def test_replay_namespace_above_pinned_engine_limit_fails(self):
+        # The engine rejects this database at startup even though its SQLite
+        # schema and total row count are valid. The preflight must agree.
+        self.db.executemany(
+            "INSERT INTO replay_entries VALUES (?, ?, ?, ?)",
+            ((f"{index:064x}", "b" * 64, "c" * 64, 9999999999999)
+             for index in range(10000)),
+        )
+        self.db.commit()
+        self.uploader.objects.clear()
+        self.uploader.order.clear()
+        result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
+        for key, payload in self.uploader.objects.items():
+            (self.paths["manifest.json"].parent / key.rsplit("/", 1)[-1]).write_bytes(payload)
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt.update(
+            **self.scope,
+            manifest_object_key=self.uploader.order[-1],
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            manifest_size=len(manifest),
+            archive_sha256=commit["objects"]["archive"]["sha256"],
+            anchors_sha256=commit["objects"]["anchors"]["sha256"],
+        )
+        with self.assertRaisesRegex(ValueError, "replay rows"):
+            self.verify()
+
+
+class AuthorityProtocolTests(unittest.TestCase):
+    def test_replay_without_sqlite_deserialize_has_explicit_requirement_error(self):
+        from tandem_runtime_bundle.backup_verify import _replay
+        with patch("tandem_runtime_bundle.backup_verify.sqlite3.connect",
+                   return_value=SimpleNamespace(close=lambda: None)):
+            with self.assertRaisesRegex(ValueError, "Python 3.11"):
+                _replay(b"SQLite format 3\x00")
+
+    def test_unwrap_requires_exact_key_scope(self):
+        with patch("tandem_runtime_bundle.backup_commands.validate_operator_command",
+                   return_value=Path("/operator/kms")):
+            kms = BackupKms("/operator/kms", test_backup_export.FakeKms.key_id, test_backup_export.FakeKms.key_version)
+        scope = {"backup_id": DEPLOYMENT, "organization_id": ORGANIZATION,
+                 "deployment_id": DEPLOYMENT}
+        with patch("tandem_runtime_bundle.backup_commands.call_command", return_value={
+            "schema_version": 1, "key_id": test_backup_export.FakeKms.key_id,
+            "key_version": test_backup_export.FakeKms.key_version, **scope,
+            "plaintext_dek_base64": base64.b64encode(b"x" * 32).decode(),
+        }):
+            self.assertEqual(kms.unwrap(base64.b64encode(b"w" * 64).decode(), scope),
+                             b"x" * 32)
+        with patch("tandem_runtime_bundle.backup_commands.call_command", return_value={
+            "schema_version": 1, "key_id": test_backup_export.FakeKms.key_id,
+            "key_version": test_backup_export.FakeKms.key_version,
+            "plaintext_dek_base64": base64.b64encode(b"x" * 32).decode(),
+        }):
+            with self.assertRaisesRegex(ValueError, "scope"):
+                kms.unwrap(base64.b64encode(b"w" * 64).decode(), scope)
+
+    def test_receipt_requires_fence_and_memory_challenge(self):
+        scope = {"backup_id": DEPLOYMENT, "organization_id": ORGANIZATION,
+                 "deployment_id": DEPLOYMENT}
+        with patch("tandem_runtime_bundle.backup_recovery_authority.validate_operator_command",
+                   return_value=Path("/operator/authority")):
+            authority = RecoveryAuthority("/operator/authority", "private-backups.example")
+        receipt = {
+            "schema_version": 1, **scope,
+            "manifest_object_key": "v3/" + ORGANIZATION + "/" + DEPLOYMENT + "/" +
+                                   DEPLOYMENT + "/manifest.json",
+            "manifest_sha256": "a" * 64, "archive_sha256": "b" * 64,
+            "anchors_sha256": "c" * 64, "manifest_size": 100,
+            "private": True, "immutable": True, "verified": True,
+            "old_host_fenced": True, "operator_authorized": True,
+            "authorization_id": "test-authority-1",
+            "remote_uri": "https://private-backups.example/v3/" + ORGANIZATION +
+                          "/" + DEPLOYMENT + "/" + DEPLOYMENT + "/manifest.json",
+            "memory_challenge": {
+                "ciphertext_base64": base64.b64encode(b"c" * 64).decode(),
+                "plaintext_sha256": "d" * 64},
+        }
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value=receipt):
+            self.assertEqual(authority.attest(scope), receipt)
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value={**receipt, "old_host_fenced": False}):
+            with self.assertRaisesRegex(ValueError, "fenced scope"):
+                authority.attest(scope)
+
+    def test_latest_keyring_authority_requires_scope_fence_and_acknowledgment(self):
+        scope = {"backup_id": DEPLOYMENT, "organization_id": ORGANIZATION,
+                 "deployment_id": DEPLOYMENT}
+        authorization_id = "test-authority-1"
+        checkpoint = {
+            "schema_version": 1, **scope,
+            "authorization_id": authorization_id, "generation": 1,
+            "document_sha256": fingerprint(keyring()),
+            "runtime_acknowledged": True, "old_host_fenced": True,
+            "latest": True,
+        }
+        with patch("tandem_runtime_bundle.backup_recovery_authority.validate_operator_command",
+                   return_value=Path("/operator/keyring-authority")):
+            authority = LatestKeyringAuthority("/operator/keyring-authority")
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value=checkpoint) as call:
+            self.assertEqual(authority.attest(scope, authorization_id), checkpoint)
+            self.assertEqual(call.call_args.args[1]["operation"],
+                             "attest_latest_runtime_keyring")
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value={key: value for key, value in checkpoint.items()
+                                 if key != "document_sha256"}):
+            with self.assertRaisesRegex(ValueError, "latest keyring authority"):
+                authority.attest(scope, authorization_id)
+        for field, value in (
+                ("backup_id", ORGANIZATION), ("organization_id", DEPLOYMENT),
+                ("deployment_id", ORGANIZATION),
+                ("authorization_id", "another-authorization"),
+                ("generation", True), ("generation", 0),
+                ("document_sha256", "not-a-digest"),
+                ("runtime_acknowledged", False),
+                ("old_host_fenced", False), ("latest", False)):
+            with self.subTest(field=field, value=value):
+                with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                           return_value={**checkpoint, field: value}):
+                    with self.assertRaisesRegex(ValueError, "latest keyring authority"):
+                        authority.attest(scope, authorization_id)
+    def test_memory_challenge_requires_exact_digest(self):
+        with patch("tandem_runtime_bundle.backup_recovery_authority.validate_operator_command",
+                   return_value=Path("/operator/memory-kms")):
+            verifier = MemoryKmsChallenge("/operator/memory-kms")
+        scope = {"backup_id": DEPLOYMENT, "organization_id": ORGANIZATION,
+                 "deployment_id": DEPLOYMENT}
+        memory = {"provider": "google_cloud_kms", "runtime_principal_id": "runtime:" + DEPLOYMENT,
+                  "kek_id": "projects/test/locations/global/keyRings/memory/cryptoKeys/hosted",
+                  "kek_version": "1", "rotation_epoch": 0}
+        challenge = {"ciphertext_base64": base64.b64encode(b"c" * 64).decode(),
+                     "plaintext_sha256": hashlib.sha256(b"x" * 32).hexdigest()}
+        response = {"schema_version": 1, **scope, **memory,
+                    "plaintext_base64": base64.b64encode(b"x" * 32).decode()}
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value=response):
+            verifier.verify(scope, memory, challenge)
+        with patch("tandem_runtime_bundle.backup_recovery_authority.call_command",
+                   return_value={**response, "plaintext_base64":
+                                 base64.b64encode(b"y" * 32).decode()}):
+            with self.assertRaisesRegex(ValueError, "challenge"):
+                verifier.verify(scope, memory, challenge)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and os.geteuid() == 0,
+                     "requires a disposable Linux root operator")
+class OperatorPathTests(unittest.TestCase):
+    def test_root_only_command_and_ancestors(self):
+        with tempfile.TemporaryDirectory(prefix="tandem-recovery-command-") as temporary:
+            root = Path(temporary)
+            command = root / "authority"
+            command.write_text("#!/bin/sh\nexit 0\n")
+            command.chmod(0o500)
+            self.assertEqual(validate_operator_command(command), command)
+            command.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "root-only"):
+                validate_operator_command(command)
+            command.chmod(0o500)
+            root.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "ancestors"):
+                validate_operator_command(command)
+            root.chmod(0o700)
+
+
+if __name__ == "__main__":
+    unittest.main()

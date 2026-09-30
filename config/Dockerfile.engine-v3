@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.7
+
+# The named context is an exact Tandem checkout verified by the publisher.
+# Compile on bookworm so the binary uses the runtime image's libc baseline.
+FROM rust:1.98.0-bookworm AS engine-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang cmake libssl-dev pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=tandem-source / /src
+WORKDIR /src
+RUN cargo build --release --locked -p tandem-ai --features browser,enterprise-full --bin tandem-engine
+
+FROM node:20-bookworm-slim
+ARG HOST_UID=1000
+ARG HOST_GID=1000
+ARG TANDEM_ENGINE_SOURCE_REVISION
+ARG VERSION=dev
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NPM_CONFIG_PREFIX=/home/node/npm \
+    npm_config_update_notifier=false \
+    PATH="/home/node/npm/bin:${PATH}" \
+    TANDEM_BROWSER_EXECUTABLE=/usr/bin/chromium
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash ca-certificates curl chromium libssl3 \
+  && rm -rf /var/lib/apt/lists/*
+
+# Keep the existing wrapper path while excluding the 0.7.2 npm engine package.
+COPY --from=engine-build --chmod=0755 /src/target/release/tandem-engine /home/node/npm/bin/tandem-engine
+RUN mkdir -p /usr/share/tandem /home/node/.local/share/tandem /workspace/tandem-data \
+  && sha256sum /home/node/npm/bin/tandem-engine | cut -d' ' -f1 > /usr/share/tandem/engine-binary.sha256 \
+  && test -n "$TANDEM_ENGINE_SOURCE_REVISION" \
+  && printf '%s\n' "$TANDEM_ENGINE_SOURCE_REVISION" > /usr/share/tandem/engine-source-revision \
+  && chown -R node:node /home/node/.local/share/tandem /workspace/tandem-data
+
+COPY --chown=${HOST_UID}:${HOST_GID} scripts/tandem-engine-serve.sh /usr/local/bin/tandem-engine-serve.sh
+COPY --chown=${HOST_UID}:${HOST_GID} scripts/tandem-mcp-bootstrap.js /usr/local/lib/tandem-mcp-bootstrap.js
+RUN chmod +x /usr/local/bin/tandem-engine-serve.sh
+COPY LICENSE /LICENSE
+COPY NOTICE /NOTICE
+
+LABEL org.opencontainers.image.title="Tandem Engine" \
+      org.opencontainers.image.description="Source-built enterprise Tandem engine sidecar" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      ac.tandem.engine.source-revision="${TANDEM_ENGINE_SOURCE_REVISION}"
+
+EXPOSE 39733
+CMD ["/usr/local/bin/tandem-engine-serve.sh"]

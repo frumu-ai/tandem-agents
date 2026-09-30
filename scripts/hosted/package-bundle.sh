@@ -121,16 +121,17 @@ set +a
 python3 "${SCRIPT_DIR}/runtime-security.py" render --output "${bundle_dir}/runtime-security.json"
 "${SCRIPT_DIR}/release-manifest.sh" > "${bundle_dir}/release-manifest.env"
 
-python3 - "${bundle_dir}/release-manifest.json" <<'PY'
+python3 - "${bundle_dir}/release-manifest.json" "${bundle_dir}/runtime-security.json" <<'PY'
 import json
 import os
 import sys
 
 target = sys.argv[1]
+runtime_security = json.load(open(sys.argv[2], encoding="utf-8"))
 data = {
-    "runtime_security_version": 1,
+    "runtime_security_version": int(os.environ["HOSTED_RUNTIME_SECURITY_VERSION"]),
     "tandem_control_panel_source_revision": os.environ["HOSTED_TANDEM_CONTROL_PANEL_SOURCE_REVISION"],
-    "runtime_security_profile": "hosted-single-node-v1",
+    "runtime_security_profile": f"hosted-single-node-v{os.environ['HOSTED_RUNTIME_SECURITY_VERSION']}",
     "platform": "linux/amd64",
     "release_tag": os.environ["HOSTED_RELEASE_TAG"],
     "git_sha": os.environ["HOSTED_GIT_SHA"],
@@ -159,6 +160,8 @@ data = {
     "bundle_archive": os.environ.get("HOSTED_BUNDLE_ARCHIVE", ""),
     "public_url": os.environ.get("HOSTED_CONTROL_PANEL_PUBLIC_URL", ""),
 }
+if runtime_security["schema_version"] == 3:
+    data["engine_provenance"] = runtime_security["engine_provenance"]
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(data, handle, indent=2)
     handle.write("\n")
@@ -188,6 +191,7 @@ stage_exec "${SCRIPT_DIR}/host-hardening.sh" "${bundle_dir}/host-hardening.sh"
 stage_exec "${SCRIPT_DIR}/release-manifest.sh" "${bundle_dir}/release-manifest.sh"
 stage_copy "${SCRIPT_DIR}/lib.sh" "${bundle_dir}/lib.sh"
 stage_exec "${SCRIPT_DIR}/runtime-security.py" "${bundle_dir}/runtime-security.py"
+stage_exec "${SCRIPT_DIR}/export-runtime-backup.py" "${bundle_dir}/export-runtime-backup.py"
 stage_copy "${SCRIPT_DIR}/compose.py" "${bundle_dir}/compose.py"
 mkdir -p "${bundle_dir}/tandem_runtime_bundle"
 for module in "${SCRIPT_DIR}/../../packages/runtime-bundle/tandem_runtime_bundle/"*.py; do

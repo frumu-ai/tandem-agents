@@ -46,7 +46,7 @@ apt_install() {
 case "$os_id" in
   ubuntu|debian)
     hosted::log "Installing Docker prereqs on ${os_id} ${codename} using ${install_source} packages."
-    apt_install ca-certificates curl gnupg lsb-release python3 fail2ban unattended-upgrades
+    apt_install ca-certificates curl gnupg lsb-release python3 python3-cryptography fail2ban unattended-upgrades
 
     if [[ "$have_docker" == false ]]; then
       if [[ "$install_source" == "official" ]]; then

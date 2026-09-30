@@ -4,6 +4,22 @@ This directory contains the setup, schema, and workflow docs for the local
 Tandem Agents stack: Tandem engine, control panel, ACA runtime, KB MCP, and
 supporting operator scripts.
 
+- [HOSTED_MEMORY_ACCEPTANCE.md](HOSTED_MEMORY_ACCEPTANCE.md) - governed memory
+  acceptance for users, departments and customer isolation.
+
+- [RUNTIME_KEY_ROTATION.md](RUNTIME_KEY_ROTATION.md) - scoped public verifier
+  overlap, retirement, operator staging and runtime reload.
+- [RUNTIME_CLEAN_HOST_RECOVERY.md](RUNTIME_CLEAN_HOST_RECOVERY.md) - v3 recovery
+  blockers and the evidence required before storage-root rebind.
+- [RUNTIME_BACKUP_GOOGLE_STORAGE.md](RUNTIME_BACKUP_GOOGLE_STORAGE.md) - scoped
+  Google Cloud Storage transport candidate for encrypted v3 backup objects.
+- [RUNTIME_BACKUP_EXPORT.md](RUNTIME_BACKUP_EXPORT.md) - export-only encrypted
+  off-site v3 backup candidate, operator prerequisites and residual limits.
+- [RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md](RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md) - read-only
+  v3 encrypted archive and independent authority preflight candidate.
+- [RUNTIME_BACKUP_GOOGLE_KMS.md](RUNTIME_BACKUP_GOOGLE_KMS.md) - scoped
+  Google Cloud KMS backup-key command and separate recovery credentials.
+
 ACA smoke harness documentation:
 
 - [ACA_SMOKE_HARNESS.md](ACA_SMOKE_HARNESS.md) - contract for the ACA smoke

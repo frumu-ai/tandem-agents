@@ -146,6 +146,7 @@ stage_executable "$secrets_copy" "${install_root}/generate-secrets.sh"
 stage_file "$lib_copy" "${install_root}/lib.sh"
 stage_file "${bundle_dir}/runtime-security.json" "${install_root}/runtime-security.json"
 stage_executable "${bundle_dir}/runtime-security.py" "${install_root}/runtime-security.py"
+stage_executable "${bundle_dir}/export-runtime-backup.py" "${install_root}/export-runtime-backup.py"
 stage_file "${bundle_dir}/compose.py" "${install_root}/compose.py"
 hosted::as_root install -d -m 0755 "${install_root}/tandem_runtime_bundle"
 for module in "${bundle_dir}/tandem_runtime_bundle/"*.py; do
