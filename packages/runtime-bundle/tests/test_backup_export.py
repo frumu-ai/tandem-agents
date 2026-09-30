@@ -309,6 +309,29 @@ class BackupExportTests(unittest.TestCase):
         self.assertEqual(self.uploader.objects, {})
         self.assertFalse(hasattr(self.kms, "dek"))
 
+    def test_oversized_manifest_is_rejected_before_any_remote_upload(self):
+        document = keyring()
+        # This valid engine metadata remains below the source control-file cap,
+        # while an artificially small manifest budget models a large inventory.
+        document["test-key"]["operator_metadata"] = "m" * 20000
+        (Path(self.bundle["host_paths"]["security"]) /
+         "context-keyring.json").write_text(json.dumps(document))
+        original = backup_export._sealed_manifest
+        def manifest_budget(inner, outer, dek):
+            with patch.object(backup_export, "MAX_DOCUMENT_BYTES",
+                              len(canonical_json(inner)) + 100):
+                return original(inner, outer, dek)
+        with patch.object(backup_export, "_sealed_manifest", side_effect=manifest_budget):
+            with self.assertRaisesRegex(ValueError, "manifest exceeds"):
+                self.export()
+        self.assertEqual(self.uploader.objects, {})
+
+    def test_oversized_sealed_inventory_is_rejected_before_any_remote_upload(self):
+        with patch.object(backup_export, "MAX_DOCUMENT_BYTES", 100):
+            with self.assertRaisesRegex(ValueError, "inventory exceeds"):
+                self.export()
+        self.assertEqual(self.uploader.objects, {})
+
     def test_policy_or_release_change_during_quiescence_fails_before_kms(self):
         policy_path = Path(self.bundle["host_paths"]["policy"]) / "current.json"
         release_path = self.install / "release-manifest.json"
@@ -335,6 +358,35 @@ class BackupExportTests(unittest.TestCase):
                 self.assertFalse(hasattr(self.kms, "dek"))
             finally:
                 target.write_bytes(original)
+
+    def test_boolean_policy_schema_cannot_publish_unrecoverable_candidate(self):
+        path = Path(self.bundle["host_paths"]["policy"]) / "current.json"
+        value = json.loads(path.read_text())
+        path.write_text(json.dumps({**value, "schema_version": True}))
+        with self.assertRaisesRegex(ValueError, "policy snapshot"):
+            self.export()
+        self.assertEqual(self.uploader.objects, {})
+        self.assertFalse(hasattr(self.kms, "dek"))
+
+    def test_noncanonical_configuration_paths_cannot_publish_candidate(self):
+        for section, name in (("host_paths", "state"), ("ordinary_paths", "DATA")):
+            altered = json.loads(json.dumps(self.bundle))
+            altered[section][name] += "/"
+            (self.install / "runtime-security.json").write_text(json.dumps(altered))
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "canonical"):
+                self.export()
+            self.assertEqual(self.uploader.objects, {})
+            self.assertFalse(hasattr(self.kms, "dek"))
+
+    def test_replay_above_verifier_memory_limit_fails_before_upload(self):
+        self.db.close()
+        replay = Path(self.bundle["host_paths"]["replay"]) / "assertions.sqlite3"
+        with replay.open("r+b") as handle:
+            handle.truncate(128 * 1024 * 1024 + 1)
+        with self.assertRaisesRegex(ValueError, "replay database exceeds"):
+            self.export()
+        self.assertEqual(self.uploader.objects, {})
+        self.assertFalse(hasattr(self.kms, "dek"))
 
     def test_staging_rejects_writable_ancestor_and_preplanted_output(self):
         unsafe = SimpleNamespace(st_mode=stat.S_IFDIR | 0o777, st_uid=0)
@@ -364,6 +416,31 @@ class BackupExportTests(unittest.TestCase):
 
 
 class AuthorityProtocolTests(unittest.TestCase):
+    def test_compose_quiescence_checks_every_state_and_json_format(self):
+        stopped = [{"State": "exited"}, {"State": "created"}, {"State": "dead"}]
+        root = Path.cwd()
+        def invoke(payload, returncode=0):
+            with (patch.object(backup_export.os, "name", "posix"),
+                  patch.object(backup_export.os, "geteuid", return_value=0, create=True),
+                  patch.object(backup_export, "_service_inactive"),
+                  patch.object(backup_export, "plain_path", return_value=root),
+                  patch.object(backup_export.subprocess, "run", return_value=SimpleNamespace(
+                      returncode=returncode, stdout=payload)) as run):
+                backup_export.assert_quiescent(root, DEPLOYMENT)
+                self.assertIn("--all", run.call_args.args[0])
+                self.assertNotIn("--status", run.call_args.args[0])
+        invoke(json.dumps(stopped))
+        invoke("\n".join(json.dumps(row) for row in stopped))
+        invoke("")
+        for state in ("running", "restarting", "paused", "removing", "unknown", None):
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, "stopped"):
+                invoke(json.dumps([{"State": state}]))
+        for payload in ("broken-json", "null", "[null]"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                invoke(payload)
+        with self.assertRaises(ValueError):
+            invoke("[]", returncode=1)
+
     def test_wrong_kms_version_and_nonprivate_receipt_fail_closed(self):
         key_id = FakeKms.key_id
         version = FakeKms.key_version

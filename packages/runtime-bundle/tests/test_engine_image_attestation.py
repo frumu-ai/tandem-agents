@@ -185,12 +185,27 @@ class EngineImageAttestationTests(unittest.TestCase):
         self.assertIn("Require configured protected publisher",
                       [step.get("name") for step in jobs["publish"]["steps"]])
         self.assertEqual(jobs["register-hosted-release"]["environment"], "hosted-release")
-        self.assertEqual(jobs["register-hosted-release"]["permissions"], {"contents": "read"})
+        self.assertEqual(jobs["register-hosted-release"]["permissions"], {"contents": "read", "actions": "read"})
+        self.assertIn("reuse_reviewed_images", jobs["publish"]["if"])
+        registration = jobs["register-hosted-release"]
+        self.assertIn("needs.publish.result == 'skipped'", registration["if"])
+        downloads = [step["with"] for step in registration["steps"]
+                     if step.get("uses", "").startswith("actions/download-artifact@")]
+        self.assertEqual(len(downloads), 2)
+        self.assertTrue(all("reviewed_publish_run_id" in item["run-id"] for item in downloads))
         security = yaml.safe_load((repo / ".github/workflows/runtime-security.yml").read_text())
         paths = security.get("on", security.get(True))["pull_request"]["paths"]
         for required in (".github/workflows/publish-images.yml", "config/Dockerfile.engine-v3",
                          "config/Dockerfile", ".dockerignore"):
             self.assertIn(required, paths)
+        memory = security["jobs"]["memory-engine"]
+        builds = [step for step in memory["steps"] if "cargo build" in step.get("run", "")]
+        self.assertEqual(len(builds), 1)
+        self.assertIn("cargo build --release --locked -p tandem-ai --features browser,enterprise-full --bin tandem-engine",
+                      builds[0]["run"])
+        integration = next(step for step in memory["steps"]
+                           if "memory_encryption_engine_integration.py" in step.get("run", ""))
+        self.assertIn("target/release/tandem-engine", integration["run"])
 
 
 if __name__ == "__main__":

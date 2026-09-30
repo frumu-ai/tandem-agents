@@ -1,5 +1,10 @@
 # Runtime security v3 recovery preflight candidate
 
+Use Python 3.11 or newer with SQLite `deserialize` support. The verifier keeps
+the replay database in memory and does not create a plaintext recovery database
+on disk. The exporter enforces the same 8 MiB document/manifest and 200,000-entry
+inventory limits before publishing a candidate.
+
 `scripts/hosted/verify-runtime-backup.py` is a **read-only** Linux root operator
 command. It consumes the encrypted format produced by
 `export-runtime-backup.py`; it does not extract files, write

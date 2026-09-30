@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -17,6 +18,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fixtures import DEPLOYMENT, ORGANIZATION, keyring
 import test_backup_export
 from tandem_runtime_bundle.backup_archive import canonical_json
+from tandem_runtime_bundle import backup_export
+from tandem_runtime_bundle.backup_source import _check_source
 from tandem_runtime_bundle.keyring_lifecycle import fingerprint
 from tandem_runtime_bundle.backup_commands import BackupKms, validate_operator_command
 from tandem_runtime_bundle.backup_recovery_authority import (
@@ -127,6 +130,94 @@ class RecoveryPreflightTests(unittest.TestCase):
             FakeRecoveryAuthority(receipt or self.receipt),
             FakeKeyringAuthority(checkpoint or self.checkpoint),
             self.kms, FakeMemoryKms())
+
+    def reexport_control(self, path, value, *, unchecked=False):
+        # Model an independently receipted artifact from another exporter.
+        # Only the producer's source checks are bypassed for malformed controls;
+        # encryption, sealed inventory, hashes and the recovery verifier are real.
+        prior = _check_source(self.install, strict_host=False)
+        if path.name == "current.json":
+            prior = (*prior[:3], value, prior[4])
+        path.write_text(json.dumps(value))
+        self.uploader.objects.clear()
+        self.uploader.order.clear()
+        if unchecked:
+            with patch.object(backup_export, "_check_source", return_value=prior):
+                result = test_backup_export.BackupExportTests.export(self)
+        else:
+            result = test_backup_export.BackupExportTests.export(self)
+        self.scope = {key: result[key] for key in self.scope}
+        self.checkpoint["backup_id"] = self.scope["backup_id"]
+        for key, payload in self.uploader.objects.items():
+            self.paths[key.rsplit("/", 1)[-1]].write_bytes(payload)
+        manifest = self.paths["manifest.json"].read_bytes()
+        commit = json.loads(manifest)
+        self.receipt.update(
+            **self.scope, manifest_object_key=self.uploader.order[-1],
+            manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            manifest_size=len(manifest),
+            archive_sha256=commit["objects"]["archive"]["sha256"],
+            anchors_sha256=commit["objects"]["anchors"]["sha256"])
+
+    def test_exported_engine_keyring_metadata_remains_recoverable(self):
+        document = keyring()
+        document["test-key"]["operator_metadata"] = "m" * (257 * 1024)
+        self.reexport_control(Path(self.bundle["host_paths"]["security"]) /
+                              "context-keyring.json", document)
+        self.checkpoint["document_sha256"] = fingerprint(document)
+        self.assertEqual(self.verify()["keyring_document_sha256"], fingerprint(document))
+        with self.assertRaisesRegex(ValueError, "independent latest authority"):
+            self.verify(checkpoint={**self.checkpoint, "document_sha256": "0" * 64})
+
+    def test_authenticated_captured_configuration_must_mount_sealed_roots(self):
+        original = json.loads((self.install / "runtime-security.json").read_text())
+        for section, name in (("host_paths", "state"), ("host_paths", "replay"),
+                              ("host_paths", "anchor"), ("ordinary_paths", "DATA")):
+            altered = json.loads(json.dumps(original))
+            altered[section][name] += "-uncaptured"
+            self.reexport_control(self.install / "runtime-security.json", altered,
+                                  unchecked=True)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "inventory roots differ"):
+                self.verify()
+            (self.install / "runtime-security.json").write_text(json.dumps(original))
+
+    def test_authenticated_policy_requires_schema_and_positive_integer_version(self):
+        path = Path(self.bundle["host_paths"]["policy"]) / "current.json"
+        original = json.loads(path.read_text())
+        for schema, version in ((None, 7), (True, 7), (1, 0), (1, True), (1, "7")):
+            altered = {**original, "schema_version": schema, "policy_version": version}
+            # The sealed inventory intentionally repeats the malformed version.
+            self.reexport_control(path, altered, unchecked=True)
+            with self.subTest(schema=schema, version=version), self.assertRaisesRegex(
+                    ValueError, "recovery controls differ"):
+                self.verify()
+            path.write_text(json.dumps(original))
+
+    def test_candidate_reusing_backup_key_for_memory_is_rejected(self):
+        commit = json.loads(self.paths["manifest.json"].read_bytes())
+        outer = {key: value for key, value in commit.items()
+                 if key not in ("manifest_nonce_base64", "manifest_ciphertext_base64")}
+        nonce = base64.b64decode(commit["manifest_nonce_base64"])
+        inner = AESGCM(self.kms.dek).decrypt(
+            nonce, base64.b64decode(commit["manifest_ciphertext_base64"]), canonical_json(outer))
+        key_id = self.bundle["memory_encryption"]["kek_id"]
+        key_version = key_id + "/cryptoKeyVersions/1"
+        outer["backup_kms"] = {**outer["backup_kms"], "key_id": key_id,
+                               "key_version": key_version}
+        commit.update(outer)
+        commit["manifest_ciphertext_base64"] = base64.b64encode(
+            AESGCM(self.kms.dek).encrypt(nonce, inner, canonical_json(outer))).decode()
+        manifest = canonical_json(commit)
+        self.paths["manifest.json"].write_bytes(manifest)
+        self.receipt.update(manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+                            manifest_size=len(manifest))
+        with (patch.object(self.kms, "key_id", key_id),
+              patch.object(self.kms, "key_version", key_version),
+              patch.object(FakeMemoryKms, "verify") as challenge):
+            with self.assertRaisesRegex(ValueError, "must be separate"):
+                self.verify()
+            challenge.assert_not_called()
 
     def test_verified_archive_replay_anchor_and_binding_are_read_only(self):
         original = (Path(self.bundle["host_paths"]["security"]) /
@@ -296,6 +387,13 @@ class RecoveryPreflightTests(unittest.TestCase):
 
 
 class AuthorityProtocolTests(unittest.TestCase):
+    def test_replay_without_sqlite_deserialize_has_explicit_requirement_error(self):
+        from tandem_runtime_bundle.backup_verify import _replay
+        with patch("tandem_runtime_bundle.backup_verify.sqlite3.connect",
+                   return_value=SimpleNamespace(close=lambda: None)):
+            with self.assertRaisesRegex(ValueError, "Python 3.11"):
+                _replay(b"SQLite format 3\x00")
+
     def test_unwrap_requires_exact_key_scope(self):
         with patch("tandem_runtime_bundle.backup_commands.validate_operator_command",
                    return_value=Path("/operator/kms")):

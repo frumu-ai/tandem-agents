@@ -63,6 +63,23 @@ def _write(path, value, uid, gid):
 _V3_ROOT_SENTINEL = ".runtime-security-v3-root"
 
 
+def _check_storage_parents(path, uid):
+    """Keep validated bind roots irreplaceable by the runtime before mounting."""
+    child_uid = uid
+    for parent in path.parents:
+        try:
+            info = parent.lstat()
+        except OSError:
+            raise ValueError("v3 storage ancestors must be preprovisioned and prevent non-root replacement") from None
+        mode = stat.S_IMODE(info.st_mode)
+        # A sticky parent protects only root-owned children. The runtime owns
+        # these mount leaves, so /tmp/root itself is unsafe even with sticky.
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                or (mode & 0o022 and not (mode & stat.S_ISVTX and child_uid == 0))):
+            raise ValueError("v3 storage ancestors must prevent non-root replacement")
+        child_uid = info.st_uid
+
+
 def _v3_storage_identity(bundle, uid, include_history=False):
     """Bind workload mounts and, once initialized, non-regenerable history roots."""
     identity = {}
@@ -72,6 +89,7 @@ def _v3_storage_identity(bundle, uid, include_history=False):
         roots.extend((name, bundle["host_paths"][name]) for name in ("replay", "anchor"))
     for name, value in roots:
         path = _plain_path(value)
+        _check_storage_parents(path, uid)
         try:
             info = path.lstat()
         except OSError:
@@ -172,6 +190,9 @@ def prepare_security(bundle, keyring, host_agent_token_file, panel_config=None):
     try:
         v3_identity = None
         if bundle["schema_version"] == 3:
+            # Validate history parents before helpers can create these roots.
+            for name in ("replay", "anchor"):
+                _check_storage_parents(paths[name], uid)
             v3_identity = _v3_storage_identity(bundle, uid)
             _check_memory_commands(bundle, gid)
         # A new security root is not proof that the workload mounts are new.

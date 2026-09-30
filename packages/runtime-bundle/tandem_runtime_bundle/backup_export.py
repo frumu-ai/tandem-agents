@@ -7,6 +7,7 @@ import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import secrets
@@ -16,7 +17,8 @@ import tempfile
 import uuid
 
 from .backup_archive import canonical_json, plain_path, read_file, write_encrypted_tar
-from .backup_source import _check_source, _uuid, collect_inventory
+from .backup_source import (MAX_DOCUMENT_BYTES, MAX_INVENTORY_ENTRIES,
+                            _check_source, _uuid, collect_inventory)
 
 
 def _put_offsite_receipt(uploader, source_path, object_key, sha256, size):
@@ -46,9 +48,25 @@ def assert_quiescent(install_root, deployment_id):
     root = plain_path(install_root)
     result = subprocess.run(["docker", "compose", "--env-file", str(root / "hosted.env"),
                              "-f", str(root / "docker-compose.hosted.yml"),
-                             "ps", "--services", "--status", "running"],
+                             "ps", "--all", "--format", "json"],
                             capture_output=True, text=True, timeout=30, check=False)
-    if result.returncode != 0 or result.stdout.strip():
+    if result.returncode != 0:
+        raise ValueError("backup requires all hosted compose services stopped")
+    raw = result.stdout.strip()
+    try:
+        # Compose versions emit either an array or one JSON object per line.
+        records = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        try:
+            records = [json.loads(line) for line in raw.splitlines()]
+        except json.JSONDecodeError:
+            raise ValueError("backup compose status is invalid") from None
+    if isinstance(records, dict):
+        records = [records]
+    if (not isinstance(records, list)
+            or any(not isinstance(record, dict)
+                   or record.get("State") not in ("exited", "created", "dead")
+                   for record in records)):
         raise ValueError("backup requires all hosted compose services stopped")
 
 
@@ -147,9 +165,15 @@ def _sealed_manifest(inner, outer, dek):
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     # Domain 2 is disjoint from archive (0) and anchor (1) chunk nonces.
     nonce = b"\x02" + secrets.token_bytes(11)
-    ciphertext = AESGCM(dek).encrypt(nonce, canonical_json(inner), canonical_json(outer))
-    return {**outer, "manifest_nonce_base64": base64.b64encode(nonce).decode("ascii"),
-            "manifest_ciphertext_base64": base64.b64encode(ciphertext).decode("ascii")}
+    plaintext = canonical_json(inner)
+    if len(plaintext) > MAX_DOCUMENT_BYTES:
+        raise ValueError("sealed backup inventory exceeds 8 MiB verification limit")
+    ciphertext = AESGCM(dek).encrypt(nonce, plaintext, canonical_json(outer))
+    commit = {**outer, "manifest_nonce_base64": base64.b64encode(nonce).decode("ascii"),
+              "manifest_ciphertext_base64": base64.b64encode(ciphertext).decode("ascii")}
+    if len(canonical_json(commit)) > MAX_DOCUMENT_BYTES:
+        raise ValueError("backup manifest exceeds 8 MiB verification limit")
+    return commit
 
 
 def _file_digest(path):
@@ -183,6 +207,8 @@ def export_backup(install_root, staging_root, kms, uploader, *, quiescence=None,
                 raise ValueError("backup authority commands must be outside captured roots")
     staging = _validate_staging(staging_root, source_paths, strict_host=strict_host)
     before, root_records = collect_inventory(root, bundle)
+    if not 1 <= len(before) <= MAX_INVENTORY_ENTRIES:
+        raise ValueError("backup inventory exceeds verification entry limit")
     if _check_source(root, strict_host=strict_host) != source_state:
         raise ValueError("backup source changed before capture")
     anchor_entries = [item for item in before if item["archive_path"].startswith("host-anchor/")

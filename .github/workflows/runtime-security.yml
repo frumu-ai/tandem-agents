@@ -106,6 +106,8 @@ jobs:
         run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-policy-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/policy_engine_integration.py
       - name: Non-root engine key overlap, retirement, protected reload and restart
         run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-policy-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/keyring_engine_integration.py
+      - name: Actual hosted memory isolation for two users and two customers
+        run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-policy-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/memory_engine_integration.py
 
   memory-engine:
     runs-on: ubuntu-24.04
@@ -138,12 +140,12 @@ jobs:
         with:
           cache-profile: hosted-memory-engine
           workspaces: '.test-memory-engine -> target'
-      - name: Build the exact enterprise engine for v3 integration
+      - name: Build the release engine with the exact v3 image features
         working-directory: .test-memory-engine
         env:
           EXPECTED_REVISION: ${{ steps.engine-source.outputs.revision }}
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
-          cargo build --locked -p tandem-ai --features enterprise --bin tandem-engine
+          cargo build --release --locked -p tandem-ai --features browser,enterprise-full --bin tandem-engine
       - name: Non-root v3 KMS crypto regression (release blocker)
-        run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-memory-engine/target/debug/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/memory_encryption_engine_integration.py
+        run: sudo env TANDEM_TEST_ENGINE="$GITHUB_WORKSPACE/.test-memory-engine/target/release/tandem-engine" PYTHONPATH="$GITHUB_WORKSPACE/packages/runtime-bundle" "$(command -v python)" packages/runtime-bundle/tests/memory_encryption_engine_integration.py

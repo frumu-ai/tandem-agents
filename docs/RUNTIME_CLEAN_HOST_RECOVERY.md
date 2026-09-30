@@ -11,24 +11,17 @@ anchors; selective deletion or rollback still needs independent evidence and
 engine verification. Do not edit `storage-roots.json` to make a copied
 installation start.
 
-The Tandem web host-agent snapshot reviewed at commit
-`02edded32762eba4e7b9f4b47cc18b2414a62fc4` explicitly rejects both legacy
-snapshot and restore jobs whenever `runtime-security.json` exists. Preserve
-that gate. Its archive path includes deployment-local data, engine state, panel
-state, repositories, runs, proxy, secrets, and release files, but omits the
-separate runtime-security root (audit HMAC key, public keyring, and storage
-binding), durable context replay root, independent audit-anchor root,
-hosted-policy root, and panel-auth root. The external memory KMS key, principal,
-command provisioning, and access policy also require independent recovery. The
-local tar archive and adjacent SHA-256 metadata do not establish an encrypted,
-off-site, independently authenticated backup. A v3 backup/restore procedure
-must be a separate path, not an extension that enables the legacy archive.
+Legacy local snapshots do not meet the v3 recovery contract. Recovery requires
+an encrypted off-site backup, an independently authenticated receipt, preserved
+replay and audit continuity, current signing authority, and separately
+provisioned KMS access. A copied archive with an adjacent checksum is
+insufficient. Existing v3 restrictions on legacy snapshot recovery remain in
+force until the complete recovery procedure has acceptance evidence.
 
 An export-only operator candidate is described in
 `RUNTIME_BACKUP_EXPORT.md`. A read-only encrypted recovery preflight candidate
-is described in `RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md`. Neither enables hosted
-jobs, extraction, or any rebind. The remaining backup integration belongs in tandem-web's host-agent and control
-plane:
+is described in `RUNTIME_BACKUP_RECOVERY_PREFLIGHT.md`. Neither enables
+extraction or any rebind. The complete recovery contract requires:
 
 1. Quiesce writes and policy synchronization, then capture a consistent set of
    all v3 data and security roots, including replay and audit anchors. Record

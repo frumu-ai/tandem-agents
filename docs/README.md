@@ -4,6 +4,9 @@ This directory contains the setup, schema, and workflow docs for the local
 Tandem Agents stack: Tandem engine, control panel, ACA runtime, KB MCP, and
 supporting operator scripts.
 
+- [HOSTED_MEMORY_ACCEPTANCE.md](HOSTED_MEMORY_ACCEPTANCE.md) - governed memory
+  acceptance for users, departments and customer isolation.
+
 - [RUNTIME_KEY_ROTATION.md](RUNTIME_KEY_ROTATION.md) - scoped public verifier
   overlap, retirement, operator staging and runtime reload.
 - [RUNTIME_CLEAN_HOST_RECOVERY.md](RUNTIME_CLEAN_HOST_RECOVERY.md) - v3 recovery

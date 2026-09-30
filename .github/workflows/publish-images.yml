@@ -23,10 +23,15 @@ on:
         default: false
         type: boolean
       register_hosted_release:
-        description: "Register a hosted release in Tandem Web after images publish"
+        description: "Register a hosted release (v3 reuses a previously reviewed publication)"
         required: true
         default: false
         type: boolean
+      reviewed_publish_run_id:
+        description: "Successful main publisher run whose immutable v3 images were reviewed"
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
 
@@ -44,6 +49,8 @@ jobs:
       push_latest: ${{ steps.resolve.outputs.push_latest }}
       security_version: ${{ steps.resolve.outputs.security_version }}
       engine_revision: ${{ steps.resolve.outputs.engine_revision }}
+      reuse_reviewed_images: ${{ steps.resolve.outputs.reuse_reviewed_images }}
+      reviewed_publish_run_id: ${{ steps.resolve.outputs.reviewed_publish_run_id }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - id: resolve
@@ -55,18 +62,23 @@ jobs:
           RELEASE_VERSION: ${{ inputs.tandem_release_version }}
           SECURITY_VERSION: ${{ inputs.runtime_security_version }}
           PUSH_LATEST: ${{ inputs.push_latest }}
+          REGISTER_HOSTED_RELEASE: ${{ inputs.register_hosted_release }}
+          REVIEWED_PUBLISH_RUN_ID: ${{ inputs.reviewed_publish_run_id }}
         run: |
           set -euo pipefail
           PYTHONPATH=packages/runtime-bundle python3 -m tandem_runtime_bundle.release_lane \
             --event "$RELEASE_EVENT" --ref "$RELEASE_REF" \
             --tag "$RELEASE_TAG" --version "$RELEASE_VERSION" \
             --security-version "$SECURITY_VERSION" --push-latest "$PUSH_LATEST" \
+            --register-hosted-release "$REGISTER_HOSTED_RELEASE" \
+            --reviewed-publish-run-id "$REVIEWED_PUBLISH_RUN_ID" \
             >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish ${{ matrix.image }}
     runs-on: ubuntu-latest
     needs: resolve
+    if: ${{ needs.resolve.outputs.reuse_reviewed_images != 'true' }}
     environment: hosted-image-publish
     permissions:
       contents: read
@@ -237,23 +249,47 @@ jobs:
     environment: hosted-release
     permissions:
       contents: read
+      actions: read
     needs:
       - resolve
       - publish
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.register_hosted_release }}
+    if: ${{ always() && needs.resolve.result == 'success' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.resolve.outputs.reuse_reviewed_images == 'true')) && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.register_hosted_release }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify selected immutable publisher run
+        if: ${{ needs.resolve.outputs.reuse_reviewed_images == 'true' }}
+        env:
+          REVIEWED_RUN_ID: ${{ needs.resolve.outputs.reviewed_publish_run_id }}
+          ACTIONS_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fsS --proto '=https' \
+            -H "Authorization: Bearer $ACTIONS_READ_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/frumu-ai/tandem-agents/actions/runs/$REVIEWED_RUN_ID" \
+            > reviewed-publisher-run.json
+          PYTHONPATH=packages/runtime-bundle python3 - "$REVIEWED_RUN_ID" <<'PY'
+          import json, sys
+          from pathlib import Path
+          from tandem_runtime_bundle.reviewed_release import validate_publisher_run
+          validate_publisher_run(json.loads(Path("reviewed-publisher-run.json").read_bytes()), sys.argv[1])
+          PY
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: hosted-image-digest-*
           merge-multiple: true
           path: image-digests
+          run-id: ${{ needs.resolve.outputs.reviewed_publish_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         if: ${{ needs.resolve.outputs.security_version == '3' }}
         with:
           name: hosted-engine-v3-attestation
           path: engine-attestation
+          run-id: ${{ needs.resolve.outputs.reviewed_publish_run_id }}
+          github-token: ${{ github.token }}
       - name: Prepare pinned hosted release inputs
         shell: bash
         env:
@@ -262,6 +298,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
           SECURITY_VERSION: ${{ needs.resolve.outputs.security_version }}
           ENGINE_REVISION: ${{ needs.resolve.outputs.engine_revision }}
+          REVIEWED_RUN_ID: ${{ needs.resolve.outputs.reviewed_publish_run_id }}
         run: |
           set -euo pipefail
           test "$RELEASE_VERSION" = "0.7.2" || { echo "Runtime security contract requires tested engine version 0.7.2" >&2; exit 1; }
@@ -286,12 +323,13 @@ jobs:
           if [[ "$SECURITY_VERSION" == "3" ]]; then
             test -f engine-attestation/engine-image-attestation.json
             image_ref="$IMAGE_REGISTRY/engine-enterprise@$(cat image-digests/engine-enterprise)"
-            PYTHONPATH=packages/runtime-bundle python3 - "$image_ref" "$ENGINE_REVISION" <<'PY' >> "$GITHUB_ENV"
-          import sys
+            PYTHONPATH=packages/runtime-bundle python3 - "$image_ref" "$REVIEWED_RUN_ID" <<'PY' >> "$GITHUB_ENV"
+          import json, sys
           from pathlib import Path
-          from tandem_runtime_bundle.engine_image_attestation import load_attestation
-          document, digest = load_attestation(
-              "engine-attestation/engine-image-attestation.json", sys.argv[1], sys.argv[2])
+          from tandem_runtime_bundle.reviewed_release import validate_reviewed_engine
+          document, digest = validate_reviewed_engine(
+              json.loads(Path("reviewed-publisher-run.json").read_bytes()), sys.argv[2],
+              "engine-attestation/engine-image-attestation.json", sys.argv[1])
           if Path("engine-attestation/engine-image-attestation.sha256").read_text().strip() != digest:
               raise SystemExit("v3 engine attestation fingerprint mismatch")
           print("HOSTED_ENGINE_BINARY_SHA256=" + document["engine_binary_sha256"])

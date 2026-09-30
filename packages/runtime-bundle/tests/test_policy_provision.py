@@ -23,7 +23,7 @@ class PolicyProvisionTests(unittest.TestCase):
         self.provenance = synthetic_v3_provenance()
         self.provenance.start()
         self.addCleanup(self.provenance.stop)
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.temp.name)
         self.management = self.root / "management"
         self.management.mkdir(mode=0o700)
@@ -224,6 +224,43 @@ class PolicyProvisionTests(unittest.TestCase):
         weak_parent.chmod(0o777)
         with self.assertRaisesRegex(ValueError, "ancestors must prevent non-root replacement"):
             prepare_security(relocated, keyring(), self.token)
+
+    def test_v3_storage_roots_cannot_be_replaced_through_a_writable_parent(self):
+        self.root.chmod(0o755)
+        variables = {"state": "HOSTED_ENGINE_STATE_ROOT", "data": "HOSTED_DATA_ROOT",
+                     "replay": "HOSTED_REPLAY_ROOT", "anchor": "HOSTED_AUDIT_ANCHOR_ROOT"}
+        for location, variable in variables.items():
+            with self.subTest(root=location):
+                parent = self.root / (location + "-mutable-parent")
+                parent.mkdir(mode=0o755)
+                values = {**self.values, "HOSTED_RUNTIME_SECURITY_VERSION": "3",
+                          "HOSTED_TANDEM_ENGINE_SOURCE_REVISION": MEMORY_ENGINE_REVISION,
+                          "HOSTED_INSTALL_ROOT": str(self.root / (location + "-install")),
+                          "HOSTED_AUDIT_ANCHOR_ROOT": str(self.root / (location + "-anchors")),
+                          variable: str(parent / "bind-root")}
+                bundle = build_security_bundle(values)
+                self.precreate_workload_roots(bundle)
+                self.provision_memory_commands(bundle)
+                security = Path(bundle["host_paths"]["security"])
+                os.chown(parent, bundle["uid"], bundle["gid"])
+                with self.assertRaisesRegex(ValueError, "storage ancestors"):
+                    prepare_security(bundle, keyring(), self.token)
+                self.assertFalse(security.exists())
+                os.chown(parent, 0, 0)
+                for mode in (0o777, 0o1777):
+                    parent.chmod(mode)
+                    with self.assertRaisesRegex(ValueError, "storage ancestors"):
+                        prepare_security(bundle, keyring(), self.token)
+                    self.assertFalse(security.exists())
+                parent.chmod(0o755)
+                prepare_security(bundle, keyring(), self.token)
+                leaf = Path(values[variable])
+                result = subprocess.run(["python3", "-c",
+                    "import os,sys; os.rename(sys.argv[1],sys.argv[2])",
+                    str(leaf), str(parent / "replaced")], user=bundle["uid"],
+                    group=bundle["gid"], extra_groups=[], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(leaf.is_dir())
 
 
 if __name__ == "__main__":

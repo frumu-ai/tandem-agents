@@ -195,8 +195,15 @@ SHA-256 back from the published digest image. A
 versioned observation binds that source, binary, image, builder commit and run
 ID. The reviewed production allowlist must independently bind all three
 hashes: image digest, binary digest and canonical observation digest. Release
-registration requires the matching observation file and the code-owned
-allowlist entry. The map remains empty while integrated-engine and image proof
+registration is a separate manual dispatch with `register_hosted_release=true`
+and `reviewed_publish_run_id` set to the successful candidate publisher run.
+That dispatch skips building and uses the prior run's immutable image digests
+and observation. It verifies that the earlier run was a successful main-branch
+manual publisher run, that the observation binds its builder commit and run ID,
+and that the code-owned allowlist approves the exact source, binary and
+observation hashes. Committing an approval therefore cannot change the image
+being registered. Missing or expired artifacts require a new candidate review;
+registration never substitutes a rebuilt image. The map remains empty while integrated-engine and image proof
 are outstanding, so publishing a candidate image does not enable v3 deployment.
 The local `build-images.sh` v3 path can smoke-build an exact clean checkout but
 cannot push or register it; the published workflow owns the attested path.

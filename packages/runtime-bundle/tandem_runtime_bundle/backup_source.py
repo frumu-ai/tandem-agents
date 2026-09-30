@@ -17,6 +17,9 @@ REQUIRED_ORDINARY_ROOTS = ("DATA", "REPOS", "RUNS", "SECRETS", "PANEL_STATE",
                            "KB_DOCS", "KB_INDEX", "PROXY_DATA", "PROXY_CONFIG")
 CONFIG_FILES = ("hosted.env", "docker-compose.hosted.yml", "release-manifest.env",
                 "release-manifest.json", "runtime-security.json", "proxy/Caddyfile")
+MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+MAX_INVENTORY_ENTRIES = 200000
+MAX_REPLAY_BYTES = 128 * 1024 * 1024
 
 
 def _unique_object(pairs):
@@ -30,7 +33,7 @@ def _unique_object(pairs):
 
 def _json_file(path):
     try:
-        if path.lstat().st_size > 8 * 1024 * 1024:
+        if path.lstat().st_size > MAX_DOCUMENT_BYTES:
             raise ValueError("backup configuration document exceeds 8 MiB")
         return json.loads(read_file(path), object_pairs_hook=_unique_object)
     except (UnicodeError, json.JSONDecodeError):
@@ -96,7 +99,10 @@ def _check_source(install_root, *, strict_host):
             or set(hosts) != set(REQUIRED_HOST_ROOTS) | {"memory_kms_commands"}
             or set(ordinary) != set(REQUIRED_ORDINARY_ROOTS)):
         raise ValueError("v3 backup root contract is incomplete")
-    locations = [plain_path(value) for value in [*hosts.values(), *ordinary.values()]]
+    values = [*hosts.values(), *ordinary.values()]
+    locations = [plain_path(value) for value in values]
+    if any(str(path) != value for path, value in zip(locations, values)):
+        raise ValueError("v3 backup root paths must be canonical")
     for index, path in enumerate(locations):
         for other in locations[index + 1:]:
             if path == other or path in other.parents or other in path.parents:
@@ -134,13 +140,14 @@ def _check_source(install_root, *, strict_host):
     identity = _check_binding(bundle, strict_host=strict_host)
     security = plain_path(hosts["security"])
     audit_key = read_file(security / "audit-hmac-key")
-    if len(audit_key.strip()) < 32:
+    if len(audit_key.strip()) < 32 or len(audit_key) > MAX_DOCUMENT_BYTES:
         raise ValueError("v3 audit HMAC key is missing or invalid")
     keyring = _json_file(security / "context-keyring.json")
     validate_keyring(keyring, deployment_id, organization_id)
     replay = plain_path(hosts["replay"]) / "assertions.sqlite3"
     from .backup_archive import file_info
-    file_info(replay)
+    if file_info(replay).st_size > MAX_REPLAY_BYTES:
+        raise ValueError("replay database exceeds in-memory preflight limit")
     descriptor = open_no_symlink(replay)
     try:
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
@@ -150,7 +157,8 @@ def _check_source(install_root, *, strict_host):
     if replay_header != b"SQLite format 3\x00":
         raise ValueError("v3 durable replay database is missing or invalid")
     policy = _json_file(plain_path(hosts["policy"]) / "current.json")
-    if (not isinstance(policy, dict) or policy.get("schema_version") != 1
+    if (not isinstance(policy, dict) or type(policy.get("schema_version")) is not int
+            or policy["schema_version"] != 1
             or policy.get("organization_id") != organization_id
             or policy.get("deployment_id") != deployment_id
             or type(policy.get("policy_version")) is not int
