@@ -18,12 +18,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .backup_archive import CHUNK_SIZE, canonical_json, read_file
 from .backup_decrypt import DecryptingReader
 from .backup_source import (CONFIG_FILES, REQUIRED_HOST_ROOTS,
-                            REQUIRED_ORDINARY_ROOTS, _unique_object, _uuid)
-from .keyring_lifecycle import fingerprint, validate_document
+                            REQUIRED_ORDINARY_ROOTS, MAX_DOCUMENT_BYTES,
+                            MAX_INVENTORY_ENTRIES, MAX_REPLAY_BYTES, _unique_object, _uuid)
+from .contract import validate_keyring
+from .keyring_lifecycle import fingerprint
 
 
 _HEX = re.compile(r"[a-f0-9]{64}\Z")
-_SMALL = 8 * 1024 * 1024
+_SMALL = MAX_DOCUMENT_BYTES
 _CONTROL = {
     "config-3/release-manifest.json", "config-4/runtime-security.json",
     "host-security/.initialized", "host-security/storage-roots.json",
@@ -118,7 +120,7 @@ def _inventory(inner):
     roots = inner.get("roots")
     expected_roots = {f"host-{name}" for name in REQUIRED_HOST_ROOTS}
     expected_roots |= {f"ordinary-{name.lower()}" for name in REQUIRED_ORDINARY_ROOTS}
-    if (not isinstance(entries, list) or not 1 <= len(entries) <= 200000
+    if (not isinstance(entries, list) or not 1 <= len(entries) <= MAX_INVENTORY_ENTRIES
             or not isinstance(roots, dict) or set(roots) != expected_roots):
         raise ValueError("sealed backup inventory is incomplete")
     names = []
@@ -185,7 +187,7 @@ def _tar_object(path, metadata, dek, scope, kind, entries):
                     digest = hashlib.sha256()
                     small = bytearray() if name in _CONTROL else None
                     if kind == "archive" and name == "host-replay/assertions.sqlite3":
-                        if member.size > 128 * 1024 * 1024:
+                        if member.size > MAX_REPLAY_BYTES:
                             raise ValueError("replay database exceeds in-memory preflight limit")
                         replay_image = bytearray()
                     source = archive.extractfile(member)
@@ -213,6 +215,8 @@ def _replay(image):
         raise ValueError("durable replay database is invalid")
     try:
         with closing(sqlite3.connect(":memory:")) as connection:
+            if not hasattr(connection, "deserialize"):
+                raise ValueError("recovery preflight requires Python 3.11+ with SQLite deserialize support")
             connection.execute("PRAGMA trusted_schema=OFF")
             connection.deserialize(image)
             connection.execute("PRAGMA query_only=ON")
@@ -267,6 +271,8 @@ def _controls(inner, captured, by_name, scope, latest_keyring):
             or release.get("engine_image") != inner.get("engine_image")
             or policy.get("organization_id") != scope["organization_id"]
             or policy.get("deployment_id") != scope["deployment_id"]
+            or type(policy.get("schema_version")) is not int or policy["schema_version"] != 1
+            or type(policy.get("policy_version")) is not int or policy["policy_version"] < 1
             or policy.get("policy_version") != inner.get("policy_version")
             or captured["host-security/.initialized"] != b"runtime-security-v3\n"
             or binding != identity or not isinstance(identity, dict)
@@ -276,6 +282,18 @@ def _controls(inner, captured, by_name, scope, latest_keyring):
                 "TANDEM_AUDIT_HMAC_KEY_ID")
             or len(captured["host-security/audit-hmac-key"].strip()) < 32):
         raise ValueError("recovery controls differ from sealed scope or storage identity")
+    hosts = bundle.get("host_paths")
+    ordinary = bundle.get("ordinary_paths")
+    if (not isinstance(hosts, dict) or not isinstance(ordinary, dict)
+            or set(hosts) != set(REQUIRED_HOST_ROOTS) | {"memory_kms_commands"}
+            or set(ordinary) != set(REQUIRED_ORDINARY_ROOTS)):
+        raise ValueError("recovery runtime configuration root contract is incomplete")
+    configured = {f"host-{name}": hosts[name] for name in REQUIRED_HOST_ROOTS}
+    configured.update({f"ordinary-{name.lower()}": ordinary[name]
+                       for name in REQUIRED_ORDINARY_ROOTS})
+    if any(not isinstance(path, str) or path != inner["roots"][group]["source_path"]
+           for group, path in configured.items()):
+        raise ValueError("recovery inventory roots differ from captured runtime configuration")
     for key, group in (("state", "host-state"), ("data", "ordinary-data"),
                        ("replay", "host-replay"), ("anchor", "host-anchor")):
         record = inner["roots"][group]
@@ -291,7 +309,9 @@ def _controls(inner, captured, by_name, scope, latest_keyring):
                 prior["sentinel"].encode("ascii")):
             raise ValueError("recovery history sentinel differs from storage binding")
     keyring = parsed("host-security/context-keyring.json")
-    validate_document(keyring, scope["deployment_id"], scope["organization_id"])
+    # Provisioning and export accept scoped engine metadata. Lifecycle staging
+    # imposes a narrower schema, which must not invalidate an existing backup.
+    validate_keyring(keyring, scope["deployment_id"], scope["organization_id"])
     if fingerprint(keyring) != latest_keyring["document_sha256"]:
         raise ValueError("backup verifier keyring differs from independent latest authority")
     memory = inner.get("memory_kms")
@@ -331,6 +351,8 @@ def verify_recovery_candidate(manifest_path, archive_path, anchors_path,
            _CONTROL if name.startswith("host-anchor/")):
         raise ValueError("independent anchor copy differs from full archive")
     memory = _controls(inner, controls, by_name, scope, checkpoint)
+    if memory["kek_id"] == backup_kms.key_id:
+        raise ValueError("backup KMS authority must be separate from hosted memory KMS")
     replay_entries = _replay(replay_image)
     memory_kms.verify(scope, memory, receipt["memory_challenge"])
     return {"scope": scope, "authorization_id": receipt["authorization_id"],

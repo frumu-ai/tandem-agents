@@ -1,5 +1,10 @@
 # Runtime security v3 backup export candidate
 
+The shared package requires Python 3.11 or newer. Export and recovery use the
+same 8 MiB bound for control documents, sealed inventory and final manifest,
+plus a 200,000-entry inventory limit. An oversized candidate fails before any
+remote object upload; split or reduce the captured installation before retrying.
+
 `scripts/hosted/export-runtime-backup.py` is an **export-only** Linux operator
 command backed by the shared `tandem_runtime_bundle.backup_cli` entry point.
 The package also exposes `tandem-runtime-backup-export` for deployments that
