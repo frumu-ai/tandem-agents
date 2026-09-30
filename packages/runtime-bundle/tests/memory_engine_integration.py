@@ -53,14 +53,22 @@ class HostedMemoryTests(unittest.TestCase):
                 for directory in (home, install):
                     directory.mkdir(mode=0o700)
                     os.chown(directory, 1000, 1000)
-                policy = {"version": 1, "bob_unit": "eng", "actors": ["alice", "bob"]}
+                policy = {"version": 1, "bob_unit": "eng", "actors": ["alice", "bob", "carol"]}
+                def actor_unit(actor):
+                    return {"alice": "eng", "bob": policy["bob_unit"], "carol": "finance"}[actor]
                 def document():
                     value = json.loads(policy_document(policy["version"], policy["actors"]))
                     value.update(organization_id=organization, deployment_id=deployment)
+                    value["org_units"].append({"id": "finance", "slug": "finance",
+                        "display_name": "Finance", "kind": "department", "state": "active"})
+                    value["deployment_grants"].append({"id": "unit-finance",
+                        "deployment_id": deployment, "principal_kind": "org_unit",
+                        "principal_id": "finance", "resource_kind": "deployment",
+                        "resource_id": deployment, "permissions": ["hosted.use"]})
                     for row in value["deployment_grants"]:
                         row.update(deployment_id=deployment, resource_id=deployment)
                     for row in value["org_unit_memberships"]:
-                        row["unit_id"] = "eng" if row["user_id"] == "alice" else policy["bob_unit"]
+                        row["unit_id"] = actor_unit(row["user_id"])
                     return json.dumps(value).encode()
                 with tls_endpoint(document, required_token=TOKEN) as (url, context, _):
                     values = inputs(install, root / "independent-anchors")
@@ -90,7 +98,7 @@ class HostedMemoryTests(unittest.TestCase):
                     engine.binary = str(executable)
                     os.chown(engine.env["TANDEM_STATE_DIR"], 1000, 1000)
                     engine.process_options = {"user": 1000, "group": 1000, "extra_groups": []}
-                    token = lambda actor: signed(key, actor, policy["version"], "eng" if actor == "alice" else policy["bob_unit"], organization, deployment)
+                    token = lambda actor: signed(key, actor, policy["version"], actor_unit(actor), organization, deployment)
                     ready = lambda: json.loads(engine.request("/global/health")[1])["ready"]
                     partition = {"org_id": organization, "workspace_id": deployment,
                                  "project_id": "company-brain-text", "tier": "session"}
@@ -184,26 +192,42 @@ class HostedMemoryTests(unittest.TestCase):
                         self.assertEqual(put("bob", "scope spoof", metadata={"owner_org_unit_id": "ops"})[0], 403)
                         foreign_partition = {**partition, "org_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"}
                         self.assertEqual(put("bob", "tenant spoof", partition=foreign_partition)[0], 403)
+                        # Carol has current hosted.use and finance membership,
+                        # but finance has no persisted knowledge-read grant.
+                        self.assertEqual(engine.request(token=token("carol"))[0], 200)
+                        visible("carol", [], list(ids))
                         for tier in ("team", "curated"):
-                            self.assertEqual(put("bob", "unsupported backing store", partition={**partition, "tier": tier})[0], 403)
+                            scope = {"knowledge_scope_registry": {"registry_id": "acceptance-notes",
+                                "resource_ref": resource, "data_class": "internal",
+                                "allowed_write_tiers": [tier]}}
+                            capability = {"run_id": "memory-acceptance", "subject": "bob",
+                                "org_id": organization, "workspace_id": deployment,
+                                "project_id": partition["project_id"],
+                                "memory": {"read_tiers": ["session"], "write_tiers": [tier],
+                                    "promote_targets": [], "require_review_for_promote": True,
+                                    "allow_auto_use_tiers": []},
+                                "expires_at": int(time.time() * 1000) + 240_000}
+                            self.assertEqual(put("bob", "unsupported backing store", metadata=scope,
+                                capability=capability, partition={**partition, "tier": tier})[0], 403)
                         foreign = signed(key, "alice", 1, "eng", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", deployment)
                         self.assertEqual(engine.request(token=foreign)[0], 403)
                         old_bob = token("bob")
                         policy.update(version=2, bob_unit="ops")
                         fetch()
                         wait_for(lambda: engine.request(token=old_bob)[0] == 403)
-                        visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private"])
+                        visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private", "bob-department-private"])
                         visible("bob", ["bob-private", "tenant-shared"], ["alice-private", "engineering-shared", "bob-department-private"])
                         status, body = put("bob", "acceptance lantern operations-shared", metadata={"owner_org_unit_id": "ops"})
                         self.assertEqual(status, 200, body)
-                        visible("alice", ["engineering-shared"], ["operations-shared", "bob-private"])
+                        visible("alice", ["engineering-shared"], ["operations-shared", "bob-private", "bob-department-private"])
                         engine.stop()
                         engine.start(wait_ready=False)
                         self.assertFalse(ready())
                         fetch()
                         wait_for(ready)
-                        visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private", "operations-shared"])
+                        visible("alice", ["alice-private", "engineering-shared", "tenant-shared"], ["bob-private", "bob-department-private", "operations-shared"])
                         visible("bob", ["bob-private", "operations-shared", "tenant-shared"], ["alice-private", "engineering-shared", "bob-department-private"])
+                        visible("carol", [], [*ids, "operations-shared"])
                     except AssertionError as error:
                         # Diagnostic data belongs only to this disposable synthetic
                         # host. Print row counts, never record contents or tokens.

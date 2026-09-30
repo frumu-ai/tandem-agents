@@ -112,13 +112,13 @@ class MemoryEncryptionEngineTests(unittest.TestCase):
             root.chmod(0o755)
             home, install = root / "runtime-home", root / "install"
             for directory in (home, install):
-                directory.mkdir(mode=0o700)
-                os.chown(directory, 1000, 1000)
+                directory.mkdir(mode=0o755 if directory == install else 0o700)
+                os.chown(directory, 0 if directory == install else 1000,
+                         0 if directory == install else 1000)
             with synthetic_v3_provenance():
                 values = inputs(install, root / "independent-anchors")
-                # The install root belongs to the non-root engine. KMS command
-                # ancestors must remain root-owned so that user cannot replace
-                # the executable before a later bind mount.
+                # Bind-root and KMS command ancestors remain root-owned so the
+                # runtime cannot replace validated directories before mounting.
                 values.update(HOSTED_RUNTIME_SECURITY_VERSION="3",
                               HOSTED_TANDEM_ENGINE_SOURCE_REVISION=MEMORY_ENGINE_REVISION,
                               HOSTED_MEMORY_KMS_COMMAND_ROOT=str(root / "memory-kms-commands"),
