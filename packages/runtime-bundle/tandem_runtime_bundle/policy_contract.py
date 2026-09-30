@@ -5,10 +5,11 @@ from pathlib import PurePosixPath
 
 # Candidate source must pass the exact-source engine integration before release.
 # Version 0.7.2 alone is insufficient: its released binary predates policy sync.
-POLICY_ENGINE_REVISION = "364d20926455e3154a6bed623945b8d9e3d464e5"
+POLICY_ENGINE_REVISION = "774b990e781eaea76eaa1b20ec5d350488bba19e"
+# The active v2 source includes tenant sharing across department changes.
 # Existing v2 releases were accepted by the previous shared bundle. Keep
 # rendering those immutable manifests during the v3 consumer upgrade.
-PREVIOUS_POLICY_ENGINE_REVISION = "774b990e781eaea76eaa1b20ec5d350488bba19e"
+PREVIOUS_POLICY_ENGINE_REVISION = "364d20926455e3154a6bed623945b8d9e3d464e5"
 SUPPORTED_POLICY_ENGINE_REVISIONS = (POLICY_ENGINE_REVISION, PREVIOUS_POLICY_ENGINE_REVISION)
 # Combined hosted-grant and encrypted-global-memory source candidate for v3,
 # independent of the v2 source pin. Exact-source integration and a verified
